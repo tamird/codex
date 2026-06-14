@@ -1,6 +1,24 @@
 use super::*;
 
 impl ChatWidget {
+    pub(super) fn on_raw_response_item(&mut self, item: ResponseItem) {
+        let Some(communication) = inter_agent_communication_from_item(&item) else {
+            return;
+        };
+        self.on_inter_agent_communication(communication);
+    }
+
+    pub(super) fn on_inter_agent_communication(&mut self, communication: InterAgentCommunication) {
+        let sender = communication.author.to_string();
+        let message = display_inter_agent_message_content(&communication.content);
+        let hint = (!sender.is_empty()).then(|| format!("from {sender}"));
+        self.add_to_history(history_cell::new_info_event(
+            format!("Agent message: {message}"),
+            hint,
+        ));
+        self.request_redraw();
+    }
+
     pub(crate) fn handle_server_notification(
         &mut self,
         notification: ServerNotification,
@@ -74,6 +92,9 @@ impl ChatWidget {
             }
             ServerNotification::ItemCompleted(notification) => {
                 self.handle_item_completed_notification(notification, replay_kind);
+            }
+            ServerNotification::RawResponseItemCompleted(notification) => {
+                self.on_raw_response_item(notification.item);
             }
             ServerNotification::AgentMessageDelta(notification) => {
                 self.on_agent_message_delta(notification.delta);
@@ -225,7 +246,7 @@ impl ChatWidget {
             | ServerNotification::ThreadArchived(_)
             | ServerNotification::ThreadDeleted(_)
             | ServerNotification::ThreadUnarchived(_)
-            | ServerNotification::RawResponseItemCompleted(_)
+            | ServerNotification::StrictReviewRequired(_)
             | ServerNotification::RawResponseCompleted(_)
             | ServerNotification::CommandExecOutputDelta(_)
             | ServerNotification::ProcessOutputDelta(_)
@@ -387,6 +408,7 @@ impl ChatWidget {
                 reasoning_effort,
                 agents_states,
             }),
+            ThreadItem::SubAgentActivity { .. } => {}
             ThreadItem::EnteredReviewMode { review, .. } if !from_replay => {
                 self.enter_review_mode_with_hint(review, /*from_replay*/ false);
             }

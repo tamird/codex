@@ -27,10 +27,12 @@ use codex_protocol::memory_citation::MemoryCitation as CoreMemoryCitation;
 use codex_protocol::memory_citation::MemoryCitationEntry as CoreMemoryCitationEntry;
 use codex_protocol::models::AdditionalPermissionProfile as CoreAdditionalPermissionProfile;
 use codex_protocol::models::BUILT_IN_PERMISSION_PROFILE_WORKSPACE;
+use codex_protocol::models::ContentItem;
 use codex_protocol::models::FileSystemPermissions as CoreFileSystemPermissions;
 use codex_protocol::models::ImageDetail;
 use codex_protocol::models::MessagePhase;
 use codex_protocol::models::NetworkPermissions as CoreNetworkPermissions;
+use codex_protocol::models::ResponseItem;
 use codex_protocol::models::WebSearchAction as CoreWebSearchAction;
 use codex_protocol::permissions::FileSystemAccessMode as CoreFileSystemAccessMode;
 use codex_protocol::permissions::FileSystemPath as CoreFileSystemPath;
@@ -368,6 +370,32 @@ fn thread_resume_response_round_trips_initial_turns_page() {
     let decoded = serde_json::from_value::<ThreadResumeResponse>(value)
         .expect("deserialize thread resume response");
     assert_eq!(decoded, response);
+}
+
+#[test]
+fn thread_item_accepts_legacy_raw_response_item() {
+    let item = ResponseItem::Message {
+        id: None,
+        role: "assistant".to_string(),
+        content: vec![ContentItem::OutputText {
+            text: "legacy inter-agent message".to_string(),
+        }],
+        phase: Some(MessagePhase::Commentary),
+        internal_chat_message_metadata_passthrough: None,
+    };
+    let value = json!({
+        "type": "rawResponseItem",
+        "id": "legacy-item-1",
+        "item": serde_json::to_value(&item).expect("serialize response item"),
+    });
+
+    assert_eq!(
+        serde_json::from_value::<ThreadItem>(value).expect("deserialize legacy thread item"),
+        ThreadItem::RawResponseItem {
+            id: "legacy-item-1".to_string(),
+            item,
+        }
+    );
 }
 
 #[test]

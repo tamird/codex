@@ -1043,6 +1043,7 @@ async fn thread_list_relation_filters_read_spawn_graph_from_state_db() -> Result
     let parent_id = ThreadId::new();
     let older_child_id = ThreadId::new();
     let newer_child_id = ThreadId::new();
+    let closed_child_id = ThreadId::new();
     let grandchild_id = ThreadId::new();
     let state_db = codex_state::StateRuntime::init(
         codex_state::SqliteConfig::new_for_testing(codex_home.path().abs()),
@@ -1060,6 +1061,12 @@ async fn thread_list_relation_filters_read_spawn_graph_from_state_db() -> Result
             newer_child_id,
             "2025-02-01T11:00:00Z",
             CoreSessionSource::Cli,
+            "mock_provider",
+        ),
+        (
+            closed_child_id,
+            "2025-02-01T11:30:00Z",
+            CoreSessionSource::SubAgent(SubAgentSource::Other("agent_job:closed".to_string())),
             "mock_provider",
         ),
         (
@@ -1084,17 +1091,30 @@ async fn thread_list_relation_filters_read_spawn_graph_from_state_db() -> Result
         metadata.first_user_message = metadata.preview.clone();
         state_db.upsert_thread(&metadata).await?;
     }
-    for (parent_thread_id, child_thread_id) in [
-        (parent_id, older_child_id),
-        (parent_id, newer_child_id),
-        (newer_child_id, grandchild_id),
+    for (parent_thread_id, child_thread_id, status) in [
+        (
+            parent_id,
+            older_child_id,
+            DirectionalThreadSpawnEdgeStatus::Open,
+        ),
+        (
+            parent_id,
+            newer_child_id,
+            DirectionalThreadSpawnEdgeStatus::Open,
+        ),
+        (
+            parent_id,
+            closed_child_id,
+            DirectionalThreadSpawnEdgeStatus::Closed,
+        ),
+        (
+            newer_child_id,
+            grandchild_id,
+            DirectionalThreadSpawnEdgeStatus::Open,
+        ),
     ] {
         state_db
-            .upsert_thread_spawn_edge(
-                parent_thread_id,
-                child_thread_id,
-                DirectionalThreadSpawnEdgeStatus::Open,
-            )
+            .upsert_thread_spawn_edge(parent_thread_id, child_thread_id, status)
             .await?;
     }
     state_db
@@ -1180,6 +1200,7 @@ async fn thread_list_relation_filters_read_spawn_graph_from_state_db() -> Result
             .collect::<Vec<_>>(),
         vec![
             (grandchild_id.to_string(), Some(newer_child_id.to_string())),
+            (closed_child_id.to_string(), Some(parent_id.to_string())),
             (newer_child_id.to_string(), Some(parent_id.to_string())),
             (older_child_id.to_string(), Some(parent_id.to_string())),
         ]

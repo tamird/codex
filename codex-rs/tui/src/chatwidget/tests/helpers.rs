@@ -323,10 +323,17 @@ pub(crate) async fn make_chatwidget_manual_with_sender() -> (
 pub(super) fn drain_insert_history(
     rx: &mut tokio::sync::mpsc::UnboundedReceiver<AppEvent>,
 ) -> Vec<Vec<ratatui::text::Line<'static>>> {
+    drain_insert_history_with_width(rx, /*width*/ 80)
+}
+
+pub(super) fn drain_insert_history_with_width(
+    rx: &mut tokio::sync::mpsc::UnboundedReceiver<AppEvent>,
+    width: u16,
+) -> Vec<Vec<ratatui::text::Line<'static>>> {
     let mut out = Vec::new();
     while let Ok(ev) = rx.try_recv() {
         if let AppEvent::InsertHistoryCell(cell) = ev {
-            let mut lines = cell.display_lines(/*width*/ 80);
+            let mut lines = cell.display_lines(width);
             if !cell.is_stream_continuation() && !out.is_empty() && !lines.is_empty() {
                 lines.insert(0, "".into());
             }
@@ -345,6 +352,13 @@ pub(super) fn lines_to_single_string(lines: &[ratatui::text::Line<'static>]) -> 
         s.push('\n');
     }
     s
+}
+
+pub(super) fn trim_snapshot_line_end(text: &str) -> String {
+    text.split('\n')
+        .map(str::trim_end)
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 pub(super) fn status_line_text(chat: &ChatWidget) -> Option<String> {

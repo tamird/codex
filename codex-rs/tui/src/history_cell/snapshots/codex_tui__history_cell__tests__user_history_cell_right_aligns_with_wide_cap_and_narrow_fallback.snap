@@ -1,0 +1,8 @@
+---
+source: tui/src/history_cell/tests.rs
+expression: "render_lines_trimmed(&wide).join(\"\\n\")"
+---
+
+                   › 界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界
+                     界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界
+                     界界界界界界界界界界界界界界界界界界界界界界

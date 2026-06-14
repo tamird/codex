@@ -2573,6 +2573,70 @@ async fn send_input_accepts_structured_items() {
 }
 
 #[tokio::test]
+async fn send_input_from_subagent_message_uses_inter_agent_communication() {
+    let (mut session, mut turn) = make_session_and_context().await;
+    let manager = thread_manager();
+    session.services.agent_control = manager.agent_control();
+    let config = turn.config.as_ref().clone();
+    let parent = manager
+        .start_thread(StartThreadOptions::new(config))
+        .await
+        .expect("start parent");
+    let parent_thread_id = parent.thread_id;
+    session
+        .services
+        .agent_control
+        .register_session_root(parent_thread_id, /*current_parent_thread_id*/ None);
+    let sender_path = AgentPath::try_from("/root/worker").expect("valid sender path");
+    turn.session_source = SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+        parent_thread_id,
+        depth: 1,
+        agent_path: Some(sender_path.clone()),
+        agent_nickname: Some("Worker".to_string()),
+        agent_role: None,
+    });
+
+    let invocation = invocation(
+        Arc::new(session),
+        Arc::new(turn),
+        "send_input",
+        function_payload(json!({
+            "target": parent_thread_id.to_string(),
+            "message": "ready for review"
+        })),
+    );
+    SendInputHandler
+        .handle(invocation)
+        .await
+        .expect("send_input should succeed");
+
+    let expected = InterAgentCommunication::new(
+        sender_path,
+        AgentPath::root(),
+        Vec::new(),
+        "ready for review".to_string(),
+        /*trigger_turn*/ true,
+    );
+    assert!(manager.captured_ops().iter().any(|(id, op)| {
+        *id == parent_thread_id
+            && matches!(
+                op,
+                Op::InterAgentCommunication {
+                    communication,
+                    start_options: _,
+                }
+                    if communication == &expected
+            )
+    }));
+
+    let _ = parent
+        .thread
+        .submit(Op::Shutdown {})
+        .await
+        .expect("shutdown should submit");
+}
+
+#[tokio::test]
 async fn resume_agent_rejects_invalid_id() {
     let (session, turn) = make_session_and_context().await;
     let invocation = invocation(

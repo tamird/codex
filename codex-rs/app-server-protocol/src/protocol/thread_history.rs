@@ -393,8 +393,16 @@ impl ThreadHistoryBuilder {
             RolloutItem::EventMsg(event) => self.handle_event(event),
             RolloutItem::Compacted(payload) => self.handle_compacted(payload),
             RolloutItem::ResponseItem(item) => self.handle_response_item(&item.item),
-            RolloutItem::InterAgentCommunication(_)
-            | RolloutItem::InterAgentCommunicationMetadata { .. }
+            RolloutItem::InterAgentCommunication(communication) => {
+                let id = self.next_item_id();
+                self.ensure_turn()
+                    .items
+                    .push(ThreadItem::InterAgentCommunication {
+                        id,
+                        communication: communication.clone(),
+                    });
+            }
+            RolloutItem::InterAgentCommunicationMetadata { .. }
             | RolloutItem::TurnContext(_)
             | RolloutItem::WorldState(_)
             | RolloutItem::RealtimeItem(_)
@@ -1659,6 +1667,7 @@ mod tests {
     use crate::protocol::v2::CommandExecutionSource;
     use codex_extension_items::ExtensionItem as CoreExtensionItem;
     use codex_extension_items::sleep::SleepItem as CoreSleepItem;
+    use codex_protocol::AgentPath;
     use codex_protocol::ThreadId;
     use codex_protocol::dynamic_tools::DynamicToolCallOutputContentItem as CoreDynamicToolCallOutputContentItem;
     use codex_protocol::items::CommandExecutionItem as CoreCommandExecutionItem;
@@ -1685,6 +1694,8 @@ mod tests {
     use codex_protocol::protocol::ExecCommandEndEvent;
     use codex_protocol::protocol::ExecCommandSource;
     use codex_protocol::protocol::ExitedReviewModeEvent;
+    use codex_protocol::protocol::InterAgentCommunication;
+    use codex_protocol::protocol::ItemCompletedEvent;
     use codex_protocol::protocol::ItemStartedEvent;
     use codex_protocol::protocol::McpInvocation;
     use codex_protocol::protocol::McpToolCallEndEvent;
@@ -4200,6 +4211,28 @@ mod tests {
                 .into_iter()
                 .collect(),
             }
+        );
+    }
+
+    #[test]
+    fn reconstructs_typed_inter_agent_communication() {
+        let communication = InterAgentCommunication::new(
+            AgentPath::try_from("/root/worker").expect("valid agent path"),
+            AgentPath::root(),
+            Vec::new(),
+            "ready for review".to_string(),
+            /*trigger_turn*/ true,
+        );
+        let items = vec![RolloutItem::InterAgentCommunication(communication.clone())];
+
+        let turns = build_turns_from_rollout_items(&items);
+        assert_eq!(turns.len(), 1);
+        assert_eq!(
+            turns[0].items,
+            vec![ThreadItem::InterAgentCommunication {
+                id: "item-1".into(),
+                communication,
+            }],
         );
     }
 

@@ -473,7 +473,7 @@ ON CONFLICT(child_thread_id) DO NOTHING
             .await
     }
 
-    /// List direct children of `parent_thread_id` using persisted spawn edges.
+    /// List direct open children of `parent_thread_id` using persisted spawn edges.
     pub async fn list_threads_by_parent(
         &self,
         page_size: usize,
@@ -1236,6 +1236,8 @@ WITH RECURSIVE subtree(child_thread_id, parent_thread_id) AS (
         Some(crate::ThreadRelationFilter::DirectChildrenOf(parent_thread_id)) => {
             builder.push(" AND listed_edge.parent_thread_id = ");
             builder.push_bind(parent_thread_id.to_string());
+            builder.push(" AND listed_edge.status = ");
+            builder.push_bind(crate::DirectionalThreadSpawnEdgeStatus::Open.as_ref());
         }
         Some(crate::ThreadRelationFilter::DescendantsOf(ancestor_thread_id)) => {
             builder.push(" AND subtree.child_thread_id != ");
@@ -2329,7 +2331,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn list_threads_by_relation_filters_spawn_graph_with_keyset_pagination() {
+    async fn list_threads_by_relation_filters_open_children_and_all_descendants() {
         let codex_home = unique_temp_dir();
         let runtime = StateRuntime::init(
             crate::SqliteConfig::new_for_testing(codex_home.as_path().abs()),
@@ -2342,13 +2344,16 @@ mod tests {
             ThreadId::from_string("00000000-0000-0000-0000-000000000001").expect("valid thread id");
         let second_child_id =
             ThreadId::from_string("00000000-0000-0000-0000-000000000002").expect("valid thread id");
+        let closed_child_id =
+            ThreadId::from_string("00000000-0000-0000-0000-000000000003").expect("valid thread id");
         let grandchild_id = ThreadId::new();
 
         for (thread_id, created_at) in [
             (parent_id, 1_700_000_000),
             (first_child_id, 1_700_000_200),
             (second_child_id, 1_700_000_200),
-            (grandchild_id, 1_700_000_300),
+            (closed_child_id, 1_700_000_300),
+            (grandchild_id, 1_700_000_400),
         ] {
             let mut metadata = test_thread_metadata(&codex_home, thread_id, codex_home.clone());
             metadata.created_at =
@@ -2372,6 +2377,11 @@ mod tests {
             (
                 parent_id,
                 second_child_id,
+                DirectionalThreadSpawnEdgeStatus::Open,
+            ),
+            (
+                parent_id,
+                closed_child_id,
                 DirectionalThreadSpawnEdgeStatus::Closed,
             ),
             (
@@ -2501,14 +2511,14 @@ mod tests {
                 second_descendant_page.next_anchor,
             ),
             (
-                vec![grandchild_id, second_child_id],
-                vec![first_child_id],
+                vec![grandchild_id, closed_child_id],
+                vec![second_child_id, first_child_id],
                 [
                     (grandchild_id, first_child_id),
-                    (second_child_id, parent_id)
+                    (closed_child_id, parent_id)
                 ]
                 .into(),
-                [(first_child_id, parent_id)].into(),
+                [(second_child_id, parent_id), (first_child_id, parent_id)].into(),
                 None,
             )
         );
@@ -2535,7 +2545,12 @@ mod tests {
                 .iter()
                 .map(|item| item.id)
                 .collect::<Vec<_>>(),
-            vec![grandchild_id, second_child_id, first_child_id]
+            vec![
+                grandchild_id,
+                closed_child_id,
+                second_child_id,
+                first_child_id
+            ]
         );
     }
 

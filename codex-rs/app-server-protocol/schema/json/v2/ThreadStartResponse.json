@@ -708,6 +708,70 @@
         }
       ]
     },
+    "InterAgentCommunication": {
+      "properties": {
+        "author": {
+          "$ref": "#/definitions/AgentPath"
+        },
+        "content": {
+          "type": "string"
+        },
+        "encrypted_content": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "internal_chat_message_metadata_passthrough": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/InternalChatMessageMetadataPassthrough"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "other_recipients": {
+          "default": [],
+          "items": {
+            "$ref": "#/definitions/AgentPath"
+          },
+          "type": "array"
+        },
+        "recipient": {
+          "$ref": "#/definitions/AgentPath"
+        },
+        "trigger_turn": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "author",
+        "content",
+        "recipient",
+        "trigger_turn"
+      ],
+      "type": "object"
+    },
+    "InternalChatMessageMetadataPassthrough": {
+      "description": "Internal Responses API passthrough metadata copied into underlying chat messages.\n\nResponses API strongly types this payload. Do not modify it without first getting API approval and making the corresponding Responses API change.",
+      "properties": {
+        "turn_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
     "LegacyAppPathString": {
       "type": "string"
     },
@@ -1611,6 +1675,30 @@
             "type"
           ],
           "title": "FunctionCallOutputThreadItem",
+          "type": "object"
+        },
+        {
+          "properties": {
+            "communication": {
+              "$ref": "#/definitions/InterAgentCommunication"
+            },
+            "id": {
+              "type": "string"
+            },
+            "type": {
+              "enum": [
+                "interAgentCommunication"
+              ],
+              "title": "InterAgentCommunicationThreadItemType",
+              "type": "string"
+            }
+          },
+          "required": [
+            "communication",
+            "id",
+            "type"
+          ],
+          "title": "InterAgentCommunicationThreadItem",
           "type": "object"
         },
         {

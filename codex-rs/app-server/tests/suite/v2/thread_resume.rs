@@ -80,6 +80,7 @@ use codex_config::types::AuthCredentialsStoreMode;
 use codex_core::ARCHIVED_SESSIONS_SUBDIR;
 use codex_features::Feature;
 use codex_login::REFRESH_TOKEN_URL_OVERRIDE_ENV_VAR;
+use codex_protocol::AgentPath;
 use codex_protocol::ThreadId;
 use codex_protocol::config_types::CollaborationMode;
 use codex_protocol::config_types::ModeKind;
@@ -95,6 +96,7 @@ use codex_protocol::openai_models::ReasoningEffort;
 use codex_protocol::protocol::AgentMessageEvent;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::ImageGenerationEndEvent;
+use codex_protocol::protocol::InterAgentCommunication;
 use codex_protocol::protocol::McpInvocation;
 use codex_protocol::protocol::McpToolCallEndEvent;
 use codex_protocol::protocol::MultiAgentVersion;
@@ -5349,6 +5351,68 @@ async fn thread_resume_supports_history_and_overrides() -> Result<()> {
     assert_eq!(model_provider, "mock_provider");
     assert_eq!(resumed.preview, history_text);
     assert_eq!(resumed.status, ThreadStatus::Idle);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn thread_resume_reconstructs_typed_inter_agent_communication() -> Result<()> {
+    let server = create_mock_responses_server_repeating_assistant("Done").await;
+    let codex_home = TempDir::new()?;
+    mock_responses_config(&server.uri()).write(codex_home.path())?;
+
+    let filename_ts = "2025-01-05T12-00-00";
+    let meta_rfc3339 = "2025-01-05T12:00:00Z";
+    let conversation_id = create_fake_rollout_with_text_elements(
+        codex_home.path(),
+        filename_ts,
+        meta_rfc3339,
+        "Saved user message",
+        Vec::new(),
+        Some("mock_provider"),
+        /*git_info*/ None,
+    )?;
+    let rollout_file_path = rollout_path(codex_home.path(), filename_ts, &conversation_id);
+    let communication = InterAgentCommunication::new(
+        AgentPath::try_from("/root/worker").expect("valid agent path"),
+        AgentPath::root(),
+        Vec::new(),
+        "ready for review".to_string(),
+        /*trigger_turn*/ true,
+    );
+    append_rollout_item_to_path(
+        &rollout_file_path,
+        &RolloutItem::InterAgentCommunication(communication.clone()),
+    )
+    .await?;
+
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .build()
+        .await?;
+    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+
+    let resume_id = mcp
+        .send_thread_resume_request(ThreadResumeParams {
+            thread_id: conversation_id,
+            ..Default::default()
+        })
+        .await?;
+    let resume_resp: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(resume_id)),
+    )
+    .await??;
+    let ThreadResumeResponse { thread, .. } = to_response::<ThreadResumeResponse>(resume_resp)?;
+
+    let reconstructed_turn = thread.turns.last().expect("reconstructed inter-agent turn");
+    assert_eq!(
+        reconstructed_turn.items[1..],
+        vec![ThreadItem::InterAgentCommunication {
+            id: "item-2".to_string(),
+            communication,
+        }]
+    );
 
     Ok(())
 }

@@ -1669,7 +1669,8 @@ async fn output_free_ctrl_c_interrupt_keeps_prompt_and_opens_blank_composer() {
     insta::assert_snapshot!(
         "output_free_ctrl_c_interrupt_keeps_prompt_and_blank_composer",
         format!(
-            "history:\n{interrupted_history}\ncomposer:\n{}",
+            "history:\n{}\ncomposer:\n{}",
+            trim_snapshot_line_end(&interrupted_history),
             chat.bottom_pane.composer_text()
         )
     );

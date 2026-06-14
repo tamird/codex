@@ -519,6 +519,8 @@ WHERE thread_id = ?
             }
             | ThreadItem::HookPrompt { .. }
             | ThreadItem::FunctionCallOutput { .. }
+            | ThreadItem::InterAgentCommunication { .. }
+            | ThreadItem::RawResponseItem { .. }
             | ThreadItem::Plan { .. }
             | ThreadItem::Reasoning { .. }
             | ThreadItem::CommandExecution { .. }

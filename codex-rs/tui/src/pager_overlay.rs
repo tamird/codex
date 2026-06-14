@@ -23,6 +23,7 @@ use std::sync::Arc;
 use crate::chatwidget::ActiveCellTranscriptKey;
 use crate::history_cell::HistoryCell;
 use crate::history_cell::SessionInfoCell;
+use crate::history_cell::UserHistoryCell;
 use crate::key_hint;
 use crate::key_hint::KeyBinding;
 use crate::key_hint::KeyBindingListExt;
@@ -568,7 +569,7 @@ impl TranscriptOverlay {
         }
         let cell_renderable = CellRenderable {
             cell: cell.clone(),
-            highlighted: highlight_cell == Some(index),
+            highlighted: cell.as_any().is::<UserHistoryCell>() && highlight_cell == Some(index),
         };
         let mut cell_renderable: Box<dyn Renderable> = if cell.has_stable_transcript_height() {
             Box::new(CachedRenderable::new(cell_renderable))

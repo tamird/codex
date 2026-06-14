@@ -374,6 +374,40 @@ fn activity_metadata_is_retained_without_including_outputs() -> color_eyre::Resu
     Ok(())
 }
 
+#[test]
+fn turn_summary_bounds_inter_agent_messages_and_hides_encrypted_content() -> color_eyre::Result<()>
+{
+    let turn: Turn = serde_json::from_value(json!({
+        "id": "turn-1",
+        "status": "completed",
+        "items": [
+            {"type": "interAgentCommunication", "id": "visible", "communication": {
+                "author": "/root/worker", "recipient": "/root", "other_recipients": [],
+                "content": "x".repeat(DEFAULT_OUTPUT_CHARS * 2), "trigger_turn": false
+            }},
+            {"type": "interAgentCommunication", "id": "encrypted", "communication": {
+                "author": "/root/worker", "recipient": "/root", "other_recipients": [],
+                "content": "must stay hidden", "encrypted_content": "ciphertext", "trigger_turn": false
+            }},
+            {"type": "rawResponseItem", "id": "legacy", "item": {
+                "type": "message", "role": "assistant", "content": []
+            }}
+        ]
+    }))?;
+    let summary = turn_summary(&turn, false, DEFAULT_OUTPUT_CHARS);
+    assert_eq!(
+        summary["items"],
+        json!([
+            {"type": "interAgentCommunication", "id": "visible", "author": "/root/worker",
+                "recipient": "/root", "text": truncate(&"x".repeat(DEFAULT_OUTPUT_CHARS * 2), DEFAULT_OUTPUT_CHARS)},
+            {"type": "interAgentCommunication", "id": "encrypted", "author": "/root/worker",
+                "recipient": "/root", "text": null},
+            {"type": "rawResponseItem", "id": "legacy", "text": null}
+        ])
+    );
+    Ok(())
+}
+
 #[tokio::test]
 async fn task_management_tools_use_existing_app_server_operations() -> color_eyre::Result<()> {
     let (codex_home, server, source, target) = test_server().await?;

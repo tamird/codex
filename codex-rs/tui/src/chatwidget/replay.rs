@@ -261,6 +261,10 @@ impl ChatWidget {
                 agents_states,
             }),
             item @ ThreadItem::SubAgentActivity { .. } => self.on_sub_agent_activity(item),
+            ThreadItem::InterAgentCommunication { communication, .. } => {
+                self.on_inter_agent_communication(communication)
+            }
+            ThreadItem::RawResponseItem { item, .. } => self.on_raw_response_item(item),
             ThreadItem::DynamicToolCall { .. } => {}
             ThreadItem::Sleep(_) => {}
         }

@@ -783,6 +783,7 @@ goals = true
         let rendered_retry = forked_history
             .lines()
             .skip_while(|line| !line.contains(RETRY_PROMPT))
+            .map(str::trim_end)
             .collect::<Vec<_>>()
             .join("\n");
         insta::assert_snapshot!("safety_retry_committed_steer_history", rendered_retry);

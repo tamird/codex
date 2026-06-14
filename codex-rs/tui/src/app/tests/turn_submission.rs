@@ -45,10 +45,15 @@ async fn turn_start_failure_is_shown_without_exiting() -> Result<()> {
     let transcript = app
         .transcript_cells
         .iter()
-        .map(|cell| lines_to_single_string(&cell.display_lines(/*width*/ 80)))
+        .map(|cell| lines_to_single_string(&cell.display_lines(/*width*/ 39)))
         .chain(std::iter::once(lines_to_single_string(
             &error_cell.display_lines(/*width*/ 80),
         )))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let transcript = transcript
+        .lines()
+        .map(str::trim_end)
         .collect::<Vec<_>>()
         .join("\n");
     insta::assert_snapshot!(transcript, @r"

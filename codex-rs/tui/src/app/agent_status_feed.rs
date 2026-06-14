@@ -195,9 +195,9 @@ fn activity_summary(item: &ThreadItem) -> Option<String> {
         ThreadItem::UserMessage { .. }
         | ThreadItem::HookPrompt { .. }
         | ThreadItem::FunctionCallOutput { .. }
-        | ThreadItem::Sleep(_) => {
-            return None;
-        }
+        | ThreadItem::Sleep(_)
+        | ThreadItem::RawResponseItem { .. }
+        | ThreadItem::InterAgentCommunication { .. } => return None,
     };
     bounded_summary(summary)
 }

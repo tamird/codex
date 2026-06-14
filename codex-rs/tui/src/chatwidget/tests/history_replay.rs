@@ -116,6 +116,7 @@ async fn replayed_failed_turns_preserve_overload_warnings_between_retries() {
         .into_iter()
         .map(|lines| lines_to_single_string(&lines))
         .collect::<String>();
+    let rendered = trim_snapshot_line_end(&rendered);
 
     assert_eq!(rendered.matches(prompt).count(), 2);
     assert_eq!(rendered.matches(error_message).count(), 2);
@@ -395,6 +396,7 @@ async fn replayed_nested_review_prompts_do_not_render_or_seed_composer_history()
         .into_iter()
         .map(|lines| lines_to_single_string(&lines))
         .collect::<String>();
+    let rendered = trim_snapshot_line_end(&rendered);
     assert!(!rendered.contains(review_prompt));
     assert_eq!(rendered.matches(review_hint).count(), 4);
     insta::assert_snapshot!("replayed_nested_review_prompts", rendered);

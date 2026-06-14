@@ -3,6 +3,7 @@ use std::collections::HashSet;
 use std::path::Path;
 use std::path::PathBuf;
 
+use codex_utils_absolute_path::AbsolutePathBuf;
 use futures::future::join_all;
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -51,6 +52,19 @@ pub struct GitInfo {
     /// Repository URL (if available from remote)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub repository_url: Option<SanitizedGitUrl>,
+}
+
+/// Canonical filesystem identity for one checkout in a Git worktree set.
+///
+/// Linked worktrees have different `worktree_root` values and the same `common_dir` value.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GitWorktreeIdentity {
+    /// Canonical root directory of this checkout.
+    pub worktree_root: AbsolutePathBuf,
+    /// Canonical Git directory shared by the primary checkout and its linked worktrees.
+    pub common_dir: AbsolutePathBuf,
+    /// Whether this checkout uses per-worktree Git metadata rather than the primary Git directory.
+    pub is_linked_worktree: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -115,6 +129,57 @@ pub async fn collect_git_info(cwd: &Path) -> Option<GitInfo> {
     }
 
     Some(git_info)
+}
+
+/// Returns canonical worktree and common-directory paths for the registered checkout containing
+/// `cwd`.
+///
+/// This returns `None` when `cwd` is not in a Git worktree, Git does not support the required
+/// absolute-path query, either reported path cannot be canonicalized, or the reported worktree is
+/// not present in Git's registered worktree list. The final check prevents an arbitrary directory
+/// from impersonating a worktree with a `.git` file or symlink that points at another checkout.
+pub async fn get_git_worktree_identity(cwd: &Path) -> Option<GitWorktreeIdentity> {
+    let output = run_git_command_with_timeout(
+        &[
+            "rev-parse",
+            "--path-format=absolute",
+            "--show-toplevel",
+            "--git-common-dir",
+            "--git-dir",
+        ],
+        cwd,
+    )
+    .await?;
+    if !output.status.success() {
+        return None;
+    }
+
+    let stdout = String::from_utf8(output.stdout).ok()?;
+    let mut lines = stdout.lines();
+    let worktree_root = std::fs::canonicalize(lines.next()?.trim()).ok()?;
+    let common_dir = std::fs::canonicalize(lines.next()?.trim()).ok()?;
+    let git_dir = std::fs::canonicalize(lines.next()?.trim()).ok()?;
+    let listed_worktrees =
+        run_git_command_with_timeout(&["worktree", "list", "--porcelain", "-z"], cwd).await?;
+    if !listed_worktrees.status.success() {
+        return None;
+    }
+    let listed_worktrees = String::from_utf8(listed_worktrees.stdout).ok()?;
+    let worktree_is_registered = listed_worktrees.split('\0').any(|field| {
+        field
+            .strip_prefix("worktree ")
+            .and_then(|path| std::fs::canonicalize(path).ok())
+            .is_some_and(|path| path == worktree_root)
+    });
+    if !worktree_is_registered {
+        return None;
+    }
+    let is_linked_worktree = git_dir != common_dir;
+    Some(GitWorktreeIdentity {
+        worktree_root: AbsolutePathBuf::try_from(worktree_root).ok()?,
+        common_dir: AbsolutePathBuf::try_from(common_dir).ok()?,
+        is_linked_worktree,
+    })
 }
 
 /// Collect fetch remotes in a multi-root-friendly format: {"origin": "https://..."}.
@@ -887,6 +952,83 @@ mod tests {
         drop(stdin);
 
         assert!(status.success(), "child test process failed: {status}");
+    }
+
+    #[tokio::test]
+    async fn linked_worktree_identity_uses_shared_common_directory() {
+        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        let primary = temp_dir.path().join("primary");
+        let linked = temp_dir.path().join("linked");
+        let unrelated = temp_dir.path().join("unrelated");
+        std::fs::create_dir(&primary).expect("create primary checkout directory");
+        std::fs::create_dir(&unrelated).expect("create unrelated checkout directory");
+
+        let run_git = |cwd: &Path, args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .current_dir(cwd)
+                .output()
+                .expect("run git");
+            assert!(
+                output.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        run_git(&primary, &["init", "-q"]);
+        run_git(&primary, &["config", "user.email", "codex@example.com"]);
+        run_git(&primary, &["config", "user.name", "Codex Test"]);
+        std::fs::write(primary.join("README.md"), "test\n").expect("write initial file");
+        run_git(&primary, &["add", "README.md"]);
+        run_git(&primary, &["commit", "-qm", "initial"]);
+        run_git(
+            &primary,
+            &[
+                "worktree",
+                "add",
+                "-qb",
+                "linked-test",
+                linked.to_str().expect("linked path is UTF-8"),
+            ],
+        );
+        let linked_nested = linked.join("nested");
+        std::fs::create_dir(&linked_nested).expect("create linked nested directory");
+        run_git(&unrelated, &["init", "-q"]);
+
+        let primary_identity = get_git_worktree_identity(&primary)
+            .await
+            .expect("resolve primary identity");
+        let linked_identity = get_git_worktree_identity(&linked_nested)
+            .await
+            .expect("resolve linked identity");
+        let unrelated_identity = get_git_worktree_identity(&unrelated)
+            .await
+            .expect("resolve unrelated identity");
+
+        assert_eq!(
+            primary_identity.worktree_root,
+            AbsolutePathBuf::try_from(std::fs::canonicalize(&primary).expect("canonical primary"))
+                .expect("absolute primary")
+        );
+        assert_eq!(
+            linked_identity.worktree_root,
+            AbsolutePathBuf::try_from(std::fs::canonicalize(&linked).expect("canonical linked"))
+                .expect("absolute linked")
+        );
+        assert_eq!(primary_identity.common_dir, linked_identity.common_dir);
+        assert_ne!(primary_identity.common_dir, unrelated_identity.common_dir);
+        assert!(!primary_identity.is_linked_worktree);
+        assert!(linked_identity.is_linked_worktree);
+        assert!(!unrelated_identity.is_linked_worktree);
+
+        #[cfg(unix)]
+        {
+            let impersonator = temp_dir.path().join("impersonator");
+            std::fs::create_dir(&impersonator).expect("create impersonator directory");
+            std::os::unix::fs::symlink(primary.join(".git"), impersonator.join(".git"))
+                .expect("link impersonator git directory");
+            assert_eq!(get_git_worktree_identity(&impersonator).await, None);
+        }
     }
 
     #[test]

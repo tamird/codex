@@ -538,6 +538,24 @@ async fn on_event_updates_status_from_task_complete() {
 }
 
 #[tokio::test]
+async fn on_event_updates_status_from_failed_task_complete() {
+    let status = agent_status_from_event(&EventMsg::TurnComplete(TurnCompleteEvent {
+        turn_id: "turn-1".to_string(),
+        started_at: None,
+        last_agent_message: None,
+        error: Some(ErrorEvent {
+            message: "boom".to_string(),
+            codex_error_info: None,
+            misalignment: None,
+        }),
+        completed_at: None,
+        duration_ms: None,
+        time_to_first_token_ms: None,
+    }));
+    assert_eq!(status, Some(AgentStatus::Errored("boom".to_string())));
+}
+
+#[tokio::test]
 async fn on_event_updates_status_from_error() {
     let status = agent_status_from_event(&EventMsg::Error(ErrorEvent {
         misalignment: None,

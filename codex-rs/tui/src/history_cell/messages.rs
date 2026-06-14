@@ -8,6 +8,13 @@ use crate::wrapping::url_preserving_wrap_options;
 use crate::wrapping::word_wrap_line;
 use std::borrow::Cow;
 
+const USER_MESSAGE_RIGHT_MARGIN: u16 = 1;
+const USER_MESSAGE_MIN_ALIGNMENT_WIDTH: u16 = 40;
+
+pub(crate) fn user_message_uses_right_alignment(width: u16) -> bool {
+    width >= USER_MESSAGE_MIN_ALIGNMENT_WIDTH
+}
+
 #[derive(Debug)]
 pub(crate) struct UserHistoryCell {
     pub message: String,
@@ -151,6 +158,52 @@ fn remote_image_display_line(style: Style, index: usize) -> Line<'static> {
     Line::from(local_image_label_text(index)).style(style)
 }
 
+pub(crate) fn finish_user_message_lines(
+    mut lines: Vec<HyperlinkLine>,
+    width: u16,
+    available_width: u16,
+    style: Style,
+) -> Vec<HyperlinkLine> {
+    for line in &mut lines {
+        for span in &mut line.line.spans {
+            span.style = span.style.patch(line.line.style);
+        }
+        line.line.style = Style::default();
+    }
+
+    let bubble_width = lines.iter().map(HyperlinkLine::width).max().unwrap_or(0);
+    if bubble_width == 0 {
+        return lines;
+    }
+    let visible_bubble_width = bubble_width.min(usize::from(available_width));
+    let left_padding = if user_message_uses_right_alignment(width) {
+        usize::from(available_width).saturating_sub(bubble_width)
+    } else {
+        0
+    };
+    for line in &mut lines {
+        let line_width = line.width();
+        let mut spans = Vec::with_capacity(line.line.spans.len() + 2);
+        if left_padding > 0 {
+            spans.push(Span::raw(" ".repeat(left_padding)));
+            for hyperlink in &mut line.hyperlinks {
+                hyperlink.columns =
+                    hyperlink.columns.start + left_padding..hyperlink.columns.end + left_padding;
+            }
+        }
+        if line_width == 0 {
+            spans.push(Span::styled(" ".repeat(visible_bubble_width), style));
+        } else {
+            spans.append(&mut line.line.spans);
+        }
+        let right_padding = bubble_width.saturating_sub(line_width);
+        if line_width > 0 && right_padding > 0 {
+            spans.push(Span::styled(" ".repeat(right_padding), style));
+        }
+        line.line.spans = spans;
+    }
+    lines
+}
 impl HistoryCell for UserHistoryCell {
     fn display_lines(&self, width: u16) -> Vec<Line<'static>> {
         visible_lines(self.display_hyperlink_lines(width))
@@ -163,11 +216,15 @@ impl HistoryCell for UserHistoryCell {
         } else {
             &[]
         };
-        let wrap_width = width
-            .saturating_sub(
-                LIVE_PREFIX_COLS + 1, /* keep a one-column right margin for wrapping */
-            )
-            .max(1);
+        let available_width = width.saturating_sub(USER_MESSAGE_RIGHT_MARGIN).max(1);
+        let block_width = if user_message_uses_right_alignment(width) {
+            u16::try_from(usize::from(width) * 4 / 5)
+                .unwrap_or(available_width)
+                .min(available_width)
+        } else {
+            available_width
+        };
+        let wrap_width = block_width.saturating_sub(LIVE_PREFIX_COLS).max(1);
 
         let style = user_message_style();
         let element_style = style.fg(Color::Cyan);
@@ -268,7 +325,7 @@ impl HistoryCell for UserHistoryCell {
         }
 
         lines.push(HyperlinkLine::new(Line::from("").style(style)));
-        lines
+        finish_user_message_lines(lines, width, available_width, style)
     }
 
     fn transcript_hyperlink_lines(&self, width: u16) -> Vec<HyperlinkLine> {
@@ -290,6 +347,31 @@ impl HistoryCell for UserHistoryCell {
             );
         }
         lines
+    }
+
+    fn desired_height(&self, width: u16) -> u16 {
+        self.display_lines(width)
+            .into_iter()
+            .map(|line| {
+                if line
+                    .spans
+                    .iter()
+                    .all(|span| span.content.chars().all(char::is_whitespace))
+                {
+                    1
+                } else {
+                    Paragraph::new(line)
+                        .wrap(Wrap { trim: false })
+                        .line_count(width.max(1))
+                }
+            })
+            .sum::<usize>()
+            .try_into()
+            .unwrap_or(u16::MAX)
+    }
+
+    fn desired_transcript_height(&self, width: u16) -> u16 {
+        self.desired_height(width)
     }
 }
 

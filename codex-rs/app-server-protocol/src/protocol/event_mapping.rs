@@ -19,8 +19,84 @@ use crate::protocol::v2::ReasoningTextDeltaNotification;
 use crate::protocol::v2::TerminalInteractionNotification;
 use crate::protocol::v2::ThreadItem;
 use codex_protocol::dynamic_tools::DynamicToolCallOutputContentItem as CoreDynamicToolCallOutputContentItem;
+use codex_protocol::models::ResponseItem;
+use codex_protocol::models::plaintext_agent_message_content;
 use codex_protocol::protocol::EventMsg;
+use codex_protocol::protocol::InterAgentCommunication;
 use std::collections::HashMap;
+
+/// User-visible projection of one persisted or live inter-agent response item.
+///
+/// `encrypted_content` is opaque provider data. App-server clients must never receive it as text,
+/// so any agent-message item containing an encrypted part is represented by a fixed placeholder.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InterAgentMessageDisplay {
+    /// Persisted response item ID, when the producer assigned one.
+    pub item_id: Option<String>,
+    /// Stable agent path recorded as the message author.
+    pub author: String,
+    /// Plaintext message content or the fixed opaque-content placeholder.
+    pub content: String,
+}
+
+impl InterAgentMessageDisplay {
+    pub fn text(&self) -> String {
+        format!("Agent message: {} from {}", self.content, self.author)
+    }
+}
+
+pub fn inter_agent_message_display_from_response_item(
+    item: &ResponseItem,
+) -> Option<InterAgentMessageDisplay> {
+    match item {
+        ResponseItem::AgentMessage {
+            id,
+            author,
+            content,
+            ..
+        } => {
+            let content = plaintext_agent_message_content(content)?;
+            let content = visible_agent_message(author, &content)?;
+            Some(InterAgentMessageDisplay {
+                item_id: id.as_ref().map(ToString::to_string),
+                author: author.clone(),
+                content,
+            })
+        }
+        ResponseItem::Message { content, id, .. } => {
+            let communication = InterAgentCommunication::from_message_content(content)?;
+            Some(InterAgentMessageDisplay {
+                item_id: id.as_ref().map(ToString::to_string),
+                author: communication.author.to_string(),
+                content: visible_inter_agent_message_content(&communication)?,
+            })
+        }
+        _ => None,
+    }
+}
+
+pub fn visible_inter_agent_message_content(
+    communication: &InterAgentCommunication,
+) -> Option<String> {
+    if communication.encrypted_content.is_some() {
+        None
+    } else {
+        Some(communication.content.clone())
+    }
+}
+
+fn visible_agent_message(author: &str, content: &str) -> Option<String> {
+    if content.starts_with("Message Type: MESSAGE\n")
+        || content.starts_with("Message Type: NEW_TASK\n")
+    {
+        return content
+            .split_once("\nPayload:\n")
+            .map(|(_, payload)| payload.to_string());
+    }
+
+    (!content.starts_with("Message Type:") && author.rsplit('/').next() == Some("goal_supervisor"))
+        .then(|| content.to_string())
+}
 
 /// Build the v2 app-server notification that directly corresponds to a single core event.
 ///
@@ -469,12 +545,78 @@ pub fn item_event_to_server_notification(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use codex_protocol::AgentPath;
     use codex_protocol::ThreadId;
     use codex_protocol::protocol::CollabResumeBeginEvent;
     use codex_protocol::protocol::CollabResumeEndEvent;
     use codex_protocol::protocol::ExecCommandOutputDeltaEvent;
     use codex_protocol::protocol::ExecOutputStream;
     use pretty_assertions::assert_eq;
+
+    #[test]
+    fn ordinary_child_completion_is_not_user_visible() {
+        let item = InterAgentCommunication::new(
+            AgentPath::try_from("/root/worker").expect("valid agent path"),
+            AgentPath::root(),
+            Vec::new(),
+            "Message Type: FINAL_ANSWER\nTask name: /root\nSender: /root/worker\nPayload:\nanalysis complete"
+                .to_string(),
+            /*trigger_turn*/ false,
+        )
+        .to_model_input_item();
+
+        assert_eq!(inter_agent_message_display_from_response_item(&item), None);
+    }
+
+    #[test]
+    fn encrypted_child_message_is_not_user_visible() {
+        let item = InterAgentCommunication::new_encrypted(
+            AgentPath::try_from("/root/worker").expect("valid agent path"),
+            AgentPath::root(),
+            Vec::new(),
+            "ciphertext".to_string(),
+            /*trigger_turn*/ false,
+        )
+        .to_model_input_item();
+
+        assert_eq!(inter_agent_message_display_from_response_item(&item), None);
+    }
+
+    #[test]
+    fn explicit_child_message_displays_payload_without_envelope() {
+        let item = InterAgentCommunication::new(
+            AgentPath::try_from("/root/worker").expect("valid agent path"),
+            AgentPath::root(),
+            Vec::new(),
+            "Message Type: MESSAGE\nTask name: /root\nSender: /root/worker\nPayload:\nThe focused test is green."
+                .to_string(),
+            /*trigger_turn*/ false,
+        )
+        .to_model_input_item();
+
+        let display = inter_agent_message_display_from_response_item(&item)
+            .expect("explicit child message should be visible");
+        assert_eq!(display.author, "/root/worker");
+        assert_eq!(display.content, "The focused test is green.");
+    }
+
+    #[test]
+    fn goal_supervisor_message_displays_payload_without_envelope() {
+        let item = InterAgentCommunication::new(
+            AgentPath::try_from("/root/goal_supervisor").expect("valid agent path"),
+            AgentPath::root(),
+            Vec::new(),
+            "Message Type: NEW_TASK\nTask name: /root\nSender: /root/goal_supervisor\nPayload:\nReview the completed work."
+                .to_string(),
+            /*trigger_turn*/ true,
+        )
+        .to_model_input_item();
+
+        let display = inter_agent_message_display_from_response_item(&item)
+            .expect("goal supervisor message should be visible");
+        assert_eq!(display.author, "/root/goal_supervisor");
+        assert_eq!(display.content, "Review the completed work.");
+    }
 
     fn assert_item_started_server_notification(
         notification: ServerNotification,

@@ -2206,6 +2206,7 @@ mod tests {
     use codex_protocol::protocol::EventMsg;
     use codex_protocol::protocol::GuardianAssessmentEvent;
     use codex_protocol::protocol::GuardianAssessmentStatus;
+    use codex_protocol::protocol::InterAgentCommunication;
     use codex_protocol::protocol::ItemCompletedEvent;
     use codex_protocol::protocol::ItemStartedEvent;
     use codex_protocol::protocol::RateLimitSnapshot;
@@ -4232,6 +4233,44 @@ mod tests {
                 assert_eq!(notification.thread_id, conversation_id.to_string());
                 assert_eq!(notification.turn_id, "turn-1");
                 assert_eq!(notification.diff, unified_diff);
+            }
+            other => bail!("unexpected message: {other:?}"),
+        }
+        assert!(rx.try_recv().is_err(), "no extra messages expected");
+        Ok(())
+    }
+    #[tokio::test]
+    async fn test_inter_agent_raw_response_emits_raw_response_item_completed() -> Result<()> {
+        let (tx, mut rx) = mpsc::channel(CHANNEL_CAPACITY);
+        let outgoing = Arc::new(OutgoingMessageSender::new(
+            tx,
+            codex_analytics::AnalyticsEventsClient::disabled(),
+        ));
+        let conversation_id = ThreadId::new();
+        let outgoing = ThreadScopedOutgoingMessageSender::new(
+            outgoing,
+            vec![ConnectionId(1)],
+            conversation_id,
+        );
+        let communication = InterAgentCommunication::new(
+            AgentPath::try_from("/root/worker").expect("valid agent path"),
+            AgentPath::root(),
+            Vec::new(),
+            "ready for review".to_string(),
+            /*trigger_turn*/ true,
+        );
+        let item: codex_protocol::models::ResponseItem =
+            communication.to_response_input_item().into();
+
+        maybe_emit_raw_response_item_completed(conversation_id, "turn-1", item.clone(), &outgoing)
+            .await;
+
+        let msg = recv_broadcast_notification(&mut rx).await?;
+        match msg {
+            ServerNotification::RawResponseItemCompleted(notification) => {
+                assert_eq!(notification.thread_id, conversation_id.to_string());
+                assert_eq!(notification.turn_id, "turn-1");
+                assert_eq!(notification.item, item);
             }
             other => bail!("unexpected message: {other:?}"),
         }

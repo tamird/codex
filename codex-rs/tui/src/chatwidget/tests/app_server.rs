@@ -1,7 +1,13 @@
 use super::*;
 use codex_app_server_protocol::AuthRecoveryNotification;
+use codex_app_server_protocol::RawResponseItemCompletedNotification;
+use codex_app_server_protocol::SubAgentActivityKind;
+use codex_app_server_protocol::build_turns_from_rollout_items;
+use codex_protocol::AgentPath;
 use codex_protocol::error::CodexErr;
 use codex_protocol::error::CodexErrorDetails;
+use codex_protocol::protocol::InterAgentCommunication;
+use codex_protocol::protocol::RolloutItem;
 use pretty_assertions::assert_eq;
 
 const SAFETY_BUFFERING_HEADER_TEXT: &str =
@@ -517,6 +523,165 @@ async fn collab_spawn_end_shows_requested_model_and_effort() {
 }
 
 #[tokio::test]
+async fn sub_agent_activity_renders_only_on_completion() {
+    let (mut chat, mut rx, _ops) = make_chatwidget_manual(/*model_override*/ None).await;
+    let item = AppServerThreadItem::SubAgentActivity {
+        id: "activity-1".to_string(),
+        kind: SubAgentActivityKind::Started,
+        agent_thread_id: ThreadId::new().to_string(),
+        agent_path: "/root/worker".to_string(),
+    };
+    let _ = drain_insert_history(&mut rx);
+
+    chat.handle_server_notification(
+        ServerNotification::ItemStarted(ItemStartedNotification {
+            thread_id: "thread-1".to_string(),
+            turn_id: "turn-1".to_string(),
+            started_at_ms: 10,
+            item: item.clone(),
+        }),
+        /*replay_kind*/ None,
+    );
+    assert!(
+        drain_insert_history(&mut rx).is_empty(),
+        "the start notification must not render a duplicate activity cell"
+    );
+
+    chat.handle_server_notification(
+        ServerNotification::ItemCompleted(ItemCompletedNotification {
+            thread_id: "thread-1".to_string(),
+            turn_id: "turn-1".to_string(),
+            completed_at_ms: 20,
+            item,
+        }),
+        /*replay_kind*/ None,
+    );
+    assert_eq!(drain_insert_history(&mut rx).len(), 1);
+}
+
+#[tokio::test]
+async fn live_app_server_inter_agent_message_renders_agent_message_cell() {
+    let (mut chat, mut rx, _ops) = make_chatwidget_manual(/*model_override*/ None).await;
+    let communication = InterAgentCommunication::new(
+        AgentPath::try_from("/root/worker").expect("valid agent path"),
+        AgentPath::root(),
+        Vec::new(),
+        "ready for review".to_string(),
+        /*trigger_turn*/ true,
+    );
+
+    chat.handle_server_notification(
+        ServerNotification::RawResponseItemCompleted(RawResponseItemCompletedNotification {
+            thread_id: "thread-1".to_string(),
+            turn_id: "turn-1".to_string(),
+            item: communication.to_response_input_item().into(),
+        }),
+        /*replay_kind*/ None,
+    );
+
+    let rendered = drain_insert_history(&mut rx)
+        .into_iter()
+        .map(|lines| lines_to_single_string(&lines))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert_chatwidget_snapshot!("live_app_server_inter_agent_message", rendered);
+}
+
+#[tokio::test]
+async fn replayed_inter_agent_message_renders_agent_message_cell() {
+    let (mut chat, mut rx, _ops) = make_chatwidget_manual(/*model_override*/ None).await;
+    let communication = InterAgentCommunication::new(
+        AgentPath::try_from("/root/worker").expect("valid agent path"),
+        AgentPath::root(),
+        Vec::new(),
+        "ready for review".to_string(),
+        /*trigger_turn*/ true,
+    );
+    let turns =
+        build_turns_from_rollout_items(&[RolloutItem::InterAgentCommunication(communication)]);
+
+    chat.replay_thread_turns(turns, ReplayKind::ResumeInitialMessages);
+
+    let rendered = drain_insert_history(&mut rx)
+        .into_iter()
+        .map(|lines| lines_to_single_string(&lines))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert_chatwidget_snapshot!("replayed_inter_agent_message", rendered);
+}
+
+#[tokio::test]
+async fn replayed_legacy_raw_response_item_renders_agent_message_cell() {
+    let (mut chat, mut rx, _ops) = make_chatwidget_manual(/*model_override*/ None).await;
+    let communication = InterAgentCommunication::new(
+        AgentPath::try_from("/root/worker").expect("valid agent path"),
+        AgentPath::root(),
+        Vec::new(),
+        "ready for review".to_string(),
+        /*trigger_turn*/ true,
+    );
+    let turns = vec![Turn {
+        id: "turn-1".to_string(),
+        items_view: codex_app_server_protocol::TurnItemsView::Full,
+        items: vec![ThreadItem::RawResponseItem {
+            id: "legacy-item-1".to_string(),
+            item: communication.to_response_input_item().into(),
+        }],
+        status: TurnStatus::Completed,
+        error: None,
+        started_at: None,
+        completed_at: None,
+        duration_ms: None,
+    }];
+
+    chat.replay_thread_turns(turns, ReplayKind::ResumeInitialMessages);
+
+    let rendered = drain_insert_history(&mut rx)
+        .into_iter()
+        .map(|lines| lines_to_single_string(&lines))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert_chatwidget_snapshot!("replayed_inter_agent_message", rendered);
+}
+
+#[tokio::test]
+async fn subagent_completion_message_renders_status_without_payload_markup() {
+    let (mut chat, mut rx, _ops) = make_chatwidget_manual(/*model_override*/ None).await;
+    let notification = format!(
+        "<subagent_notification>\n{}\n</subagent_notification>",
+        serde_json::json!({
+            "agent_path": "/root/worker",
+            "status": codex_protocol::protocol::AgentStatus::Completed(
+                Some("analysis complete".to_string())
+            ),
+        })
+    );
+    let communication = InterAgentCommunication::new(
+        AgentPath::try_from("/root/worker").expect("valid agent path"),
+        AgentPath::root(),
+        Vec::new(),
+        notification,
+        /*trigger_turn*/ false,
+    );
+
+    chat.handle_server_notification(
+        ServerNotification::RawResponseItemCompleted(RawResponseItemCompletedNotification {
+            thread_id: "thread-1".to_string(),
+            turn_id: "turn-1".to_string(),
+            item: communication.to_response_input_item().into(),
+        }),
+        /*replay_kind*/ None,
+    );
+
+    let rendered = drain_insert_history(&mut rx)
+        .into_iter()
+        .map(|lines| lines_to_single_string(&lines))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert_chatwidget_snapshot!("subagent_completion_message", rendered);
+}
+
+#[tokio::test]
 async fn live_app_server_user_message_item_completed_does_not_duplicate_rendered_prompt() {
     let (mut chat, mut rx, mut op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
     chat.thread_id = Some(ThreadId::new());
@@ -583,11 +748,11 @@ async fn live_app_server_user_message_omits_unsupported_media() {
         /*replay_kind*/ None,
     );
 
-    let inserted = drain_insert_history(&mut rx);
+    let inserted = drain_insert_history_with_width(&mut rx, /*width*/ 39);
     assert_eq!(inserted.len(), 1);
     assert_chatwidget_snapshot!(
         "live_app_server_user_message_omits_unsupported_media",
-        lines_to_single_string(&inserted[0]),
+        trim_snapshot_line_end(&lines_to_single_string(&inserted[0])),
     );
 }
 

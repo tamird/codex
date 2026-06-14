@@ -1,0 +1,5 @@
+---
+source: tui/src/chatwidget/tests/app_server.rs
+expression: rendered
+---
+• Agent message: ready for review from /root/worker
