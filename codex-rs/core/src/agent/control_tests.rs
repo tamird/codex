@@ -2003,7 +2003,11 @@ while True:
             /*current_turn_context*/ None,
         )
         .await;
-    parent.thread.session.ensure_rollout_materialized().await;
+    parent
+        .thread
+        .session
+        .ensure_rollout_materialized(PersistContext::Standard)
+        .await;
     parent.thread.session.flush_rollout().await?;
 
     // The child has no independently configured MCP servers. Its first request can only advertise

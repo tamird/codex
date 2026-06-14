@@ -298,6 +298,10 @@ pub struct ConfigToml {
     #[serde(default, deserialize_with = "deserialize_model_providers")]
     pub model_providers: HashMap<String, ModelProviderInfo>,
 
+    /// User-defined model aliases that can override model context settings.
+    #[serde(default)]
+    pub custom_models: Vec<CustomModelToml>,
+
     /// Maximum total bytes of project instruction content across all selected environments.
     #[serde(default = "default_project_doc_max_bytes")]
     pub project_doc_max_bytes: Option<usize>,
@@ -939,6 +943,19 @@ pub fn validate_model_providers(
             .map_err(|message| format!("model_providers.{key}: {message}"))?;
     }
     Ok(())
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq, JsonSchema)]
+#[schemars(deny_unknown_fields)]
+pub struct CustomModelToml {
+    /// User-facing alias shown in the model picker.
+    pub name: String,
+    /// Provider-facing model slug used on API requests.
+    pub model: String,
+    /// Optional context window override applied when this alias is selected.
+    pub model_context_window: Option<i64>,
+    /// Optional auto-compaction token limit override applied when this alias is selected.
+    pub model_auto_compact_token_limit: Option<i64>,
 }
 
 fn deserialize_model_providers<'de, D>(

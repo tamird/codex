@@ -193,6 +193,8 @@ pub enum Feature {
     MultiAgentV2,
     /// Removed compatibility flag retained as a no-op.
     MultiAgentMode,
+    /// Enable root/subagent developer prompt injection.
+    AgentPromptInjection,
     /// Removed compatibility flag for the deleted agent-job tools.
     SpawnCsv,
     /// Enable apps.
@@ -1218,6 +1220,12 @@ pub const FEATURES: &[FeatureSpec] = &[
         id: Feature::MultiAgentMode,
         key: "multi_agent_mode",
         stage: Stage::Removed,
+        default_enabled: false,
+    },
+    FeatureSpec {
+        id: Feature::AgentPromptInjection,
+        key: "agent_prompt_injection",
+        stage: Stage::UnderDevelopment,
         default_enabled: false,
     },
     FeatureSpec {

@@ -152,8 +152,8 @@ async fn spawn_v2_subagent(
             /*metrics_service_name*/ None,
             /*inherited_environments*/ None,
             /*inherited_exec_policy*/ None,
-            /*environments*/ None,
             Default::default(),
+            /*environments*/ None,
         )
         .await
         .expect("spawn v2 subagent")

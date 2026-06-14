@@ -391,6 +391,11 @@ const fn is_true(value: &bool) -> bool {
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, TS, JsonSchema)]
 pub struct ModelInfo {
     pub slug: String,
+    /// Provider-facing model slug to send on API requests.
+    ///
+    /// When unset, `slug` is used.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_model: Option<String>,
     pub display_name: String,
     pub description: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -485,6 +490,10 @@ pub struct ModelInfo {
 }
 
 impl ModelInfo {
+    pub fn request_model_slug(&self) -> &str {
+        self.request_model.as_deref().unwrap_or(self.slug.as_str())
+    }
+
     pub fn resolved_context_window(&self) -> Option<i64> {
         self.context_window.or(self.max_context_window)
     }
@@ -935,6 +944,7 @@ mod tests {
     fn test_model(spec: Option<ModelMessages>) -> ModelInfo {
         ModelInfo {
             slug: "test-model".to_string(),
+            request_model: None,
             display_name: "Test Model".to_string(),
             description: None,
             default_reasoning_level: None,

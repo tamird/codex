@@ -1,5 +1,6 @@
 use codex_protocol::config_types::Personality;
 use codex_protocol::openai_models::ModelsResponse;
+use std::collections::HashMap;
 
 #[derive(Debug, Clone, Default)]
 pub struct ModelsManagerConfig {
@@ -10,4 +11,12 @@ pub struct ModelsManagerConfig {
     pub personality_enabled: bool,
     pub personality: Option<Personality>,
     pub model_catalog: Option<ModelsResponse>,
+    pub custom_models: HashMap<String, CustomModelConfig>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CustomModelConfig {
+    pub model: String,
+    pub model_context_window: Option<i64>,
+    pub model_auto_compact_token_limit: Option<i64>,
 }

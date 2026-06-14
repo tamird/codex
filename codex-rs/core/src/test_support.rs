@@ -150,7 +150,11 @@ pub fn models_manager_with_provider(
     provider: ModelProviderInfo,
 ) -> SharedModelsManager {
     let provider = create_model_provider(provider, Some(auth_manager));
-    provider.models_manager(codex_home, /*config_model_catalog*/ None)
+    provider.models_manager(
+        codex_home,
+        /*config_model_catalog*/ None,
+        Default::default(),
+    )
 }
 
 pub fn default_http_client_factory() -> HttpClientFactory {

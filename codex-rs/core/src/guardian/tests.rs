@@ -3715,6 +3715,10 @@ async fn guardian_review_session_config_uses_live_network_proxy_state() {
 #[tokio::test]
 async fn guardian_review_session_config_disables_mcp_apps_plugins_memories_and_guardian_v2() {
     let mut parent_config = test_config().await;
+    parent_config
+        .features
+        .enable(Feature::AgentPromptInjection)
+        .expect("agent prompt injection is configurable");
     let server: McpServerConfig =
         toml::from_str("command = \"docs-server\"").expect("deserialize MCP server");
     parent_config
@@ -3750,6 +3754,11 @@ async fn guardian_review_session_config_disables_mcp_apps_plugins_memories_and_g
     assert!(!guardian_config.features.enabled(Feature::Apps));
     assert!(!guardian_config.features.enabled(Feature::Plugins));
     assert!(!guardian_config.features.enabled(Feature::GuardianV2));
+    assert!(
+        !guardian_config
+            .features
+            .enabled(Feature::AgentPromptInjection)
+    );
     assert!(!guardian_config.include_apps_instructions);
     assert!(!guardian_config.memories.use_memories);
     assert!(!guardian_config.memories.dedicated_tools);

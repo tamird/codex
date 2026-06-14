@@ -377,6 +377,7 @@ pub fn build_models_manager(
     provider.models_manager(
         config.codex_home.to_path_buf(),
         config.model_catalog.clone(),
+        config.custom_models.clone(),
     )
 }
 
@@ -637,7 +638,11 @@ impl ThreadManager {
                 thread_created_tx,
                 thread_id_generator: default_thread_id_generator(),
                 models_manager: create_model_provider(provider, Some(auth_manager.clone()))
-                    .models_manager(codex_home, /*config_model_catalog*/ None),
+                    .models_manager(
+                        codex_home,
+                        /*config_model_catalog*/ None,
+                        Default::default(),
+                    ),
                 environment_manager,
                 starting_mcp_runtimes: std::sync::Mutex::new(Vec::new()),
                 skills_service,

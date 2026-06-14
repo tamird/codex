@@ -94,6 +94,7 @@ use codex_model_provider_info::ModelProviderInfo;
 use codex_model_provider_info::OLLAMA_CHAT_PROVIDER_REMOVED_ERROR;
 use codex_model_provider_info::built_in_model_providers;
 use codex_model_provider_info::merge_configured_model_providers;
+use codex_models_manager::CustomModelConfig;
 use codex_models_manager::ModelsManagerConfig;
 use codex_protocol::config_types::AltScreenMode;
 use codex_protocol::config_types::AutoCompactTokenLimitScope;
@@ -959,6 +960,9 @@ pub struct Config {
     /// When set, this replaces the bundled catalog for the current process.
     pub model_catalog: Option<ModelsResponse>,
 
+    /// User-defined model aliases shown in the picker.
+    pub custom_models: HashMap<String, CustomModelConfig>,
+
     /// Optional verbosity control for GPT-5 models (Responses API `text.verbosity`).
     pub model_verbosity: Option<Verbosity>,
 
@@ -1610,6 +1614,7 @@ impl Config {
             personality_enabled: self.features.enabled(Feature::Personality),
             personality: self.personality,
             model_catalog: self.model_catalog.clone(),
+            custom_models: self.custom_models.clone(),
         }
     }
 
@@ -3710,6 +3715,25 @@ impl Config {
             merge_configured_model_providers(built_in_model_providers(openai_base_url), cfg.model_providers)
                 .map_err(|message| std::io::Error::new(std::io::ErrorKind::InvalidData, message))?;
 
+        let mut custom_models = HashMap::new();
+        for custom in cfg.custom_models {
+            let alias = custom.name;
+            if custom_models.contains_key(&alias) {
+                return Err(std::io::Error::new(
+                    ErrorKind::InvalidInput,
+                    format!("duplicate custom model alias: {alias}"),
+                ));
+            }
+            custom_models.insert(
+                alias,
+                CustomModelConfig {
+                    model: custom.model,
+                    model_context_window: custom.model_context_window,
+                    model_auto_compact_token_limit: custom.model_auto_compact_token_limit,
+                },
+            );
+        }
+
         let model_provider_id = model_provider
             .or(cfg.model_provider)
             .unwrap_or_else(|| "openai".to_string());
@@ -4188,6 +4212,7 @@ impl Config {
                 .map(Duration::from_millis)
                 .unwrap_or(DEFAULT_OPTIONAL_MCP_STARTUP_GRACE),
             model_providers,
+            custom_models,
             project_doc_max_bytes: cfg.project_doc_max_bytes.unwrap_or(AGENTS_MD_MAX_BYTES),
             project_doc_fallback_filenames: cfg
                 .project_doc_fallback_filenames

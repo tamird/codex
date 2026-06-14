@@ -78,6 +78,7 @@ fn gpt_5_bedrock_model(
     let mut model = bundled_openai_model(openai_slug);
     model.slug = bedrock_slug.to_string();
     model.display_name = display_name.to_string();
+    model.request_model = None;
     model.priority = priority;
     model.context_window = Some(GPT_5_BEDROCK_CONTEXT_WINDOW);
     model.max_context_window = Some(GPT_5_BEDROCK_CONTEXT_WINDOW);
@@ -298,6 +299,14 @@ mod tests {
                     .service_tier_for_request(Some(SERVICE_TIER_DEFAULT_REQUEST_VALUE.to_string())),
                 None
             );
+        }
+    }
+
+    #[test]
+    fn catalog_models_use_their_slugs_as_request_models() {
+        for model in static_model_catalog().models {
+            assert!(model.request_model.is_none());
+            assert_eq!(model.request_model_slug(), model.slug.as_str());
         }
     }
 }

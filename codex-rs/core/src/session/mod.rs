@@ -112,7 +112,6 @@ use codex_protocol::models::ActivePermissionProfile;
 use codex_protocol::models::AdditionalPermissionProfile;
 use codex_protocol::models::BaseInstructions;
 use codex_protocol::models::BaseInstructionsProvenance;
-use codex_protocol::models::ContentItem;
 use codex_protocol::models::ContentItemKind;
 use codex_protocol::models::InternalChatMessageMetadataPassthrough;
 use codex_protocol::models::PermissionProfile;
@@ -265,6 +264,75 @@ use self::turn_context::TurnContext;
 #[cfg(test)]
 mod rollout_reconstruction_tests;
 
+const ROOT_AGENT_PROMPT_FALLBACK: &str = include_str!("../../assets/root_agent_prompt.md");
+const SUBAGENT_PROMPT_FALLBACK: &str = include_str!("../../assets/subagent_prompt.md");
+
+async fn load_agent_prompt_fallback(
+    codex_home: &Path,
+    fallback: &str,
+    override_filename: &str,
+) -> String {
+    let override_path = codex_home.join(override_filename);
+    if let Ok(contents) = tokio::fs::read_to_string(&override_path).await
+        && !contents.trim().is_empty()
+    {
+        return contents;
+    }
+
+    fallback.to_string()
+}
+
+pub(crate) async fn load_root_agent_prompt(codex_home: &Path) -> String {
+    load_agent_prompt_fallback(codex_home, ROOT_AGENT_PROMPT_FALLBACK, "AGENTS.root.md").await
+}
+
+pub(crate) async fn load_subagent_prompt(codex_home: &Path) -> String {
+    load_agent_prompt_fallback(codex_home, SUBAGENT_PROMPT_FALLBACK, "AGENTS.subagent.md").await
+}
+
+fn history_contains_developer_text(
+    history: &crate::context_manager::ContextManager,
+    expected: &str,
+) -> bool {
+    history.raw_items().any(|item| {
+        matches!(
+            item,
+            ResponseItem::Message { role, content, .. }
+                if role == "developer"
+                    && content.iter().any(|content_item| matches!(
+                        content_item,
+                        ContentItem::InputText { text } if text == expected
+                    ))
+        )
+    })
+}
+
+pub(crate) async fn load_agent_role_prompt(
+    config: &Config,
+    session_source: &SessionSource,
+) -> Option<String> {
+    if !config.features.enabled(Feature::AgentPromptInjection) {
+        return None;
+    }
+
+    let role_prompt = match session_source {
+        SessionSource::SubAgent(_) => load_subagent_prompt(&config.codex_home).await,
+        SessionSource::Cli
+        | SessionSource::VSCode
+        | SessionSource::Exec
+        | SessionSource::Mcp
+        | SessionSource::Custom(_)
+        | SessionSource::Internal(_)
+        | SessionSource::Unknown => load_root_agent_prompt(&config.codex_home).await,
+    };
+
+    if role_prompt.trim().is_empty() {
+        None
+    } else {
+        Some(role_prompt)
+    }
+}
+
 /// Notes from the previous real user turn.
 ///
 /// Conceptually this is the same role that `previous_model` used to fill, but
@@ -331,6 +399,7 @@ use codex_protocol::config_types::ReasoningSummary as ReasoningSummaryConfig;
 use codex_protocol::config_types::Settings;
 use codex_protocol::config_types::WindowsSandboxLevel;
 use codex_protocol::mcp::ClientMcpExtensions;
+use codex_protocol::models::ContentItem;
 use codex_protocol::models::LocalImagePreparation;
 use codex_protocol::models::ResponseInputItem;
 use codex_protocol::models::ResponseItem;
@@ -3767,13 +3836,20 @@ impl Session {
         let mut contextual_user_sections = Vec::<RenderedFragment>::with_capacity(2);
         let mut separate_developer_sections = Vec::<RenderedFragment>::new();
         let mut context_window_hints = Vec::new();
-        let (session_source, auto_compact_window_ids) = {
+        let (session_source, auto_compact_window_ids, history) = {
             let state = self.state.lock().await;
             (
                 state.session_configuration.session_source.clone(),
                 state.auto_compact_window_ids(),
+                state.history.clone(),
             )
         };
+        if let Some(role_prompt) =
+            load_agent_role_prompt(&turn_context.config, &session_source).await
+            && !history_contains_developer_text(&history, &role_prompt)
+        {
+            developer_sections.push(DeveloperInstructions::new(&role_prompt).render_fragment());
+        }
         let separate_guardian_developer_message =
             crate::guardian::is_basic_session_source(&session_source);
         // Keep the guardian policy prompt out of the aggregated developer bundle so it

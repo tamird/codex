@@ -432,6 +432,19 @@ fn codex_hooks_is_legacy_alias_for_hooks() {
 }
 
 #[test]
+fn agent_prompt_injection_is_under_development_and_disabled_by_default() {
+    assert_eq!(
+        feature_for_key("agent_prompt_injection"),
+        Some(Feature::AgentPromptInjection)
+    );
+    assert_eq!(
+        Feature::AgentPromptInjection.stage(),
+        Stage::UnderDevelopment
+    );
+    assert_eq!(Feature::AgentPromptInjection.default_enabled(), false);
+    assert!(!Features::with_defaults().enabled(Feature::AgentPromptInjection));
+}
+
 fn apps_require_feature_flag_and_chatgpt_auth() {
     let mut features = Features::with_defaults();
     assert!(!features.apps_enabled_for_auth(/*has_chatgpt_auth*/ false));

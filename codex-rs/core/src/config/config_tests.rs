@@ -20,6 +20,7 @@ use codex_config::config_toml::AgentRoleToml;
 use codex_config::config_toml::AgentsToml;
 use codex_config::config_toml::AutoReviewToml;
 use codex_config::config_toml::ConfigToml;
+use codex_config::config_toml::CustomModelToml;
 use codex_config::config_toml::ExperimentalRequestUserInput;
 use codex_config::config_toml::ProjectConfig;
 use codex_config::config_toml::RealtimeConfig;
@@ -9460,6 +9461,70 @@ async fn model_catalog_json_rejects_empty_catalog() -> std::io::Result<()> {
     assert!(
         err.to_string().contains("must contain at least one model"),
         "unexpected error: {err}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn custom_models_load_from_config_toml() -> std::io::Result<()> {
+    let codex_home = TempDir::new()?;
+    let cfg = ConfigToml {
+        custom_models: vec![CustomModelToml {
+            name: "frontier-local".to_string(),
+            model: "gpt-5.4".to_string(),
+            model_context_window: Some(123_456),
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+
+    let config = Config::load_from_base_config_with_overrides(
+        cfg,
+        ConfigOverrides::default(),
+        codex_home.abs(),
+    )
+    .await?;
+
+    let custom = config
+        .custom_models
+        .get("frontier-local")
+        .expect("custom alias should load");
+    assert_eq!(custom.model, "gpt-5.4");
+    assert_eq!(custom.model_context_window, Some(123_456));
+    Ok(())
+}
+
+#[tokio::test]
+async fn custom_models_reject_duplicate_aliases() -> std::io::Result<()> {
+    let codex_home = TempDir::new()?;
+    let cfg = ConfigToml {
+        custom_models: vec![
+            CustomModelToml {
+                name: "alias".to_string(),
+                model: "gpt-5.4".to_string(),
+                ..Default::default()
+            },
+            CustomModelToml {
+                name: "alias".to_string(),
+                model: "gpt-5.3".to_string(),
+                ..Default::default()
+            },
+        ],
+        ..Default::default()
+    };
+
+    let err = Config::load_from_base_config_with_overrides(
+        cfg,
+        ConfigOverrides::default(),
+        codex_home.abs(),
+    )
+    .await
+    .expect_err("duplicate custom alias should fail config load");
+
+    assert_eq!(err.kind(), ErrorKind::InvalidInput);
+    assert!(
+        err.to_string()
+            .contains("duplicate custom model alias: alias")
     );
     Ok(())
 }
