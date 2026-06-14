@@ -1,5 +1,7 @@
 use super::*;
+use crate::app_event::ForkPanePlacement;
 use crate::bottom_pane::slash_commands::ServiceTierCommand;
+use codex_terminal_detection::Multiplexer;
 use pretty_assertions::assert_eq;
 use serial_test::serial;
 
@@ -3054,11 +3056,14 @@ async fn slash_pets_on_old_iterm2_shows_upgrade_warning() {
 async fn slash_fork_requests_current_fork() {
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
 
-    chat.dispatch_command(SlashCommand::Fork);
+    chat.dispatch_fork_command(/*multiplexer*/ None);
 
     assert_matches!(
         rx.try_recv(),
-        Ok(AppEvent::ForkCurrentSession { name: None })
+        Ok(AppEvent::ForkCurrentSession {
+            name: None,
+            placement: None,
+        })
     );
 }
 
@@ -3073,9 +3078,74 @@ async fn slash_fork_with_name_requests_named_fork() {
     assert_matches!(
         rx.try_recv(),
         Ok(AppEvent::ForkCurrentSession {
-            name: Some(name)
+            name: Some(name),
+            placement: None,
         }) if name == "Add User"
     );
+}
+
+#[tokio::test]
+async fn slash_fork_with_right_placement_does_not_name_the_fork() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    chat.bottom_pane
+        .set_composer_text("/fork right".to_string(), Vec::new(), Vec::new());
+
+    chat.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+    assert_matches!(
+        rx.try_recv(),
+        Ok(AppEvent::ForkCurrentSession {
+            name: None,
+            placement: Some(ForkPanePlacement::Right),
+        })
+    );
+}
+
+#[tokio::test]
+async fn slash_fork_rejects_prefixed_placement_flags() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+
+    submit_composer_text(&mut chat, "/fork --right");
+
+    let rendered = drain_insert_history(&mut rx)
+        .iter()
+        .map(|cell| lines_to_single_string(cell))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        rendered.contains("/fork"),
+        "expected fork usage, got: {rendered:?}"
+    );
+}
+
+#[tokio::test]
+async fn slash_fork_opens_tmux_popup() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+
+    chat.dispatch_fork_command(Some(&Multiplexer::Tmux { version: None }));
+
+    assert!(
+        rx.try_recv().is_err(),
+        "expected /fork in tmux to open a popup instead of dispatching immediately"
+    );
+
+    let popup = render_bottom_popup(&chat, /*width*/ 80);
+    assert_chatwidget_snapshot!("fork_selection_popup_tmux", popup);
+}
+
+#[tokio::test]
+async fn slash_fork_opens_zellij_popup() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+
+    chat.dispatch_fork_command(Some(&Multiplexer::Zellij { version: None }));
+
+    assert!(
+        rx.try_recv().is_err(),
+        "expected /fork in zellij to open a popup instead of dispatching immediately"
+    );
+
+    let popup = render_bottom_popup(&chat, /*width*/ 80);
+    assert_chatwidget_snapshot!("fork_selection_popup_zellij", popup);
 }
 
 #[tokio::test]

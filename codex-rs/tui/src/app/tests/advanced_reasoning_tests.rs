@@ -31,7 +31,10 @@ async fn fork_current_session_preserves_conversation_ultra() -> Result<()> {
     let control = Box::pin(app.handle_event(
         &mut tui,
         &mut app_server,
-        AppEvent::ForkCurrentSession { name: None },
+        AppEvent::ForkCurrentSession {
+            name: None,
+            placement: None,
+        },
     ))
     .await?;
 

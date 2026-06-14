@@ -1,6 +1,7 @@
 use clap::Args;
 use clap::FromArgMatches;
 use clap::Parser;
+use codex_protocol::ThreadId;
 use codex_utils_cli::ApprovalModeCliArg;
 use codex_utils_cli::CliConfigOverrides;
 use codex_utils_cli::SharedCliOptions;
@@ -58,6 +59,16 @@ pub struct Cli {
     #[clap(skip)]
     pub fork_show_all: bool,
 
+    /// Internal: start an ephemeral side conversation from a recorded session.
+    #[arg(
+        long = "internal-side-session-id",
+        value_name = "SESSION_ID",
+        hide = true,
+        value_parser = parse_internal_side_session_id,
+        conflicts_with_all = ["prompt", "images"]
+    )]
+    pub side_session_id: Option<String>,
+
     #[clap(flatten)]
     pub shared: TuiSharedCliOptions,
 
@@ -77,6 +88,12 @@ pub struct Cli {
 
     #[clap(skip)]
     pub config_overrides: CliConfigOverrides,
+}
+
+fn parse_internal_side_session_id(value: &str) -> Result<String, String> {
+    ThreadId::from_string(value)
+        .map(|_| value.to_string())
+        .map_err(|_| "internal side session id must be a UUID".to_string())
 }
 
 impl std::ops::Deref for Cli {
@@ -135,6 +152,10 @@ impl FromArgMatches for TuiSharedCliOptions {
         self.0.update_from_arg_matches(matches)
     }
 }
+
+#[cfg(test)]
+#[path = "cli_tests.rs"]
+mod tests;
 
 fn mark_tui_args(cmd: clap::Command) -> clap::Command {
     cmd.mut_arg("dangerously_bypass_approvals_and_sandbox", |arg| {

@@ -1,0 +1,6 @@
+---
+source: tui/src/terminal_multiplexer.rs
+assertion_line: 656
+expression: ZELLIJ_SIDE_UNSUPPORTED_MESSAGE
+---
+Zellij only supports /side [--right|--down].

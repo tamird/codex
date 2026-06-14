@@ -132,6 +132,7 @@ mod external_editor;
 mod file_search;
 mod frames;
 mod get_git_diff;
+mod ghostty_fork;
 mod git_action_directives;
 mod goal_display;
 mod goal_files;
@@ -191,6 +192,7 @@ mod style;
 mod task_mentions;
 mod temporary_structured_request;
 mod terminal_hyperlinks;
+mod terminal_multiplexer;
 mod terminal_palette;
 mod terminal_probe;
 mod terminal_title;
@@ -797,11 +799,22 @@ async fn resolve_startup_resume_or_fork_cwd(
         resume_picker::SessionSelection::Fork(target_session) => {
             Some((CwdPromptAction::Fork, target_session))
         }
+        resume_picker::SessionSelection::Side(target_session) => {
+            Some((CwdPromptAction::Fork, target_session))
+        }
         _ => None,
     }) else {
         return Ok(ResolveCwdOutcome::Continue(None));
     };
-    let resume_cwd_mode = effective_resume_cwd_mode(config.tui_resume_cwd, cwd_override);
+    let allow_prompt = allow_interactive_session_cwd_prompt(
+        uses_remote_workspace,
+        cwd_override.is_some(),
+        session_selection,
+    );
+    let mut resume_cwd_mode = effective_resume_cwd_mode(config.tui_resume_cwd, cwd_override);
+    if !allow_prompt && resume_cwd_mode.is_none() {
+        resume_cwd_mode = Some(ResumeCwdMode::Session);
+    }
     if uses_remote_workspace_or_environment
         && cwd_override.is_none()
         && matches!(resume_cwd_mode, Some(ResumeCwdMode::Current))
@@ -859,6 +872,7 @@ fn app_server_target_for_launch(
     default_daemon_socket: Option<AbsolutePathBuf>,
     can_reuse_implicit_local_daemon: bool,
     workload_identity_selected: bool,
+    force_embedded: bool,
 ) -> std::io::Result<AppServerTarget> {
     if workload_identity_selected {
         if explicit_remote_endpoint.is_some() {
@@ -867,6 +881,9 @@ fn app_server_target_for_launch(
                 "workload identity must be configured on the remote app-server host",
             ));
         }
+        return Ok(AppServerTarget::Embedded);
+    }
+    if force_embedded {
         return Ok(AppServerTarget::Embedded);
     }
     Ok(match explicit_remote_endpoint {
@@ -880,6 +897,16 @@ fn app_server_target_for_launch(
         }
         None => AppServerTarget::Embedded,
     })
+}
+
+fn allow_interactive_session_cwd_prompt(
+    uses_remote_workspace: bool,
+    cli_cwd_is_set: bool,
+    session_selection: &resume_picker::SessionSelection,
+) -> bool {
+    !uses_remote_workspace
+        && !cli_cwd_is_set
+        && !matches!(session_selection, resume_picker::SessionSelection::Side(_))
 }
 
 async fn cloud_config_bundle_for_app_server_target(
@@ -957,6 +984,25 @@ pub async fn run_main(
         }),
         result => result,
     }
+}
+
+fn missing_session_message(id_str: &str, picker_action: Option<&str>) -> String {
+    match picker_action {
+        Some(action) => format!(
+            "No saved session found with ID {id_str}. Run `codex {action}` without an ID to choose from existing sessions."
+        ),
+        None => format!(
+            "No saved session found with ID {id_str}. Return to the original conversation and retry `/side`."
+        ),
+    }
+}
+
+fn format_error_chain(error: &color_eyre::Report) -> String {
+    error
+        .chain()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(": ")
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1249,7 +1295,7 @@ async fn run_ratatui_app(
 
     let missing_session_exit =
         |id_str: &str,
-         action: &str,
+         picker_action: Option<&str>,
          tui: &mut Tui,
          terminal_restore_guard: &mut TerminalRestoreGuard| {
             error!("Error finding conversation path: {id_str}");
@@ -1262,15 +1308,29 @@ async fn run_ratatui_app(
                 resume_hint: None,
                 disconnect_info: None,
                 update_action: None,
-                exit_reason: ExitReason::Fatal(format!(
-                    "No saved session found with ID {id_str}. Run `codex {action}` without an ID to choose from existing sessions."
-                )),
+                exit_reason: ExitReason::Fatal(missing_session_message(id_str, picker_action)),
             })
         };
 
     let use_fork = cli.fork_picker || cli.fork_last || cli.fork_session_id.is_some();
     let session_selection = if cli.agents_overview {
         resume_picker::SessionSelection::AgentsOverview
+    } else if let Some(id_str) = cli.side_session_id.as_deref() {
+        let Some(startup_app_server) = app_server.as_mut() else {
+            unreachable!("app server should be initialized for an internal side session");
+        };
+        match lookup_session_target_with_app_server(startup_app_server, &config, id_str).await? {
+            Some(target_session) => resume_picker::SessionSelection::Side(target_session),
+            None => {
+                shutdown_app_server_if_present(app_server.take()).await;
+                return missing_session_exit(
+                    id_str,
+                    /*picker_action*/ None,
+                    &mut tui,
+                    &mut terminal_restore_guard,
+                );
+            }
+        }
     } else if use_fork {
         if let Some(id_str) = cli.fork_session_id.as_deref() {
             let Some(startup_app_server) = app_server.as_mut() else {
@@ -1295,7 +1355,7 @@ async fn run_ratatui_app(
                     shutdown_app_server_if_present(app_server.take()).await;
                     return missing_session_exit(
                         id_str,
-                        "fork",
+                        Some("fork"),
                         &mut tui,
                         &mut terminal_restore_guard,
                     );
@@ -1389,7 +1449,7 @@ async fn run_ratatui_app(
                 shutdown_app_server_if_present(app_server.take()).await;
                 return missing_session_exit(
                     id_str,
-                    "resume",
+                    Some("resume"),
                     &mut tui,
                     &mut terminal_restore_guard,
                 );
@@ -1526,7 +1586,9 @@ async fn run_ratatui_app(
     ) && (cli.resume_picker || cli.fork_picker);
 
     let reloaded_config = match &session_selection {
-        resume_picker::SessionSelection::Resume(_) | resume_picker::SessionSelection::Fork(_) => {
+        resume_picker::SessionSelection::Resume(_)
+        | resume_picker::SessionSelection::Fork(_)
+        | resume_picker::SessionSelection::Side(_) => {
             startup_draft
                 .run_until(
                     &mut tui,
@@ -1975,6 +2037,19 @@ mod tests {
     use serial_test::serial;
     use tempfile::TempDir;
 
+    #[test]
+    fn format_error_chain_preserves_nested_side_fork_failure() {
+        let error = color_eyre::eyre::eyre!(
+            "missing predecessor rollout 019da1a1-bed9-7a43-88a2-b49d43915021"
+        )
+        .wrap_err("thread/fork failed during TUI bootstrap")
+        .wrap_err("Failed to start standalone side conversation from parent");
+
+        assert_eq!(
+            format_error_chain(&error),
+            "Failed to start standalone side conversation from parent: thread/fork failed during TUI bootstrap: missing predecessor rollout 019da1a1-bed9-7a43-88a2-b49d43915021"
+        );
+    }
     async fn build_config(temp_dir: &TempDir) -> std::io::Result<Config> {
         ConfigBuilder::default()
             .codex_home(temp_dir.path().to_path_buf())
@@ -2579,6 +2654,7 @@ mod tests {
             Some(socket_path.clone()),
             /*can_reuse_implicit_local_daemon*/ true,
             /*workload_identity_selected*/ false,
+            /*force_embedded*/ false,
         )?;
 
         assert_eq!(
@@ -2602,6 +2678,7 @@ mod tests {
             Some(AbsolutePathBuf::relative_to_current_dir("default.sock")?),
             /*can_reuse_implicit_local_daemon*/ false,
             /*workload_identity_selected*/ false,
+            /*force_embedded*/ false,
         )?;
 
         assert_eq!(
@@ -2624,6 +2701,7 @@ mod tests {
             Some(socket_path),
             /*can_reuse_implicit_local_daemon*/ false,
             /*workload_identity_selected*/ false,
+            /*force_embedded*/ false,
         )?;
 
         assert_eq!(target, AppServerTarget::Embedded);
@@ -2639,6 +2717,7 @@ mod tests {
                 Some(default_socket),
                 /*can_reuse_implicit_local_daemon*/ true,
                 /*workload_identity_selected*/ true,
+                /*force_embedded*/ false,
             )?,
             AppServerTarget::Embedded
         );
@@ -2651,6 +2730,7 @@ mod tests {
             /*default_daemon_socket*/ None,
             /*can_reuse_implicit_local_daemon*/ false,
             /*workload_identity_selected*/ true,
+            /*force_embedded*/ false,
         )
         .expect_err("remote hosts must own workload identity");
         assert_eq!(
@@ -2658,6 +2738,44 @@ mod tests {
             "workload identity must be configured on the remote app-server host"
         );
         Ok(())
+    }
+
+    #[test]
+    fn internal_side_launch_forces_embedded_app_server() -> color_eyre::Result<()> {
+        let explicit_endpoint = RemoteAppServerEndpoint::UnixSocket {
+            socket_path: AbsolutePathBuf::relative_to_current_dir("explicit.sock")?,
+        };
+        let target = app_server_target_for_launch(
+            Some(explicit_endpoint),
+            Some(AbsolutePathBuf::relative_to_current_dir("default.sock")?),
+            /*can_reuse_implicit_local_daemon*/ true,
+            /*workload_identity_selected*/ false,
+            /*force_embedded*/ true,
+        )?;
+
+        assert_eq!(target, AppServerTarget::Embedded);
+        Ok(())
+    }
+
+    #[test]
+    fn internal_side_uses_persisted_cwd_without_interactive_prompt() {
+        let side = resume_picker::SessionSelection::Side(resume_picker::SessionTarget {
+            path: Some(PathBuf::from("/persisted/project")),
+            thread_id: ThreadId::new(),
+            history_mode: None,
+        });
+        let fork = resume_picker::SessionSelection::Fork(resume_picker::SessionTarget {
+            path: Some(PathBuf::from("/persisted/project")),
+            thread_id: ThreadId::new(),
+            history_mode: None,
+        });
+
+        assert!(!allow_interactive_session_cwd_prompt(
+            /*uses_remote_workspace*/ false, /*cli_cwd_is_set*/ false, &side,
+        ));
+        assert!(allow_interactive_session_cwd_prompt(
+            /*uses_remote_workspace*/ false, /*cli_cwd_is_set*/ false, &fork,
+        ));
     }
 
     #[test]

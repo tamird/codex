@@ -6,14 +6,19 @@
 //! slash-command recall follows the same submitted-input rule as ordinary text.
 
 use super::*;
+use crate::app_event::ForkPanePlacement;
 use crate::app_event::ThreadGoalSetMode;
 use crate::bottom_pane::prompt_args::parse_slash_name;
 use crate::bottom_pane::slash_commands::BuiltinCommandFlags;
 use crate::bottom_pane::slash_commands::ServiceTierCommand;
 use crate::bottom_pane::slash_commands::SlashCommandItem;
 use crate::bottom_pane::slash_commands::find_slash_command;
+use crate::ghostty_fork::ghostty_fork_usage;
 use crate::goal_display::GOAL_USAGE;
 use crate::goal_files::GoalDraft;
+use crate::terminal_multiplexer::fork_command_usage;
+use crate::terminal_multiplexer::fork_pane_options;
+use crate::terminal_multiplexer::parse_fork_pane_placement;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SlashCommandDispatchSource {
@@ -34,6 +39,7 @@ struct PreparedSlashCommandArgs {
 const SIDE_STARTING_CONTEXT_LABEL: &str = "Side starting...";
 const SIDE_SLASH_COMMAND_UNAVAILABLE_HINT: &str =
     "Press Ctrl+C to return to the main thread first.";
+const PLACED_SIDE_DIRECTIONS: &str = "--left|--right|--up|--down";
 const GOAL_USAGE_HINT: &str = "Example: /goal improve benchmark coverage";
 const RAW_USAGE: &str = "Usage: /raw [on|off]";
 const USAGE_CHATGPT_LOGIN_REQUIRED: &str = "Sign in with ChatGPT to use /usage.";
@@ -54,10 +60,7 @@ impl ChatWidget {
 
     pub(super) fn handle_service_tier_command_dispatch(&mut self, command: ServiceTierCommand) {
         if self.active_side_conversation {
-            self.add_error_message(format!(
-                "'/{}' is unavailable in side conversations. {SIDE_SLASH_COMMAND_UNAVAILABLE_HINT}",
-                command.name
-            ));
+            self.add_error_message(self.side_slash_command_unavailable_message(&command.name));
             self.bottom_pane.drain_pending_submission_state();
             self.bottom_pane.record_pending_slash_command_history();
             return;
@@ -114,7 +117,11 @@ impl ChatWidget {
         });
     }
 
-    fn request_empty_side_conversation(&mut self, cmd: SlashCommand) {
+    fn request_placed_side_conversation(
+        &mut self,
+        cmd: SlashCommand,
+        placement: ForkPanePlacement,
+    ) {
         let Some(parent_thread_id) = self.thread_id else {
             let command = cmd.command();
             self.add_error_message(format!(
@@ -123,7 +130,28 @@ impl ChatWidget {
             return;
         };
 
-        self.request_side_conversation(parent_thread_id, /*user_message*/ None);
+        self.app_event_tx.send(AppEvent::StartPlacedSide {
+            parent_thread_id,
+            placement,
+        });
+    }
+
+    fn placed_side_usage(cmd: SlashCommand) -> String {
+        let command = cmd.command();
+        format!("Usage: /{command} [{PLACED_SIDE_DIRECTIONS}] or /{command} <question>")
+    }
+
+    fn placed_side_placement(args: &str) -> Option<ForkPanePlacement> {
+        let value = args.strip_prefix("--")?;
+        let placement = parse_fork_pane_placement(value)?;
+        matches!(
+            placement,
+            ForkPanePlacement::Left
+                | ForkPanePlacement::Right
+                | ForkPanePlacement::Up
+                | ForkPanePlacement::Down
+        )
+        .then_some(placement)
     }
 
     fn emit_raw_output_mode_changed(&self, enabled: bool) {
@@ -244,8 +272,8 @@ impl ChatWidget {
                 self.app_event_tx.send(AppEvent::OpenResumePicker);
             }
             SlashCommand::Fork => {
-                self.app_event_tx
-                    .send(AppEvent::ForkCurrentSession { name: None });
+                let terminal_info = terminal_info();
+                self.dispatch_fork_command(terminal_info.multiplexer.as_ref());
             }
             SlashCommand::App => {
                 let Some(thread_id) = self.thread_id else {
@@ -322,7 +350,7 @@ impl ChatWidget {
                 }
             }
             SlashCommand::Side | SlashCommand::Btw => {
-                self.request_empty_side_conversation(cmd);
+                self.request_placed_side_conversation(cmd, ForkPanePlacement::Right);
             }
             SlashCommand::Agents => {
                 self.app_event_tx.send(AppEvent::OpenAgentsOverview);
@@ -787,8 +815,27 @@ impl ChatWidget {
                 });
             }
             SlashCommand::Fork if !trimmed.is_empty() => {
+                let mut parts = trimmed.split_whitespace();
+                let Some(first) = parts.next() else {
+                    return;
+                };
+                let placement = parse_fork_pane_placement(first);
+                if first.starts_with("--") && placement.is_none()
+                    || placement.is_some() && parts.next().is_some()
+                {
+                    let terminal_info = terminal_info();
+                    self.add_error_message(
+                        ghostty_fork_usage(&terminal_info)
+                            .map(str::to_string)
+                            .unwrap_or_else(|| {
+                                fork_command_usage(terminal_info.multiplexer.as_ref())
+                            }),
+                    );
+                    return;
+                }
                 self.app_event_tx.send(AppEvent::ForkCurrentSession {
-                    name: Some(trimmed.to_string()),
+                    name: placement.is_none().then(|| trimmed.to_string()),
+                    placement,
                 });
             }
             SlashCommand::Plan if !trimmed.is_empty() => {
@@ -940,6 +987,31 @@ impl ChatWidget {
                 }
             }
             SlashCommand::Side | SlashCommand::Btw if !trimmed.is_empty() => {
+                if trimmed.starts_with("--") {
+                    let placement_message = self.prepared_inline_user_message(
+                        args,
+                        text_elements,
+                        local_images,
+                        remote_image_urls,
+                        mention_bindings,
+                        source,
+                    );
+                    if placement_message.local_images.is_empty()
+                        && placement_message.remote_image_urls.is_empty()
+                        && placement_message.text_elements.is_empty()
+                        && placement_message.mention_bindings.is_empty()
+                        && let Some(placement) =
+                            Self::placed_side_placement(placement_message.text.trim())
+                    {
+                        self.request_placed_side_conversation(cmd, placement);
+                    } else {
+                        self.add_error_message(Self::placed_side_usage(cmd));
+                        if source == SlashCommandDispatchSource::Live {
+                            self.bottom_pane.drain_pending_submission_state();
+                        }
+                    }
+                    return;
+                }
                 let Some(parent_thread_id) = self.thread_id else {
                     let command = cmd.command();
                     self.add_error_message(format!(
@@ -1096,6 +1168,46 @@ impl ChatWidget {
         self.queued_command_drain_result(cmd)
     }
 
+    pub(super) fn dispatch_fork_command(&mut self, multiplexer: Option<&Multiplexer>) {
+        if let Some(multiplexer) = multiplexer {
+            self.open_fork_popup(multiplexer);
+        } else {
+            self.app_event_tx.send(AppEvent::ForkCurrentSession {
+                name: None,
+                placement: None,
+            });
+        }
+    }
+
+    fn open_fork_popup(&mut self, multiplexer: &Multiplexer) {
+        let items = fork_pane_options(multiplexer)
+            .iter()
+            .map(|option| {
+                let placement = option.placement;
+                let actions: Vec<SelectionAction> = vec![Box::new(move |tx| {
+                    tx.send(AppEvent::ForkCurrentSession {
+                        name: None,
+                        placement: Some(placement),
+                    });
+                })];
+                SelectionItem {
+                    name: format!("/fork {}", option.name),
+                    description: Some(option.description.to_string()),
+                    actions,
+                    dismiss_on_select: true,
+                    ..Default::default()
+                }
+            })
+            .collect();
+        self.bottom_pane.show_selection_view(SelectionViewParams {
+            title: Some("Fork into a new pane".to_string()),
+            subtitle: Some("Choose where to open the fork.".to_string()),
+            footer_hint: Some(standard_popup_hint_line()),
+            items,
+            ..Default::default()
+        });
+    }
+
     fn builtin_command_flags(&self) -> BuiltinCommandFlags {
         #[cfg(target_os = "windows")]
         let allow_elevate_sandbox = {
@@ -1222,15 +1334,26 @@ impl ChatWidget {
     }
 
     fn ensure_slash_command_allowed_in_side_conversation(&mut self, cmd: SlashCommand) -> bool {
-        if !self.active_side_conversation || cmd.available_in_side_conversation() {
+        if !self.active_side_conversation
+            || cmd.available_in_side_conversation()
+            || (self.standalone_side_conversation
+                && matches!(cmd, SlashCommand::Quit | SlashCommand::Exit))
+        {
             return true;
         }
-        self.add_error_message(format!(
-            "'/{}' is unavailable in side conversations. {SIDE_SLASH_COMMAND_UNAVAILABLE_HINT}",
-            cmd.command()
-        ));
+        self.add_error_message(self.side_slash_command_unavailable_message(cmd.command()));
         self.bottom_pane.drain_pending_submission_state();
         false
+    }
+
+    fn side_slash_command_unavailable_message(&self, command: &str) -> String {
+        if self.standalone_side_conversation {
+            format!("'/{command}' is unavailable in standalone side conversations.")
+        } else {
+            format!(
+                "'/{command}' is unavailable in side conversations. {SIDE_SLASH_COMMAND_UNAVAILABLE_HINT}"
+            )
+        }
     }
 
     fn ensure_side_command_allowed_outside_review(&mut self, cmd: SlashCommand) -> bool {

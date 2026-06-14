@@ -6,6 +6,7 @@
 use super::resize_reflow::trailing_run_start;
 use super::session_lifecycle::ThreadAttachPresentation;
 use super::*;
+use crate::app_event::ForkPanePlacement;
 use crate::app_event::RecapTrigger;
 use crate::app_event::ThreadTitleDestination;
 use crate::app_server_session::ForkGoalContinuation;
@@ -13,13 +14,42 @@ use crate::app_server_session::UnsupportedLegacyPermissionProfile;
 use crate::app_server_session::turn_permissions_overrides;
 use crate::config_update::format_config_error;
 use crate::external_agent_config_migration::flow::ExternalAgentConfigMigrationFlowOutcome;
+use crate::ghostty_fork::ghostty_placement;
+use crate::ghostty_fork::spawn_fork_in_ghostty_split;
 use crate::pager_overlay::TranscriptHistoryState;
 use crate::session_resume::cwds_differ;
+use crate::terminal_multiplexer::FORK_PLACEMENT_REQUIRES_PANE_HOST_MESSAGE;
+use crate::terminal_multiplexer::ForkPaneSpawnResult;
+use crate::terminal_multiplexer::spawn_fork_in_new_pane;
 use codex_app_server_protocol::ThreadGoalStatus;
 #[cfg(target_os = "windows")]
 use codex_config::types::WindowsSandboxModeToml;
 
 const SHUTDOWN_FIRST_EXIT_TIMEOUT: Duration = Duration::from_secs(/*secs*/ 2);
+pub(super) const REMOTE_FORK_PANE_UNAVAILABLE_MESSAGE: &str =
+    "Fork pane placement is unavailable for remote app-server sessions.";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum ForkPaneFailureAction {
+    KeepParent,
+    ForkInPlace,
+}
+
+pub(super) fn fork_pane_failure_action(
+    placement: Option<ForkPanePlacement>,
+) -> ForkPaneFailureAction {
+    if placement.is_some() {
+        ForkPaneFailureAction::KeepParent
+    } else {
+        ForkPaneFailureAction::ForkInPlace
+    }
+}
+
+pub(super) fn fork_pane_target_error(target: &AppServerTarget) -> Option<&'static str> {
+    target
+        .uses_remote_workspace()
+        .then_some(REMOTE_FORK_PANE_UNAVAILABLE_MESSAGE)
+}
 
 impl App {
     pub(super) async fn handle_event(
@@ -273,7 +303,7 @@ impl App {
                         )
                         .await;
                     }
-                    SessionSelection::Fork(_) => {}
+                    SessionSelection::Fork(_) | SessionSelection::Side(_) => {}
                 }
 
                 self.chat_widget.maybe_send_next_queued_input();
@@ -334,7 +364,7 @@ impl App {
             AppEvent::DeleteCurrentThread => {
                 return Ok(self.delete_current_thread(app_server).await);
             }
-            AppEvent::ForkCurrentSession { name } => {
+            AppEvent::ForkCurrentSession { name, placement } => {
                 self.session_telemetry.counter(
                     "codex.thread.fork",
                     /*inc*/ 1,
@@ -346,8 +376,12 @@ impl App {
                     self.chat_widget.thread_name(),
                     self.chat_widget.rollout_path().as_deref(),
                 );
-                self.chat_widget
-                    .add_plain_history_lines(vec!["/fork".magenta().into()]);
+                let terminal_info = codex_terminal_detection::terminal_info();
+                let ghostty_placement = ghostty_placement(&terminal_info, placement);
+                if terminal_info.multiplexer.is_none() && ghostty_placement.is_none() {
+                    self.chat_widget
+                        .add_plain_history_lines(vec!["/fork".magenta().into()]);
+                }
                 if let Some(thread_id) = self.chat_widget.thread_id() {
                     self.refresh_in_memory_config_from_disk_best_effort("forking the thread")
                         .await;
@@ -355,6 +389,85 @@ impl App {
                     fork_config.model = Some(self.chat_widget.current_model().to_string());
                     fork_config.model_reasoning_effort =
                         self.chat_widget.current_reasoning_effort();
+                    fork_config.service_tier = self.chat_widget.configured_service_tier();
+                    if let Some(multiplexer) = terminal_info
+                        .multiplexer
+                        .as_ref()
+                        .filter(|_| name.is_none())
+                    {
+                        if let Some(message) = fork_pane_target_error(&self.app_server_target) {
+                            self.chat_widget.add_error_message(message.to_string());
+                            tui.frame_requester().schedule_frame();
+                            return Ok(AppRunControl::Continue);
+                        }
+                        match spawn_fork_in_new_pane(
+                            multiplexer,
+                            &thread_id,
+                            &fork_config,
+                            &self.harness_overrides.additional_writable_roots,
+                            placement,
+                        )
+                        .await
+                        {
+                            ForkPaneSpawnResult::Spawned => {
+                                tui.frame_requester().schedule_frame();
+                                return Ok(AppRunControl::Continue);
+                            }
+                            ForkPaneSpawnResult::InvalidPlacement(message) => {
+                                self.chat_widget.add_error_message(message);
+                                tui.frame_requester().schedule_frame();
+                                return Ok(AppRunControl::Continue);
+                            }
+                            ForkPaneSpawnResult::Failed(err) => {
+                                self.chat_widget.add_error_message(format!(
+                                    "Failed to open a new pane for /fork: {err}"
+                                ));
+                                if fork_pane_failure_action(placement)
+                                    == ForkPaneFailureAction::KeepParent
+                                {
+                                    tui.frame_requester().schedule_frame();
+                                    return Ok(AppRunControl::Continue);
+                                }
+                            }
+                        }
+                    } else if let Some(placement) = ghostty_placement.filter(|_| name.is_none()) {
+                        if let Some(message) = fork_pane_target_error(&self.app_server_target) {
+                            self.chat_widget.add_error_message(message.to_string());
+                            tui.frame_requester().schedule_frame();
+                            return Ok(AppRunControl::Continue);
+                        }
+                        match spawn_fork_in_ghostty_split(
+                            &thread_id,
+                            &fork_config,
+                            &self.harness_overrides.additional_writable_roots,
+                            placement,
+                        )
+                        .await
+                        {
+                            ForkPaneSpawnResult::Spawned => {
+                                tui.frame_requester().schedule_frame();
+                                return Ok(AppRunControl::Continue);
+                            }
+                            ForkPaneSpawnResult::InvalidPlacement(message) => {
+                                self.chat_widget.add_error_message(message);
+                                tui.frame_requester().schedule_frame();
+                                return Ok(AppRunControl::Continue);
+                            }
+                            ForkPaneSpawnResult::Failed(err) => {
+                                self.chat_widget.add_error_message(format!(
+                                    "Failed to open a new pane for /fork: {err}"
+                                ));
+                                tui.frame_requester().schedule_frame();
+                                return Ok(AppRunControl::Continue);
+                            }
+                        }
+                    } else if placement.is_some() && name.is_none() {
+                        self.chat_widget.add_error_message(
+                            FORK_PLACEMENT_REQUIRES_PANE_HOST_MESSAGE.to_string(),
+                        );
+                        tui.frame_requester().schedule_frame();
+                        return Ok(AppRunControl::Continue);
+                    }
                     match app_server.fork_thread(fork_config, thread_id).await {
                         Ok(mut forked) => {
                             let name_error = if let Some(name) = name {
@@ -2578,6 +2691,14 @@ impl App {
             } => {
                 return self
                     .handle_start_side(tui, app_server, parent_thread_id, user_message)
+                    .await;
+            }
+            AppEvent::StartPlacedSide {
+                parent_thread_id,
+                placement,
+            } => {
+                return self
+                    .handle_start_placed_side(tui, parent_thread_id, placement)
                     .await;
             }
             AppEvent::OpenSkillsList => {

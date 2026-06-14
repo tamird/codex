@@ -1,0 +1,9 @@
+---
+source: tui/src/app/placed_side_tests.rs
+assertion_line: 44
+expression: "[SIDE_NO_STARTED_CONVERSATION_MESSAGE.to_string(),\nREMOTE_SIDE_PANE_UNAVAILABLE_MESSAGE.to_string(),\nSIDE_PLACEMENT_REQUIRES_PANE_HOST_MESSAGE.to_string(),\nplaced_side_spawn_failure_message(\"tmux exited with status 1\"),].join(\"\\n\")"
+---
+'/side' is unavailable until the current conversation has started. Send a message first, then try /side again.
+Side pane placement is unavailable for remote app-server sessions.
+Side pane placement requires tmux, Zellij, or macOS Ghostty.
+Failed to open a new pane for /side: tmux exited with status 1

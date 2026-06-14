@@ -66,6 +66,7 @@ pub(super) async fn run_main_inner(
         launch_loader_overrides.user_config_profile = Some(profile_v2.clone());
     }
     let workload_identity_selected = is_workload_identity_selected();
+    let internal_side_session = cli.side_session_id.is_some();
 
     if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
         let validation_target = app_server_target_for_launch(
@@ -73,6 +74,7 @@ pub(super) async fn run_main_inner(
             /*default_daemon_socket*/ None,
             /*can_reuse_implicit_local_daemon*/ false,
             workload_identity_selected,
+            internal_side_session,
         )?;
         let validation_environment_manager =
             if should_load_configured_environments(&loader_overrides, &validation_target) {
@@ -136,6 +138,7 @@ pub(super) async fn run_main_inner(
     }
 
     let reuse_implicit_local_daemon = !workload_identity_selected
+        && !internal_side_session
         && (cli.agents_overview
             || can_reuse_implicit_local_daemon(
                 &cli_kv_overrides,
@@ -187,6 +190,7 @@ pub(super) async fn run_main_inner(
         default_daemon,
         reuse_implicit_local_daemon,
         workload_identity_selected,
+        internal_side_session,
     )?;
     let remote_cwd_override = cli
         .cwd
@@ -549,7 +553,7 @@ pub(super) async fn run_main_inner(
     .await
     .map_err(|err| {
         err.downcast::<std::io::Error>()
-            .unwrap_or_else(|err| std::io::Error::other(err.to_string()))
+            .unwrap_or_else(|err| std::io::Error::other(format_error_chain(&err)))
     });
 
     if let Some(otel) = otel

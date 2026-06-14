@@ -429,6 +429,39 @@ async fn reuses_rendered_diffs_for_unchanged_paths() {
 }
 
 #[tokio::test]
+async fn rerenders_tracked_paths_after_display_root_changes() {
+    let parent = tempdir().expect("parent tempdir");
+    let root = parent.path().join("workspace");
+    fs::create_dir(&root).expect("create workspace");
+    let mut tracker = tracker_with_root(&root);
+
+    let add = apply_verified_patch(
+        &root,
+        "*** Begin Patch\n*** Add File: a.txt\n+one\n*** End Patch",
+    )
+    .await;
+    tracker.track_delta("", &add);
+    assert!(
+        tracker
+            .get_unified_diff()
+            .expect("initial diff")
+            .contains("diff --git a/a.txt b/a.txt")
+    );
+
+    tracker.set_environment_display_roots([(
+        "".to_string(),
+        PathUri::from_host_native_path(parent.path()).expect("absolute parent display root"),
+    )]);
+
+    assert!(
+        tracker
+            .get_unified_diff()
+            .expect("rerendered diff")
+            .contains("diff --git a/workspace/a.txt b/workspace/a.txt")
+    );
+}
+
+#[tokio::test]
 async fn repeated_updates_only_rerender_the_touched_path() {
     let dir = tempdir().expect("tempdir");
     let mut tracker = tracker_with_root(dir.path());

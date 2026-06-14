@@ -343,6 +343,8 @@ pub enum Feature {
     UseAgentIdentity,
     /// Enable workspace dependency support.
     WorkspaceDependencies,
+    /// Allow a root thread to adopt another linked Git worktree as its cwd.
+    WorkspaceCwdTool,
 
     // Removed
     /// Removed compatibility flag retained as a no-op so old configs can
@@ -1687,6 +1689,12 @@ pub const FEATURES: &[FeatureSpec] = &[
     FeatureSpec {
         id: Feature::WorkspaceDependencies,
         key: "workspace_dependencies",
+        stage: Stage::Stable,
+        default_enabled: true,
+    },
+    FeatureSpec {
+        id: Feature::WorkspaceCwdTool,
+        key: "workspace_cwd_tool",
         stage: Stage::Stable,
         default_enabled: true,
     },

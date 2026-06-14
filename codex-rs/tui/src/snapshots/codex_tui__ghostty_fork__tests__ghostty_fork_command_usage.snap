@@ -1,0 +1,6 @@
+---
+source: tui/src/ghostty_fork_tests.rs
+assertion_line: 80
+expression: "ghostty_fork_usage_for_platform(&terminal_info(TerminalName::Ghostty, None),\ntrue,).expect(\"Ghostty usage\")"
+---
+Usage: /fork [left|right|up|down]

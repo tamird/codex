@@ -15,6 +15,16 @@ impl ChatWidget {
     }
 
     pub(crate) fn set_side_conversation_active(&mut self, active: bool) {
+        self.standalone_side_conversation = false;
+        self.set_side_conversation_mode(active);
+    }
+
+    pub(crate) fn set_standalone_side_conversation_active(&mut self) {
+        self.standalone_side_conversation = true;
+        self.set_side_conversation_mode(/*active*/ true);
+    }
+
+    fn set_side_conversation_mode(&mut self, active: bool) {
         self.active_side_conversation = active;
         let placeholder = if active {
             self.side_placeholder_text.clone()

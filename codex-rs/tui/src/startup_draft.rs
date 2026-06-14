@@ -187,7 +187,9 @@ impl StartupDraftPump {
             | SessionSelection::Exit
             | SessionSelection::AgentsOverview => StartupDraftSessionAction::New,
             SessionSelection::Resume(_) => StartupDraftSessionAction::Resume,
-            SessionSelection::Fork(_) => StartupDraftSessionAction::Fork,
+            SessionSelection::Fork(_) | SessionSelection::Side(_) => {
+                StartupDraftSessionAction::Fork
+            }
         };
         if self.session_action == session_action {
             return Ok(());

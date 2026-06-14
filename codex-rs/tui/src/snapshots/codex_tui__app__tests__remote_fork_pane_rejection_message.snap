@@ -1,0 +1,6 @@
+---
+source: tui/src/app/tests.rs
+assertion_line: 141
+expression: REMOTE_FORK_PANE_UNAVAILABLE_MESSAGE
+---
+Fork pane placement is unavailable for remote app-server sessions.

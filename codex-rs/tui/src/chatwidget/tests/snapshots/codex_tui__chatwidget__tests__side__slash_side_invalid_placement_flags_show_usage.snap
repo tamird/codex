@@ -1,0 +1,13 @@
+---
+source: tui/src/chatwidget/tests/side.rs
+assertion_line: 410
+expression: "rendered.join(\"\\n\")"
+---
+/side --float
+■ Usage: /side [--left|--right|--up|--down] or /side <question>
+
+/side --near
+■ Usage: /side [--left|--right|--up|--down] or /side <question>
+
+/side --right extra
+■ Usage: /side [--left|--right|--up|--down] or /side <question>

@@ -1,0 +1,5 @@
+---
+source: tui/src/app/tests.rs
+expression: FORK_PLACEMENT_REQUIRES_PANE_HOST_MESSAGE
+---
+Fork pane placement requires tmux, Zellij, or macOS Ghostty.
