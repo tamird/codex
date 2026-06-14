@@ -574,6 +574,7 @@ async fn azure_store_sends_ids_and_headers() -> Result<()> {
             ResponsesOptions {
                 session_id: Some("sess_123".into()),
                 thread_id: Some("thread_123".into()),
+                prompt_cache_key: Some("prompt_cache_123".into()),
                 session_source: Some(SessionSource::SubAgent(SubAgentSource::Review)),
                 extra_headers,
                 compression: Compression::None,
@@ -588,7 +589,7 @@ async fn azure_store_sends_ids_and_headers() -> Result<()> {
 
     assert_eq!(
         req.headers.get("session-id").and_then(|v| v.to_str().ok()),
-        Some("sess_123")
+        Some("prompt_cache_123")
     );
     assert_eq!(
         req.headers.get("thread-id").and_then(|v| v.to_str().ok()),

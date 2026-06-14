@@ -250,6 +250,7 @@ impl Session {
                 Some(self.mcp_elicitation_reviewer()),
             )
             .await;
+            *self.services.mcp_tool_snapshot.lock().await = None;
             refresh_invalidation.published = true;
         }
     }
@@ -361,16 +362,27 @@ impl Session {
             .chain(&recovered_oauth_servers)
             .cloned()
             .collect::<Vec<_>>();
-        if let Some(binding) = self
+        let binding = if let Some(binding) = self
             .services
             .mcp_runtime
             .current_binding_with_required_servers(&required_servers)
             .await
         {
-            return binding;
-        }
-        let config = Arc::new(self.runtime_mcp_config(&turn_context.config).await);
-        Arc::new(codex_mcp::McpBinding::empty(config))
+            binding
+        } else {
+            let config = Arc::new(self.runtime_mcp_config(&turn_context.config).await);
+            Arc::new(codex_mcp::McpBinding::empty(config))
+        };
+        let inherited_tools = self
+            .services
+            .mcp_tool_snapshot
+            .lock()
+            .await
+            .as_ref()
+            .map(|snapshot| snapshot.tools.clone());
+        inherited_tools
+            .map(|tools| Arc::new(binding.with_tool_catalog(tools)))
+            .unwrap_or(binding)
     }
 
     #[tracing::instrument(
@@ -694,6 +706,7 @@ impl Session {
             elicitation_reviewer,
         )
         .await;
+        *self.services.mcp_tool_snapshot.lock().await = None;
     }
 
     pub(crate) fn ready_selected_capability_roots(

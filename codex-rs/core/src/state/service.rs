@@ -31,6 +31,7 @@ use codex_hooks::Hooks;
 use codex_http_client::RouteAwareClientPool;
 use codex_login::AuthManager;
 use codex_mcp::McpRuntime;
+use codex_mcp::ToolInfo as McpToolInfo;
 use codex_models_manager::manager::SharedModelsManager;
 use codex_otel::SessionTelemetry;
 use codex_protocol::capabilities::SelectedCapabilityRoot;
@@ -43,11 +44,18 @@ use codex_thread_store::ThreadStore;
 use tokio::runtime::Handle;
 use tokio::sync::Mutex;
 
+/// MCP tools inherited by a fork in the exact order used by the parent request.
+#[derive(Clone, Default)]
+pub(crate) struct McpToolSnapshot {
+    pub(crate) tools: Vec<McpToolInfo>,
+}
+
 pub(crate) struct SessionServices {
     /// The single owner of live MCP connections for this thread.
     pub(crate) mcp_runtime: Arc<McpRuntime>,
     /// Immutable MCP handlers scoped to this thread's current binding.
     pub(crate) mcp_handler_cache: McpHandlerCache,
+    pub(crate) mcp_tool_snapshot: Mutex<Option<McpToolSnapshot>>,
     pub(crate) unified_exec_manager: UnifiedExecProcessManager,
     pub(crate) elicitations: ElicitationService,
     #[cfg_attr(not(unix), allow(dead_code))]

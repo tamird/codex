@@ -8,6 +8,7 @@ use crate::compact::InitialContextInjection;
 use crate::compact::build_compaction_initial_context;
 use crate::compact::compaction_status_from_result;
 use crate::compact::insert_initial_context_before_last_real_user_or_summary;
+use crate::compact::is_compaction_filtered_history_item;
 use crate::compact_model_fallback::record_model_fallback;
 use crate::compact_model_fallback::should_retry_with_current_model;
 use crate::compact_remote_history::HistoryItemGroup;
@@ -361,8 +362,9 @@ pub(crate) async fn process_annotated_compacted_history(
 /// We drop:
 /// - `developer` messages because remote output can include stale/duplicated
 ///   instruction content.
-/// - non-user-content `user` messages (session prefix/instruction wrappers),
-///   while preserving real user messages and persisted hook prompts.
+/// - non-user-content `user` messages (session prefix/instruction wrappers).
+/// - user warnings that are known to be local runtime noise and should not
+///   survive compaction.
 ///
 /// This intentionally keeps:
 /// - `assistant` messages (future remote compaction models may emit them)
@@ -373,6 +375,9 @@ pub(crate) fn should_keep_compacted_history_item(item: &ResponseItem) -> bool {
     match item {
         ResponseItem::Message { role, .. } if role == "developer" => false,
         ResponseItem::Message { role, .. } if role == "user" => {
+            if is_compaction_filtered_history_item(item) {
+                return false;
+            }
             matches!(
                 crate::event_mapping::parse_turn_item(item),
                 Some(TurnItem::UserMessage(_) | TurnItem::HookPrompt(_))

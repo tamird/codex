@@ -56,6 +56,7 @@ pub struct ResponsesClient<T: HttpTransport> {
 pub struct ResponsesOptions {
     pub session_id: Option<String>,
     pub thread_id: Option<String>,
+    pub prompt_cache_key: Option<String>,
     pub session_source: Option<SessionSource>,
     pub extra_headers: HeaderMap,
     pub compression: Compression,
@@ -107,6 +108,7 @@ impl<T: HttpTransport> ResponsesClient<T> {
         let ResponsesOptions {
             session_id,
             thread_id,
+            prompt_cache_key,
             session_source,
             extra_headers,
             compression,
@@ -120,6 +122,7 @@ impl<T: HttpTransport> ResponsesClient<T> {
         if let Some(ref thread_id) = thread_id {
             insert_header(&mut headers, "x-client-request-id", thread_id);
         }
+        let session_id = prompt_cache_key.or(session_id);
         headers.extend(build_session_headers(session_id, thread_id));
         if let Some(subagent) = subagent_header(&session_source) {
             insert_header(&mut headers, "x-openai-subagent", &subagent);

@@ -1,9 +1,13 @@
 use anyhow::Result;
+use codex_config::types::ToolSuggestDiscoverable;
+use codex_config::types::ToolSuggestDiscoverableType;
 use codex_core::StartThreadOptions;
 use codex_core::ThreadConfigSnapshot;
 use codex_core::TurnInputRequest;
 use codex_core::config::AgentRoleConfig;
 use codex_core::config::CurrentTimeReminderConfig;
+use codex_core_plugins::OPENAI_CURATED_MARKETPLACE_NAME;
+use codex_core_plugins::startup_sync::curated_plugins_repo_path;
 use codex_features::Feature;
 use codex_history::RolloutItem;
 use codex_models_manager::bundled_models_response;
@@ -58,6 +62,7 @@ use pretty_assertions::assert_eq;
 use serde_json::Value;
 use serde_json::json;
 use std::fs;
+use std::future::Future;
 use std::path::Path;
 use std::sync::Mutex;
 use std::time::Duration;
@@ -67,7 +72,11 @@ use tokio::time::sleep;
 use tokio::time::timeout;
 use tracing::Level;
 use tracing_test::internal::MockWriter;
+use wiremock::Mock;
 use wiremock::MockServer;
+use wiremock::ResponseTemplate;
+use wiremock::matchers::method;
+use wiremock::matchers::path;
 
 const SPAWN_CALL_ID: &str = "spawn-call-1";
 const MULTI_AGENT_V1_NAMESPACE: &str = "multi_agent_v1";
@@ -148,6 +157,23 @@ fn tool_parameter_description(tool: &Value, parameter_name: &str) -> Option<Stri
         .map(str::to_owned)
 }
 
+fn tool_names(body: &Value) -> Vec<String> {
+    body.get("tools")
+        .and_then(Value::as_array)
+        .map(|tools| {
+            tools
+                .iter()
+                .filter_map(|tool| {
+                    tool.get("name")
+                        .or_else(|| tool.get("type"))
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 fn role_block(description: &str, role_name: &str) -> Option<String> {
     let role_header = format!("{role_name}: {{");
     let mut lines = description.lines().skip_while(|line| *line != role_header);
@@ -168,6 +194,85 @@ fn write_home_skill(codex_home: &Path, dir: &str, name: &str, description: &str)
     let contents = format!("---\nname: {name}\ndescription: {description}\n---\n\n# Body\n");
     fs::write(skill_dir.join("SKILL.md"), contents)?;
     Ok(())
+}
+
+fn write_discoverable_plugin(codex_home: &Path, plugin_name: &str) -> Result<()> {
+    let curated_root = curated_plugins_repo_path(codex_home);
+    let plugin_root = curated_root.join("plugins").join(plugin_name);
+    let marketplace_plugin = format!(
+        r#"{{
+      "name": "{plugin_name}",
+      "source": {{
+        "source": "local",
+        "path": "./plugins/{plugin_name}"
+      }}
+    }}"#
+    );
+    fs::create_dir_all(curated_root.join(".agents/plugins"))?;
+    fs::write(
+        curated_root.join(".agents/plugins/marketplace.json"),
+        format!(
+            r#"{{
+  "name": "{OPENAI_CURATED_MARKETPLACE_NAME}",
+  "plugins": [
+{marketplace_plugin}
+  ]
+}}"#
+        ),
+    )?;
+    fs::create_dir_all(plugin_root.join(".codex-plugin"))?;
+    fs::write(
+        plugin_root.join(".codex-plugin/plugin.json"),
+        format!(
+            r#"{{
+  "name": "{plugin_name}",
+  "description": "Plugin suggested only through request_plugin_install"
+}}"#
+        ),
+    )?;
+    Ok(())
+}
+
+async fn mount_empty_apps_directory(server: &MockServer) {
+    Mock::given(method("GET"))
+        .and(path("/connectors/directory/list"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "apps": [],
+            "nextToken": null
+        })))
+        .mount(server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/connectors/directory/list_workspace"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "apps": [],
+            "nextToken": null
+        })))
+        .mount(server)
+        .await;
+}
+
+fn run_large_fork_request_test<F, Fut>(name: &'static str, test: F) -> Result<()>
+where
+    F: FnOnce() -> Fut + Send + 'static,
+    Fut: Future<Output = Result<()>> + Send + 'static,
+{
+    let test_thread = std::thread::Builder::new()
+        .name(name.to_string())
+        .stack_size(32 * 1024 * 1024)
+        .spawn(|| {
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .thread_stack_size(32 * 1024 * 1024)
+                .enable_all()
+                .build()?;
+            runtime.block_on(test())
+        })?;
+    match test_thread.join() {
+        Ok(result) => result,
+        Err(err) => std::panic::resume_unwind(err),
+    }
 }
 
 fn write_subagent_lifecycle_hooks(
@@ -1834,6 +1939,107 @@ async fn spawned_full_history_v2_child_uses_model_precedence_without_dropping_co
             json!(expected_model),
             json!(expected_reasoning_effort.to_string()),
         )
+    );
+
+    Ok(())
+}
+
+#[test]
+fn spawned_child_inherits_parent_app_server_client_tool_filters() -> Result<()> {
+    run_large_fork_request_test(
+        "spawned_child_inherits_parent_app_server_client_tool_filters",
+        spawned_child_inherits_parent_app_server_client_tool_filters_impl,
+    )
+}
+
+async fn spawned_child_inherits_parent_app_server_client_tool_filters_impl() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let server = start_mock_server().await;
+    mount_empty_apps_directory(&server).await;
+    let spawn_args = serde_json::to_string(&json!({
+        "message": CHILD_PROMPT,
+        "fork_context": true,
+    }))?;
+    let spawn_turn = mount_sse_once_match(
+        &server,
+        |req: &wiremock::Request| body_contains(req, TURN_1_PROMPT),
+        sse(vec![
+            ev_response_created("resp-turn1-1"),
+            ev_function_call_with_namespace(
+                SPAWN_CALL_ID,
+                MULTI_AGENT_V1_NAMESPACE,
+                "spawn_agent",
+                &spawn_args,
+            ),
+            ev_completed("resp-turn1-1"),
+        ]),
+    )
+    .await;
+    let child_turn = mount_sse_once_match(
+        &server,
+        |req: &wiremock::Request| {
+            body_contains(req, CHILD_PROMPT) && !body_contains(req, SPAWN_CALL_ID)
+        },
+        sse(vec![
+            ev_response_created("resp-child-1"),
+            ev_completed("resp-child-1"),
+        ]),
+    )
+    .await;
+    let _turn1_followup = mount_sse_once_match(
+        &server,
+        |req: &wiremock::Request| body_contains(req, SPAWN_CALL_ID),
+        sse(vec![
+            ev_response_created("resp-turn1-2"),
+            ev_completed("resp-turn1-2"),
+        ]),
+    )
+    .await;
+
+    let plugin_name = "slack";
+    let chatgpt_base_url = server.uri();
+    let mut builder = test_codex()
+        .with_pre_build_hook(move |codex_home| {
+            if let Err(err) = write_discoverable_plugin(codex_home, plugin_name) {
+                panic!("discoverable plugin fixture should be written: {err}");
+            }
+        })
+        .with_config(move |config| {
+            for feature in [Feature::Apps, Feature::Plugins, Feature::ToolSuggest] {
+                if let Err(err) = config.features.enable(feature) {
+                    panic!("test config should allow enabling {feature:?}: {err}");
+                }
+            }
+            config.chatgpt_base_url = chatgpt_base_url;
+            config.tool_suggest.discoverables = vec![ToolSuggestDiscoverable {
+                kind: ToolSuggestDiscoverableType::Plugin,
+                id: format!("{plugin_name}@{OPENAI_CURATED_MARKETPLACE_NAME}"),
+            }];
+        });
+    let test = builder.build(&server).await?;
+    test.codex
+        .set_app_server_client_info(
+            Some("codex-tui".to_string()),
+            Some("test-client-version".to_string()),
+            /*mcp_elicitations_auto_deny*/ false,
+        )
+        .await?;
+
+    test.submit_turn(TURN_1_PROMPT).await?;
+    let root_tool_names = tool_names(&spawn_turn.single_request().body_json());
+    let child_requests = wait_for_requests(&child_turn).await?;
+    let child_tool_names = tool_names(&child_requests[0].body_json());
+
+    // `request_plugin_install` is controlled by client-sensitive discoverable-tool
+    // filtering. Forked children must inherit the parent client metadata so the
+    // backend-visible tool list stays byte-compatible with the parent request.
+    assert_eq!(child_tool_names, root_tool_names);
+    assert!(
+        !root_tool_names
+            .iter()
+            .any(|name| name == "request_plugin_install"),
+        "codex-tui should filter plugin install suggestions out of both requests: {root_tool_names:?}"
     );
 
     Ok(())

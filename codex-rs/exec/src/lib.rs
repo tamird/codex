@@ -214,6 +214,7 @@ struct ExecRunArgs {
     resume_approvals_reviewer_override: Option<codex_app_server_protocol::ApprovalsReviewer>,
     dangerously_bypass_approvals_and_sandbox: bool,
     exec_span: tracing::Span,
+    fork_session_id: Option<String>,
     images: Vec<PathBuf>,
     json_mode: bool,
     last_message_file: Option<PathBuf>,
@@ -251,6 +252,7 @@ pub async fn run_main(cli: Cli, arg0_paths: Arg0DispatchPaths) -> anyhow::Result
     let Cli {
         command,
         strict_config,
+        fork_session_id,
         shared,
         thread_source,
         skip_git_repo_check,
@@ -567,6 +569,7 @@ pub async fn run_main(cli: Cli, arg0_paths: Arg0DispatchPaths) -> anyhow::Result
         resume_approvals_reviewer_override,
         dangerously_bypass_approvals_and_sandbox,
         exec_span: exec_span.clone(),
+        fork_session_id,
         images,
         json_mode,
         last_message_file,
@@ -666,6 +669,7 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<()> {
         resume_approvals_reviewer_override,
         dangerously_bypass_approvals_and_sandbox,
         exec_span,
+        fork_session_id,
         images,
         json_mode,
         last_message_file,
@@ -849,9 +853,16 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<()> {
                     .map_err(anyhow::Error::msg)?;
             (session_configured.thread_id, session_configured)
         }
-    } else if let Some(ExecCommand::Fork(args)) = command.as_ref() {
+    } else if let Some(fork_session_id) = command
+        .as_ref()
+        .and_then(|command| match command {
+            ExecCommand::Fork(args) => Some(args.session_id.as_str()),
+            ExecCommand::Review(_) | ExecCommand::Resume(_) => None,
+        })
+        .or(fork_session_id.as_deref())
+    {
         let source_args = crate::cli::ResumeArgs {
-            session_id: Some(args.session_id.clone()),
+            session_id: Some(fork_session_id.to_string()),
             last: false,
             all: true,
             images: Vec::new(),
@@ -860,59 +871,25 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<()> {
         let source_thread_id =
             resolve_resume_thread_id(&client, &config, state_db.as_ref(), &source_args)
                 .await?
-                .ok_or_else(|| anyhow::anyhow!("Session not found: {}", args.session_id))?;
-        let permissions = permissions_selection_from_config(&config);
-        let sandbox = permissions.is_none().then(|| {
-            sandbox_mode_from_permission_profile(
-                &config.permissions.effective_permission_profile(),
-                config.cwd.as_path(),
-            )
-        });
+                .ok_or_else(|| anyhow::anyhow!("Session not found: {fork_session_id}"))?;
         let response: ThreadForkResponse = send_request_with_response(
             &client,
             ClientRequest::ThreadFork {
                 request_id: request_ids.next(),
                 params: ThreadForkParams {
-                    thread_id: source_thread_id,
-                    model: config.model.clone(),
-                    model_provider: Some(config.model_provider_id.clone()),
-                    cwd: Some(config.cwd.to_string_lossy().to_string()),
-                    runtime_workspace_roots: Some(config.workspace_roots.clone()),
-                    approval_policy: Some(config.permissions.approval_policy.value().into()),
                     approvals_reviewer: resume_approvals_reviewer_override,
-                    sandbox: sandbox.flatten(),
-                    permissions,
-                    config: thread_config_overrides_from_config(&config),
-                    ephemeral: config.ephemeral,
                     thread_source: Some(thread_source.clone()),
                     exclude_turns: true,
                     defer_goal_continuation: !config.ephemeral,
-                    ..ThreadForkParams::default()
+                    ..thread_fork_params_from_config(&config, &source_thread_id, /*path*/ None)
                 },
             },
             "thread/fork",
         )
         .await
         .map_err(anyhow::Error::msg)?;
-        let session_configured = session_configured_from_thread_response(
-            &response.thread.session_id,
-            &response.thread.id,
-            response.thread.forked_from_id.as_deref(),
-            response.thread.parent_thread_id.as_deref(),
-            response.thread.thread_source.clone().map(Into::into),
-            response.thread.name.clone(),
-            response.thread.path.clone(),
-            response.model,
-            response.model_provider,
-            response.service_tier,
-            response.approval_policy.to_core(),
-            response.approvals_reviewer.to_core(),
-            config.permissions.effective_permission_profile(),
-            response.active_permission_profile.map(Into::into),
-            response.cwd,
-            response.reasoning_effort,
-        )
-        .map_err(anyhow::Error::msg)?;
+        let session_configured = session_configured_from_thread_fork_response(&response, &config)
+            .map_err(anyhow::Error::msg)?;
         (session_configured.thread_id, session_configured)
     } else {
         let response = start_thread(&client, &mut request_ids, &config, &thread_source)
@@ -1230,6 +1207,36 @@ fn thread_resume_params_from_config(
     }
 }
 
+fn thread_fork_params_from_config(
+    config: &Config,
+    thread_id: &str,
+    path: Option<PathBuf>,
+) -> ThreadForkParams {
+    let permissions = permissions_selection_from_config(config);
+    let sandbox = permissions.is_none().then(|| {
+        sandbox_mode_from_permission_profile(
+            &config.permissions.effective_permission_profile(),
+            config.cwd.as_path(),
+        )
+    });
+    ThreadForkParams {
+        thread_id: thread_id.to_string(),
+        path,
+        model: config.model.clone(),
+        model_provider: Some(config.model_provider_id.clone()),
+        cwd: Some(config.cwd.to_string_lossy().to_string()),
+        runtime_workspace_roots: Some(config.workspace_roots.clone()),
+        approval_policy: Some(config.permissions.approval_policy.value().into()),
+        approvals_reviewer: Some(config.approvals_reviewer.into()),
+        sandbox: sandbox.flatten(),
+        permissions,
+        config: thread_config_overrides_from_config(config),
+        ephemeral: config.ephemeral,
+        thread_source: Some(ThreadSource::User),
+        ..ThreadForkParams::default()
+    }
+}
+
 fn thread_config_overrides_from_config(config: &Config) -> Option<HashMap<String, Value>> {
     config
         .bypass_hook_trust
@@ -1315,6 +1322,30 @@ fn session_configured_from_thread_start_response(
 
 fn session_configured_from_thread_resume_response(
     response: &ThreadResumeResponse,
+    config: &Config,
+) -> Result<SessionConfiguredEvent, String> {
+    session_configured_from_thread_response(
+        &response.thread.session_id,
+        &response.thread.id,
+        response.thread.forked_from_id.as_deref(),
+        response.thread.parent_thread_id.as_deref(),
+        response.thread.thread_source.clone().map(Into::into),
+        response.thread.name.clone(),
+        response.thread.path.clone(),
+        response.model.clone(),
+        response.model_provider.clone(),
+        response.service_tier.clone(),
+        response.approval_policy.to_core(),
+        response.approvals_reviewer.to_core(),
+        config.permissions.effective_permission_profile(),
+        response.active_permission_profile.clone().map(Into::into),
+        response.cwd.clone(),
+        response.reasoning_effort.clone(),
+    )
+}
+
+fn session_configured_from_thread_fork_response(
+    response: &ThreadForkResponse,
     config: &Config,
 ) -> Result<SessionConfiguredEvent, String> {
     session_configured_from_thread_response(

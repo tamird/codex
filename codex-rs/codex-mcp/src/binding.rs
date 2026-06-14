@@ -89,6 +89,19 @@ impl McpBinding {
             .map(PreparedMcpCall::tool_info)
     }
 
+    /// Returns a binding with a replacement model-visible tool catalog while retaining this
+    /// binding's thread-scoped clients and call authority.
+    pub fn with_tool_catalog(&self, tools: Vec<ToolInfo>) -> Self {
+        Self {
+            connections: Arc::clone(&self.connections),
+            clients: Arc::clone(&self.clients),
+            config: Arc::clone(&self.config),
+            plugins_available: self.plugins_available,
+            tools,
+            calls: self.calls.clone(),
+        }
+    }
+
     /// Binds a model-visible call to the exact client and metadata in this binding.
     pub fn prepare_call(&self, server: &str, tool: &str) -> Option<PreparedMcpCall> {
         self.calls

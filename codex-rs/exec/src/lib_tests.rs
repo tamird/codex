@@ -375,6 +375,7 @@ fn turn_items_for_thread_returns_matching_turn_items() {
         thread_source: None,
         agent_nickname: None,
         agent_role: None,
+        agent_status: None,
         git_info: None,
         name: None,
         turns: vec![
@@ -729,6 +730,11 @@ async fn thread_lifecycle_params_include_legacy_sandbox_when_no_active_profile()
         "thread-id".to_string(),
         /*approvals_reviewer_override*/ None,
     );
+    let fork_params = thread_fork_params_from_config(
+        &config,
+        "67e55044-10b1-426f-9247-bb680e5fe0c8",
+        /*path*/ None,
+    );
 
     assert_eq!(config.permissions.active_permission_profile(), None);
     assert_eq!(
@@ -741,6 +747,42 @@ async fn thread_lifecycle_params_include_legacy_sandbox_when_no_active_profile()
         Some(codex_app_server_protocol::SandboxMode::DangerFullAccess)
     );
     assert_eq!(resume_params.permissions, None);
+    assert_eq!(
+        fork_params.sandbox,
+        Some(codex_app_server_protocol::SandboxMode::DangerFullAccess)
+    );
+    assert_eq!(fork_params.permissions, None);
+}
+
+#[tokio::test]
+async fn thread_fork_params_include_review_policy_when_auto_review_is_enabled() {
+    let codex_home = tempdir().expect("create temp codex home");
+    let cwd = tempdir().expect("create temp cwd");
+    let config = ConfigBuilder::default()
+        .codex_home(codex_home.path().to_path_buf())
+        .harness_overrides(ConfigOverrides {
+            approvals_reviewer: Some(ApprovalsReviewer::AutoReview),
+            ..Default::default()
+        })
+        .fallback_cwd(Some(cwd.path().to_path_buf()))
+        .build()
+        .await
+        .expect("build config for fork params");
+
+    let params = thread_fork_params_from_config(
+        &config,
+        "67e55044-10b1-426f-9247-bb680e5fe0c8",
+        /*path*/ None,
+    );
+
+    assert_eq!(
+        params.approvals_reviewer,
+        Some(codex_app_server_protocol::ApprovalsReviewer::AutoReview)
+    );
+    assert_eq!(
+        params.permissions,
+        permissions_selection_from_config(&config)
+    );
 }
 
 #[tokio::test]
@@ -861,6 +903,7 @@ fn sample_thread_start_response() -> ThreadStartResponse {
             thread_source: Some(codex_app_server_protocol::ThreadSource::User),
             agent_nickname: None,
             agent_role: None,
+            agent_status: None,
             git_info: None,
             name: Some("thread".to_string()),
             turns: vec![],
@@ -883,4 +926,73 @@ fn sample_thread_start_response() -> ThreadStartResponse {
         reasoning_effort: None,
         multi_agent_mode: Default::default(),
     }
+}
+
+#[tokio::test]
+async fn session_configured_from_thread_fork_response_preserves_permission_profile() {
+    let codex_home = tempdir().expect("create temp codex home");
+    let cwd = tempdir().expect("create temp cwd");
+    let config = ConfigBuilder::default()
+        .codex_home(codex_home.path().to_path_buf())
+        .fallback_cwd(Some(cwd.path().to_path_buf()))
+        .build()
+        .await
+        .expect("build config");
+    let response = ThreadForkResponse {
+        thread: codex_app_server_protocol::Thread {
+            id: "67e55044-10b1-426f-9247-bb680e5fe0c8".to_string(),
+            extra: None,
+            session_id: "67e55044-10b1-426f-9247-bb680e5fe0c7".to_string(),
+            forked_from_id: Some("f6f10963-370f-4f42-8f3b-bb680e5fe0c8".to_string()),
+            parent_thread_id: None,
+            preview: String::new(),
+            ephemeral: false,
+            section: None,
+            section_entered_at: None,
+            project_id: None,
+            history_mode: Default::default(),
+            model_provider: "openai".to_string(),
+            created_at: 0,
+            updated_at: 0,
+            recency_at: Some(0),
+            status: codex_app_server_protocol::ThreadStatus::Idle,
+            path: Some(PathBuf::from("/tmp/fork-rollout.jsonl")),
+            cwd: test_path_buf("/tmp").abs(),
+            cli_version: "0.0.0".to_string(),
+            source: codex_app_server_protocol::SessionSource::Cli,
+            can_accept_direct_input: None,
+            thread_source: Some(codex_app_server_protocol::ThreadSource::User),
+            agent_nickname: None,
+            agent_role: None,
+            agent_status: None,
+            git_info: None,
+            name: Some("forked-thread".to_string()),
+            turns: vec![],
+        },
+        model: "gpt-5.4".to_string(),
+        model_provider: "openai".to_string(),
+        service_tier: None,
+        cwd: test_path_buf("/tmp").abs(),
+        runtime_workspace_roots: Vec::new(),
+        instruction_sources: Vec::new(),
+        approval_policy: codex_app_server_protocol::AskForApproval::OnRequest,
+        approvals_reviewer: codex_app_server_protocol::ApprovalsReviewer::AutoReview,
+        sandbox: codex_app_server_protocol::SandboxPolicy::WorkspaceWrite {
+            writable_roots: vec![],
+            network_access: false,
+            exclude_tmpdir_env_var: false,
+            exclude_slash_tmp: false,
+        },
+        active_permission_profile: None,
+        reasoning_effort: None,
+        multi_agent_mode: Default::default(),
+    };
+
+    let event = session_configured_from_thread_fork_response(&response, &config)
+        .expect("build fork session configured event");
+
+    assert_eq!(
+        event.permission_profile,
+        config.permissions.effective_permission_profile()
+    );
 }

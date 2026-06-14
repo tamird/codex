@@ -1,8 +1,11 @@
 use super::AuthRequestTelemetryContext;
 use super::CompactConversationRequestSettings;
+use super::LastResponse;
 use super::ModelClient;
 use super::PendingUnauthorizedRetry;
 use super::Prompt;
+use super::ResponseContinuation;
+use super::ResponsesApiRequest;
 use super::UnauthorizedRecoveryExecution;
 use super::X_CODEX_INSTALLATION_ID_HEADER;
 use super::X_CODEX_PARENT_THREAD_ID_HEADER;
@@ -47,6 +50,8 @@ use codex_protocol::error::CodexErr;
 use codex_protocol::error::CodexErrorDetails;
 use codex_protocol::models::BaseInstructions;
 use codex_protocol::models::ContentItem;
+use codex_protocol::models::ReasoningItemContent;
+use codex_protocol::models::ReasoningItemReasoningSummary;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::openai_models::ModelInfo;
 use codex_protocol::openai_models::ModelsResponse;
@@ -623,6 +628,208 @@ fn output_message(id: &str, text: &str) -> ResponseItem {
     }
 }
 
+fn user_message_item(text: &str) -> ResponseItem {
+    ResponseItem::Message {
+        id: None,
+        role: "user".to_string(),
+        content: vec![ContentItem::InputText {
+            text: text.to_string(),
+        }],
+        phase: None,
+        internal_chat_message_metadata_passthrough: None,
+    }
+}
+
+fn reasoning_item(id: &str, text: &str) -> ResponseItem {
+    ResponseItem::Reasoning {
+        id: Some(codex_protocol::ResponseItemId::new(id)),
+        summary: vec![ReasoningItemReasoningSummary::SummaryText {
+            text: "summary".to_string(),
+        }],
+        content: Some(vec![ReasoningItemContent::ReasoningText {
+            text: text.to_string(),
+        }]),
+        encrypted_content: None,
+        internal_chat_message_metadata_passthrough: None,
+    }
+}
+
+#[test]
+fn response_continuation_for_fork_drops_historical_reasoning_but_keeps_latest() {
+    let user_message = user_message_item("hello");
+    let old_reasoning = reasoning_item("rs-old", "old analysis");
+    let latest_reasoning = reasoning_item("rs-latest", "latest analysis");
+    let latest_message = output_message("msg-latest", "assistant output");
+    let response_continuation = ResponseContinuation {
+        request: ResponsesApiRequest {
+            model: "gpt-test".to_string(),
+            instructions: "base instructions".to_string(),
+            input: vec![user_message.clone(), old_reasoning],
+            tools: Some(
+                Arc::<serde_json::value::RawValue>::from(
+                    serde_json::value::RawValue::from_string("[]".to_string())
+                        .expect("valid tool JSON"),
+                )
+                .into(),
+            ),
+            tool_choice: "auto".to_string(),
+            parallel_tool_calls: false,
+            reasoning: None,
+            store: false,
+            stream: true,
+            stream_options: None,
+            include: Vec::new(),
+            service_tier: None,
+            prompt_cache_key: Some(ThreadId::new().to_string()),
+            text: None,
+            client_metadata: None,
+            access_programs: None,
+        },
+        last_response: LastResponse {
+            response_id: "parent-resp".to_string(),
+            items_added: vec![latest_reasoning.clone(), latest_message.clone()],
+        },
+        endpoint: ResponsesEndpoint::Responses,
+    }
+    .for_fork();
+
+    assert_eq!(response_continuation.request.input, vec![user_message]);
+    assert_eq!(
+        response_continuation.last_response.items_added,
+        vec![latest_reasoning, latest_message]
+    );
+}
+
+#[test_case::test_case(ResponsesEndpoint::Responses, false; "responses lazy")]
+#[test_case::test_case(ResponsesEndpoint::Responses, true; "responses preconnected")]
+#[test_case::test_case(ResponsesEndpoint::Guardian, false; "guardian lazy")]
+#[test_case::test_case(ResponsesEndpoint::Guardian, true; "guardian preconnected")]
+#[tokio::test]
+async fn inherited_response_continuation_obeys_endpoint_on_new_connection(
+    inherited_endpoint: ResponsesEndpoint,
+    preconnect: bool,
+) -> anyhow::Result<()> {
+    use core_test_support::responses::ev_completed;
+    use core_test_support::responses::ev_response_created;
+    use core_test_support::responses::start_websocket_server;
+
+    let server = start_websocket_server(vec![vec![vec![
+        ev_response_created("child-response"),
+        ev_completed("child-response"),
+    ]]])
+    .await;
+    let parent = test_model_client(SessionSource::Cli);
+    let model_info = test_model_info();
+    let session_telemetry = test_session_telemetry();
+    let summary = codex_protocol::config_types::ReasoningSummary::None;
+    let parent_metadata = test_responses_metadata_for_client(
+        &parent,
+        Some("parent-turn"),
+        "parent-window".to_string(),
+        /*parent_thread_id*/ None,
+        TestCodexResponsesRequestKind::Turn,
+    );
+    let mut prompt = Prompt {
+        input: vec![user_message_item("parent input")],
+        ..Default::default()
+    };
+    let parent_request = parent.build_responses_request(
+        &prompt,
+        &model_info,
+        /*effort*/ None,
+        summary,
+        /*service_tier*/ None,
+        &parent_metadata,
+    )?;
+    let parent_output = output_message("parent", "parent output");
+    let continuation = ResponseContinuation {
+        request: parent_request,
+        last_response: LastResponse {
+            response_id: "parent-response".to_string(),
+            items_added: vec![parent_output.clone()],
+        },
+        endpoint: inherited_endpoint,
+    };
+    let mut provider =
+        create_oss_provider_with_base_url(&format!("{}/v1", server.uri()), WireApi::Responses);
+    provider.supports_websockets = true;
+    let child = ModelClient::new_with_response_continuation(
+        /*auth_manager*/ None,
+        AgentIdentityAuthPolicy::JwtOnly,
+        ThreadId::new(),
+        provider,
+        SessionSource::Cli,
+        "test_originator".to_string(),
+        /*model_verbosity*/ None,
+        /*content_item_kinds_enabled*/ true,
+        /*enable_request_compression*/ false,
+        /*include_timing_metrics*/ false,
+        /*beta_features_header*/ None,
+        /*concurrent_reasoning_summaries_enabled*/ false,
+        /*attestation_provider*/ None,
+        HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault),
+        Some(parent.fork_prompt_cache_key()),
+        Some(continuation.for_fork()),
+    );
+    let child_metadata = test_responses_metadata_for_client(
+        &child,
+        Some("child-turn"),
+        "child-window".to_string(),
+        Some(parent.state.thread_id),
+        TestCodexResponsesRequestKind::Turn,
+    );
+    let mut session = child.new_session();
+    if preconnect {
+        session
+            .preconnect_websocket(&model_info, &session_telemetry, &child_metadata)
+            .await?;
+    }
+    prompt.input.push(parent_output);
+    prompt.input.push(user_message_item("child input"));
+    let mut stream = session
+        .stream(
+            &prompt,
+            &model_info,
+            &session_telemetry,
+            /*effort*/ None,
+            summary,
+            /*service_tier*/ None,
+            &child_metadata,
+            &InferenceTraceContext::disabled(),
+        )
+        .await?;
+    let mut completed = false;
+    while let Some(event) = stream.next().await {
+        if let ResponseEvent::Completed { .. } = event? {
+            completed = true;
+            break;
+        }
+    }
+    assert!(
+        completed,
+        "the child request must complete over the new connection"
+    );
+    let requests = server.single_connection();
+    let [request] = requests.as_slice() else {
+        panic!("expected one child request, got {}", requests.len());
+    };
+    let body = request.body_json();
+    let expected = if inherited_endpoint == ResponsesEndpoint::Responses {
+        json!({
+            "previous_response_id": "parent-response",
+            "input": &prompt.input[2..],
+        })
+    } else {
+        json!({"previous_response_id": null, "input": &prompt.input})
+    };
+    assert_eq!(
+        json!({"previous_response_id": body["previous_response_id"], "input": body["input"]}),
+        expected,
+    );
+    server.shutdown().await;
+    Ok(())
+}
+
 async fn replay_until_cancelled(temp: &TempDir) -> anyhow::Result<RolloutTrace> {
     let mut rollout = replay_bundle(temp.path())?;
     for _ in 0..50 {
@@ -677,7 +884,10 @@ fn build_subagent_headers_sets_other_subagent_label() {
 #[test]
 fn internal_session_prompt_cache_key_is_scoped_to_parent_thread() {
     let parent_thread_id = ThreadId::new();
-    let client = test_model_client(SessionSource::Internal(InternalSessionSource::Guardian));
+    let mut client = test_model_client(SessionSource::Internal(InternalSessionSource::Guardian));
+    Arc::get_mut(&mut client.state)
+        .expect("new client state is uniquely owned")
+        .prompt_cache_key_override = Some(parent_thread_id);
     let metadata = test_responses_metadata_for_client(
         &client,
         Some("turn-123"),
@@ -807,6 +1017,8 @@ async fn dropped_response_stream_traces_cancelled_partial_output() -> anyhow::Re
         test_session_telemetry(),
         attempt,
         test_model_provider(),
+        /*client_state*/ None,
+        /*request*/ None,
     );
 
     let observed = stream
@@ -858,6 +1070,8 @@ async fn response_stream_records_last_model_feedback_ids() {
         test_session_telemetry(),
         InferenceTraceAttempt::disabled(),
         test_model_provider(),
+        /*client_state*/ None,
+        /*request*/ None,
     );
 
     while stream.next().await.is_some() {}
@@ -1079,6 +1293,8 @@ async fn dropped_backpressured_response_stream_traces_cancelled_partial_output()
         test_session_telemetry(),
         attempt,
         test_model_provider(),
+        /*client_state*/ None,
+        /*request*/ None,
     );
 
     // Fill the mapper channel with non-terminal events, then yield one output

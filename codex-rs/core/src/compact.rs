@@ -60,6 +60,8 @@ use tracing::error;
 pub use codex_prompts::SUMMARIZATION_PROMPT;
 pub use codex_prompts::SUMMARY_PREFIX;
 const COMPACT_USER_MESSAGE_MAX_TOKENS: usize = 20_000;
+pub(crate) const UNIFIED_EXEC_PROCESS_WARNING_PREFIX: &str =
+    "Warning: The maximum number of unified exec process";
 
 /// Controls whether compaction replacement history must include initial context.
 ///
@@ -531,19 +533,55 @@ pub(crate) struct CompactedUserMessage {
 
 #[cfg(test)]
 pub(crate) fn collect_user_messages(items: &[ResponseItem]) -> Vec<CompactedUserMessage> {
-    items
-        .iter()
-        .filter_map(|item| compacted_user_message(item, /*harness_metadata*/ None))
-        .collect()
+    collect_compacted_user_messages(items.iter().map(|item| (item, /*harness_metadata*/ None)))
+}
+
+pub(crate) fn is_compaction_filtered_user_message(message: &str) -> bool {
+    message.starts_with(UNIFIED_EXEC_PROCESS_WARNING_PREFIX)
+}
+
+pub(crate) fn is_compaction_filtered_history_item(item: &ResponseItem) -> bool {
+    let ResponseItem::Message { role, content, .. } = item else {
+        return false;
+    };
+    if role != "user" {
+        return false;
+    }
+    content_items_to_text(content)
+        .as_deref()
+        .is_some_and(is_compaction_filtered_user_message)
 }
 
 pub(crate) fn collect_annotated_user_messages(
     items: &[ResponseItemEnvelope],
 ) -> Vec<CompactedUserMessage> {
-    items
-        .iter()
-        .filter_map(|envelope| compacted_user_message(&envelope.item, envelope.metadata.clone()))
-        .collect()
+    collect_compacted_user_messages(
+        items
+            .iter()
+            .map(|envelope| (&envelope.item, envelope.metadata.clone())),
+    )
+}
+
+fn collect_compacted_user_messages<'a>(
+    items: impl IntoIterator<Item = (&'a ResponseItem, Option<CodexHarnessMetadata>)>,
+) -> Vec<CompactedUserMessage> {
+    let mut messages = Vec::new();
+    let mut previous_message: Option<String> = Some(String::new());
+    for (item, harness_metadata) in items {
+        let Some(message) = compacted_user_message(item, harness_metadata) else {
+            previous_message = None;
+            continue;
+        };
+        if message.message.is_empty() {
+            continue;
+        }
+        if previous_message.as_deref() == Some(message.message.as_str()) {
+            continue;
+        }
+        previous_message = Some(message.message.clone());
+        messages.push(message);
+    }
+    messages
 }
 
 fn compacted_user_message(
@@ -553,7 +591,7 @@ fn compacted_user_message(
     let Some(TurnItem::UserMessage(user)) = crate::event_mapping::parse_turn_item(item) else {
         return None;
     };
-    if is_summary_message(&user.message()) {
+    if is_summary_message(&user.message()) || is_compaction_filtered_user_message(&user.message()) {
         return None;
     }
     Some(CompactedUserMessage {

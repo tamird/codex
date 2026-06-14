@@ -70,6 +70,7 @@ mod guardian;
 mod hook_mcp_executor;
 mod hook_runtime;
 mod image_preparation;
+mod inherited_thread_state;
 mod installation_id;
 pub(crate) mod mcp;
 mod mcp_skill_dependencies;

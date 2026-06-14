@@ -21,6 +21,12 @@ pub struct Cli {
     #[arg(long = "strict-config", global = true, default_value_t = false)]
     pub strict_config: bool,
 
+    /// Fork from an existing session id (or thread name) before sending the prompt.
+    ///
+    /// This creates a new session with copied history, similar to `codex fork`.
+    #[arg(long = "fork", value_name = "SESSION_ID")]
+    pub fork_session_id: Option<String>,
+
     #[clap(flatten)]
     pub shared: ExecSharedCliOptions,
 
@@ -78,6 +84,19 @@ pub struct Cli {
     /// a prompt is also provided, stdin is appended as a `<stdin>` block.
     #[arg(value_name = "PROMPT", value_hint = clap::ValueHint::Other)]
     pub prompt: Option<String>,
+}
+
+impl Cli {
+    pub fn validate(self) -> Result<Self, clap::Error> {
+        if self.fork_session_id.is_some() && self.command.is_some() {
+            return Err(clap::Error::raw(
+                clap::error::ErrorKind::ArgumentConflict,
+                "--fork cannot be used with subcommands",
+            ));
+        }
+
+        Ok(self)
+    }
 }
 
 impl std::ops::Deref for Cli {
@@ -144,7 +163,6 @@ fn mark_exec_global_args(cmd: clap::Command) -> clap::Command {
         })
         .mut_arg("bypass_hook_trust", |arg| arg.global(true))
 }
-
 #[derive(Debug, clap::Subcommand)]
 pub enum Command {
     /// Resume a previous session by id or pick the most recent with --last.

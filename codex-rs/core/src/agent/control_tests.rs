@@ -17,6 +17,8 @@ use crate::init_state_db;
 use crate::thread_manager::StartThreadOptions;
 use crate::tools::handlers::multi_agents_common::thread_spawn_source;
 use assert_matches::assert_matches;
+use codex_config::types::McpServerConfig;
+use codex_config::types::McpServerTransportConfig;
 use codex_extension_api::ExtensionDataInit;
 use codex_extension_api::empty_extension_registry;
 use codex_features::Feature;
@@ -67,6 +69,11 @@ use codex_thread_store::LocalThreadStoreConfig;
 use codex_thread_store::PersistContext;
 use codex_thread_store::ThreadStore;
 use codex_utils_path_uri::PathUri;
+use core_test_support::responses::ev_completed;
+use core_test_support::responses::ev_response_created;
+use core_test_support::responses::mount_sse_once;
+use core_test_support::responses::sse;
+use core_test_support::responses::start_mock_server;
 use core_test_support::responses::strip_response_item_ids;
 use pretty_assertions::assert_eq;
 use tempfile::TempDir;
@@ -159,6 +166,23 @@ fn register_session_root_skips_threads_with_explicit_parent() {
     assert_eq!(control.state.agent_id_for_path(&AgentPath::root()), None);
 }
 
+#[test]
+fn fork_previous_response_id_env_value_parses_truthy_values() {
+    for value in ["1", "true", "TRUE", "yes", "on"] {
+        assert!(
+            fork_previous_response_id_value_enabled(value),
+            "{value} should enable previous response forking"
+        );
+    }
+
+    for value in ["", "0", "false", "off", "no", "enabled"] {
+        assert!(
+            !fork_previous_response_id_value_enabled(value),
+            "{value} should not enable previous response forking"
+        );
+    }
+}
+
 fn spawn_agent_call(call_id: &str) -> ResponseItem {
     ResponseItem::FunctionCall {
         id: None,
@@ -182,6 +206,12 @@ struct AgentControlHarness {
 impl AgentControlHarness {
     async fn new() -> Self {
         let (home, config) = test_config().await;
+        Self::new_with_config(home, config).await
+    }
+
+    async fn new_with_multi_agent_v1() -> Self {
+        let (home, mut config) = test_config().await;
+        let _ = config.features.disable(Feature::MultiAgentV2);
         Self::new_with_config(home, config).await
     }
 
@@ -1650,6 +1680,29 @@ async fn spawn_agent_can_fork_parent_thread_history_with_sanitized_items() {
         child_thread.config_snapshot().await.history_mode,
         ThreadHistoryMode::Legacy
     );
+    assert_eq!(
+        child_thread.session.prompt_cache_key(),
+        parent_thread.session.prompt_cache_key(),
+    );
+    let child_mcp_runtime = Arc::clone(&child_thread.session.services.mcp_runtime);
+    let parent_mcp_runtime = Arc::clone(&parent_thread.session.services.mcp_runtime);
+    assert!(!Arc::ptr_eq(&child_mcp_runtime, &parent_mcp_runtime));
+    let mcp_tool_snapshot = child_thread
+        .session
+        .services
+        .mcp_tool_snapshot
+        .lock()
+        .await
+        .clone()
+        .expect("forked child should inherit an MCP tool snapshot");
+    let parent_binding = parent_mcp_runtime
+        .current_binding()
+        .await
+        .expect("parent should have a published MCP binding");
+    assert_eq!(
+        serde_json::to_value(&mcp_tool_snapshot.tools).expect("serialize inherited MCP tools"),
+        serde_json::to_value(parent_binding.tools()).expect("serialize parent MCP tools"),
+    );
     let history = child_thread.session.clone_history().await;
     let history_items = history.raw_items().cloned().collect::<Vec<_>>();
     let expected_final_answer = parent_thread
@@ -1811,6 +1864,211 @@ async fn spawn_agent_can_fork_parent_thread_history_with_sanitized_items() {
         .submit(Op::Shutdown {})
         .await
         .expect("parent shutdown should submit");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn forked_spawn_first_request_uses_parent_cache_key_and_mcp_snapshot() -> anyhow::Result<()> {
+    let server = start_mock_server().await;
+    let child_response_mock = mount_sse_once(
+        &server,
+        sse(vec![ev_response_created("resp-1"), ev_completed("resp-1")]),
+    )
+    .await;
+    let (_home, mut config) = test_config().await;
+    config.model_provider.base_url = Some(format!("{}/v1", server.uri()));
+    config.model_provider.supports_websockets = false;
+    let mcp_server_path = config.codex_home.join("fake_mcp_server.py");
+    std::fs::write(
+        &mcp_server_path,
+        r#"import json
+import sys
+
+def read_message():
+    line = sys.stdin.buffer.readline()
+    if not line:
+        return None
+    return json.loads(line)
+
+def write_message(message):
+    body = json.dumps(message).encode("utf-8")
+    sys.stdout.buffer.write(body)
+    sys.stdout.buffer.write(b"\n")
+    sys.stdout.buffer.flush()
+
+while True:
+    message = read_message()
+    if message is None:
+        break
+    method = message.get("method")
+    request_id = message.get("id")
+    if request_id is None:
+        continue
+    if method == "initialize":
+        write_message({
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "result": {
+                "protocolVersion": "2025-06-18",
+                "capabilities": {"tools": {"listChanged": False}},
+                "serverInfo": {"name": "fake-mcp", "version": "1.0.0"},
+            },
+        })
+    elif method == "tools/list":
+        write_message({
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "result": {
+                "tools": [{
+                    "name": "echo",
+                    "description": "Echo from fake MCP",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {},
+                        "additionalProperties": False,
+                    },
+                }],
+            },
+        })
+    else:
+        write_message({
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "error": {"code": -32601, "message": "method not found"},
+        })
+"#,
+    )?;
+    config
+        .mcp_servers
+        .set(std::collections::HashMap::from([(
+            "rmcp".to_string(),
+            McpServerConfig {
+                auth: Default::default(),
+                transport: McpServerTransportConfig::Stdio {
+                    command: "python3".to_string(),
+                    args: vec![mcp_server_path.to_string_lossy().to_string()],
+                    env: None,
+                    env_vars: Vec::new(),
+                    cwd: None,
+                },
+                environment_id: codex_config::DEFAULT_MCP_SERVER_ENVIRONMENT_ID.to_string(),
+                enabled: true,
+                required: false,
+                supports_parallel_tool_calls: false,
+                omit_tools_from: None,
+                disabled_reason: None,
+                oauth: None,
+                startup_timeout_sec: Some(Duration::from_secs(5)),
+                tool_timeout_sec: None,
+                default_tools_approval_mode: None,
+                enabled_tools: None,
+                disabled_tools: None,
+                scopes: None,
+                oauth_resource: None,
+                tools: std::collections::HashMap::new(),
+            },
+        )]))
+        .expect("test config should allow MCP servers");
+
+    let manager = ThreadManager::with_models_provider_and_home_for_tests(
+        CodexAuth::from_api_key("dummy"),
+        config.model_provider.clone(),
+        config.codex_home.to_path_buf(),
+        std::sync::Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
+    );
+    let control = manager.agent_control();
+    let parent = manager
+        .start_thread(StartThreadOptions::new(config.clone()))
+        .await?;
+    let parent_thread_id = parent.thread_id;
+    let parent_prompt_cache_key = parent.thread.session.prompt_cache_key();
+    let mcp_runtime = Arc::clone(&parent.thread.session.services.mcp_runtime);
+    assert!(
+        mcp_runtime
+            .latest_wait_for_server_ready("rmcp", Duration::from_secs(5))
+            .await,
+        "parent MCP server should become ready before forking"
+    );
+    let parent_mcp_tools = mcp_runtime.latest_list_all_tools().await;
+    assert!(
+        parent_mcp_tools
+            .iter()
+            .any(|tool| tool.server_name == "rmcp" && tool.tool.name == "echo"),
+        "parent MCP manager should expose live MCP tools before forking: tools={parent_mcp_tools:#?}"
+    );
+    parent
+        .thread
+        .session
+        .inject_no_new_turn(
+            vec![user_message("parent seed")],
+            /*current_turn_context*/ None,
+        )
+        .await;
+    parent.thread.session.ensure_rollout_materialized().await;
+    parent.thread.session.flush_rollout().await?;
+
+    // The child has no independently configured MCP servers. Its first request can only advertise
+    // the parent's tool catalog if full-history fork inheritance applies the snapshot.
+    config
+        .mcp_servers
+        .set(std::collections::HashMap::new())
+        .expect("test config should allow clearing MCP servers");
+
+    let child_thread_id = control
+        .spawn_agent_with_metadata(
+            config,
+            text_input("child request boundary"),
+            Some(SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+                parent_thread_id,
+                depth: 1,
+                agent_path: None,
+                agent_nickname: Some("worker".to_string()),
+                agent_role: None,
+            })),
+            SpawnAgentOptions {
+                fork_parent_spawn_call_id: Some("spawn-call-request-boundary".to_string()),
+                fork_mode: Some(SpawnAgentForkMode::FullHistory),
+                ..Default::default()
+            },
+        )
+        .await?
+        .thread_id;
+    let child_thread = manager
+        .get_thread(child_thread_id)
+        .await
+        .expect("child thread should be registered");
+
+    timeout(Duration::from_secs(5), async {
+        loop {
+            let event = child_thread
+                .next_event()
+                .await
+                .expect("child event channel should stay open");
+            if matches!(event.msg, EventMsg::TurnComplete(_)) {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("child turn should complete");
+    let body = child_response_mock.single_request().body_json();
+    let expected_prompt_cache_key = parent_prompt_cache_key.to_string();
+    assert_eq!(
+        body["prompt_cache_key"].as_str(),
+        Some(expected_prompt_cache_key.as_str())
+    );
+    assert!(
+        body["tools"]
+            .as_array()
+            .is_some_and(|tools| tools.iter().any(|tool| {
+                tool["type"] == "tool_search"
+                    && tool["description"]
+                        .as_str()
+                        .is_some_and(|description| description.contains("\n- rmcp\n"))
+            })),
+        "forked child request should advertise the inherited parent MCP tool catalog: {body:#}"
+    );
+
+    Ok(())
 }
 
 #[tokio::test]
@@ -3493,7 +3751,7 @@ async fn resume_thread_subagent_restores_stored_metadata() {
         manager,
         control,
     };
-    let (parent_thread_id, _parent_thread) = harness.start_thread().await;
+    let (parent_thread_id, parent_thread) = harness.start_thread().await;
     let agent_path = AgentPath::from_string("/root/explorer".to_string())
         .expect("test agent path should be valid");
 
@@ -3596,13 +3854,22 @@ async fn resume_thread_subagent_restores_stored_metadata() {
         .expect("resume should succeed");
     assert_eq!(resumed_thread_id, child_thread_id);
 
-    let resumed_snapshot = harness
+    let resumed_thread = harness
         .manager
         .get_thread(resumed_thread_id)
         .await
-        .expect("resumed child thread should exist")
-        .config_snapshot()
-        .await;
+        .expect("resumed child thread should exist");
+    assert_eq!(
+        resumed_thread.session.prompt_cache_key(),
+        resumed_thread_id,
+        "resume should keep the resumed thread's own cache key"
+    );
+    assert_ne!(
+        resumed_thread.session.prompt_cache_key(),
+        parent_thread.session.prompt_cache_key(),
+        "resume must not opportunistically inherit cache state from a live parent"
+    );
+    let resumed_snapshot = resumed_thread.config_snapshot().await;
     let SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
         parent_thread_id: resumed_parent_thread_id,
         depth: resumed_depth,
@@ -4099,7 +4366,7 @@ async fn shutdown_agent_tree_closes_descendants_when_started_at_child() {
 
 #[tokio::test]
 async fn resume_agent_from_rollout_does_not_reopen_closed_descendants() {
-    let harness = AgentControlHarness::new().await;
+    let harness = AgentControlHarness::new_with_multi_agent_v1().await;
     let (parent_thread_id, parent_thread) = harness.start_thread().await;
 
     let child_thread_id = harness
@@ -4194,7 +4461,7 @@ async fn resume_agent_from_rollout_does_not_reopen_closed_descendants() {
 
 #[tokio::test]
 async fn resume_closed_child_reopens_open_descendants() {
-    let harness = AgentControlHarness::new().await;
+    let harness = AgentControlHarness::new_with_multi_agent_v1().await;
     let (parent_thread_id, parent_thread) = harness.start_thread().await;
 
     let child_thread_id = harness
@@ -4291,7 +4558,7 @@ async fn resume_closed_child_reopens_open_descendants() {
 
 #[tokio::test]
 async fn resume_agent_from_rollout_reopens_open_descendants_after_manager_shutdown() {
-    let harness = AgentControlHarness::new().await;
+    let harness = AgentControlHarness::new_with_multi_agent_v1().await;
     let (parent_thread_id, parent_thread) = harness.start_thread().await;
 
     let child_thread_id = harness
@@ -4382,7 +4649,7 @@ async fn resume_agent_from_rollout_reopens_open_descendants_after_manager_shutdo
 
 #[tokio::test]
 async fn resume_agent_from_rollout_uses_edge_data_when_descendant_metadata_source_is_stale() {
-    let harness = AgentControlHarness::new().await;
+    let harness = AgentControlHarness::new_with_multi_agent_v1().await;
     let (parent_thread_id, parent_thread) = harness.start_thread().await;
 
     let child_thread_id = harness
@@ -4513,7 +4780,7 @@ async fn resume_agent_from_rollout_uses_edge_data_when_descendant_metadata_sourc
 
 #[tokio::test]
 async fn resume_agent_from_rollout_skips_descendants_when_parent_resume_fails() {
-    let harness = AgentControlHarness::new().await;
+    let harness = AgentControlHarness::new_with_multi_agent_v1().await;
     let (parent_thread_id, parent_thread) = harness.start_thread().await;
 
     let child_thread_id = harness
