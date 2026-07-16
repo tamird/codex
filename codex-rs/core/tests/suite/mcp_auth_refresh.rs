@@ -99,6 +99,8 @@ async fn hosted_plugin_runtime_ps_mcp_tool_calls_use_current_auth_manager_token(
         submit_id: "test".to_string(),
         tx_event: None,
         startup_cancellation_token: CancellationToken::new(),
+        connection_pool: codex_mcp::McpConnectionPool::default(),
+        connection_pool_mode: codex_mcp::McpConnectionPoolMode::Reuse,
         runtime_context: McpRuntimeContext::new(
             Arc::new(environment_manager_without_environments()),
             home.path().to_path_buf(),

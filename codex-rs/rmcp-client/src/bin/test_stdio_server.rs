@@ -5,14 +5,19 @@ use std::collections::hash_map::Entry;
 use std::sync::Arc;
 use std::sync::OnceLock;
 use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use rmcp::ErrorData as McpError;
 use rmcp::ServiceExt;
 use rmcp::handler::server::ServerHandler;
+use rmcp::model::BooleanSchema;
 use rmcp::model::CallToolRequestParams;
 use rmcp::model::CallToolResult;
+use rmcp::model::ElicitRequestParams;
+use rmcp::model::ElicitationAction;
+use rmcp::model::ElicitationSchema;
 use rmcp::model::Implementation;
 use rmcp::model::InitializeRequestParams;
 use rmcp::model::InitializeResult;
@@ -22,6 +27,7 @@ use rmcp::model::ListResourcesResult;
 use rmcp::model::ListToolsResult;
 use rmcp::model::MetaObject;
 use rmcp::model::PaginatedRequestParams;
+use rmcp::model::PrimitiveSchemaDefinition;
 use rmcp::model::ReadResourceRequestParams;
 use rmcp::model::ReadResourceResult;
 use rmcp::model::Resource;
@@ -43,6 +49,9 @@ struct TestToolServer {
     resources: Arc<Vec<Resource>>,
     resource_templates: Arc<Vec<ResourceTemplate>>,
     supports_openai_form_elicitation: Arc<AtomicBool>,
+    shared_counter: Arc<AtomicUsize>,
+    serialized_probe_active: Arc<AtomicUsize>,
+    serialized_probe_maximum: Arc<AtomicUsize>,
 }
 
 const MEMO_URI: &str = "memo://codex/example-note";
@@ -53,6 +62,8 @@ const APP_ONLY_CWD_MARKER_FILE_ENV: &str = "MCP_TEST_APP_ONLY_CWD_MARKER_FILE";
 const DYNAMIC_SERVER_METADATA_ENV: &str = "MCP_TEST_DYNAMIC_SERVER_METADATA";
 const INITIALIZE_BARRIER_FILE_ENV: &str = "MCP_TEST_INITIALIZE_BARRIER_FILE";
 const SERVER_INSTRUCTIONS_ENV: &str = "MCP_TEST_SERVER_INSTRUCTIONS";
+const AGENT_TREE_TOOLS_ENV: &str = "MCP_TEST_AGENT_TREE_TOOLS";
+const DELAYED_RESOURCE_ELICITATION_MS_ENV: &str = "MCP_TEST_DELAYED_RESOURCE_ELICITATION_MS";
 
 fn dynamic_server_process_label() -> Option<String> {
     std::env::var_os(DYNAMIC_SERVER_METADATA_ENV)
@@ -174,6 +185,13 @@ impl TestToolServer {
         {
             echo.description = Some(Cow::Owned("x".repeat(8 * 1024 * 1024 + 1)));
         }
+        if std::env::var_os(AGENT_TREE_TOOLS_ENV).is_some() {
+            tools.push(Self::shared_counter_tool());
+            tools.push(Self::elicitation_tool());
+            tools.push(Self::delayed_elicitation_tool());
+            tools.push(Self::crash_tool());
+            tools.push(Self::serialized_probe_tool());
+        }
         let resources = vec![Self::memo_resource()];
         let resource_templates = vec![Self::memo_template()];
         Self {
@@ -181,7 +199,101 @@ impl TestToolServer {
             resources: Arc::new(resources),
             resource_templates: Arc::new(resource_templates),
             supports_openai_form_elicitation: Arc::new(AtomicBool::new(false)),
+            shared_counter: Arc::new(AtomicUsize::new(0)),
+            serialized_probe_active: Arc::new(AtomicUsize::new(0)),
+            serialized_probe_maximum: Arc::new(AtomicUsize::new(0)),
         }
+    }
+
+    fn shared_counter_tool() -> Tool {
+        #[expect(clippy::expect_used)]
+        let schema: JsonObject = serde_json::from_value(json!({
+            "type": "object",
+            "properties": {},
+            "additionalProperties": false
+        }))
+        .expect("shared counter tool schema should deserialize");
+        let mut tool = Tool::new(
+            Cow::Borrowed("shared_counter"),
+            Cow::Borrowed("Increment and return process-local state for agent-tree tests."),
+            Arc::new(schema),
+        );
+        tool.annotations = Some(ToolAnnotations::new().read_only(false));
+        tool
+    }
+
+    fn elicitation_tool() -> Tool {
+        #[expect(clippy::expect_used)]
+        let schema: JsonObject = serde_json::from_value(json!({
+            "type": "object",
+            "properties": {},
+            "additionalProperties": false
+        }))
+        .expect("elicitation tool schema should deserialize");
+        let mut tool = Tool::new(
+            Cow::Borrowed("request_elicitation"),
+            Cow::Borrowed("Request a spec form elicitation from the initiating agent."),
+            Arc::new(schema),
+        );
+        tool.annotations = Some(ToolAnnotations::new().read_only(true));
+        tool
+    }
+
+    fn delayed_elicitation_tool() -> Tool {
+        #[expect(clippy::expect_used)]
+        let schema: JsonObject = serde_json::from_value(json!({
+            "type": "object",
+            "properties": {
+                "delay_ms": { "type": "integer", "minimum": 0 }
+            },
+            "required": ["delay_ms"],
+            "additionalProperties": false
+        }))
+        .expect("delayed elicitation tool schema should deserialize");
+        let mut tool = Tool::new(
+            Cow::Borrowed("delayed_elicitation"),
+            Cow::Borrowed("Wait, then request a spec form elicitation from the initiating agent."),
+            Arc::new(schema),
+        );
+        tool.annotations = Some(ToolAnnotations::new().read_only(true));
+        tool
+    }
+
+    fn crash_tool() -> Tool {
+        #[expect(clippy::expect_used)]
+        let schema: JsonObject = serde_json::from_value(json!({
+            "type": "object",
+            "properties": {},
+            "additionalProperties": false
+        }))
+        .expect("crash tool schema should deserialize");
+        Tool::new(
+            Cow::Borrowed("crash"),
+            Cow::Borrowed("Terminate this test MCP server immediately."),
+            Arc::new(schema),
+        )
+    }
+
+    fn serialized_probe_tool() -> Tool {
+        #[expect(clippy::expect_used)]
+        let schema: JsonObject = serde_json::from_value(json!({
+            "type": "object",
+            "properties": {
+                "label": { "type": "string" },
+                "entered_file": { "type": "string" },
+                "release_file": { "type": "string" }
+            },
+            "required": ["label", "entered_file"],
+            "additionalProperties": false
+        }))
+        .expect("serialized probe tool schema should deserialize");
+        let mut tool = Tool::new(
+            Cow::Borrowed("serialized_probe"),
+            Cow::Borrowed("Measure whether agent-tree calls enter this server concurrently."),
+            Arc::new(schema),
+        );
+        tool.annotations = Some(ToolAnnotations::new().read_only(true));
+        tool
     }
 
     fn echo_tool() -> Tool {
@@ -469,6 +581,19 @@ struct SyncArgs {
     barrier: Option<SyncBarrierArgs>,
 }
 
+#[derive(Debug, Deserialize)]
+struct SerializedProbeArgs {
+    label: String,
+    entered_file: String,
+    #[serde(default)]
+    release_file: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct DelayedElicitationArgs {
+    delay_ms: u64,
+}
+
 fn default_sync_timeout_ms() -> u64 {
     DEFAULT_SYNC_TIMEOUT_MS
 }
@@ -616,9 +741,30 @@ impl ServerHandler for TestToolServer {
     async fn read_resource(
         &self,
         ReadResourceRequestParams { uri, .. }: ReadResourceRequestParams,
-        _context: rmcp::service::RequestContext<rmcp::service::RoleServer>,
+        context: rmcp::service::RequestContext<rmcp::service::RoleServer>,
     ) -> Result<rmcp::model::ReadResourceResponse, McpError> {
         if uri == MEMO_URI {
+            if let Ok(delay_ms) = std::env::var(DELAYED_RESOURCE_ELICITATION_MS_ENV)
+                && let Ok(delay_ms) = delay_ms.parse::<u64>()
+            {
+                sleep(Duration::from_millis(delay_ms)).await;
+                let requested_schema = ElicitationSchema::builder()
+                    .required_property(
+                        "confirmed",
+                        PrimitiveSchemaDefinition::Boolean(BooleanSchema::new()),
+                    )
+                    .build()
+                    .map_err(|error| McpError::internal_error(error.to_string(), None))?;
+                context
+                    .peer
+                    .create_elicitation(ElicitRequestParams::FormElicitationParams {
+                        meta: None,
+                        message: "confirm the delayed MCP resource request".to_string(),
+                        requested_schema,
+                    })
+                    .await
+                    .map_err(|error| McpError::internal_error(error.to_string(), None))?;
+            }
             Ok(
                 ReadResourceResult::new(vec![ResourceContents::TextResourceContents {
                     uri,
@@ -781,6 +927,85 @@ impl ServerHandler for TestToolServer {
             "sync_readonly" => {
                 let args = Self::parse_call_args::<SyncArgs>(&request, "sync_readonly")?;
                 Self::sync_result(args).await
+            }
+            "shared_counter" => Ok(Self::structured_result(json!({
+                "count": self.shared_counter.fetch_add(1, Ordering::SeqCst) + 1,
+                "pid": std::process::id(),
+            }))),
+            "request_elicitation" => {
+                let requested_schema = ElicitationSchema::builder()
+                    .required_property(
+                        "confirmed",
+                        PrimitiveSchemaDefinition::Boolean(BooleanSchema::new()),
+                    )
+                    .build()
+                    .map_err(|error| McpError::internal_error(error.to_string(), None))?;
+                let response = context
+                    .peer
+                    .create_elicitation(ElicitRequestParams::FormElicitationParams {
+                        meta: None,
+                        message: "confirm the shared MCP child request".to_string(),
+                        requested_schema,
+                    })
+                    .await
+                    .map_err(|error| McpError::internal_error(error.to_string(), None))?;
+                let action = match response.action {
+                    ElicitationAction::Accept => "accepted",
+                    ElicitationAction::Decline => "declined",
+                    ElicitationAction::Cancel => "cancelled",
+                    _ => "unknown",
+                };
+                Ok(Self::structured_result(json!({ "action": action })))
+            }
+            "delayed_elicitation" => {
+                let args = Self::parse_call_args::<DelayedElicitationArgs>(
+                    &request,
+                    "delayed_elicitation",
+                )?;
+                sleep(Duration::from_millis(args.delay_ms)).await;
+                let requested_schema = ElicitationSchema::builder()
+                    .required_property(
+                        "confirmed",
+                        PrimitiveSchemaDefinition::Boolean(BooleanSchema::new()),
+                    )
+                    .build()
+                    .map_err(|error| McpError::internal_error(error.to_string(), None))?;
+                let response = context
+                    .peer
+                    .create_elicitation(ElicitRequestParams::FormElicitationParams {
+                        meta: None,
+                        message: "confirm the delayed shared MCP request".to_string(),
+                        requested_schema,
+                    })
+                    .await
+                    .map_err(|error| McpError::internal_error(error.to_string(), None))?;
+                let action = match response.action {
+                    ElicitationAction::Accept => "accepted",
+                    ElicitationAction::Decline => "declined",
+                    ElicitationAction::Cancel => "cancelled",
+                    _ => "unknown",
+                };
+                Ok(Self::structured_result(json!({ "action": action })))
+            }
+            "crash" => std::process::exit(42),
+            "serialized_probe" => {
+                let args =
+                    Self::parse_call_args::<SerializedProbeArgs>(&request, "serialized_probe")?;
+                let active = self.serialized_probe_active.fetch_add(1, Ordering::SeqCst) + 1;
+                self.serialized_probe_maximum
+                    .fetch_max(active, Ordering::SeqCst);
+                std::fs::write(&args.entered_file, &args.label)
+                    .map_err(|error| McpError::internal_error(error.to_string(), None))?;
+                if let Some(release_file) = args.release_file {
+                    while !std::path::Path::new(&release_file).is_file() {
+                        sleep(Duration::from_millis(10)).await;
+                    }
+                }
+                self.serialized_probe_active.fetch_sub(1, Ordering::SeqCst);
+                Ok(Self::structured_result(json!({
+                    "label": args.label,
+                    "maximum_active": self.serialized_probe_maximum.load(Ordering::SeqCst),
+                })))
             }
             other => Err(McpError::invalid_params(
                 format!("unknown tool: {other}"),

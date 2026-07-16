@@ -275,6 +275,22 @@ pub(crate) enum ClientOperationError {
     Timeout { label: String, duration: Duration },
 }
 
+/// Returns whether another request cannot safely reuse the connection after this failure.
+pub fn is_connection_unusable(error: &anyhow::Error) -> bool {
+    matches!(
+        error.downcast_ref::<ClientOperationError>(),
+        Some(
+            ClientOperationError::Timeout { .. }
+                | ClientOperationError::Service(
+                    rmcp::service::ServiceError::TransportSend(_)
+                        | rmcp::service::ServiceError::TransportClosed
+                        | rmcp::service::ServiceError::Cancelled { .. }
+                        | rmcp::service::ServiceError::Timeout { .. }
+                )
+        )
+    )
+}
+
 fn remaining_operation_timeout(
     label: &str,
     timeout: Option<Duration>,

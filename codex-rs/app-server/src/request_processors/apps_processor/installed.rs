@@ -91,6 +91,8 @@ impl AppsRequestProcessor {
                         submit_id: APPS_INSTALLED_SUBMIT_ID.to_string(),
                         tx_event: None,
                         startup_cancellation_token: cancellation_token.clone(),
+                        connection_pool: codex_mcp::McpConnectionPool::default(),
+                        connection_pool_mode: codex_mcp::McpConnectionPoolMode::Reuse,
                         runtime_context,
                         codex_apps_tools_cache: mcp_manager.codex_apps_tools_cache(),
                         tool_catalog_cache: mcp_manager.tool_catalog_cache(),

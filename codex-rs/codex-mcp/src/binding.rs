@@ -24,7 +24,7 @@ use tokio::sync::RwLock;
 use crate::McpConfig;
 use crate::binding_clients::McpBindingClients;
 use crate::connection_manager::McpConnectionSet;
-use crate::rmcp_client::ManagedClient;
+use crate::connection_pool::McpPooledBindingClient;
 use crate::server::McpServerMetadata;
 use crate::tools::ToolInfo;
 
@@ -184,7 +184,7 @@ impl fmt::Debug for McpBinding {
 #[derive(Clone)]
 pub struct PreparedMcpCall {
     connections: Arc<McpConnectionSet>,
-    client: Arc<ManagedClient>,
+    client: McpPooledBindingClient,
     config: Arc<McpConfig>,
     catalog_revision: u64,
     catalog_revision_source: Arc<RwLock<u64>>,
@@ -202,7 +202,7 @@ impl PreparedMcpCall {
     )]
     pub(crate) fn new(
         connections: Arc<McpConnectionSet>,
-        client: Arc<ManagedClient>,
+        client: McpPooledBindingClient,
         config: Arc<McpConfig>,
         catalog_revision: u64,
         catalog_revision_source: Arc<RwLock<u64>>,
@@ -293,6 +293,11 @@ impl PreparedMcpCall {
             .map(std::num::NonZeroUsize::get)
     }
 
+    #[cfg(test)]
+    pub(crate) fn captured_tool_timeout(&self) -> Option<std::time::Duration> {
+        self.client.tool_timeout()
+    }
+
     pub fn plugin_id(&self) -> Option<&str> {
         self.plugin_id.as_deref()
     }
@@ -364,24 +369,35 @@ impl PreparedMcpCall {
             }
             None => add_trusted_access_context.await,
         };
-        let remaining_timeout = match effective_timeout.zip(timeout_deadline) {
-            Some((timeout, deadline)) => {
-                let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-                if remaining.is_zero() {
-                    return Err(anyhow::anyhow!(
-                        "timed out awaiting tools/call after {timeout:.0?}"
-                    ));
+        let server_name = self.server_name.clone();
+        let result = self.client.run(move |client| async move {
+            let remaining_timeout = match effective_timeout.zip(timeout_deadline) {
+                Some((timeout, deadline)) => {
+                    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                    if remaining.is_zero() {
+                        return Err(anyhow::anyhow!(
+                            "timed out awaiting tools/call after {timeout:.0?}"
+                        ));
+                    }
+                    Some(remaining)
                 }
-                Some(remaining)
-            }
-            None => None,
-        };
-        let result = self
-            .client
-            .client
-            .call_tool(tool_name.clone(), arguments, meta, remaining_timeout)
-            .await
-            .with_context(|| format!("tool call failed for `{}/{tool_name}`", self.server_name))?;
+                None => None,
+            };
+            client
+                .client
+                .call_tool(tool_name.clone(), arguments, meta, remaining_timeout)
+                .await
+                .with_context(|| format!("tool call failed for `{server_name}/{tool_name}`"))
+        });
+        let result =
+            match effective_timeout.zip(timeout_deadline) {
+                Some((timeout, deadline)) => tokio::time::timeout_at(deadline, result)
+                    .await
+                    .map_err(|_| {
+                        anyhow::anyhow!("timed out awaiting tools/call after {timeout:.0?}")
+                    })??,
+                None => result.await?,
+            };
         drop(current_revision);
         Ok(call_tool_result_from_rmcp(result))
     }

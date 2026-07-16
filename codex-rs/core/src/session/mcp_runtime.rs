@@ -130,6 +130,7 @@ impl Session {
             mcp_projection,
             /*ready_selected_capability_roots*/ &[],
             Some(self.mcp_elicitation_reviewer()),
+            codex_mcp::McpConnectionPoolMode::Reuse,
         )
         .instrument(info_span!(
             "session_init.mcp_manager_init",
@@ -303,6 +304,7 @@ impl Session {
         mcp_projection: McpRuntimeProjection,
         ready_selected_capability_roots: &[SelectedCapabilityRoot],
         elicitation_reviewer: Option<ElicitationReviewerHandle>,
+        connection_pool_mode: codex_mcp::McpConnectionPoolMode,
     ) {
         let mcp_projection = self
             .project_selected_environment_mcp_servers(
@@ -318,6 +320,7 @@ impl Session {
             mcp_projection,
             ready_selected_capability_roots,
             elicitation_reviewer,
+            connection_pool_mode,
         );
         self.services.mcp_runtime.replace(input).await;
         self.services.thread_extension_data.insert(selected_plugins);
@@ -329,6 +332,7 @@ impl Session {
         mcp_projection: McpRuntimeProjection,
         ready_selected_capability_roots: &[SelectedCapabilityRoot],
         elicitation_reviewer: Option<ElicitationReviewerHandle>,
+        connection_pool_mode: codex_mcp::McpConnectionPoolMode,
     ) -> McpRuntimeInput {
         let auth = desired.auth.clone();
         let McpRuntimeProjection {
@@ -393,6 +397,8 @@ impl Session {
             submit_id: desired.submit_id.clone(),
             tx_event: Some(self.get_tx_event()),
             startup_cancellation_token: CancellationToken::new(),
+            connection_pool: self.services.agent_control.mcp_connection_pool().clone(),
+            connection_pool_mode,
             runtime_context,
             codex_apps_tools_cache: self.services.mcp_manager.codex_apps_tools_cache(),
             tool_catalog_cache: self.services.mcp_manager.tool_catalog_cache(),

@@ -1531,22 +1531,19 @@ async fn selected_capability_roots_round_trip_through_fork() {
             path: PathUri::parse("file:///plugins/demo").expect("plugin root URI"),
         },
     }];
-    let inherited = manager
-        .start_thread(StartThreadOptions {
-            initial_history: InitialHistory::Forked(vec![RolloutItem::SessionMeta(
-                SessionMetaLine {
-                    meta: SessionMeta {
-                        selected_capability_roots: selected_roots.clone(),
-                        ..SessionMeta::default()
-                    },
-                    git: None,
-                },
-            )]),
-            environments: Some(Vec::new()),
-            ..StartThreadOptions::new(config)
-        })
-        .await
-        .expect("start inherited fork");
+    let inherited = Box::pin(manager.start_thread(StartThreadOptions {
+        initial_history: InitialHistory::Forked(vec![RolloutItem::SessionMeta(SessionMetaLine {
+            meta: SessionMeta {
+                selected_capability_roots: selected_roots.clone(),
+                ..SessionMeta::default()
+            },
+            git: None,
+        })]),
+        environments: Some(Vec::new()),
+        ..StartThreadOptions::new(config)
+    }))
+    .await
+    .expect("start inherited fork");
     inherited.thread.ensure_rollout_materialized().await;
     inherited
         .thread

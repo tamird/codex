@@ -41,8 +41,8 @@ use codex_config::types::McpServerConfig;
 use codex_config::types::McpServerTransportConfig;
 use codex_config::types::ToolSuggestDisabledTool;
 use codex_config::types::WindowsSandboxModeToml;
-use core_test_support::test_codex::TurnInputRequest as ExternalTurnInputRequest;
 use codex_extension_api::empty_extension_registry;
+use core_test_support::test_codex::TurnInputRequest as ExternalTurnInputRequest;
 
 use codex_features::Feature;
 use codex_file_system::FileSystemSandboxContext;
@@ -1782,10 +1782,10 @@ async fn refresh_runtime_config_renames_selected_routing_profile_and_preserves_h
         state.session_configuration.original_config_do_not_use = Arc::new(current_config);
         let selected = Arc::make_mut(&mut state.session_configuration.step_settings);
         selected.collaboration_mode = selected.collaboration_mode.with_updates(
-                Some("old-profile".to_string()),
-                /*effort*/ None,
-                /*developer_instructions*/ None,
-            );
+            Some("old-profile".to_string()),
+            /*effort*/ None,
+            /*developer_instructions*/ None,
+        );
         state.model_routing.reconcile_profile("old-profile");
         state.model_routing.record_success(&fallback);
     }
@@ -1795,7 +1795,11 @@ async fn refresh_runtime_config_renames_selected_routing_profile_and_preserves_h
 
     let state = session.state.lock().await;
     assert_eq!(
-        state.session_configuration.step_settings.collaboration_mode.model(),
+        state
+            .session_configuration
+            .step_settings
+            .collaboration_mode
+            .model(),
         "new-profile"
     );
     assert_eq!(state.model_routing.last_success(), Some(&fallback));
@@ -1832,10 +1836,10 @@ async fn refresh_runtime_config_detaches_removed_profile_to_last_successful_tupl
         state.session_configuration.original_config_do_not_use = Arc::new(current_config);
         let selected = Arc::make_mut(&mut state.session_configuration.step_settings);
         selected.collaboration_mode = selected.collaboration_mode.with_updates(
-                Some("removed-profile".to_string()),
-                /*effort*/ None,
-                /*developer_instructions*/ None,
-            );
+            Some("removed-profile".to_string()),
+            /*effort*/ None,
+            /*developer_instructions*/ None,
+        );
         state.model_routing.record_success(&fallback);
     }
     next_config.custom_models.clear();
@@ -1844,7 +1848,11 @@ async fn refresh_runtime_config_detaches_removed_profile_to_last_successful_tupl
 
     let state = session.state.lock().await;
     assert_eq!(
-        state.session_configuration.step_settings.collaboration_mode.model(),
+        state
+            .session_configuration
+            .step_settings
+            .collaboration_mode
+            .model(),
         fallback.model
     );
     assert_eq!(
@@ -1890,10 +1898,10 @@ async fn refresh_runtime_config_detaches_removed_direct_alias_without_changing_r
         state.session_configuration.original_config_do_not_use = Arc::new(current_config);
         let selected = Arc::make_mut(&mut state.session_configuration.step_settings);
         selected.collaboration_mode = selected.collaboration_mode.with_updates(
-                Some("removed-alias".to_string()),
-                Some(Some(effort.clone())),
-                /*developer_instructions*/ None,
-            );
+            Some("removed-alias".to_string()),
+            Some(Some(effort.clone())),
+            /*developer_instructions*/ None,
+        );
         selected.service_tier = Some(service_tier.clone());
     }
     next_config.custom_models.clear();
@@ -1902,7 +1910,11 @@ async fn refresh_runtime_config_detaches_removed_direct_alias_without_changing_r
 
     let state = session.state.lock().await;
     assert_eq!(
-        state.session_configuration.step_settings.collaboration_mode.model(),
+        state
+            .session_configuration
+            .step_settings
+            .collaboration_mode
+            .model(),
         "test-model"
     );
     assert_eq!(
@@ -1914,7 +1926,11 @@ async fn refresh_runtime_config_detaches_removed_direct_alias_without_changing_r
         Some(effort)
     );
     assert_eq!(
-        state.session_configuration.step_settings.service_tier.as_deref(),
+        state
+            .session_configuration
+            .step_settings
+            .service_tier
+            .as_deref(),
         Some(service_tier.as_str())
     );
     assert_eq!(state.model_routing.last_success(), None);
@@ -4365,10 +4381,12 @@ async fn assert_prepared_paginated_fork_preserves_parent_model_messages(
 
     child
         .thread
-        .start_or_steer_turn(ExternalTurnInputRequest::user_input(vec![UserInput::Text {
+        .start_or_steer_turn(ExternalTurnInputRequest::user_input(vec![
+            UserInput::Text {
                 text: "paginated-child-message".to_string(),
                 text_elements: Vec::new(),
-            }]))
+            },
+        ]))
         .await?;
     wait_for_event(&child.thread, |event| {
         matches!(event, EventMsg::TurnComplete(_))
@@ -9970,6 +9988,17 @@ async fn refresh_mcp_servers_uses_latest_state_for_existing_turns() {
         codex_mcp::configured_mcp_servers(current.config()).contains_key("refreshed"),
         "the refreshed state should remain globally current"
     );
+}
+
+#[tokio::test]
+async fn mcp_publication_clears_inherited_tool_snapshot() {
+    let (session, _turn_context) = make_session_and_context().await;
+    *session.services.mcp_tool_snapshot.lock().await =
+        Some(crate::state::McpToolSnapshot::default());
+
+    session.clear_inherited_mcp_tool_snapshot().await;
+
+    assert!(session.services.mcp_tool_snapshot.lock().await.is_none());
 }
 
 #[tokio::test]

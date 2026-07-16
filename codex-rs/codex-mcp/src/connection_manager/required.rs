@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use anyhow::Result;
 use anyhow::anyhow;
 use codex_protocol::protocol::McpStartupFailure;
@@ -23,12 +25,16 @@ impl McpConnectionSet {
                     });
                     continue;
                 };
-                if view.connection.startup_is_dormant() && view.connection.client.has_cached_tools()
-                {
+                if view.startup_is_dormant() && view.connection.has_cached_tools() {
                     continue;
                 }
 
-                match view.connection.client().await {
+                view.trigger_startup().await;
+                match view
+                    .connection
+                    .await_current_startup(Arc::clone(&self.session_route))
+                    .await
+                {
                     Ok(_) => {}
                     Err(error) => failures.push(McpStartupFailure {
                         server: server_name.clone(),

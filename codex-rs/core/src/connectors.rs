@@ -260,6 +260,8 @@ pub async fn list_accessible_connectors_from_mcp_tools_with_mcp_manager(
         submit_id: INITIAL_SUBMIT_ID.to_owned(),
         tx_event: None,
         startup_cancellation_token: cancel_token.clone(),
+        connection_pool: codex_mcp::McpConnectionPool::default(),
+        connection_pool_mode: codex_mcp::McpConnectionPoolMode::Reuse,
         // Connector discovery is threadless. Use an actually configured env if
         // one exists, but do not reintroduce the old hidden-local fallback.
         runtime_context,
