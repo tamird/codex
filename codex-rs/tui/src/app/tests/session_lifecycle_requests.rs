@@ -3171,6 +3171,7 @@ fn session_lifecycle_avoids_redundant_subagent_metadata_reads() -> Result<()> {
                     })
                 );
 
+                app.agent_navigation.mark_stopped(child_thread_id);
                 let child_store = Arc::clone(
                     &app.thread_event_channels
                         .entry(child_thread_id)
@@ -3221,7 +3222,6 @@ fn session_lifecycle_avoids_redundant_subagent_metadata_reads() -> Result<()> {
                     ),
                     /*replay_kind*/ None,
                 );
-                app.agent_navigation.mark_stopped(child_thread_id);
                 release_tx.send(()).expect("release blocked thread list");
                 let discovered_thread_id = ThreadId::new();
                 let mut completion = tokio::time::timeout(Duration::from_secs(5), async {

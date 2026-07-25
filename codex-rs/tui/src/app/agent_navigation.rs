@@ -28,7 +28,9 @@ use codex_protocol::ThreadId;
 use ratatui::text::Span;
 use std::collections::HashMap;
 use std::collections::HashSet;
-use uuid::Uuid;
+
+/// Remote requests cannot be canceled, so bound root changes without dropping pending replies.
+const MAX_IN_FLIGHT_PICKER_ROOTS: usize = 8;
 
 /// Small state container for multi-agent picker ordering and labeling.
 ///
@@ -49,8 +51,10 @@ pub(crate) struct AgentNavigationState {
     stopped_threads: HashSet<ThreadId>,
     /// Spawned child threads whose instructions are owned by their parent agent.
     parent_owned_threads: HashSet<ThreadId>,
-    /// Coalesces root refreshes while rejecting replies from a previous session.
-    picker_refresh: Option<(ThreadId, Uuid)>,
+    /// Assigns a distinct generation to each remote picker refresh.
+    picker_refresh_generation: u64,
+    /// Shares each unfinished request and its timeout state across opens of the same root.
+    picker_refreshes: HashMap<ThreadId, (u64, bool)>,
 }
 
 /// Direction of keyboard traversal through the stable picker order.
@@ -63,21 +67,74 @@ pub(crate) enum AgentNavigationDirection {
 }
 
 impl AgentNavigationState {
-    pub(crate) fn begin_picker_refresh(&mut self, thread_id: ThreadId) -> Option<Uuid> {
-        if self.picker_refresh.is_some() {
+    pub(crate) fn begin_picker_refresh(&mut self, primary_thread_id: ThreadId) -> Option<u64> {
+        if self.picker_refreshes.contains_key(&primary_thread_id)
+            || self.picker_refreshes.len() >= MAX_IN_FLIGHT_PICKER_ROOTS
+        {
             return None;
         }
-        let request_id = Uuid::new_v4();
-        self.picker_refresh = Some((thread_id, request_id));
-        Some(request_id)
+
+        self.picker_refresh_generation = self.picker_refresh_generation.wrapping_add(1);
+        let generation = self.picker_refresh_generation;
+        self.picker_refreshes
+            .insert(primary_thread_id, (generation, /*timed_out*/ false));
+        Some(generation)
     }
 
-    pub(crate) fn finish_picker_refresh(&mut self, thread_id: ThreadId, request_id: Uuid) -> bool {
-        if self.picker_refresh != Some((thread_id, request_id)) {
+    pub(crate) fn finish_picker_refresh(
+        &mut self,
+        root: ThreadId,
+        generation: u64,
+    ) -> Option<bool> {
+        if self
+            .picker_refreshes
+            .get(&root)
+            .is_none_or(|(pending, _)| *pending != generation)
+        {
+            return None;
+        }
+        self.picker_refreshes.remove(&root);
+        Some(self.picker_refresh_generation == generation)
+    }
+
+    pub(crate) fn is_current_picker_refresh(&self, root: ThreadId, generation: u64) -> bool {
+        self.picker_refreshes
+            .get(&root)
+            .is_some_and(|(pending, _)| *pending == generation)
+    }
+
+    pub(crate) fn is_current_picker_refresh_epoch(&self, root: ThreadId, generation: u64) -> bool {
+        self.picker_refresh_generation == generation
+            && self.is_current_picker_refresh(root, generation)
+    }
+
+    pub(crate) fn mark_picker_refresh_timed_out(
+        &mut self,
+        root: ThreadId,
+        generation: u64,
+    ) -> bool {
+        if !self.is_current_picker_refresh(root, generation) {
             return false;
         }
-        self.picker_refresh = None;
-        true
+        if let Some((_, timed_out)) = self.picker_refreshes.get_mut(&root) {
+            *timed_out = true;
+            return true;
+        }
+        false
+    }
+
+    pub(crate) fn is_timed_out_picker_refresh(&self, root: ThreadId) -> bool {
+        self.picker_refreshes
+            .get(&root)
+            .is_some_and(|(_, timed_out)| *timed_out)
+    }
+
+    pub(crate) fn has_picker_refresh(&self, root: ThreadId) -> bool {
+        self.picker_refreshes.contains_key(&root)
+    }
+
+    pub(crate) fn picker_refreshes_at_capacity(&self) -> bool {
+        self.picker_refreshes.len() >= MAX_IN_FLIGHT_PICKER_ROOTS
     }
 
     /// Returns the cached picker entry for a specific thread id.
@@ -150,14 +207,30 @@ impl AgentNavigationState {
             && !entry.is_closed
             && !self.stopped_threads.contains(&activity.thread_id)
         {
-            entry.is_running = true;
+            self.mark_running(activity.thread_id);
         } else {
-            entry.is_running = false;
-            self.stopped_threads.insert(activity.thread_id);
+            self.mark_stopped(activity.thread_id);
         }
     }
 
     pub(crate) fn mark_running(&mut self, thread_id: ThreadId) {
+        let was_running = self
+            .threads
+            .get(&thread_id)
+            .is_some_and(|entry| entry.is_running);
+        self.mark_running_from_snapshot(thread_id);
+        if !was_running
+            && self
+                .threads
+                .get(&thread_id)
+                .is_some_and(|entry| entry.is_running)
+            && !self.picker_refreshes.is_empty()
+        {
+            self.picker_refresh_generation = self.picker_refresh_generation.wrapping_add(1);
+        }
+    }
+
+    pub(crate) fn mark_running_from_snapshot(&mut self, thread_id: ThreadId) {
         if self
             .threads
             .get(&thread_id)
@@ -170,7 +243,9 @@ impl AgentNavigationState {
     }
 
     pub(crate) fn mark_stopped(&mut self, thread_id: ThreadId) {
-        self.stopped_threads.insert(thread_id);
+        if self.stopped_threads.insert(thread_id) && !self.picker_refreshes.is_empty() {
+            self.picker_refresh_generation = self.picker_refresh_generation.wrapping_add(1);
+        }
         self.set_running(thread_id, /*is_running*/ false);
     }
 
@@ -215,7 +290,7 @@ impl AgentNavigationState {
         self.order.clear();
         self.stopped_threads.clear();
         self.parent_owned_threads.clear();
-        self.picker_refresh = None;
+        self.picker_refresh_generation = self.picker_refresh_generation.wrapping_add(1);
     }
 
     /// Removes a tracked thread entirely from picker metadata and traversal order.
@@ -223,11 +298,21 @@ impl AgentNavigationState {
     /// This is reserved for entries that were only discovered opportunistically and never became
     /// replayable local threads. Keeping those around after the backend confirms they are gone
     /// would leave ghost rows in `/subagents`.
+    /// Invalidate pending refreshes so their older snapshots cannot restore the removed entry.
     pub(crate) fn remove(&mut self, thread_id: ThreadId) {
-        self.threads.remove(&thread_id);
+        if self.threads.remove(&thread_id).is_some() && !self.picker_refreshes.is_empty() {
+            self.picker_refresh_generation = self.picker_refresh_generation.wrapping_add(1);
+        }
         self.order.retain(|candidate| *candidate != thread_id);
         self.stopped_threads.remove(&thread_id);
         self.parent_owned_threads.remove(&thread_id);
+    }
+
+    /// Returns whether the picker has a user-visible thread other than the primary one.
+    pub(crate) fn has_non_primary_thread(&self, primary_thread_id: Option<ThreadId>) -> bool {
+        self.threads.iter().any(|(thread_id, entry)| {
+            Some(*thread_id) != primary_thread_id && !entry.is_goal_supervisor()
+        })
     }
 
     /// Returns live picker rows in the same order users cycle through them.
@@ -445,8 +530,8 @@ mod tests {
 
     #[test]
     fn parent_owned_state_is_removed_with_thread_metadata() {
-        let (mut state, _main_thread_id, first_agent_id, second_agent_id) = populated_state();
-
+        let (mut state, main_thread_id, first_agent_id, second_agent_id) = populated_state();
+        let generation = state.begin_picker_refresh(main_thread_id).expect("refresh");
         state.mark_parent_owned(first_agent_id);
         assert!(state.is_parent_owned(first_agent_id));
         state.remove(first_agent_id);
@@ -454,25 +539,165 @@ mod tests {
 
         state.mark_parent_owned(second_agent_id);
         state.clear();
+        assert!(state.begin_picker_refresh(first_agent_id).is_some());
+        assert!(state.mark_picker_refresh_timed_out(main_thread_id, generation));
+        assert!(state.is_timed_out_picker_refresh(main_thread_id));
+        state.clear();
+        assert!(state.is_timed_out_picker_refresh(main_thread_id));
         assert!(!state.is_parent_owned(second_agent_id));
+        assert_eq!(state.begin_picker_refresh(main_thread_id), None);
+        assert!(state.is_current_picker_refresh(main_thread_id, generation));
+        assert_eq!(
+            state.finish_picker_refresh(main_thread_id, generation),
+            Some(false)
+        );
+        assert!(!state.is_timed_out_picker_refresh(main_thread_id));
+        assert!(state.begin_picker_refresh(main_thread_id).is_some());
     }
 
     #[test]
-    fn picker_refresh_rejects_responses_from_before_clear() {
+    fn adopted_picker_refresh_accepts_timeout_without_accepting_stale_epoch() {
         let mut state = AgentNavigationState::default();
-        let thread_id = ThreadId::new();
-        let stale_request = state
-            .begin_picker_refresh(thread_id)
-            .expect("first picker refresh");
+        let first_root = ThreadId::new();
+        let second_root = ThreadId::new();
+        let generation = state
+            .begin_picker_refresh(first_root)
+            .expect("first root refresh");
 
-        assert_eq!(state.begin_picker_refresh(thread_id), None);
         state.clear();
-        let current_request = state
-            .begin_picker_refresh(thread_id)
-            .expect("refresh after session reset");
+        assert!(state.begin_picker_refresh(second_root).is_some());
+        state.clear();
 
-        assert!(!state.finish_picker_refresh(thread_id, stale_request));
-        assert!(state.finish_picker_refresh(thread_id, current_request));
+        assert!(state.is_current_picker_refresh(first_root, generation));
+        assert!(!state.is_current_picker_refresh_epoch(first_root, generation));
+        assert!(state.mark_picker_refresh_timed_out(first_root, generation));
+        assert!(state.is_timed_out_picker_refresh(first_root));
+        assert_eq!(state.begin_picker_refresh(first_root), None);
+        assert_eq!(
+            state.finish_picker_refresh(first_root, generation),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn pending_picker_requests_are_bounded_without_dropping_a_root() {
+        let mut state = AgentNavigationState::default();
+        let root = ThreadId::new();
+        let generation = state.begin_picker_refresh(root).expect("first request");
+        for _ in 1..MAX_IN_FLIGHT_PICKER_ROOTS {
+            assert!(state.begin_picker_refresh(ThreadId::new()).is_some());
+        }
+        let next_root = ThreadId::new();
+        assert!(state.picker_refreshes_at_capacity());
+        assert_eq!(state.begin_picker_refresh(root), None);
+        assert_eq!(state.begin_picker_refresh(next_root), None);
+        assert_eq!(state.finish_picker_refresh(root, generation), Some(false));
+        assert!(state.begin_picker_refresh(next_root).is_some());
+    }
+
+    #[test]
+    fn removing_thread_cached_during_picker_refresh_invalidates_stale_response() {
+        let mut state = AgentNavigationState::default();
+        let root = ThreadId::new();
+        let child = ThreadId::new();
+        let generation = state.begin_picker_refresh(root).expect("first request");
+
+        state.remove(ThreadId::new());
+        assert_eq!(state.picker_refresh_generation, generation);
+
+        state.upsert(
+            child, /*agent_nickname*/ None, /*agent_role*/ None, /*is_closed*/ false,
+        );
+        state.remove(child);
+
+        assert!(state.get(&child).is_none());
+        assert!(state.is_current_picker_refresh(root, generation));
+        assert_eq!(state.begin_picker_refresh(root), None);
+        assert_eq!(state.finish_picker_refresh(root, generation), Some(false));
+        assert!(state.begin_picker_refresh(root).is_some());
+    }
+
+    #[test]
+    fn stopping_thread_invalidates_pending_picker_refresh_without_preventing_revival() {
+        let (mut state, root, child, _) = populated_state();
+        state.mark_running(child);
+        let generation = state.begin_picker_refresh(root).expect("first request");
+
+        state.record_sub_agent_activity(SubAgentActivityDisplay {
+            thread_id: child,
+            agent_path: "/root/worker".to_string(),
+            is_running_hint: false,
+        });
+
+        assert!(state.get(&child).is_some_and(|entry| !entry.is_running));
+        assert!(state.is_current_picker_refresh(root, generation));
+        assert!(!state.is_current_picker_refresh_epoch(root, generation));
+        let stopped_generation = state.picker_refresh_generation;
+        state.mark_stopped(child);
+        assert_eq!(state.picker_refresh_generation, stopped_generation);
+        assert_eq!(state.finish_picker_refresh(root, generation), Some(false));
+
+        state.mark_running(child);
+        assert!(state.get(&child).is_some_and(|entry| entry.is_running));
+        let generation = state.begin_picker_refresh(root).expect("fresh request");
+        state.mark_stopped(child);
+        assert_eq!(state.finish_picker_refresh(root, generation), Some(false));
+    }
+
+    #[test]
+    fn running_activity_invalidates_pending_picker_refresh_only_on_transition() {
+        let (mut state, root, child, _) = populated_state();
+        let generation = state.begin_picker_refresh(root).expect("first request");
+
+        state.record_sub_agent_activity(SubAgentActivityDisplay {
+            thread_id: child,
+            agent_path: "/root/worker".to_string(),
+            is_running_hint: true,
+        });
+
+        assert!(state.get(&child).is_some_and(|entry| entry.is_running));
+        assert!(!state.is_current_picker_refresh_epoch(root, generation));
+        let running_generation = state.picker_refresh_generation;
+        state.record_sub_agent_activity(SubAgentActivityDisplay {
+            thread_id: child,
+            agent_path: "/root/worker".to_string(),
+            is_running_hint: true,
+        });
+        assert_eq!(state.picker_refresh_generation, running_generation);
+        assert_eq!(state.finish_picker_refresh(root, generation), Some(false));
+
+        let generation = state.begin_picker_refresh(root).expect("fresh request");
+        let new_child = ThreadId::new();
+        state.record_sub_agent_activity(SubAgentActivityDisplay {
+            thread_id: new_child,
+            agent_path: "/root/new-worker".to_string(),
+            is_running_hint: true,
+        });
+        assert!(state.get(&new_child).is_some_and(|entry| entry.is_running));
+        assert_eq!(state.finish_picker_refresh(root, generation), Some(false));
+    }
+
+    #[test]
+    fn authoritative_liveness_invalidates_refresh_but_snapshot_does_not() {
+        let (mut state, root, child, snapshot_child) = populated_state();
+        let generation = state.begin_picker_refresh(root).expect("first request");
+
+        state.mark_running(child);
+
+        assert!(state.get(&child).is_some_and(|entry| entry.is_running));
+        assert!(!state.is_current_picker_refresh_epoch(root, generation));
+        assert_eq!(state.finish_picker_refresh(root, generation), Some(false));
+
+        let generation = state.begin_picker_refresh(root).expect("fresh request");
+        state.mark_running_from_snapshot(snapshot_child);
+
+        assert!(
+            state
+                .get(&snapshot_child)
+                .is_some_and(|entry| entry.is_running)
+        );
+        assert!(state.is_current_picker_refresh_epoch(root, generation));
+        assert_eq!(state.finish_picker_refresh(root, generation), Some(true));
     }
 
     #[test]

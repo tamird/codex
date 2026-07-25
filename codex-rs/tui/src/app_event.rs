@@ -276,7 +276,7 @@ pub(crate) enum AppEvent {
     RefreshModelCatalog,
     AgentPickerThreadsLoaded {
         primary_thread_id: ThreadId,
-        request_id: Uuid,
+        generation: u64,
         result: Result<Vec<Thread>, String>,
     },
     /// Switch the active thread to the selected agent.

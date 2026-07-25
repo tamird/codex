@@ -20,7 +20,7 @@ impl App {
         app_server: &AppServerSession,
         root: ThreadId,
     ) {
-        let Some(request_id) = self.agent_navigation.begin_picker_refresh(root) else {
+        let Some(generation) = self.agent_navigation.begin_picker_refresh(root) else {
             return;
         };
         let request_handle = app_server.request_handle();
@@ -79,7 +79,7 @@ impl App {
 
             app_event_tx.send(AppEvent::AgentPickerThreadsLoaded {
                 primary_thread_id: root,
-                request_id,
+                generation,
                 result,
             });
         });
@@ -88,14 +88,16 @@ impl App {
     pub(super) fn apply_agent_picker_thread_refresh(
         &mut self,
         root: ThreadId,
-        request_id: Uuid,
+        generation: u64,
         result: Result<Vec<Thread>, String>,
     ) {
-        if !self
+        let Some(is_current_epoch) = self
             .agent_navigation
-            .finish_picker_refresh(root, request_id)
-            || self.primary_thread_id != Some(root)
-        {
+            .finish_picker_refresh(root, generation)
+        else {
+            return;
+        };
+        if self.primary_thread_id != Some(root) || !is_current_epoch {
             return;
         }
         let threads = match result {
