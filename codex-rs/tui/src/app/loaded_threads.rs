@@ -61,25 +61,26 @@ pub(crate) fn find_loaded_subagent_threads_for_primary(
         threads_by_id.insert(thread_id, thread);
     }
 
+    let mut children_by_parent: HashMap<ThreadId, Vec<ThreadId>> = HashMap::new();
+    for (thread_id, thread) in &threads_by_id {
+        if let Some(parent_thread_id) = thread_spawn_parent_thread_id(&thread.source) {
+            children_by_parent
+                .entry(parent_thread_id)
+                .or_default()
+                .push(*thread_id);
+        }
+    }
+
     let mut included = HashSet::new();
     let mut pending = vec![primary_thread_id];
     while let Some(parent_thread_id) = pending.pop() {
-        for (thread_id, thread) in &threads_by_id {
-            if included.contains(thread_id) {
-                continue;
+        for thread_id in children_by_parent
+            .remove(&parent_thread_id)
+            .unwrap_or_default()
+        {
+            if included.insert(thread_id) {
+                pending.push(thread_id);
             }
-
-            let Some(source_parent_thread_id) = thread_spawn_parent_thread_id(&thread.source)
-            else {
-                continue;
-            };
-
-            if source_parent_thread_id != parent_thread_id {
-                continue;
-            }
-
-            included.insert(*thread_id);
-            pending.push(*thread_id);
         }
     }
 
@@ -107,7 +108,7 @@ pub(crate) fn find_loaded_subagent_threads_for_primary(
             })
         })
         .collect();
-    loaded_threads.sort_by_key(|thread| thread.thread_id.to_string());
+    loaded_threads.sort_by_cached_key(|thread| thread.thread_id.to_string());
     loaded_threads
 }
 
@@ -301,5 +302,47 @@ mod tests {
                 agent_path: None,
             }]
         );
+    }
+
+    #[test]
+    fn indexes_only_the_latest_duplicate_thread_identity() {
+        let primary_thread_id =
+            ThreadId::from_string("00000000-0000-0000-0000-000000000021").expect("valid thread");
+        let unrelated_parent_id =
+            ThreadId::from_string("00000000-0000-0000-0000-000000000022").expect("valid thread");
+        let child_thread_id =
+            ThreadId::from_string("00000000-0000-0000-0000-000000000023").expect("valid thread");
+        let grandchild_thread_id =
+            ThreadId::from_string("00000000-0000-0000-0000-000000000024").expect("valid thread");
+
+        let stale_child = test_thread(
+            child_thread_id,
+            thread_spawn_source(primary_thread_id, /*depth*/ 1, "Old child", "worker"),
+        );
+        let latest_child = test_thread(
+            child_thread_id,
+            thread_spawn_source(
+                unrelated_parent_id,
+                /*depth*/ 1,
+                "Moved child",
+                "worker",
+            ),
+        );
+        let grandchild = test_thread(
+            grandchild_thread_id,
+            thread_spawn_source(child_thread_id, /*depth*/ 2, "Grandchild", "worker"),
+        );
+
+        let loaded = find_loaded_subagent_threads_for_primary(
+            vec![
+                test_thread(primary_thread_id, SessionSource::Cli),
+                stale_child,
+                grandchild,
+                latest_child,
+            ],
+            primary_thread_id,
+        );
+
+        assert_eq!(loaded, Vec::new());
     }
 }

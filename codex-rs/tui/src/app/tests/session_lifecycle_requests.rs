@@ -49,13 +49,17 @@ enum HistoryCapabilities {
     ForkHydrationFails,
 }
 
-/// Returns and resets `(thread/loaded/list, thread/read)` request counts.
-fn take_backfill_counts(requests: &RecordedRequests) -> (usize, usize) {
+/// Returns and resets `(thread/loaded/list, thread/list, thread/read)` request counts.
+fn take_backfill_counts(requests: &RecordedRequests) -> (usize, usize, usize) {
     let requests = std::mem::take(&mut *requests.lock().expect("request recorder lock"));
     (
         requests
             .iter()
             .filter(|request| request.method == "thread/loaded/list")
+            .count(),
+        requests
+            .iter()
+            .filter(|request| request.method == "thread/list")
             .count(),
         requests
             .iter()
@@ -239,6 +243,7 @@ async fn start_recording_app_server_with_history(
                             serde_json::to_value(request)?,
                         )?;
                         if let ClientRequest::ThreadList { params, .. } = &request
+                            && params.sort_direction == Some(SortDirection::Asc)
                             && let Some((root, started, release)) = blocked_thread_list.take()
                         {
                             assert_eq!(params.ancestor_thread_id, Some(root.to_string()));
@@ -2977,7 +2982,7 @@ fn fresh_session_applies_requested_name() -> Result<()> {
 
 #[test]
 fn session_lifecycle_avoids_redundant_subagent_metadata_reads() -> Result<()> {
-    const TEST_STACK_SIZE_BYTES: usize = 8 * 1024 * 1024;
+    const TEST_STACK_SIZE_BYTES: usize = 32 * 1024 * 1024;
 
     std::thread::Builder::new()
         .name("tui-session-lifecycle-requests".to_string())
@@ -3080,7 +3085,10 @@ fn session_lifecycle_avoids_redundant_subagent_metadata_reads() -> Result<()> {
                 );
                 // Forking may read the source metadata once when the response includes its parent
                 // id. It must not scan or backfill loaded threads for the newly created fork.
-                assert!(matches!(take_backfill_counts(&requests), (0, 0) | (0, 1)));
+                assert!(matches!(
+                    take_backfill_counts(&requests),
+                    (0, 0, 0) | (0, 0, 1)
+                ));
                 let named_fork = app_server
                     .thread_read(named_fork_id, /*include_turns*/ false)
                     .await?;
@@ -3115,7 +3123,10 @@ fn session_lifecycle_avoids_redundant_subagent_metadata_reads() -> Result<()> {
                     name_error,
                     @"■ Failed to name the forked session: thread/name/set failed in TUI"
                 );
-                assert!(matches!(take_backfill_counts(&requests), (0, 0) | (0, 1)));
+                assert!(matches!(
+                    take_backfill_counts(&requests),
+                    (0, 0, 0) | (0, 0, 1)
+                ));
 
                 app.start_fresh_session_with_summary_hint(
                     &mut tui,
@@ -3127,21 +3138,17 @@ fn session_lifecycle_avoids_redundant_subagent_metadata_reads() -> Result<()> {
                 .await;
 
                 assert_ne!(app.chat_widget.thread_id(), Some(root_thread_id));
-                assert_eq!(take_backfill_counts(&requests), (0, 0));
+                assert_eq!(take_backfill_counts(&requests), (0, 0, 0));
 
                 let loaded_threads = app_server
                     .thread_loaded_list(ThreadLoadedListParams {
                         cursor: None,
                         limit: None,
-                        ancestor_thread_id: None,
+                        ancestor_thread_id: Some(root_thread_id.to_string()),
                     })
                     .await?
                     .data;
-                let expected_reads = loaded_threads
-                    .iter()
-                    .filter(|thread_id| *thread_id != &root_thread_id.to_string())
-                    .count();
-                assert!(loaded_threads.contains(&child_thread_id.to_string()));
+                assert_eq!(loaded_threads, vec![child_thread_id.to_string()]);
                 take_backfill_counts(&requests);
                 app.harness_overrides.cwd = Some(app.config.cwd.to_path_buf());
 
@@ -3159,7 +3166,7 @@ fn session_lifecycle_avoids_redundant_subagent_metadata_reads() -> Result<()> {
 
                 assert!(matches!(control, AppRunControl::Continue));
                 assert_eq!(app.chat_widget.thread_id(), Some(root_thread_id));
-                assert_eq!(take_backfill_counts(&requests), (1, expected_reads));
+                assert_eq!(take_backfill_counts(&requests), (1, 2, 0));
                 assert_eq!(
                     app.agent_navigation.get(&child_thread_id),
                     Some(&AgentPickerThreadEntry {
@@ -3196,7 +3203,7 @@ fn session_lifecycle_avoids_redundant_subagent_metadata_reads() -> Result<()> {
                       Press enter to confirm or esc to go back
                     "###
                 );
-                assert_eq!(take_backfill_counts(&requests), (0, 0));
+                assert_eq!(take_backfill_counts(&requests), (0, 0, 0));
                 tokio::time::timeout(Duration::from_secs(5), started_rx).await??;
                 app.chat_widget
                     .handle_key_event(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));

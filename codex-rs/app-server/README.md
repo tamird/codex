@@ -560,11 +560,17 @@ Enable `capabilities.experimentalApi` during initialization, then use `thread/li
 
 `thread/loaded/list` returns thread ids currently loaded in memory. This is useful when you want to check which sessions are active without scanning rollouts on disk.
 
+Set `ancestorThreadId` to return only the loaded descendants of a particular thread, excluding the ancestor itself. Use `limit` and the returned `nextCursor` to paginate the results.
+
 ```json
 { "method": "thread/loaded/list", "id": 21 }
 { "id": 21, "result": {
     "data": ["thr_123", "thr_456"]
 } }
+{ "method": "thread/loaded/list", "id": 22,
+    "params": { "ancestorThreadId": "00000000-0000-0000-0000-000000000100", "limit": 25 } }
+{ "id": 22, "result": {
+    "data": ["00000000-0000-0000-0000-000000000101"], "nextCursor": null } }
 ```
 
 ### Example: Read server diagnostics

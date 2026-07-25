@@ -1619,6 +1619,8 @@ fn push_list_threads_query(
     limit: usize,
 ) {
     if let Some(crate::ThreadRelationFilter::DescendantsOf(ancestor_thread_id)) = relation_filter {
+        // Each child has one persisted parent, so every reachable cycle must return to the
+        // ancestor. Excluding that ancestor makes UNION ALL terminate without duplicate tracking.
         builder.push(
             r#"
 WITH RECURSIVE subtree(child_thread_id, parent_thread_id) AS (
@@ -1628,12 +1630,20 @@ WITH RECURSIVE subtree(child_thread_id, parent_thread_id) AS (
 "#,
         );
         builder.push_bind(ancestor_thread_id.to_string());
+        builder.push(" AND child_thread_id != ");
+        builder.push_bind(ancestor_thread_id.to_string());
         builder.push(
             r#"
-    UNION
+    UNION ALL
     SELECT edge.child_thread_id, edge.parent_thread_id
     FROM thread_spawn_edges AS edge
     JOIN subtree ON edge.parent_thread_id = subtree.child_thread_id
+    WHERE edge.child_thread_id !=
+"#,
+        );
+        builder.push_bind(ancestor_thread_id.to_string());
+        builder.push(
+            r#"
 )
 "#,
         );
@@ -2460,6 +2470,78 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn get_threads_returns_each_existing_thread_once() {
+        let codex_home = unique_temp_dir();
+        let runtime = StateRuntime::init(
+            crate::SqliteConfig::new_for_testing(codex_home.as_path().abs()),
+            "test-provider".to_string(),
+        )
+        .await
+        .expect("state db should initialize");
+        let first_thread_id = ThreadId::new();
+        let second_thread_id = ThreadId::new();
+        let missing_thread_id = ThreadId::new();
+
+        for (thread_id, title) in [
+            (first_thread_id, "first thread"),
+            (second_thread_id, "second thread"),
+        ] {
+            let mut metadata = test_thread_metadata(&codex_home, thread_id, codex_home.clone());
+            metadata.title = title.to_string();
+            runtime
+                .upsert_thread(&metadata)
+                .await
+                .expect("thread insert should succeed");
+        }
+
+        let threads = runtime
+            .get_threads_valid(&[
+                second_thread_id,
+                missing_thread_id,
+                first_thread_id,
+                second_thread_id,
+            ])
+            .await
+            .expect("batched thread lookup should succeed");
+
+        assert_eq!(threads.len(), 2);
+        assert_eq!(
+            threads
+                .get(&first_thread_id)
+                .map(|thread| thread.title.as_str()),
+            Some("first thread")
+        );
+        assert_eq!(
+            threads
+                .get(&second_thread_id)
+                .map(|thread| thread.title.as_str()),
+            Some("second thread")
+        );
+        assert!(!threads.contains_key(&missing_thread_id));
+
+        let mut multiple_batches = vec![first_thread_id; 256];
+        multiple_batches.push(second_thread_id);
+        multiple_batches.push(missing_thread_id);
+        multiple_batches.push(first_thread_id);
+        let threads = runtime
+            .get_threads_valid(&multiple_batches)
+            .await
+            .expect("thread lookup should span multiple bounded queries");
+        assert_eq!(threads.len(), 2);
+        assert!(threads.contains_key(&first_thread_id));
+        assert!(threads.contains_key(&second_thread_id));
+        assert!(!threads.contains_key(&missing_thread_id));
+
+        assert!(
+            runtime
+                .get_threads_valid(&[])
+                .await
+                .expect("empty batched thread lookup should succeed")
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
     async fn list_threads_updated_after_returns_oldest_changes_first() {
         let codex_home = unique_temp_dir();
         let runtime = StateRuntime::init(
@@ -2859,6 +2941,37 @@ mod tests {
             "spawn relationship query did not use the parent index: {plan_details:?}"
         );
 
+        let mut bytecode = QueryBuilder::<Sqlite>::new("EXPLAIN ");
+        push_list_threads_query(
+            &mut bytecode,
+            ThreadFilterOptions {
+                archived_only: false,
+                allowed_sources: &[],
+                model_providers: None,
+                cwd_filters: None,
+                section: None,
+                project_id: None,
+                anchor: None,
+                sort_key: SortKey::CreatedAt,
+                sort_direction: SortDirection::Desc,
+                search_term: None,
+            },
+            Some(crate::ThreadRelationFilter::DescendantsOf(parent_id)),
+            /*limit*/ 10,
+        );
+        let distinct_subtree_operations = bytecode
+            .build()
+            .fetch_all(runtime.pool.as_ref())
+            .await
+            .expect("relationship query bytecode should load")
+            .into_iter()
+            .filter(|row| row.get::<String, _>("opcode") == "Found")
+            .count();
+        assert_eq!(
+            distinct_subtree_operations, 0,
+            "unique child ownership should avoid duplicate-elimination work"
+        );
+
         let filters = |anchor| ThreadFilterOptions {
             archived_only: false,
             allowed_sources: &[],
@@ -2971,6 +3084,32 @@ mod tests {
             .expect("cyclic descendant graph should terminate");
         assert_eq!(
             cyclic_descendants
+                .items
+                .iter()
+                .map(|item| item.id)
+                .collect::<Vec<_>>(),
+            vec![
+                grandchild_id,
+                closed_child_id,
+                second_child_id,
+                first_child_id
+            ]
+        );
+
+        runtime
+            .upsert_thread_spawn_edge(parent_id, parent_id, DirectionalThreadSpawnEdgeStatus::Open)
+            .await
+            .expect("self-referencing spawn edge insert should succeed");
+        let self_referencing_descendants = runtime
+            .list_threads_by_relation(
+                /*page_size*/ 10,
+                crate::ThreadRelationFilter::DescendantsOf(parent_id),
+                filters(None),
+            )
+            .await
+            .expect("self-referencing descendant graph should terminate");
+        assert_eq!(
+            self_referencing_descendants
                 .items
                 .iter()
                 .map(|item| item.id)

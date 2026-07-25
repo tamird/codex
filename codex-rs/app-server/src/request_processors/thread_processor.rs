@@ -44,6 +44,7 @@ use subagent_history_projection::SubagentHistoryProjection;
 
 pub(super) const THREAD_LIST_DEFAULT_LIMIT: usize = 25;
 pub(super) const THREAD_LIST_MAX_LIMIT: usize = 100;
+const THREAD_RELATION_LIST_MAX_LIMIT: usize = 200;
 const CODEX_TUI_CLIENT_NAME: &str = "codex-tui";
 const THREAD_ROLLBACK_DEPRECATION_SUMMARY: &str =
     "thread/rollback is deprecated and will be removed soon";
@@ -2997,10 +2998,15 @@ impl ThreadRequestProcessor {
             None
         };
 
+        let max_page_size = if relation_filter.is_some() {
+            THREAD_RELATION_LIST_MAX_LIMIT
+        } else {
+            THREAD_LIST_MAX_LIMIT
+        };
         let requested_page_size = limit
             .map(|value| value as usize)
             .unwrap_or(THREAD_LIST_DEFAULT_LIMIT)
-            .clamp(1, THREAD_LIST_MAX_LIMIT);
+            .clamp(1, max_page_size);
         let store_sort_key = match sort_key.unwrap_or(ThreadSortKey::CreatedAt) {
             ThreadSortKey::CreatedAt => StoreThreadSortKey::CreatedAt,
             ThreadSortKey::UpdatedAt => StoreThreadSortKey::UpdatedAt,
@@ -7493,9 +7499,14 @@ impl ThreadRequestProcessor {
             SortDirection::Asc => StoreSortDirection::Asc,
             SortDirection::Desc => StoreSortDirection::Desc,
         };
+        let max_page_size = if relation_filter.is_some() {
+            THREAD_RELATION_LIST_MAX_LIMIT
+        } else {
+            THREAD_LIST_MAX_LIMIT
+        };
 
         while remaining > 0 {
-            let page_size = remaining.min(THREAD_LIST_MAX_LIMIT);
+            let page_size = remaining.min(max_page_size);
             let page = self
                 .thread_store
                 .list_threads(StoreListThreadsParams {

@@ -13,6 +13,8 @@ use super::app_server_event_targets::server_request_thread_id;
 use super::*;
 use crate::app_server_session::source_agent_path;
 use crate::app_server_session::thread_blocks_direct_input;
+use codex_app_server_protocol::ThreadListParams;
+use codex_app_server_protocol::ThreadSourceKind;
 use codex_config::types::ResumeCwdMode;
 
 #[derive(Clone, Copy)]
@@ -870,8 +872,10 @@ impl App {
     /// keyboard navigation are pre-populated even if the TUI did not witness the original spawn
     /// events. Fresh and forked threads cannot have pre-existing descendants.
     ///
-    /// The loaded-thread list is fetched in full (no pagination) and the spawn tree is walked
-    /// by `find_loaded_subagent_threads_for_primary`. Each discovered subagent is registered via
+    /// The loaded-thread list remains authoritative for membership. Ancestor-filtered thread-list
+    /// pages provide metadata in batches. A second, stored-subagent pass covers loaded historical
+    /// children outside the current agent registry, with individual reads retained for older
+    /// servers and missing entries. Each discovered subagent is registered via
     /// `upsert_agent_picker_thread`, which writes to both `AgentNavigationState` and the
     /// `ChatWidget` metadata map.
     pub(super) async fn backfill_loaded_subagent_threads(
@@ -887,7 +891,7 @@ impl App {
             .thread_loaded_list(ThreadLoadedListParams {
                 cursor: None,
                 limit: None,
-                ancestor_thread_id: None,
+                ancestor_thread_id: Some(primary_thread_id.to_string()),
             })
             .await
         {
@@ -899,6 +903,69 @@ impl App {
         };
 
         let loaded_thread_count = loaded_thread_ids.len();
+        let loaded_thread_id_set: HashSet<_> = loaded_thread_ids
+            .iter()
+            .filter_map(|thread_id| {
+                ThreadId::from_string(thread_id)
+                    .ok()
+                    .filter(|thread_id| *thread_id != primary_thread_id)
+                    .map(|_| thread_id.as_str())
+            })
+            .collect();
+        let mut loaded_thread_metadata = HashMap::new();
+        let mut page_count = 0;
+        if !loaded_thread_id_set.is_empty() {
+            let mut cursor = None;
+            let mut seen_cursors = HashSet::new();
+            let mut current_members_only = true;
+            loop {
+                if !seen_cursors.insert((current_members_only, cursor.clone())) {
+                    break;
+                }
+                page_count += 1;
+                let page = match app_server
+                    .thread_list(ThreadListParams {
+                        cursor,
+                        limit: Some(200),
+                        sort_key: None,
+                        sort_direction: None,
+                        model_providers: (!current_members_only).then(Vec::new),
+                        source_kinds: (!current_members_only)
+                            .then(|| vec![ThreadSourceKind::SubAgentThreadSpawn]),
+                        archived: None,
+                        section_id: None,
+                        project_id: None,
+                        cwd: None,
+                        use_state_db_only: true,
+                        search_term: None,
+                        parent_thread_id: None,
+                        ancestor_thread_id: current_members_only
+                            .then(|| primary_thread_id.to_string()),
+                    })
+                    .await
+                {
+                    Ok(page) => page,
+                    Err(_) => break,
+                };
+                loaded_thread_metadata.extend(
+                    page.data
+                        .into_iter()
+                        .filter(|thread| loaded_thread_id_set.contains(thread.id.as_str()))
+                        .map(|thread| (thread.id.clone(), thread)),
+                );
+                if loaded_thread_metadata.len() == loaded_thread_id_set.len() {
+                    break;
+                }
+                if let Some(next_cursor) = page.next_cursor {
+                    cursor = Some(next_cursor);
+                } else if current_members_only {
+                    current_members_only = false;
+                    cursor = None;
+                } else {
+                    break;
+                }
+            }
+        }
         let mut threads = Vec::new();
         let mut had_read_error = false;
         let mut read_count = 0;
@@ -909,6 +976,11 @@ impl App {
             };
 
             if thread_id == primary_thread_id {
+                continue;
+            }
+
+            if let Some(thread) = loaded_thread_metadata.remove(&thread_id.to_string()) {
+                threads.push(thread);
                 continue;
             }
 
@@ -975,6 +1047,7 @@ impl App {
                 target: "codex.performance",
                 thread_id = %primary_thread_id,
                 loaded_threads = loaded_thread_count,
+                list_requests = page_count,
                 read_requests = read_count,
                 discovered_threads = discovered_thread_count,
                 duration_us = duration.as_micros(),
