@@ -16,6 +16,7 @@ use tokio_tungstenite::tungstenite::Message;
 #[derive(Clone, Copy, Eq, PartialEq)]
 pub(super) enum BlockedThreadListPage {
     First,
+    Second,
     SecondError,
 }
 
@@ -103,8 +104,10 @@ pub(super) async fn start_recording_app_server(
                             params.ancestor_thread_id.as_deref(),
                             expected_ancestor.as_deref()
                         );
-                        let is_second_page =
-                            matches!(*blocked_page, BlockedThreadListPage::SecondError);
+                        let is_second_page = matches!(
+                            *blocked_page,
+                            BlockedThreadListPage::Second | BlockedThreadListPage::SecondError
+                        );
                         if is_second_page {
                             params.limit = Some(1);
                         }

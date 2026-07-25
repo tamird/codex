@@ -415,3 +415,311 @@ async fn blocked_agent_picker_retains_selection_and_coalesces_reopens() -> Resul
     proxy.await??;
     Ok(())
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn dismissed_agent_picker_does_not_retry_invalidated_refresh() -> Result<()> {
+    let (mut app, mut app_event_rx, _op_rx) = make_test_app_with_channels().await;
+    let codex_home = tempdir()?;
+    app.config.codex_home = codex_home.path().to_path_buf().abs();
+    app.config.sqlite = SqliteConfig::new_for_testing(codex_home.path().abs());
+
+    let (root_thread_id, child_thread_id) = create_picker_rollouts(
+        codex_home.path(),
+        app.config.model_provider_id.as_str(),
+        /*index*/ 0,
+    )?;
+    let (started_tx, started_rx) = oneshot::channel();
+    let (release_tx, release_rx) = oneshot::channel();
+    let (mut app_server, requests, proxy) = start_recording_app_server(
+        &app.config,
+        Some((
+            root_thread_id,
+            started_tx,
+            release_rx,
+            BlockedThreadListPage::First,
+        )),
+    )
+    .await?;
+    let model_settings = app.resume_model_settings();
+    let root = app_server
+        .resume_thread(app.config.clone(), root_thread_id, model_settings)
+        .await?;
+    app.enqueue_primary_thread_session(root.session, root.turns)
+        .await?;
+
+    let mut tui = crate::tui::test_support::make_test_tui()?;
+    Box::pin(app.handle_event(&mut tui, &mut app_server, AppEvent::OpenAgentPicker)).await?;
+    tokio::time::timeout(AGENT_PICKER_MAX_SCAN_DURATION, started_rx).await??;
+    app.chat_widget
+        .handle_key_event(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+    assert!(
+        app.chat_widget
+            .selected_index_for_present_view(super::super::agent_picker::AGENT_PICKER_VIEW_ID)
+            .is_none()
+    );
+
+    app.thread_event_channels
+        .insert(child_thread_id, ThreadEventChannel::new(/*capacity*/ 1));
+    app.agent_navigation.upsert(
+        child_thread_id,
+        /*agent_nickname*/ None,
+        /*agent_role*/ None,
+        /*is_closed*/ false,
+    );
+    app.agent_navigation
+        .set_agent_path(child_thread_id, Some("/root/worker".to_string()));
+    app.agent_navigation
+        .set_running(child_thread_id, /*is_running*/ true);
+    release_tx.send(()).expect("release blocked thread list");
+    let completion = next_agent_picker_completion(&mut app_event_rx).await?;
+    Box::pin(app.handle_event(&mut tui, &mut app_server, completion)).await?;
+
+    assert!(
+        app.agent_navigation
+            .get(&child_thread_id)
+            .is_some_and(|entry| entry.is_running && !entry.is_closed)
+    );
+    assert!(!app.agent_navigation.has_picker_refresh(root_thread_id));
+    assert_eq!(
+        requests
+            .lock()
+            .expect("requests")
+            .iter()
+            .filter(|method| *method == "thread/list")
+            .count(),
+        2
+    );
+
+    app_server.shutdown().await?;
+    proxy.await??;
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn stalled_agent_picker_page_publishes_completed_descendants() -> Result<()> {
+    paged_agent_picker_publishes_completed_descendants(BlockedThreadListPage::Second).await
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn failed_agent_picker_page_publishes_completed_descendants() -> Result<()> {
+    paged_agent_picker_publishes_completed_descendants(BlockedThreadListPage::SecondError).await
+}
+
+async fn paged_agent_picker_publishes_completed_descendants(
+    blocked_page: BlockedThreadListPage,
+) -> Result<()> {
+    let (mut app, mut app_event_rx, _op_rx) = make_test_app_with_channels().await;
+    let codex_home = tempdir()?;
+    app.config.codex_home = codex_home.path().to_path_buf().abs();
+    app.config.sqlite = SqliteConfig::new_for_testing(codex_home.path().abs());
+    let model_provider = app.config.model_provider_id.as_str();
+    let (root_thread_id, child_thread_id) =
+        create_picker_rollouts(codex_home.path(), model_provider, /*index*/ 0)?;
+    let grandchild_thread_id = ThreadId::from_string(
+        &create_fake_parented_rollout_with_source(
+            codex_home.path(),
+            "2026-01-01T00-00-04",
+            "2026-01-01T00:00:04Z",
+            "Saved grandchild message",
+            Some(model_provider),
+            /*git_info*/ None,
+            RolloutSessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+                parent_thread_id: child_thread_id,
+                depth: 2,
+                agent_path: Some(
+                    AgentPath::try_from("/root/worker/grandchild".to_string())
+                        .expect("valid agent path"),
+                ),
+                agent_nickname: Some("grandchild".to_string()),
+                agent_role: Some("worker".to_string()),
+            }),
+            root_thread_id.into(),
+            child_thread_id,
+        )
+        .map_err(|err| color_eyre::eyre::eyre!(err))?,
+    )?;
+    let state_db = codex_state::StateRuntime::init(
+        SqliteConfig::new_for_testing(codex_home.path().abs()),
+        model_provider.to_string(),
+    )
+    .await
+    .map_err(|err| color_eyre::eyre::eyre!(err))?;
+    for (parent_thread_id, thread_id, timestamp, depth, agent_path, nickname) in [
+        (
+            root_thread_id,
+            child_thread_id,
+            "2026-01-01T00:00:02Z",
+            1,
+            "/root/worker",
+            "worker",
+        ),
+        (
+            child_thread_id,
+            grandchild_thread_id,
+            "2026-01-01T00:00:04Z",
+            2,
+            "/root/worker/grandchild",
+            "grandchild",
+        ),
+    ] {
+        let source = RolloutSessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+            parent_thread_id,
+            depth,
+            agent_path: Some(
+                AgentPath::try_from(agent_path.to_string())
+                    .map_err(|err| color_eyre::eyre::eyre!(err))?,
+            ),
+            agent_nickname: Some(nickname.to_string()),
+            agent_role: Some("worker".to_string()),
+        });
+        let rollout_path = codex_rollout::find_thread_path_by_id_str(
+            codex_home.path(),
+            &thread_id.to_string(),
+            /*state_db_ctx*/ None,
+        )
+        .await?
+        .ok_or_else(|| color_eyre::eyre::eyre!("missing rollout for {thread_id}"))?;
+        let mut metadata = codex_state::ThreadMetadataBuilder::new(
+            thread_id,
+            rollout_path,
+            chrono::DateTime::parse_from_rfc3339(timestamp)?.to_utc(),
+            source,
+        );
+        metadata.agent_nickname = Some(nickname.to_string());
+        metadata.agent_role = Some("worker".to_string());
+        metadata.agent_path = Some(agent_path.to_string());
+        metadata.model_provider = Some(model_provider.to_string());
+        metadata.cwd = codex_home.path().to_path_buf();
+        state_db
+            .upsert_thread(&metadata.build(model_provider))
+            .await
+            .map_err(|err| color_eyre::eyre::eyre!(err))?;
+        state_db
+            .upsert_thread_spawn_edge(
+                parent_thread_id,
+                thread_id,
+                codex_state::DirectionalThreadSpawnEdgeStatus::Open,
+            )
+            .await
+            .map_err(|err| color_eyre::eyre::eyre!(err))?;
+    }
+
+    let (started_tx, started_rx) = oneshot::channel();
+    let (release_tx, release_rx) = oneshot::channel();
+    let (mut app_server, requests, proxy) = start_recording_app_server(
+        &app.config,
+        Some((root_thread_id, started_tx, release_rx, blocked_page)),
+    )
+    .await?;
+    let model_settings = app.resume_model_settings();
+    let root = app_server
+        .resume_thread(app.config.clone(), root_thread_id, model_settings)
+        .await?;
+    app.enqueue_primary_thread_session(root.session, root.turns)
+        .await?;
+    app.thread_event_channels
+        .insert(child_thread_id, ThreadEventChannel::new(/*capacity*/ 1));
+    app.agent_navigation
+        .record_sub_agent_activity(SubAgentActivityDisplay {
+            thread_id: child_thread_id,
+            agent_path: "/root/worker".to_string(),
+            is_running_hint: true,
+        });
+
+    let ghost_thread_id = ThreadId::new();
+    app.agent_navigation.upsert(
+        ghost_thread_id,
+        /*agent_nickname*/ None,
+        /*agent_role*/ None,
+        /*is_closed*/ true,
+    );
+    let thread_list_count = || {
+        requests
+            .lock()
+            .expect("requests")
+            .iter()
+            .filter(|method| *method == "thread/list")
+            .count()
+    };
+    let mut tui = crate::tui::test_support::make_test_tui()?;
+    Box::pin(app.handle_event(&mut tui, &mut app_server, AppEvent::OpenAgentPicker)).await?;
+    tokio::time::timeout(AGENT_PICKER_MAX_SCAN_DURATION, started_rx).await??;
+    assert_eq!(thread_list_count(), 3);
+
+    let mut release_tx = Some(release_tx);
+    let partial = if blocked_page == BlockedThreadListPage::Second {
+        tokio::time::pause();
+        tokio::time::advance(AGENT_PICKER_MAX_SCAN_DURATION).await;
+        let timeout = next_agent_picker_completion(&mut app_event_rx).await?;
+        assert_matches!(
+            &timeout,
+            AppEvent::AgentPickerThreadsLoaded {
+                refresh: AgentPickerRefresh::TimedOut { threads, .. },
+                ..
+            } if threads.iter().any(|thread| thread.id == child_thread_id.to_string())
+        );
+        tokio::time::resume();
+        timeout
+    } else {
+        release_tx
+            .take()
+            .expect("blocked second page")
+            .send(())
+            .expect("release failing second page");
+        let completion = next_agent_picker_completion(&mut app_event_rx).await?;
+        assert_matches!(
+            &completion,
+            AppEvent::AgentPickerThreadsLoaded {
+                refresh: AgentPickerRefresh::Completed {
+                    exhaustive: false,
+                    result: Ok(threads),
+                    ..
+                },
+                ..
+            } if threads.iter().any(|thread| thread.id == child_thread_id.to_string())
+        );
+        completion
+    };
+    Box::pin(app.handle_event(&mut tui, &mut app_server, partial)).await?;
+    assert!(app.agent_navigation.get(&child_thread_id).is_some());
+    assert!(app.agent_navigation.get(&grandchild_thread_id).is_none());
+    assert!(app.agent_navigation.get(&ghost_thread_id).is_some());
+    assert!(render_bottom_popup(&app.chat_widget, /*width*/ 80).contains("/root/worker"));
+
+    if blocked_page == BlockedThreadListPage::Second {
+        Box::pin(app.handle_event(&mut tui, &mut app_server, AppEvent::OpenAgentPicker)).await?;
+        assert_eq!(thread_list_count(), 3);
+        app.thread_event_channels.insert(
+            grandchild_thread_id,
+            ThreadEventChannel::new(/*capacity*/ 1),
+        );
+        app.agent_navigation.upsert(
+            grandchild_thread_id,
+            /*agent_nickname*/ None,
+            /*agent_role*/ None,
+            /*is_closed*/ false,
+        );
+        app.agent_navigation.set_agent_path(
+            grandchild_thread_id,
+            Some("/root/worker/grandchild".to_string()),
+        );
+        app.agent_navigation
+            .set_running(grandchild_thread_id, /*is_running*/ true);
+        release_tx
+            .take()
+            .expect("blocked second page")
+            .send(())
+            .expect("release blocked second page");
+        let completion = next_agent_picker_completion(&mut app_event_rx).await?;
+        Box::pin(app.handle_event(&mut tui, &mut app_server, completion)).await?;
+        assert_eq!(
+            app.agent_navigation.ordered_thread_ids(),
+            vec![root_thread_id, child_thread_id, grandchild_thread_id,]
+        );
+    }
+    assert_eq!(thread_list_count(), 3);
+
+    app_server.shutdown().await?;
+    proxy.await??;
+    Ok(())
+}
