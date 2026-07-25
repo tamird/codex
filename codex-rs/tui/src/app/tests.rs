@@ -2,6 +2,8 @@
 
 #[path = "tests/advanced_reasoning_tests.rs"]
 mod advanced_reasoning_tests;
+#[path = "tests/agent_picker_requests.rs"]
+mod agent_picker_requests;
 #[path = "tests/approval_routing_tests.rs"]
 mod approval_routing;
 #[path = "tests/background_exit_tests.rs"]
@@ -24,6 +26,8 @@ mod recap_generation;
 mod safety_buffering;
 #[path = "tests/session_lifecycle_requests.rs"]
 mod session_lifecycle_requests;
+#[path = "tests/session_request_support.rs"]
+mod session_request_support;
 mod session_summary;
 mod startup;
 #[path = "tests/stream_animation_tests.rs"]
