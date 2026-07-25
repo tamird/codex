@@ -242,7 +242,7 @@ async fn start_recording_app_server_with_history(
                             && let Some((root, started, release)) = blocked_thread_list.take()
                         {
                             assert_eq!(params.ancestor_thread_id, Some(root.to_string()));
-                            assert_eq!(params.sort_direction, Some(SortDirection::Desc));
+                            assert_eq!(params.sort_direction, Some(SortDirection::Asc));
                             let _ = started.send(());
                             let _ = release.await;
                         }
@@ -3234,7 +3234,11 @@ fn session_lifecycle_avoids_redundant_subagent_metadata_reads() -> Result<()> {
                 })
                 .await?;
                 if let AppEvent::AgentPickerThreadsLoaded {
-                    result: Ok(threads),
+                    refresh:
+                        AgentPickerRefresh::Completed {
+                            result: Ok(threads),
+                            ..
+                        },
                     ..
                 } = &mut completion
                 {
@@ -3244,7 +3248,10 @@ fn session_lifecycle_avoids_redundant_subagent_metadata_reads() -> Result<()> {
                         .expect("root-scoped response includes the cached child");
                     let mut discovered = child.clone();
                     discovered.id = discovered_thread_id.to_string();
-                    discovered.can_accept_direct_input = None;
+                    discovered.can_accept_direct_input = Some(true);
+                    discovered.status = ThreadStatus::Active {
+                        active_flags: Vec::new(),
+                    };
                     child.status = ThreadStatus::Active {
                         active_flags: Vec::new(),
                     };
@@ -3252,12 +3259,11 @@ fn session_lifecycle_avoids_redundant_subagent_metadata_reads() -> Result<()> {
                 }
                 app.handle_event(&mut tui, &mut app_server, completion)
                     .await?;
-                assert_eq!(
+                assert!(
                     app.agent_navigation
                         .ordered_threads()
-                        .last()
-                        .map(|(thread_id, _)| *thread_id),
-                    Some(discovered_thread_id)
+                        .iter()
+                        .any(|(thread_id, _)| *thread_id == discovered_thread_id)
                 );
                 assert!(!app.agent_navigation.is_parent_owned(discovered_thread_id));
                 assert_eq!(

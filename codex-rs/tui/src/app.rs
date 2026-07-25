@@ -6,6 +6,7 @@
 use crate::AppServerTarget;
 use crate::app_backtrack::BacktrackState;
 use crate::app_command::AppCommand;
+use crate::app_event::AgentPickerRefresh;
 use crate::app_event::AppEvent;
 use crate::app_event::ExitMode;
 use crate::app_event::FeedbackCategory;

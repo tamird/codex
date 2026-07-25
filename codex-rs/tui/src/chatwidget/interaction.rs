@@ -265,6 +265,14 @@ impl ChatWidget {
             .replace_selection_view_if_present(view_id, params)
     }
 
+    pub(crate) fn replace_selection_view_with_multi_agent_enable_prompt(
+        &mut self,
+        view_id: &'static str,
+    ) -> bool {
+        let params = self.multi_agent_enable_prompt_params(Some(view_id));
+        self.replace_selection_view_if_present(view_id, params)
+    }
+
     pub(crate) fn no_modal_or_popup_active(&self) -> bool {
         self.bottom_pane.no_modal_or_popup_active()
     }

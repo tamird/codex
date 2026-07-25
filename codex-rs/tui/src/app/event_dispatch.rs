@@ -2709,9 +2709,14 @@ impl App {
             AppEvent::AgentPickerThreadsLoaded {
                 primary_thread_id,
                 generation,
-                result,
+                refresh,
             } => {
-                self.apply_agent_picker_thread_refresh(primary_thread_id, generation, result);
+                self.apply_agent_picker_thread_refresh(
+                    app_server,
+                    primary_thread_id,
+                    generation,
+                    refresh,
+                );
             }
             AppEvent::SelectAgentThread(thread_id) => {
                 self.select_agent_thread_and_discard_side(tui, app_server, thread_id)

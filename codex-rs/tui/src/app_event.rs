@@ -213,6 +213,19 @@ pub(crate) enum RecapTrigger {
     Manual,
 }
 
+#[derive(Debug)]
+pub(crate) enum AgentPickerRefresh {
+    TimedOut {
+        known_at_start: std::collections::HashSet<ThreadId>,
+        threads: Vec<Thread>,
+    },
+    Completed {
+        known_at_start: std::collections::HashSet<ThreadId>,
+        exhaustive: bool,
+        result: Result<Vec<Thread>, String>,
+    },
+}
+
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug, IntoStaticStr)]
 pub(crate) enum AppEvent {
@@ -271,13 +284,13 @@ pub(crate) enum AppEvent {
     },
     /// Open the agent picker for switching active threads.
     OpenAgentPicker,
-    /// Merge a completed root-scoped agent-picker refresh without blocking terminal input.
     /// Refresh the model catalog from app-server and reopen the model picker.
     RefreshModelCatalog,
+    /// Apply a background descendant refresh without blocking the agent picker.
     AgentPickerThreadsLoaded {
         primary_thread_id: ThreadId,
         generation: u64,
-        result: Result<Vec<Thread>, String>,
+        refresh: AgentPickerRefresh,
     },
     /// Switch the active thread to the selected agent.
     SelectAgentThread(ThreadId),

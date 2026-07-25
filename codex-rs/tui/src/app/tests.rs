@@ -1996,6 +1996,11 @@ async fn open_agent_picker_preserves_cached_metadata_for_replay_threads() -> Res
 #[tokio::test]
 async fn relation_refresh_preserves_cold_ephemeral_agent_identity() -> Result<()> {
     let mut app = Box::pin(make_test_app()).await;
+    let app_server = Box::pin(crate::start_embedded_app_server_for_picker(
+        app.chat_widget.config_ref(),
+    ))
+    .await
+    .expect("embedded app server");
     let root_thread_id = ThreadId::new();
     let child_thread_id = ThreadId::new();
     app.primary_thread_id = Some(root_thread_id);
@@ -2011,38 +2016,43 @@ async fn relation_refresh_preserves_cold_ephemeral_agent_identity() -> Result<()
         agent_role: Some("explorer".to_string()),
     });
     app.apply_agent_picker_thread_refresh(
+        &app_server,
         root_thread_id,
         request_id,
-        Ok(vec![Thread {
-            id: child_thread_id.to_string(),
-            extra: None,
-            session_id: child_thread_id.to_string(),
-            forked_from_id: None,
-            parent_thread_id: Some(root_thread_id.to_string()),
-            preview: String::new(),
-            ephemeral: true,
-            section: None,
-            section_entered_at: None,
-            project_id: None,
-            history_mode: Default::default(),
-            model_provider: app.config.model_provider_id.clone(),
-            created_at: 0,
-            updated_at: 0,
-            recency_at: Some(0),
-            status: codex_app_server_protocol::ThreadStatus::NotLoaded,
-            agent_status: Some(codex_app_server_protocol::CollabAgentStatus::Completed),
-            path: None,
-            cwd: app.config.cwd.clone(),
-            cli_version: "0.0.0".to_string(),
-            source,
-            can_accept_direct_input: Some(false),
-            thread_source: Some(codex_app_server_protocol::ThreadSource::Subagent),
-            agent_nickname: Some("Robie".to_string()),
-            agent_role: Some("explorer".to_string()),
-            git_info: None,
-            name: None,
-            turns: Vec::new(),
-        }]),
+        crate::app_event::AgentPickerRefresh::Completed {
+            known_at_start: Default::default(),
+            exhaustive: true,
+            result: Ok(vec![Thread {
+                id: child_thread_id.to_string(),
+                extra: None,
+                session_id: child_thread_id.to_string(),
+                forked_from_id: None,
+                parent_thread_id: Some(root_thread_id.to_string()),
+                preview: String::new(),
+                ephemeral: true,
+                section: None,
+                section_entered_at: None,
+                project_id: None,
+                history_mode: Default::default(),
+                model_provider: app.config.model_provider_id.clone(),
+                created_at: 0,
+                updated_at: 0,
+                recency_at: Some(0),
+                status: codex_app_server_protocol::ThreadStatus::NotLoaded,
+                agent_status: Some(codex_app_server_protocol::CollabAgentStatus::Completed),
+                path: None,
+                cwd: app.config.cwd.clone(),
+                cli_version: "0.0.0".to_string(),
+                source,
+                can_accept_direct_input: Some(false),
+                thread_source: Some(codex_app_server_protocol::ThreadSource::Subagent),
+                agent_nickname: Some("Robie".to_string()),
+                agent_role: Some("explorer".to_string()),
+                git_info: None,
+                name: None,
+                turns: Vec::new(),
+            }]),
+        },
     );
 
     assert_eq!(

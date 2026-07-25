@@ -1100,6 +1100,14 @@ impl ChatWidget {
     }
 
     pub(crate) fn open_multi_agent_enable_prompt(&mut self) {
+        let params = self.multi_agent_enable_prompt_params(/*view_id*/ None);
+        self.bottom_pane.show_selection_view(params);
+    }
+
+    fn multi_agent_enable_prompt_params(
+        &self,
+        view_id: Option<&'static str>,
+    ) -> SelectionViewParams {
         let items = vec![
             SelectionItem {
                 name: MULTI_AGENT_ENABLE_YES.to_string(),
@@ -1125,13 +1133,14 @@ impl ChatWidget {
             },
         ];
 
-        self.bottom_pane.show_selection_view(SelectionViewParams {
+        SelectionViewParams {
+            view_id,
             title: Some(MULTI_AGENT_ENABLE_TITLE.to_string()),
             subtitle: Some("Subagents are currently disabled in your config.".to_string()),
             footer_hint: Some(standard_popup_hint_line()),
             items,
             ..Default::default()
-        });
+        }
     }
 
     pub(crate) fn open_memories_popup(&mut self) {
