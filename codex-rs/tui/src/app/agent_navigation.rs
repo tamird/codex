@@ -99,11 +99,6 @@ impl AgentNavigationState {
         self.parent_owned_threads.insert(thread_id);
     }
 
-    #[cfg(test)]
-    pub(crate) fn is_empty(&self) -> bool {
-        self.threads.is_empty()
-    }
-
     /// Inserts or updates a picker entry while preserving first-seen traversal order.
     ///
     /// The key invariant of this module is enforced here: a thread id is appended to `order` only

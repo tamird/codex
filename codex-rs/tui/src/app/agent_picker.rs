@@ -107,7 +107,8 @@ impl App {
         };
         let selected = self
             .chat_widget
-            .selected_index_for_present_view(AGENT_PICKER_VIEW_ID);
+            .selected_item_description_for_present_view(AGENT_PICKER_VIEW_ID)
+            .and_then(|description| ThreadId::from_string(description).ok());
         for thread in threads {
             let Ok(thread_id) = ThreadId::from_string(&thread.id) else {
                 continue;

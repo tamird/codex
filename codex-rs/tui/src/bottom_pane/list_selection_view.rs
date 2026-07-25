@@ -1116,6 +1116,12 @@ impl BottomPaneView for ListSelectionView {
         self.selected_actual_idx()
     }
 
+    fn selected_item_description(&self) -> Option<&str> {
+        self.selected_actual_idx()
+            .and_then(|index| self.items.get(index))
+            .and_then(|item| item.description.as_deref())
+    }
+
     fn active_tab_id(&self) -> Option<&str> {
         ListSelectionView::active_tab_id(self)
     }
