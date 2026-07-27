@@ -732,10 +732,11 @@ async fn resume_and_fork_append_permissions_messages() -> Result<()> {
         permissions_base.as_slice()
     );
     assert!(!permissions_base.contains(permissions_resume.last().expect("new permissions")));
+    resumed.codex.shutdown_and_wait().await?;
 
     let mut fork_config = initial.config.clone();
     fork_config.permissions.approval_policy = Constrained::allow_any(AskForApproval::UnlessTrusted);
-    let forked = initial
+    let forked = resumed
         .thread_manager
         .fork_thread(
             ForkSnapshot::Interrupted,

@@ -114,6 +114,11 @@ impl LegacyRolloutCanonicalizer {
         let bytes_before = self.bytes_written;
         match line.item {
             RolloutItem::SessionMeta(_) => return Ok(0),
+            RolloutItem::RolloutReference(_) => {
+                return Err(migration_error(
+                    "reference-backed legacy rollout reached the canonical writer",
+                ));
+            }
             RolloutItem::ResponseItem(response) => {
                 if matches!(&response.item, ResponseItem::Other) {
                     return Err(migration_error(

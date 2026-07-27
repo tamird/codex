@@ -6,9 +6,11 @@ use std::os::unix::fs::PermissionsExt;
 use std::time::Duration;
 use std::time::SystemTime;
 
+use codex_protocol::SegmentId;
 use codex_protocol::ThreadId;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::HistoryPosition;
+use codex_protocol::protocol::RolloutReferenceItem;
 use codex_protocol::protocol::SessionMeta;
 use codex_protocol::protocol::SessionMetaLine;
 use codex_protocol::protocol::SessionSource;
@@ -393,6 +395,87 @@ async fn worker_compresses_archived_fork_chain_only_with_shared_mode() -> anyhow
 }
 
 #[tokio::test]
+async fn worker_preserves_reference_pointers_without_pinning_detached_sources() -> anyhow::Result<()>
+{
+    for detached in [false, true] {
+        for mode in [
+            RolloutCompressionMode::Standalone,
+            RolloutCompressionMode::IncludeShared,
+        ] {
+            let home = TempDir::new()?;
+            let source_uuid = Uuid::from_u128(100);
+            let source_id = ThreadId::from_string(&source_uuid.to_string())?;
+            let source_path = rollout_path(home.path(), "2025-01-03T12-00-00", source_uuid);
+            write_rollout(&source_path, source_id, "referenced source")?;
+            let source_bytes = fs::read(&source_path)?;
+            let segment_id = detached.then(SegmentId::new);
+            let reference_path = if let Some(segment_id) = segment_id {
+                let snapshot = home
+                    .path()
+                    .join(crate::ROTATED_ROLLOUT_SEGMENTS_SUBDIR)
+                    .join(source_id.to_string())
+                    .join(segment_id.to_string())
+                    .join(source_path.file_name().expect("source filename"));
+                fs::create_dir_all(snapshot.parent().expect("snapshot directory"))?;
+                let source = fs::read_to_string(&source_path)?;
+                let (head, tail) = source.split_once('\n').expect("source metadata record");
+                let mut head: serde_json::Value = serde_json::from_str(head)?;
+                head["payload"]["segment_id"] = serde_json::to_value(segment_id)?;
+                fs::write(
+                    &snapshot,
+                    format!("{}\n{tail}", serde_json::to_string(&head)?),
+                )?;
+                snapshot
+            } else {
+                source_path.clone()
+            };
+
+            let child_uuid = Uuid::from_u128(101);
+            let child_id = ThreadId::from_string(&child_uuid.to_string())?;
+            let child_path = archived_rollout_path(home.path(), "2025-01-03T12-00-01", child_uuid);
+            write_rollout(&child_path, child_id, "pointer child")?;
+            let child = fs::read_to_string(&child_path)?;
+            let (head, tail) = child.split_once('\n').expect("child metadata record");
+            let reference = RolloutLine {
+                timestamp: "2025-01-03T12:00:00Z".to_string(),
+                ordinal: None,
+                item: RolloutItem::RolloutReference(RolloutReferenceItem {
+                    rollout_id: Some(source_id),
+                    rollout_path: reference_path,
+                    thread_id: Some(source_id),
+                    rollout_timestamp: Some("2025-01-03T12-00-00".to_string()),
+                    segment_id,
+                    max_depth: crate::MAX_ROLLOUT_REFERENCE_DEPTH,
+                    nth_user_message: None,
+                    compacted_replacement_history_filter_texts: None,
+                }),
+            };
+            fs::write(
+                &child_path,
+                format!("{head}\n{}\n{tail}", serde_json::to_string(&reference)?),
+            )?;
+            let child_bytes = fs::read(&child_path)?;
+            set_old_mtime(&source_path)?;
+            set_old_mtime(&child_path)?;
+
+            worker::run(home.path().to_path_buf(), mode).await?;
+
+            let include_shared = mode == RolloutCompressionMode::IncludeShared;
+            for (path, original, compressed) in [
+                (&source_path, source_bytes, include_shared || detached),
+                (&child_path, child_bytes, include_shared),
+            ] {
+                assert_eq!(path.exists(), !compressed, "{mode:?}, detached={detached}");
+                let mut restored = Vec::new();
+                crate::open_rollout_seekable_reader(path)?.read_to_end(&mut restored)?;
+                assert_eq!(restored, original);
+            }
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
 async fn worker_skips_source_referenced_by_archived_compressed_rollout() -> anyhow::Result<()> {
     let home = TempDir::new()?;
     let source_uuid = Uuid::from_u128(18);
@@ -752,6 +835,7 @@ fn write_rollout(path: &std::path::Path, thread_id: ThreadId, message: &str) -> 
         meta: SessionMeta {
             session_id: thread_id.into(),
             id: thread_id,
+            segment_id: None,
             forked_from_id: None,
             forked_from_ordinal_exclusive: None,
             parent_thread_id: None,

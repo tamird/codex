@@ -1,21 +1,29 @@
 use std::fs;
+use std::io::Write;
 use std::time::Duration;
 
 use chrono::Utc;
 use codex_app_server_protocol::CodexErrorInfo;
+use codex_app_server_protocol::ThreadHistoryBuilder;
 use codex_app_server_protocol::ThreadTimelineEntry;
+use codex_protocol::SegmentId;
 use codex_protocol::ThreadId;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::HistoryPosition;
+use codex_protocol::protocol::RolloutReferenceItem;
 use codex_protocol::protocol::SessionMeta;
 use codex_protocol::protocol::SessionMetaLine;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::ThreadHistoryMode;
+use codex_protocol::protocol::TurnCompleteEvent;
+use codex_protocol::protocol::TurnStartedEvent;
+use codex_protocol::protocol::UserMessageEvent;
 use codex_protocol::realtime::BemItemPresentation;
 use codex_protocol::realtime::RealtimeItem;
 use codex_protocol::realtime::RealtimeItemContent;
 use codex_protocol::realtime::RealtimeSessionOutcome;
 use codex_protocol::realtime::RealtimeTranscriptRole;
+use codex_rollout::CompactedItem;
 use codex_rollout::RolloutItem;
 use codex_rollout::RolloutLine;
 use pretty_assertions::assert_eq;
@@ -125,6 +133,485 @@ async fn list_turns_pages_projected_rows_and_applies_item_views() {
         .await
         .expect("backwards turns page");
     assert_eq!(turn_ids(&backwards_page), vec!["turn-3", "turn-2"]);
+}
+
+#[tokio::test]
+async fn indexed_paginated_reads_do_not_traverse_same_thread_segments() {
+    assert_indexed_paginated_segment_count(/*segment_count*/ 1_025).await;
+}
+
+#[tokio::test]
+async fn indexed_paginated_reads_remain_bounded_across_ten_thousand_segments() {
+    assert_indexed_paginated_segment_count(/*segment_count*/ 10_001).await;
+}
+
+#[tokio::test]
+async fn indexed_paginated_reads_trust_current_projection_for_immutable_predecessors() {
+    assert_indexed_paginated_segment_count_with_missing_predecessor(
+        /*segment_count*/ 4, /*remove_projected_predecessor*/ true,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn indexed_paginated_cursor_pages_never_open_projected_predecessors() {
+    assert_indexed_cursor_pages_ignore_missing_predecessors(ThreadHistoryMode::Paginated).await;
+}
+
+#[tokio::test]
+async fn indexed_legacy_cursor_pages_never_open_projected_predecessors() {
+    assert_indexed_cursor_pages_ignore_missing_predecessors(ThreadHistoryMode::Legacy).await;
+}
+
+async fn assert_indexed_cursor_pages_ignore_missing_predecessors(history_mode: ThreadHistoryMode) {
+    const SEGMENT_COUNT: usize = 65;
+    const TURN_COUNT: usize = 6;
+
+    let (home, store, thread_id) = store_with_mode(history_mode).await;
+    let active_path = write_projected_same_thread_segments_with_mode(
+        home.path(),
+        thread_id,
+        SEGMENT_COUNT,
+        history_mode,
+    );
+    let db = history_db(&store).await;
+    let next_ordinal = i64::try_from(SEGMENT_COUNT).expect("segment count fits ordinal") * 4;
+
+    sqlx::query(
+        "INSERT INTO thread_history_projection_state (thread_id, next_rollout_byte_offset, next_rollout_ordinal) VALUES (?, ?, ?)",
+    )
+    .bind(thread_id.to_string())
+    .bind(
+        i64::try_from(
+            fs::metadata(active_path.as_path())
+                .expect("active segment metadata")
+                .len(),
+        )
+        .expect("active segment length fits SQLite integer"),
+    )
+    .bind(next_ordinal)
+    .execute(db)
+    .await
+    .expect("seed current projected history");
+
+    for index in 0..TURN_COUNT {
+        let segment_index = SEGMENT_COUNT - TURN_COUNT + index;
+        let ordinal = i64::try_from(segment_index).expect("turn segment fits ordinal") * 4;
+        let turn_id = format!("turn-{index}");
+        let user_id = format!("user-{index}");
+        let agent_id = format!("agent-{index}");
+        insert_turn(
+            db,
+            thread_id,
+            turn_id.as_str(),
+            ordinal,
+            "completed",
+            /*error_json*/ None,
+            Some(user_id.as_str()),
+            Some(agent_id.as_str()),
+        )
+        .await;
+        insert_item(
+            db,
+            thread_id,
+            turn_id.as_str(),
+            user_id.as_str(),
+            ordinal + 1,
+        )
+        .await;
+        insert_item(
+            db,
+            thread_id,
+            turn_id.as_str(),
+            agent_id.as_str(),
+            ordinal + 2,
+        )
+        .await;
+    }
+
+    let immutable_directory = home
+        .path()
+        .join(codex_rollout::ROTATED_ROLLOUT_SEGMENTS_SUBDIR)
+        .join(thread_id.to_string());
+    let mut deleted_predecessors = 0;
+    for segment in fs::read_dir(immutable_directory).expect("list immutable predecessor segments") {
+        let segment = segment.expect("read immutable segment directory");
+        fs::remove_file(segment.path().join("segment.jsonl"))
+            .expect("remove already projected immutable predecessor");
+        deleted_predecessors += 1;
+    }
+    assert_eq!(deleted_predecessors, SEGMENT_COUNT - 1);
+    assert!(
+        store.resolve_rollout_lineage(thread_id).await.is_err(),
+        "the deleted predecessors must reject any complete physical lineage traversal"
+    );
+
+    let first_turn_page = indexed_projected_turn_page(
+        &store,
+        history_mode,
+        turn_params(
+            thread_id,
+            /*cursor*/ None,
+            /*page_size*/ 2,
+            SortDirection::Desc,
+            StoredTurnItemsView::Summary,
+        ),
+    )
+    .await;
+    assert_eq!(turn_ids(&first_turn_page), vec!["turn-5", "turn-4"]);
+    assert_eq!(
+        first_turn_page.turns[0].items,
+        vec![
+            expected_item("turn-5", "user-5", /*rollout_ordinal*/ 257),
+            expected_item("turn-5", "agent-5", /*rollout_ordinal*/ 258),
+        ]
+    );
+
+    let older_turn_page = indexed_projected_turn_page(
+        &store,
+        history_mode,
+        turn_params(
+            thread_id,
+            first_turn_page.next_cursor,
+            /*page_size*/ 2,
+            SortDirection::Desc,
+            StoredTurnItemsView::NotLoaded,
+        ),
+    )
+    .await;
+    assert_eq!(turn_ids(&older_turn_page), vec!["turn-3", "turn-2"]);
+    assert!(older_turn_page.turns[0].items.is_empty());
+
+    let oldest_turn_page = indexed_projected_turn_page(
+        &store,
+        history_mode,
+        turn_params(
+            thread_id,
+            older_turn_page.next_cursor.clone(),
+            /*page_size*/ 2,
+            SortDirection::Desc,
+            StoredTurnItemsView::Summary,
+        ),
+    )
+    .await;
+    assert_eq!(turn_ids(&oldest_turn_page), vec!["turn-1", "turn-0"]);
+    assert!(oldest_turn_page.next_cursor.is_none());
+
+    let backwards_turn_page = indexed_projected_turn_page(
+        &store,
+        history_mode,
+        turn_params(
+            thread_id,
+            older_turn_page.backwards_cursor,
+            /*page_size*/ 2,
+            SortDirection::Asc,
+            StoredTurnItemsView::NotLoaded,
+        ),
+    )
+    .await;
+    assert_eq!(turn_ids(&backwards_turn_page), vec!["turn-3", "turn-4"]);
+
+    let first_item_page = indexed_projected_item_page(
+        &store,
+        history_mode,
+        item_params(
+            thread_id,
+            /*turn_id*/ None,
+            /*cursor*/ None,
+            /*page_size*/ 3,
+            SortDirection::Asc,
+        ),
+    )
+    .await;
+    assert_eq!(
+        item_ids(&first_item_page),
+        vec!["user-0", "agent-0", "user-1"]
+    );
+
+    let second_item_page = indexed_projected_item_page(
+        &store,
+        history_mode,
+        item_params(
+            thread_id,
+            /*turn_id*/ None,
+            first_item_page.next_cursor,
+            /*page_size*/ 3,
+            SortDirection::Asc,
+        ),
+    )
+    .await;
+    assert_eq!(
+        item_ids(&second_item_page),
+        vec!["agent-1", "user-2", "agent-2"]
+    );
+
+    let backwards_item_page = indexed_projected_item_page(
+        &store,
+        history_mode,
+        item_params(
+            thread_id,
+            /*turn_id*/ None,
+            second_item_page.backwards_cursor,
+            /*page_size*/ 3,
+            SortDirection::Desc,
+        ),
+    )
+    .await;
+    assert_eq!(
+        item_ids(&backwards_item_page),
+        vec!["agent-1", "user-1", "agent-0"]
+    );
+
+    let first_turn_items = indexed_projected_item_page(
+        &store,
+        history_mode,
+        item_params(
+            thread_id,
+            Some("turn-4"),
+            /*cursor*/ None,
+            /*page_size*/ 1,
+            SortDirection::Asc,
+        ),
+    )
+    .await;
+    assert_eq!(item_ids(&first_turn_items), vec!["user-4"]);
+
+    let second_turn_items = indexed_projected_item_page(
+        &store,
+        history_mode,
+        item_params(
+            thread_id,
+            Some("turn-4"),
+            first_turn_items.next_cursor,
+            /*page_size*/ 1,
+            SortDirection::Asc,
+        ),
+    )
+    .await;
+    assert_eq!(item_ids(&second_turn_items), vec!["agent-4"]);
+    assert!(second_turn_items.next_cursor.is_none());
+
+    if history_mode == ThreadHistoryMode::Legacy {
+        let latest_turn_page = list_segmented_legacy_turns(
+            &store,
+            turn_params(
+                thread_id,
+                /*cursor*/ None,
+                /*page_size*/ 1,
+                SortDirection::Desc,
+                StoredTurnItemsView::Summary,
+            ),
+        )
+        .await
+        .expect("read current indexed legacy projection")
+        .expect("complete legacy projection remains available");
+        assert_eq!(turn_ids(&latest_turn_page), vec!["turn-5"]);
+    }
+
+    fs::OpenOptions::new()
+        .append(true)
+        .open(active_path.as_path())
+        .expect("open active projected segment")
+        .write_all(b"\n")
+        .expect("invalidate active projection checkpoint");
+
+    let params = turn_params(
+        thread_id,
+        /*cursor*/ None,
+        /*page_size*/ 1,
+        SortDirection::Desc,
+        StoredTurnItemsView::Summary,
+    );
+    match history_mode {
+        ThreadHistoryMode::Paginated => {
+            let error = store
+                .list_turns(params)
+                .await
+                .expect_err("stale paginated projection must inspect the missing predecessor");
+            assert!(
+                error.to_string().contains("rollout reference")
+                    || error.to_string().contains("referenced rollout"),
+                "stale paginated projection must reject missing immutable history: {error}"
+            );
+        }
+        ThreadHistoryMode::Legacy => {
+            let page = list_existing_segmented_legacy_turns(&store, params)
+                .await
+                .expect("inspect stale legacy projection");
+            assert!(
+                page.is_none(),
+                "a stale legacy projection must not expose outdated indexed turns"
+            );
+        }
+    }
+}
+
+async fn indexed_projected_turn_page(
+    store: &LocalThreadStore,
+    history_mode: ThreadHistoryMode,
+    params: ListTurnsParams,
+) -> TurnPage {
+    match history_mode {
+        ThreadHistoryMode::Paginated => store
+            .list_turns(params)
+            .await
+            .expect("read projected paginated turn page"),
+        ThreadHistoryMode::Legacy => list_existing_segmented_legacy_turns(store, params)
+            .await
+            .expect("read projected legacy turn page")
+            .expect("complete legacy projection remains available"),
+    }
+}
+
+async fn indexed_projected_item_page(
+    store: &LocalThreadStore,
+    history_mode: ThreadHistoryMode,
+    params: ListItemsParams,
+) -> ItemPage {
+    match history_mode {
+        ThreadHistoryMode::Paginated => store
+            .list_items(params)
+            .await
+            .expect("read projected paginated item page"),
+        ThreadHistoryMode::Legacy => list_segmented_legacy_items(store, params)
+            .await
+            .expect("read projected legacy item page")
+            .expect("complete legacy projection remains available"),
+    }
+}
+
+async fn assert_indexed_paginated_segment_count(segment_count: usize) {
+    assert_indexed_paginated_segment_count_with_missing_predecessor(
+        segment_count,
+        /*remove_projected_predecessor*/ false,
+    )
+    .await;
+}
+
+async fn assert_indexed_paginated_segment_count_with_missing_predecessor(
+    segment_count: usize,
+    remove_projected_predecessor: bool,
+) {
+    let (home, store, thread_id) = store_with_mode(ThreadHistoryMode::Paginated).await;
+    let active_path = write_projected_same_thread_segments(home.path(), thread_id, segment_count);
+    let db = history_db(&store).await;
+    let newest_ordinal = i64::try_from(segment_count).expect("segment count fits ordinal") * 4;
+
+    insert_turn(
+        db,
+        thread_id,
+        "newest-turn",
+        newest_ordinal,
+        "completed",
+        /*error_json*/ None,
+        Some("newest-user"),
+        Some("newest-agent"),
+    )
+    .await;
+    insert_item(
+        db,
+        thread_id,
+        "newest-turn",
+        "newest-user",
+        newest_ordinal + 1,
+    )
+    .await;
+    insert_item(
+        db,
+        thread_id,
+        "newest-turn",
+        "newest-agent",
+        newest_ordinal + 2,
+    )
+    .await;
+    sqlx::query(
+        "INSERT INTO thread_history_projection_state (thread_id, next_rollout_byte_offset, next_rollout_ordinal) VALUES (?, ?, ?)",
+    )
+    .bind(thread_id.to_string())
+    .bind(
+        i64::try_from(
+            fs::metadata(active_path.as_path())
+                .expect("active metadata")
+                .len(),
+        )
+        .expect("byte offset"),
+    )
+    .bind(newest_ordinal + 3)
+    .execute(db)
+    .await
+    .expect("seed current projection checkpoint");
+
+    if remove_projected_predecessor {
+        let segment_directory = fs::read_dir(
+            home.path()
+                .join(codex_rollout::ROTATED_ROLLOUT_SEGMENTS_SUBDIR)
+                .join(thread_id.to_string()),
+        )
+        .expect("list projected immutable segments")
+        .next()
+        .expect("projected immutable predecessor")
+        .expect("read projected immutable predecessor")
+        .path();
+        fs::remove_file(segment_directory.join("segment.jsonl"))
+            .expect("remove already projected immutable predecessor");
+    }
+
+    assert!(
+        store
+            .has_history_projection(thread_id)
+            .await
+            .expect("indexed same-thread history projection"),
+        "an indexed projected thread must not resolve all immutable predecessors"
+    );
+
+    let turns = store
+        .list_turns(turn_params(
+            thread_id,
+            /*cursor*/ None,
+            /*page_size*/ 1,
+            SortDirection::Desc,
+            StoredTurnItemsView::Summary,
+        ))
+        .await
+        .expect("indexed latest turn beyond the physical segment limit");
+    assert_eq!(turn_ids(&turns), vec!["newest-turn"]);
+    assert_eq!(turns.turns[0].items.len(), 2);
+
+    let items = store
+        .list_items(item_params(
+            thread_id,
+            Some("newest-turn"),
+            /*cursor*/ None,
+            /*page_size*/ 2,
+            SortDirection::Asc,
+        ))
+        .await
+        .expect("indexed latest items beyond the physical segment limit");
+    assert_eq!(item_ids(&items), vec!["newest-user", "newest-agent"]);
+
+    if remove_projected_predecessor {
+        fs::OpenOptions::new()
+            .append(true)
+            .open(active_path.as_path())
+            .expect("open active projected segment")
+            .write_all(b"\n")
+            .expect("invalidate active projection checkpoint");
+        let error = store
+            .list_turns(turn_params(
+                thread_id,
+                /*cursor*/ None,
+                /*page_size*/ 1,
+                SortDirection::Desc,
+                StoredTurnItemsView::Summary,
+            ))
+            .await
+            .expect_err("stale projection must validate the missing immutable predecessor");
+        assert!(
+            error.to_string().contains("rollout reference")
+                || error.to_string().contains("referenced rollout"),
+            "stale projected history must reject missing immutable predecessors: {error}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -812,6 +1299,272 @@ async fn list_items_update_ordinals_use_selected_rollout_id() {
 }
 
 #[tokio::test]
+async fn cursors_are_bound_to_the_selected_rollout_generation() {
+    let (home, store, thread_id) = store_with_mode(ThreadHistoryMode::Paginated).await;
+    let first_rollout_id = ThreadId::new();
+    let second_rollout_id = ThreadId::new();
+    let first_path = selected_rollout_path(home.path(), thread_id, first_rollout_id);
+    let second_path = selected_rollout_path(home.path(), thread_id, second_rollout_id);
+    write_rollout(first_path.as_path(), thread_id, /*history_base*/ None);
+    write_rollout(second_path.as_path(), thread_id, /*history_base*/ None);
+    select_rollout_path(&store, thread_id, first_path).await;
+
+    let db = history_db(&store).await;
+    for (rollout_id, prefix) in [(first_rollout_id, "first"), (second_rollout_id, "second")] {
+        for (index, ordinal) in [(1, 10), (2, 20)] {
+            let turn_id = format!("{prefix}-turn-{index}");
+            let item_id = format!("{prefix}-item-{index}");
+            insert_turn(
+                db,
+                rollout_id,
+                turn_id.as_str(),
+                ordinal,
+                "completed",
+                /*error_json*/ None,
+                Some(item_id.as_str()),
+                /*final_agent_item_id*/ None,
+            )
+            .await;
+            insert_item(
+                db,
+                rollout_id,
+                turn_id.as_str(),
+                item_id.as_str(),
+                ordinal + 1,
+            )
+            .await;
+        }
+    }
+
+    let first_turn_page = store
+        .list_turns(turn_params(
+            thread_id,
+            /*cursor*/ None,
+            /*page_size*/ 1,
+            SortDirection::Asc,
+            StoredTurnItemsView::NotLoaded,
+        ))
+        .await
+        .expect("first-generation turn page");
+    let first_item_page = store
+        .list_items(item_params(
+            thread_id,
+            /*turn_id*/ None,
+            /*cursor*/ None,
+            /*page_size*/ 1,
+            SortDirection::Asc,
+        ))
+        .await
+        .expect("first-generation item page");
+    let first_updated_item_page = store
+        .list_items(ListItemsParams {
+            page_size: 1,
+            ..updated_item_params(thread_id, /*after_updated_at_ordinal*/ 0)
+        })
+        .await
+        .expect("first-generation updated-item page");
+    let first_search_page = store
+        .search_thread_occurrences(SearchThreadOccurrencesParams {
+            thread_id,
+            search_term: "item".to_string(),
+            cursor: None,
+            page_size: 1,
+        })
+        .await
+        .expect("first-generation search page");
+
+    let first_turn_next = first_turn_page
+        .next_cursor
+        .clone()
+        .expect("first turn page should continue");
+    let decoded: HistoryCursor =
+        serde_json::from_str(first_turn_next.as_str()).expect("decode generated history cursor");
+    assert_eq!(decoded.requested_thread_id, thread_id);
+    assert_eq!(decoded.root_rollout_id, first_rollout_id);
+    let first_search_next = first_search_page
+        .next_cursor
+        .clone()
+        .expect("first search page should continue");
+    let search_cursor_json = serde_json::from_str::<serde_json::Value>(first_search_next.as_str())
+        .expect("decode generated search cursor");
+    assert_eq!(
+        search_cursor_json
+            .get("threadId")
+            .and_then(|value| value.as_str()),
+        Some(thread_id.to_string().as_str())
+    );
+    assert_eq!(
+        search_cursor_json
+            .get("rootRolloutId")
+            .and_then(|value| value.as_str()),
+        Some(first_rollout_id.to_string().as_str())
+    );
+
+    // Appending under one selected rollout does not change its cursor generation.
+    insert_turn(
+        db,
+        first_rollout_id,
+        "first-turn-3",
+        30,
+        "completed",
+        /*error_json*/ None,
+        /*first_user_item_id*/ None,
+        /*final_agent_item_id*/ None,
+    )
+    .await;
+    let continued_first_generation = store
+        .list_turns(turn_params(
+            thread_id,
+            Some(first_turn_next.clone()),
+            /*page_size*/ 3,
+            SortDirection::Asc,
+            StoredTurnItemsView::NotLoaded,
+        ))
+        .await
+        .expect("same-generation cursor should survive append");
+    assert_eq!(
+        turn_ids(&continued_first_generation),
+        vec!["first-turn-2", "first-turn-3"]
+    );
+
+    let mut history_cursors = vec![
+        first_turn_next,
+        first_turn_page
+            .backwards_cursor
+            .expect("turn backwards cursor"),
+        first_item_page.next_cursor.expect("item next cursor"),
+        first_item_page
+            .backwards_cursor
+            .expect("item backwards cursor"),
+        first_updated_item_page
+            .next_cursor
+            .expect("updated-item next cursor"),
+        first_updated_item_page
+            .backwards_cursor
+            .expect("updated-item backwards cursor"),
+        first_search_page.items[0].turn_cursor.clone(),
+    ];
+    let missing_generation_cursor = {
+        let mut value = serde_json::to_value(&decoded).expect("encode history cursor");
+        value
+            .as_object_mut()
+            .expect("history cursor object")
+            .remove("rootRolloutId");
+        serde_json::to_string(&value).expect("encode pre-generation cursor")
+    };
+    let error = store
+        .list_turns(turn_params(
+            thread_id,
+            Some(missing_generation_cursor),
+            /*page_size*/ 1,
+            SortDirection::Asc,
+            StoredTurnItemsView::NotLoaded,
+        ))
+        .await
+        .expect_err("cursor without rollout generation must fail closed");
+    assert!(matches!(error, ThreadStoreError::InvalidRequest { .. }));
+    let missing_search_generation_cursor = {
+        let mut value = search_cursor_json;
+        value
+            .as_object_mut()
+            .expect("search cursor object")
+            .remove("rootRolloutId");
+        serde_json::to_string(&value).expect("encode pre-generation search cursor")
+    };
+    let error = store
+        .search_thread_occurrences(SearchThreadOccurrencesParams {
+            thread_id,
+            search_term: "item".to_string(),
+            cursor: Some(missing_search_generation_cursor),
+            page_size: 1,
+        })
+        .await
+        .expect_err("search cursor without rollout generation must fail closed");
+    assert!(matches!(error, ThreadStoreError::InvalidRequest { .. }));
+
+    select_rollout_path(&store, thread_id, second_path).await;
+
+    for cursor in history_cursors.drain(..2) {
+        let error = store
+            .list_turns(turn_params(
+                thread_id,
+                Some(cursor),
+                /*page_size*/ 1,
+                SortDirection::Asc,
+                StoredTurnItemsView::NotLoaded,
+            ))
+            .await
+            .expect_err("turn cursor from replaced rollout must fail");
+        assert!(matches!(error, ThreadStoreError::InvalidRequest { .. }));
+    }
+    for cursor in history_cursors.drain(..2) {
+        let error = store
+            .list_items(item_params(
+                thread_id,
+                /*turn_id*/ None,
+                Some(cursor),
+                /*page_size*/ 1,
+                SortDirection::Asc,
+            ))
+            .await
+            .expect_err("item cursor from replaced rollout must fail");
+        assert!(matches!(error, ThreadStoreError::InvalidRequest { .. }));
+    }
+    for cursor in history_cursors.drain(..2) {
+        let error = store
+            .list_items(ListItemsParams {
+                cursor: Some(cursor),
+                page_size: 1,
+                ..updated_item_params(thread_id, /*after_updated_at_ordinal*/ 0)
+            })
+            .await
+            .expect_err("updated-item cursor from replaced rollout must fail");
+        assert!(matches!(error, ThreadStoreError::InvalidRequest { .. }));
+    }
+    let error = store
+        .list_turns(turn_params(
+            thread_id,
+            history_cursors.pop(),
+            /*page_size*/ 1,
+            SortDirection::Asc,
+            StoredTurnItemsView::NotLoaded,
+        ))
+        .await
+        .expect_err("search turn cursor from replaced rollout must fail");
+    assert!(matches!(error, ThreadStoreError::InvalidRequest { .. }));
+    let error = store
+        .search_thread_occurrences(SearchThreadOccurrencesParams {
+            thread_id,
+            search_term: "item".to_string(),
+            cursor: Some(first_search_next),
+            page_size: 1,
+        })
+        .await
+        .expect_err("search cursor from replaced rollout must fail");
+    assert!(matches!(error, ThreadStoreError::InvalidRequest { .. }));
+    let second_turn_page = store
+        .list_turns(turn_params(
+            thread_id,
+            /*cursor*/ None,
+            /*page_size*/ 1,
+            SortDirection::Asc,
+            StoredTurnItemsView::NotLoaded,
+        ))
+        .await
+        .expect("fresh second-generation cursor");
+    assert_eq!(turn_ids(&second_turn_page), vec!["second-turn-1"]);
+    let second_cursor: HistoryCursor = serde_json::from_str(
+        second_turn_page
+            .next_cursor
+            .as_deref()
+            .expect("second generation should continue"),
+    )
+    .expect("decode second-generation cursor");
+    assert_eq!(second_cursor.requested_thread_id, thread_id);
+    assert_eq!(second_cursor.root_rollout_id, second_rollout_id);
+}
+
+#[tokio::test]
 async fn list_history_keeps_legacy_threads_unsupported() {
     let (_home, store, thread_id) = store_with_mode(ThreadHistoryMode::Legacy).await;
 
@@ -848,6 +1601,823 @@ async fn list_history_keeps_legacy_threads_unsupported() {
             operation: "list_turns"
         }
     ));
+}
+
+#[tokio::test]
+async fn segmented_legacy_reads_without_projection_return_none() {
+    let (_home, store, thread_id) = store_with_mode(ThreadHistoryMode::Legacy).await;
+
+    let turns = list_segmented_legacy_turns(
+        &store,
+        turn_params(
+            thread_id,
+            /*cursor*/ None,
+            /*page_size*/ 2,
+            SortDirection::Desc,
+            StoredTurnItemsView::Summary,
+        ),
+    )
+    .await
+    .expect("check for existing legacy turn projection");
+    assert!(turns.is_none());
+
+    let items = list_segmented_legacy_items(
+        &store,
+        item_params(
+            thread_id,
+            /*turn_id*/ None,
+            /*cursor*/ None,
+            /*page_size*/ 2,
+            SortDirection::Desc,
+        ),
+    )
+    .await
+    .expect("check for existing legacy item projection");
+    assert!(items.is_none());
+    assert!(
+        !tokio::fs::try_exists(store.config.sqlite.thread_history_db_path())
+            .await
+            .expect("inspect history database path"),
+        "checking for a legacy projection must not create a history database"
+    );
+}
+
+#[tokio::test]
+async fn segmented_legacy_projection_preserves_legacy_turn_cursors() {
+    let (home, store, thread_id) = store_with_mode(ThreadHistoryMode::Legacy).await;
+    let rollout_len = write_segmented_legacy_rollout(home.path(), thread_id);
+    let db = history_db(&store).await;
+    sqlx::query(
+        "INSERT INTO thread_history_projection_state (thread_id, next_rollout_byte_offset, next_rollout_ordinal) VALUES (?, ?, ?)",
+    )
+    .bind(thread_id.to_string())
+    .bind(i64::try_from(rollout_len).expect("rollout length fits SQLite integer"))
+    .bind(100_i64)
+    .execute(db)
+    .await
+    .expect("insert legacy projection state");
+
+    for index in 1_i64..=5 {
+        let turn_id = format!("turn-{index}");
+        let user_id = format!("user-{index}");
+        let agent_id = format!("agent-{index}");
+        let ordinal = index * 10;
+        insert_turn(
+            db,
+            thread_id,
+            turn_id.as_str(),
+            ordinal,
+            "completed",
+            /*error_json*/ None,
+            Some(user_id.as_str()),
+            Some(agent_id.as_str()),
+        )
+        .await;
+        insert_item(
+            db,
+            thread_id,
+            turn_id.as_str(),
+            user_id.as_str(),
+            ordinal + 1,
+        )
+        .await;
+        insert_item(
+            db,
+            thread_id,
+            turn_id.as_str(),
+            agent_id.as_str(),
+            ordinal + 2,
+        )
+        .await;
+    }
+    insert_turn(
+        db,
+        thread_id,
+        "rollout-45",
+        /*rollout_ordinal*/ 45,
+        "completed",
+        /*error_json*/ None,
+        /*first_user_item_id*/ None,
+        /*final_agent_item_id*/ None,
+    )
+    .await;
+
+    let first_page = list_segmented_legacy_turns(
+        &store,
+        turn_params(
+            thread_id,
+            /*cursor*/ None,
+            /*page_size*/ 2,
+            SortDirection::Desc,
+            StoredTurnItemsView::Summary,
+        ),
+    )
+    .await
+    .expect("read indexed legacy first page")
+    .expect("legacy projection exists");
+    assert_eq!(turn_ids(&first_page), vec!["turn-5", "turn-4"]);
+    assert_eq!(
+        first_page.turns[0].items,
+        vec![
+            expected_item("turn-5", "user-5", /*rollout_ordinal*/ 51),
+            expected_item("turn-5", "agent-5", /*rollout_ordinal*/ 52),
+        ]
+    );
+
+    let next_cursor = first_page
+        .next_cursor
+        .expect("indexed first page has older turns");
+    let cursor = serde_json::from_str::<serde_json::Value>(&next_cursor)
+        .expect("parse public legacy turn cursor");
+    let fields = cursor.as_object().expect("legacy cursor is an object");
+    assert_eq!(fields.len(), 2);
+    assert!(fields.contains_key("turnId"));
+    assert!(fields.contains_key("includeAnchor"));
+
+    let second_page = list_segmented_legacy_turns(
+        &store,
+        turn_params(
+            thread_id,
+            Some(next_cursor),
+            /*page_size*/ 2,
+            SortDirection::Desc,
+            StoredTurnItemsView::NotLoaded,
+        ),
+    )
+    .await
+    .expect("read indexed legacy second page")
+    .expect("legacy projection exists");
+    assert_eq!(turn_ids(&second_page), vec!["turn-3", "turn-2"]);
+    assert!(second_page.turns[0].items.is_empty());
+
+    let backwards_page = list_segmented_legacy_turns(
+        &store,
+        turn_params(
+            thread_id,
+            second_page.backwards_cursor,
+            /*page_size*/ 2,
+            SortDirection::Asc,
+            StoredTurnItemsView::NotLoaded,
+        ),
+    )
+    .await
+    .expect("read indexed legacy backwards page")
+    .expect("legacy projection exists");
+    assert_eq!(turn_ids(&backwards_page), vec!["turn-3", "turn-4"]);
+}
+
+#[tokio::test]
+async fn segmented_legacy_projection_pages_full_turn_items() {
+    let (home, store, thread_id) = store_with_mode(ThreadHistoryMode::Legacy).await;
+    let rollout_len = write_segmented_legacy_rollout(home.path(), thread_id);
+    let db = history_db(&store).await;
+    sqlx::query(
+        "INSERT INTO thread_history_projection_state (thread_id, next_rollout_byte_offset, next_rollout_ordinal) VALUES (?, ?, ?)",
+    )
+    .bind(thread_id.to_string())
+    .bind(i64::try_from(rollout_len).expect("rollout length fits SQLite integer"))
+    .bind(100_i64)
+    .execute(db)
+    .await
+    .expect("insert legacy projection state");
+    insert_turn(
+        db,
+        thread_id,
+        "turn-1",
+        /*rollout_ordinal*/ 10,
+        "completed",
+        /*error_json*/ None,
+        /*first_user_item_id*/ None,
+        /*final_agent_item_id*/ None,
+    )
+    .await;
+    for (item_id, ordinal) in [("item-1", 11), ("item-2", 12), ("item-3", 13)] {
+        insert_item(db, thread_id, "turn-1", item_id, ordinal).await;
+    }
+
+    let first_page = list_segmented_legacy_items(
+        &store,
+        item_params(
+            thread_id,
+            Some("turn-1"),
+            /*cursor*/ None,
+            /*page_size*/ 2,
+            SortDirection::Asc,
+        ),
+    )
+    .await
+    .expect("read indexed legacy turn items")
+    .expect("legacy projection exists");
+    assert_eq!(item_ids(&first_page), vec!["item-1", "item-2"]);
+
+    let second_page = list_segmented_legacy_items(
+        &store,
+        item_params(
+            thread_id,
+            Some("turn-1"),
+            first_page.next_cursor,
+            /*page_size*/ 2,
+            SortDirection::Asc,
+        ),
+    )
+    .await
+    .expect("read indexed legacy remaining turn items")
+    .expect("legacy projection exists");
+    assert_eq!(item_ids(&second_page), vec!["item-3"]);
+}
+
+#[tokio::test]
+async fn segmented_legacy_summary_uses_last_agent_message_after_final_answer() {
+    let (home, store, thread_id) = store_with_mode(ThreadHistoryMode::Legacy).await;
+    let rollout_len = write_segmented_legacy_rollout(home.path(), thread_id);
+    let db = history_db(&store).await;
+    sqlx::query(
+        "INSERT INTO thread_history_projection_state (thread_id, next_rollout_byte_offset, next_rollout_ordinal) VALUES (?, ?, ?)",
+    )
+    .bind(thread_id.to_string())
+    .bind(i64::try_from(rollout_len).expect("rollout length fits SQLite integer"))
+    .bind(100_i64)
+    .execute(db)
+    .await
+    .expect("insert current legacy projection state");
+    insert_turn(
+        db,
+        thread_id,
+        "turn-1",
+        /*rollout_ordinal*/ 10,
+        "completed",
+        /*error_json*/ None,
+        Some("user-1"),
+        Some("agent-final"),
+    )
+    .await;
+    for (item_id, ordinal) in [
+        ("user-1", 11),
+        ("agent-final", 12),
+        ("agent-commentary", 13),
+    ] {
+        insert_item(db, thread_id, "turn-1", item_id, ordinal).await;
+    }
+
+    let page = list_segmented_legacy_turns(
+        &store,
+        turn_params(
+            thread_id,
+            /*cursor*/ None,
+            /*page_size*/ 1,
+            SortDirection::Desc,
+            StoredTurnItemsView::Summary,
+        ),
+    )
+    .await
+    .expect("read completed legacy turn summary")
+    .expect("current legacy projection exists");
+    let summary_ids = page.turns[0]
+        .items
+        .iter()
+        .map(|item| item.item_id.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(summary_ids, vec!["user-1", "agent-commentary"]);
+}
+
+#[tokio::test]
+async fn segmented_legacy_reads_reject_stale_projection_offsets() {
+    let (home, store, thread_id) = store_with_mode(ThreadHistoryMode::Legacy).await;
+    write_segmented_legacy_rollout(home.path(), thread_id);
+    let rollout_len = append_segmented_legacy_turn(home.path(), thread_id, "turn-1");
+    let db = history_db(&store).await;
+    sqlx::query(
+        "INSERT INTO thread_history_projection_state (thread_id, next_rollout_byte_offset, next_rollout_ordinal) VALUES (?, ?, ?)",
+    )
+    .bind(thread_id.to_string())
+    .bind(i64::try_from(rollout_len - 1).expect("rollout length fits SQLite integer"))
+    .bind(100_i64)
+    .execute(db)
+    .await
+    .expect("insert stale legacy projection state");
+    insert_turn(
+        db,
+        thread_id,
+        "turn-1",
+        /*rollout_ordinal*/ 10,
+        "completed",
+        /*error_json*/ None,
+        /*first_user_item_id*/ None,
+        /*final_agent_item_id*/ None,
+    )
+    .await;
+
+    let turns = list_existing_segmented_legacy_turns(
+        &store,
+        turn_params(
+            thread_id,
+            /*cursor*/ None,
+            /*page_size*/ 1,
+            SortDirection::Desc,
+            StoredTurnItemsView::Summary,
+        ),
+    )
+    .await
+    .expect("inspect stale legacy projection");
+    assert!(
+        turns.is_none(),
+        "a projection behind the active rollout must use canonical history"
+    );
+
+    let turns = list_segmented_legacy_turns(
+        &store,
+        turn_params(
+            thread_id,
+            /*cursor*/ None,
+            /*page_size*/ 1,
+            SortDirection::Desc,
+            StoredTurnItemsView::Summary,
+        ),
+    )
+    .await
+    .expect("recover stale legacy projection")
+    .expect("recovered legacy projection exists");
+    assert_eq!(turn_ids(&turns), vec!["turn-1"]);
+    let projected_offset = sqlx::query_scalar::<_, i64>(
+        "SELECT next_rollout_byte_offset FROM thread_history_projection_state WHERE thread_id = ?",
+    )
+    .bind(thread_id.to_string())
+    .fetch_one(db)
+    .await
+    .expect("read recovered legacy projection state");
+    assert_eq!(projected_offset, i64::try_from(rollout_len).unwrap());
+}
+
+#[tokio::test]
+async fn segmented_legacy_reads_reject_interrupted_backfill_until_projection_is_current() {
+    let (home, store, thread_id) = store_with_mode(ThreadHistoryMode::Legacy).await;
+    write_segmented_legacy_rollout(home.path(), thread_id);
+    let rollout_len = append_segmented_legacy_turn(home.path(), thread_id, "turn-1");
+    let db = history_db(&store).await;
+    sqlx::query(
+        "INSERT INTO thread_history_projection_state (thread_id, next_rollout_byte_offset, next_rollout_ordinal) VALUES (?, ?, ?)",
+    )
+    .bind(thread_id.to_string())
+    .bind(i64::MAX)
+    .bind(100_i64)
+    .execute(db)
+    .await
+    .expect("insert interrupted legacy projection state");
+    insert_turn(
+        db,
+        thread_id,
+        "turn-1",
+        /*rollout_ordinal*/ 10,
+        "completed",
+        /*error_json*/ None,
+        Some("item-1"),
+        /*final_agent_item_id*/ None,
+    )
+    .await;
+    insert_item(
+        db, thread_id, "turn-1", "item-1", /*rollout_ordinal*/ 11,
+    )
+    .await;
+
+    let turns = list_existing_segmented_legacy_turns(
+        &store,
+        turn_params(
+            thread_id,
+            /*cursor*/ None,
+            /*page_size*/ 1,
+            SortDirection::Desc,
+            StoredTurnItemsView::Summary,
+        ),
+    )
+    .await
+    .expect("inspect interrupted legacy projection");
+    assert!(
+        turns.is_none(),
+        "interrupted backfill must not expose partial turns"
+    );
+
+    let turns = list_segmented_legacy_turns(
+        &store,
+        turn_params(
+            thread_id,
+            /*cursor*/ None,
+            /*page_size*/ 1,
+            SortDirection::Desc,
+            StoredTurnItemsView::Summary,
+        ),
+    )
+    .await
+    .expect("read completed legacy projection")
+    .expect("completed projection must expose indexed turns");
+    assert_eq!(turn_ids(&turns), vec!["turn-1"]);
+
+    let items = list_segmented_legacy_items(
+        &store,
+        item_params(
+            thread_id,
+            Some("turn-1"),
+            /*cursor*/ None,
+            /*page_size*/ 1,
+            SortDirection::Asc,
+        ),
+    )
+    .await
+    .expect("read recovered legacy item projection")
+    .expect("recovered projection must expose indexed items");
+    assert_eq!(item_ids(&items), vec!["item-1"]);
+
+    let projected_offset = sqlx::query_scalar::<_, i64>(
+        "SELECT next_rollout_byte_offset FROM thread_history_projection_state WHERE thread_id = ?",
+    )
+    .bind(thread_id.to_string())
+    .fetch_one(db)
+    .await
+    .expect("read recovered legacy projection state");
+    assert_eq!(projected_offset, i64::try_from(rollout_len).unwrap());
+}
+
+#[tokio::test]
+async fn segmented_legacy_reads_accept_historical_fork_and_parent_metadata() {
+    for (forked_from_id, parent_thread_id) in [
+        (Some(ThreadId::new()), None),
+        (None, Some(ThreadId::new())),
+        (Some(ThreadId::new()), Some(ThreadId::new())),
+    ] {
+        let (home, store, thread_id) = store_with_mode(ThreadHistoryMode::Legacy).await;
+        let rollout_len = write_segmented_legacy_rollout_with_origin(
+            home.path(),
+            thread_id,
+            /*history_base*/ None,
+            forked_from_id,
+            parent_thread_id,
+        );
+        let db = history_db(&store).await;
+        sqlx::query(
+            "INSERT INTO thread_history_projection_state (thread_id, next_rollout_byte_offset, next_rollout_ordinal) VALUES (?, ?, ?)",
+        )
+        .bind(thread_id.to_string())
+        .bind(i64::try_from(rollout_len).expect("rollout length fits SQLite integer"))
+        .bind(100_i64)
+        .execute(db)
+        .await
+        .expect("insert complete same-thread legacy projection state");
+        insert_turn(
+            db,
+            thread_id,
+            "turn-1",
+            /*rollout_ordinal*/ 10,
+            "completed",
+            /*error_json*/ None,
+            Some("item-1"),
+            /*final_agent_item_id*/ None,
+        )
+        .await;
+        insert_item(
+            db, thread_id, "turn-1", "item-1", /*rollout_ordinal*/ 11,
+        )
+        .await;
+
+        let turns = list_segmented_legacy_turns(
+            &store,
+            turn_params(
+                thread_id,
+                /*cursor*/ None,
+                /*page_size*/ 1,
+                SortDirection::Desc,
+                StoredTurnItemsView::Summary,
+            ),
+        )
+        .await
+        .expect("read indexed history for a historically forked same-thread rollout")
+        .expect("historical origin metadata must not exclude same-thread history");
+        assert_eq!(turn_ids(&turns), vec!["turn-1"]);
+
+        let items = list_segmented_legacy_items(
+            &store,
+            item_params(
+                thread_id,
+                Some("turn-1"),
+                /*cursor*/ None,
+                /*page_size*/ 1,
+                SortDirection::Asc,
+            ),
+        )
+        .await
+        .expect("read items for a historically forked same-thread rollout")
+        .expect("historical origin metadata must not exclude same-thread items");
+        assert_eq!(item_ids(&items), vec!["item-1"]);
+    }
+}
+
+#[tokio::test]
+async fn segmented_legacy_index_preserves_implicit_compaction_only_turn() {
+    let (home, store, thread_id) = store_with_mode(ThreadHistoryMode::Legacy).await;
+    write_segmented_legacy_rollout(home.path(), thread_id);
+    let path = rollout_path(home.path(), thread_id);
+    let session_meta = codex_rollout::read_session_meta_line(path.as_path())
+        .await
+        .expect("read canonical legacy session metadata");
+    let compacted = RolloutItem::Compacted(CompactedItem {
+        message: String::new(),
+        replacement_history: None,
+        mcp_resource_origins: None,
+        window_number: None,
+        first_window_id: None,
+        previous_window_id: None,
+        window_id: None,
+    });
+    let mut file = fs::OpenOptions::new()
+        .append(true)
+        .open(path.as_path())
+        .expect("open segmented legacy rollout");
+    writeln!(
+        file,
+        "{}",
+        serde_json::to_string(&RolloutLine {
+            timestamp: "2026-07-16T00:00:00.000Z".to_string(),
+            ordinal: None,
+            item: compacted.clone(),
+        })
+        .expect("serialize legacy compaction marker")
+    )
+    .expect("append legacy compaction marker");
+    file.flush().expect("flush legacy compaction marker");
+
+    let mut canonical = ThreadHistoryBuilder::new();
+    canonical.handle_rollout_item_with_changes(&RolloutItem::SessionMeta(session_meta));
+    canonical.handle_rollout_item_with_changes(&compacted);
+    let canonical_turns = canonical.finish();
+    assert_eq!(canonical_turns.len(), 1);
+    assert_eq!(canonical_turns[0].id, "rollout-1");
+    assert!(canonical_turns[0].items.is_empty());
+
+    let indexed_turns = list_segmented_legacy_turns(
+        &store,
+        turn_params(
+            thread_id,
+            /*cursor*/ None,
+            /*page_size*/ 1,
+            SortDirection::Desc,
+            StoredTurnItemsView::Summary,
+        ),
+    )
+    .await
+    .expect("read indexed compaction-only legacy history")
+    .expect("compaction-only legacy history must have a complete projection");
+    assert_eq!(
+        turn_ids(&indexed_turns),
+        vec![canonical_turns[0].id.as_str()]
+    );
+    assert!(indexed_turns.turns[0].items.is_empty());
+}
+
+#[tokio::test]
+async fn segmented_legacy_reads_reject_active_cross_thread_rollout_references() {
+    let (home, store, child_id) = store_with_mode(ThreadHistoryMode::Legacy).await;
+    let parent_id = ThreadId::new();
+    write_segmented_legacy_rollout_with_origin(
+        home.path(),
+        child_id,
+        /*history_base*/ None,
+        Some(parent_id),
+        /*parent_thread_id*/ None,
+    );
+    let child_path = rollout_path(home.path(), child_id);
+    let reference = RolloutLine {
+        timestamp: "2026-07-16T00:00:01.000Z".to_string(),
+        ordinal: None,
+        item: RolloutItem::RolloutReference(RolloutReferenceItem {
+            rollout_id: Some(parent_id),
+            rollout_path: rollout_path(home.path(), parent_id),
+            thread_id: Some(parent_id),
+            rollout_timestamp: None,
+            segment_id: None,
+            max_depth: codex_protocol::protocol::DEFAULT_ROLLOUT_REFERENCE_DEPTH,
+            nth_user_message: None,
+            compacted_replacement_history_filter_texts: None,
+        }),
+    };
+    let mut file = fs::OpenOptions::new()
+        .append(true)
+        .open(child_path.as_path())
+        .expect("open forked legacy rollout");
+    writeln!(
+        file,
+        "{}",
+        serde_json::to_string(&reference).expect("serialize inherited rollout reference")
+    )
+    .expect("append inherited rollout reference");
+    file.flush().expect("flush inherited rollout reference");
+    let rollout_len = fs::metadata(child_path.as_path())
+        .expect("read forked legacy rollout length")
+        .len();
+
+    let db = history_db(&store).await;
+    sqlx::query(
+        "INSERT INTO thread_history_projection_state (thread_id, next_rollout_byte_offset, next_rollout_ordinal) VALUES (?, ?, ?)",
+    )
+    .bind(child_id.to_string())
+    .bind(i64::try_from(rollout_len).expect("rollout length fits SQLite integer"))
+    .bind(100_i64)
+    .execute(db)
+    .await
+    .expect("insert complete child projection state");
+    insert_turn(
+        db,
+        parent_id,
+        "parent-turn",
+        /*rollout_ordinal*/ 1,
+        "completed",
+        /*error_json*/ None,
+        Some("parent-item"),
+        /*final_agent_item_id*/ None,
+    )
+    .await;
+    insert_item(
+        db,
+        parent_id,
+        "parent-turn",
+        "parent-item",
+        /*rollout_ordinal*/ 2,
+    )
+    .await;
+
+    let turns = list_existing_segmented_legacy_turns(
+        &store,
+        turn_params(
+            child_id,
+            /*cursor*/ None,
+            /*page_size*/ 1,
+            SortDirection::Desc,
+            StoredTurnItemsView::Summary,
+        ),
+    )
+    .await
+    .expect("inspect inherited legacy turn projection");
+    assert!(
+        turns.is_none(),
+        "child-only rows cannot replace an inherited parent rollout"
+    );
+
+    let items = list_segmented_legacy_items(
+        &store,
+        item_params(
+            child_id,
+            /*turn_id*/ None,
+            /*cursor*/ None,
+            /*page_size*/ 1,
+            SortDirection::Desc,
+        ),
+    )
+    .await
+    .expect("inspect inherited legacy item projection");
+    assert!(items.is_none(), "inherited items remain parent-owned");
+
+    let owners = sqlx::query_scalar::<_, String>(
+        "SELECT thread_id FROM thread_items WHERE item_id = ? ORDER BY thread_id",
+    )
+    .bind("parent-item")
+    .fetch_all(db)
+    .await
+    .expect("inspect inherited item ownership");
+    assert_eq!(owners, vec![parent_id.to_string()]);
+}
+
+#[tokio::test]
+async fn segmented_legacy_reads_reject_cross_thread_history_bases() {
+    let (home, store, thread_id) = store_with_mode(ThreadHistoryMode::Legacy).await;
+    let parent_id = ThreadId::new();
+    let rollout_len = write_segmented_legacy_rollout_with_history_base(
+        home.path(),
+        thread_id,
+        Some(HistoryPosition {
+            thread_id: parent_id,
+            end_ordinal_exclusive: 5,
+            end_byte_offset: 128,
+        }),
+    );
+    let db = history_db(&store).await;
+    insert_turn(
+        db,
+        parent_id,
+        "parent-turn",
+        /*rollout_ordinal*/ 1,
+        "completed",
+        /*error_json*/ None,
+        Some("parent-item"),
+        /*final_agent_item_id*/ None,
+    )
+    .await;
+    insert_item(
+        db,
+        parent_id,
+        "parent-turn",
+        "parent-item",
+        /*rollout_ordinal*/ 2,
+    )
+    .await;
+    sqlx::query(
+        "INSERT INTO thread_history_projection_state (thread_id, next_rollout_byte_offset, next_rollout_ordinal) VALUES (?, ?, ?)",
+    )
+    .bind(thread_id.to_string())
+    .bind(i64::try_from(rollout_len).expect("rollout length fits SQLite integer"))
+    .bind(100_i64)
+    .execute(db)
+    .await
+    .expect("insert cross-thread legacy projection state");
+    insert_turn(
+        db,
+        thread_id,
+        "child-turn",
+        /*rollout_ordinal*/ 10,
+        "completed",
+        /*error_json*/ None,
+        /*first_user_item_id*/ None,
+        /*final_agent_item_id*/ None,
+    )
+    .await;
+
+    let turns = list_segmented_legacy_turns(
+        &store,
+        turn_params(
+            thread_id,
+            /*cursor*/ None,
+            /*page_size*/ 1,
+            SortDirection::Desc,
+            StoredTurnItemsView::Summary,
+        ),
+    )
+    .await
+    .expect("inspect inherited legacy projection");
+    assert!(
+        turns.is_none(),
+        "child-only projected rows cannot replace inherited parent history"
+    );
+
+    let inherited_item_owners = sqlx::query_scalar::<_, String>(
+        "SELECT thread_id FROM thread_items WHERE item_id = ? ORDER BY thread_id",
+    )
+    .bind("parent-item")
+    .fetch_all(db)
+    .await
+    .expect("inspect physical ownership of inherited items");
+    assert_eq!(
+        inherited_item_owners,
+        vec![parent_id.to_string()],
+        "inherited parent items must not be copied into the child projection"
+    );
+}
+
+#[tokio::test]
+async fn segmented_legacy_reads_reject_same_thread_history_bases() {
+    let (home, store, thread_id) = store_with_mode(ThreadHistoryMode::Legacy).await;
+    let rollout_len = write_segmented_legacy_rollout_with_history_base(
+        home.path(),
+        thread_id,
+        Some(HistoryPosition {
+            thread_id,
+            end_ordinal_exclusive: 5,
+            end_byte_offset: 128,
+        }),
+    );
+    let db = history_db(&store).await;
+    sqlx::query(
+        "INSERT INTO thread_history_projection_state (thread_id, next_rollout_byte_offset, next_rollout_ordinal) VALUES (?, ?, ?)",
+    )
+    .bind(thread_id.to_string())
+    .bind(i64::try_from(rollout_len).expect("rollout length fits SQLite integer"))
+    .bind(100_i64)
+    .execute(db)
+    .await
+    .expect("insert same-thread inherited legacy projection state");
+    insert_turn(
+        db,
+        thread_id,
+        "child-turn",
+        /*rollout_ordinal*/ 10,
+        "completed",
+        /*error_json*/ None,
+        /*first_user_item_id*/ None,
+        /*final_agent_item_id*/ None,
+    )
+    .await;
+
+    let turns = list_segmented_legacy_turns(
+        &store,
+        turn_params(
+            thread_id,
+            /*cursor*/ None,
+            /*page_size*/ 1,
+            SortDirection::Desc,
+            StoredTurnItemsView::Summary,
+        ),
+    )
+    .await
+    .expect("inspect same-thread inherited legacy projection");
+    assert!(
+        turns.is_none(),
+        "a frozen history-base cutoff cannot be replaced by unfiltered indexed rows"
+    );
 }
 
 #[tokio::test]
@@ -992,6 +2562,22 @@ async fn lineage_reads_page_across_parent_and_child_segments() {
         vec!["root-user", "root-agent"]
     );
 
+    let owner_counts = sqlx::query_as::<_, (i64, i64, i64, i64)>(
+        "SELECT (SELECT COUNT(*) FROM thread_turns WHERE thread_id = ?), (SELECT COUNT(*) FROM thread_items WHERE thread_id = ?), (SELECT COUNT(*) FROM thread_turns WHERE thread_id = ?), (SELECT COUNT(*) FROM thread_items WHERE thread_id = ?)",
+    )
+    .bind(root_id.to_string())
+    .bind(root_id.to_string())
+    .bind(child_id.to_string())
+    .bind(child_id.to_string())
+    .fetch_one(db)
+    .await
+    .expect("inspect parent and child history row owners");
+    assert_eq!(
+        owner_counts,
+        (3, 4, 1, 1),
+        "inherited pagination must leave parent turns and items parent-owned"
+    );
+
     for sort_key in [ItemSortKey::CreatedAtOrdinal, ItemSortKey::UpdatedAtOrdinal] {
         let error = store
             .list_items(ListItemsParams {
@@ -1045,6 +2631,7 @@ async fn lineage_reads_page_across_parent_and_child_segments() {
 
     let gap_cursor = serde_json::to_string(&HistoryCursor {
         requested_thread_id: child_id,
+        root_rollout_id: child_id,
         rollout_ordinal: 6,
         include_anchor: true,
         scope: CursorScope::Turns,
@@ -1315,12 +2902,145 @@ async fn store_with_mode(history_mode: ThreadHistoryMode) -> (TempDir, LocalThre
     (home, store, thread_id)
 }
 
+fn selected_rollout_path(
+    home: &std::path::Path,
+    thread_id: ThreadId,
+    rollout_id: ThreadId,
+) -> std::path::PathBuf {
+    home.join(format!(
+        "sessions/2026/07/16/rollout-2026-07-16T00-00-00-{thread_id}_{rollout_id}.jsonl"
+    ))
+}
+
+async fn select_rollout_path(
+    store: &LocalThreadStore,
+    thread_id: ThreadId,
+    rollout_path: std::path::PathBuf,
+) {
+    let state_db = store.state_db().await.expect("state runtime");
+    let mut metadata = state_db
+        .get_thread(thread_id)
+        .await
+        .expect("read metadata")
+        .expect("thread metadata");
+    metadata.rollout_path = rollout_path;
+    state_db
+        .upsert_thread(&metadata)
+        .await
+        .expect("select rollout generation");
+}
+
 fn write_rollout(
     path: &std::path::Path,
     thread_id: ThreadId,
     history_base: Option<HistoryPosition>,
 ) {
     write_rollout_with_end(path, thread_id, history_base, /*next_ordinal*/ 1);
+}
+
+fn write_segmented_legacy_rollout(home: &std::path::Path, thread_id: ThreadId) -> u64 {
+    write_segmented_legacy_rollout_with_history_base(home, thread_id, /*history_base*/ None)
+}
+
+fn append_segmented_legacy_turn(home: &std::path::Path, thread_id: ThreadId, turn_id: &str) -> u64 {
+    let path = rollout_path(home, thread_id);
+    let mut file = fs::OpenOptions::new()
+        .append(true)
+        .open(path.as_path())
+        .expect("open segmented legacy rollout");
+    let items = [
+        RolloutItem::EventMsg(EventMsg::TurnStarted(TurnStartedEvent {
+            turn_id: turn_id.to_string(),
+            trace_id: None,
+            started_at: Some(10),
+            model_context_window: None,
+            collaboration_mode_kind: Default::default(),
+        })),
+        RolloutItem::EventMsg(EventMsg::UserMessage(UserMessageEvent {
+            message: "indexed legacy message".to_string(),
+            ..Default::default()
+        })),
+        RolloutItem::EventMsg(EventMsg::TurnComplete(TurnCompleteEvent {
+            turn_id: turn_id.to_string(),
+            last_agent_message: None,
+            error: None,
+            started_at: Some(10),
+            completed_at: Some(20),
+            duration_ms: Some(10_000),
+            time_to_first_token_ms: None,
+        })),
+    ];
+    for item in items {
+        let line = RolloutLine {
+            timestamp: "2026-07-16T00:00:00.000Z".to_string(),
+            ordinal: None,
+            item,
+        };
+        writeln!(
+            file,
+            "{}",
+            serde_json::to_string(&line).expect("serialize legacy rollout item")
+        )
+        .expect("append legacy rollout item");
+    }
+    file.flush().expect("flush segmented legacy rollout");
+    fs::metadata(path)
+        .expect("read segmented legacy rollout metadata")
+        .len()
+}
+
+fn write_segmented_legacy_rollout_with_history_base(
+    home: &std::path::Path,
+    thread_id: ThreadId,
+    history_base: Option<HistoryPosition>,
+) -> u64 {
+    write_segmented_legacy_rollout_with_origin(
+        home,
+        thread_id,
+        history_base,
+        /*forked_from_id*/ None,
+        /*parent_thread_id*/ None,
+    )
+}
+
+fn write_segmented_legacy_rollout_with_origin(
+    home: &std::path::Path,
+    thread_id: ThreadId,
+    history_base: Option<HistoryPosition>,
+    forked_from_id: Option<ThreadId>,
+    parent_thread_id: Option<ThreadId>,
+) -> u64 {
+    let path = rollout_path(home, thread_id);
+    fs::create_dir_all(path.parent().expect("rollout parent"))
+        .expect("create legacy rollout parent");
+    let line = RolloutLine {
+        timestamp: "2026-07-16T00:00:00.000Z".to_string(),
+        ordinal: None,
+        item: RolloutItem::SessionMeta(SessionMetaLine {
+            meta: SessionMeta {
+                session_id: thread_id.into(),
+                id: thread_id,
+                segment_id: Some(SegmentId::new()),
+                history_mode: ThreadHistoryMode::Legacy,
+                history_base,
+                forked_from_id,
+                parent_thread_id,
+                ..SessionMeta::default()
+            },
+            git: None,
+        }),
+    };
+    fs::write(
+        path.as_path(),
+        format!(
+            "{}\n",
+            serde_json::to_string(&line).expect("serialize segmented legacy rollout")
+        ),
+    )
+    .expect("write segmented legacy rollout");
+    fs::metadata(path)
+        .expect("read segmented legacy rollout metadata")
+        .len()
 }
 
 fn write_rollout_with_end(
@@ -1367,6 +3087,95 @@ fn write_rollout_with_end(
         ),
     )
     .expect("write rollout");
+}
+
+fn write_projected_same_thread_segments(
+    home: &std::path::Path,
+    thread_id: ThreadId,
+    segment_count: usize,
+) -> std::path::PathBuf {
+    write_projected_same_thread_segments_with_mode(
+        home,
+        thread_id,
+        segment_count,
+        ThreadHistoryMode::Paginated,
+    )
+}
+
+fn write_projected_same_thread_segments_with_mode(
+    home: &std::path::Path,
+    thread_id: ThreadId,
+    segment_count: usize,
+    history_mode: ThreadHistoryMode,
+) -> std::path::PathBuf {
+    let segment_ids = (0..segment_count)
+        .map(|_| SegmentId::new())
+        .collect::<Vec<_>>();
+    let active_path = rollout_path(home, thread_id);
+    let paths = segment_ids
+        .iter()
+        .enumerate()
+        .map(|(index, segment_id)| {
+            if index + 1 == segment_count {
+                active_path.clone()
+            } else {
+                home.join(codex_rollout::ROTATED_ROLLOUT_SEGMENTS_SUBDIR)
+                    .join(thread_id.to_string())
+                    .join(segment_id.to_string())
+                    .join("segment.jsonl")
+            }
+        })
+        .collect::<Vec<_>>();
+
+    for index in 0..segment_count {
+        let ordinal = u64::try_from(index).expect("fixture ordinal") * 4;
+        let mut lines = vec![RolloutLine {
+            timestamp: "2026-07-16T00:00:00.000Z".to_string(),
+            ordinal: Some(ordinal),
+            item: RolloutItem::SessionMeta(SessionMetaLine {
+                meta: SessionMeta {
+                    session_id: thread_id.into(),
+                    id: thread_id,
+                    segment_id: Some(segment_ids[index]),
+                    history_mode,
+                    ..SessionMeta::default()
+                },
+                git: None,
+            }),
+        }];
+        if let Some(previous_index) = index.checked_sub(1) {
+            lines.push(RolloutLine {
+                timestamp: "2026-07-16T00:00:00.000Z".to_string(),
+                ordinal: Some(ordinal + 1),
+                item: RolloutItem::RolloutReference(RolloutReferenceItem {
+                    rollout_id: Some(thread_id),
+                    rollout_path: paths[previous_index].clone(),
+                    thread_id: Some(thread_id),
+                    rollout_timestamp: None,
+                    segment_id: Some(segment_ids[previous_index]),
+                    max_depth: codex_protocol::protocol::DEFAULT_ROLLOUT_REFERENCE_DEPTH,
+                    nth_user_message: None,
+                    compacted_replacement_history_filter_texts: None,
+                }),
+            });
+        }
+        lines.push(RolloutLine {
+            timestamp: "2026-07-16T00:00:00.000Z".to_string(),
+            ordinal: Some(ordinal + 2),
+            item: RolloutItem::EventMsg(EventMsg::ShutdownComplete),
+        });
+        let path = &paths[index];
+        fs::create_dir_all(path.parent().expect("segment parent"))
+            .expect("create segment directory");
+        let encoded = lines
+            .iter()
+            .map(|line| serde_json::to_string(line).expect("serialize segment line"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        fs::write(path, format!("{encoded}\n")).expect("write physical segment");
+    }
+
+    active_path
 }
 
 fn rollout_path(home: &std::path::Path, thread_id: ThreadId) -> std::path::PathBuf {

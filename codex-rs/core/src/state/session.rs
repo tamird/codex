@@ -7,6 +7,7 @@ use codex_sandboxing::policy_transforms::merge_permission_profiles;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::collections::VecDeque;
+use std::sync::Arc;
 
 use super::AdditionalContextStore;
 use super::auto_compact_window::AutoCompactWindow;
@@ -140,6 +141,22 @@ impl SessionState {
         self.history.replace_annotated(items);
         self.history
             .set_reference_context_item(reference_context_item);
+        self.auto_compact_window.clear_prefill();
+    }
+
+    pub(crate) fn replace_shared_history(
+        &mut self,
+        items: Arc<Vec<ResponseItemEnvelope>>,
+        reference_context_item: Option<TurnContextItem>,
+    ) {
+        self.history.replace_shared_annotated(items);
+        self.history
+            .set_reference_context_item(reference_context_item);
+        self.auto_compact_window.clear_prefill();
+    }
+
+    pub(crate) fn replace_shared_history_snapshot(&mut self, source: &ContextManager) {
+        self.history.replace_shared_snapshot(source);
         self.auto_compact_window.clear_prefill();
     }
 

@@ -108,6 +108,12 @@ impl RollbackPlanner {
     }
 
     pub(super) fn observe(&mut self, line: &RolloutLine) -> ThreadStoreResult<()> {
+        if matches!(line.item, RolloutItem::RolloutReference(_)) {
+            self.model_replay
+                .observe(self.record_boundaries.len(), &line.item);
+            self.record_boundaries.push(None);
+            return Ok(());
+        }
         let index = self.record_boundaries.len();
         self.model_replay.observe(index, &line.item);
         self.record_boundaries
@@ -133,6 +139,7 @@ impl RollbackPlanner {
 
         match &line.item {
             RolloutItem::SessionMeta(_) => self.record_boundaries[index] = None,
+            RolloutItem::RolloutReference(_) => {}
             RolloutItem::ResponseItem(response) => {
                 if let Some(boundary) = paired_delivery_boundary {
                     self.record_boundaries[index] = Some(boundary);

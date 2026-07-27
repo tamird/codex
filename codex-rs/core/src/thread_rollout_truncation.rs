@@ -37,9 +37,17 @@ fn rollout_item_is_user_turn_boundary(item: &RolloutItem) -> bool {
 /// last N user turns were removed from the effective thread history; we apply them here so
 /// indexing uses the post-rollback history rather than the raw stream.
 pub(crate) fn user_message_positions_in_rollout(items: &[RolloutItem]) -> Vec<usize> {
-    let mut user_positions = Vec::new();
+    let mut event_user_positions = Vec::new();
+    let mut response_user_positions = Vec::new();
+    let mut active_turn_start = None;
     for (idx, item) in items.iter().enumerate() {
         match item {
+            RolloutItem::EventMsg(EventMsg::TurnStarted(_)) => {
+                active_turn_start = Some(idx);
+            }
+            RolloutItem::EventMsg(EventMsg::UserMessage(_)) => {
+                event_user_positions.push(active_turn_start.unwrap_or(idx));
+            }
             RolloutItem::ResponseItem(item)
                 if matches!(&item.item, ResponseItem::Message { .. })
                     && matches!(
@@ -47,17 +55,25 @@ pub(crate) fn user_message_positions_in_rollout(items: &[RolloutItem]) -> Vec<us
                         Some(TurnItem::UserMessage(_))
                     ) =>
             {
-                user_positions.push(idx);
+                response_user_positions.push(active_turn_start.unwrap_or(idx));
+            }
+            RolloutItem::EventMsg(EventMsg::TurnComplete(_) | EventMsg::TurnAborted(_)) => {
+                active_turn_start = None;
             }
             RolloutItem::EventMsg(EventMsg::ThreadRolledBack(rollback)) => {
                 let num_turns = usize::try_from(rollback.num_turns).unwrap_or(usize::MAX);
-                let new_len = user_positions.len().saturating_sub(num_turns);
-                user_positions.truncate(new_len);
+                event_user_positions.truncate(event_user_positions.len().saturating_sub(num_turns));
+                response_user_positions
+                    .truncate(response_user_positions.len().saturating_sub(num_turns));
             }
             _ => {}
         }
     }
-    user_positions
+    if event_user_positions.is_empty() {
+        response_user_positions
+    } else {
+        event_user_positions
+    }
 }
 
 /// Return the indices of fork-turn boundaries in a rollout.
@@ -165,7 +181,16 @@ pub fn truncate_rollout_after_turn_id(
     mut items: Vec<RolloutItem>,
     last_turn_id: &str,
 ) -> CodexResult<Vec<RolloutItem>> {
-    let turns = build_turns_from_rollout_items(&items);
+    let cut_index = rollout_cut_index_after_turn_id(&items, last_turn_id)?;
+    items.truncate(cut_index);
+    Ok(items)
+}
+
+fn rollout_cut_index_after_turn_id(
+    items: &[RolloutItem],
+    last_turn_id: &str,
+) -> CodexResult<usize> {
+    let turns = build_turns_from_rollout_items(items);
     let turn = turns
         .iter()
         .find(|turn| turn.id == last_turn_id)
@@ -196,16 +221,14 @@ pub fn truncate_rollout_after_turn_id(
         )));
     }
 
-    let cut_index = items
+    Ok(items
         .iter()
         .enumerate()
         .skip(target_start_index.saturating_add(1))
         .find_map(|(index, item)| {
             matches!(item, RolloutItem::EventMsg(EventMsg::TurnStarted(_))).then_some(index)
         })
-        .unwrap_or(items.len());
-    items.truncate(cut_index);
-    Ok(items)
+        .unwrap_or(items.len()))
 }
 
 /// Return a rollout prefix ending immediately before the requested persisted turn.
@@ -213,6 +236,15 @@ pub fn truncate_rollout_before_turn_id(
     mut items: Vec<RolloutItem>,
     before_turn_id: &str,
 ) -> CodexResult<Vec<RolloutItem>> {
+    let cut_index = rollout_cut_index_before_turn_id(&items, before_turn_id)?;
+    items.truncate(cut_index);
+    Ok(items)
+}
+
+fn rollout_cut_index_before_turn_id(
+    items: &[RolloutItem],
+    before_turn_id: &str,
+) -> CodexResult<usize> {
     let cut_index = items.iter().position(|item| {
         matches!(
             item,
@@ -223,7 +255,7 @@ pub fn truncate_rollout_before_turn_id(
 
     let Some(cut_index) = cut_index else {
         // Older rollouts can expose generated turn IDs without a TurnStarted item to fork at.
-        if build_turns_from_rollout_items(&items)
+        if build_turns_from_rollout_items(items)
             .iter()
             .any(|turn| turn.id == before_turn_id)
         {
@@ -241,7 +273,7 @@ pub fn truncate_rollout_before_turn_id(
     if items[cut_index + 1..]
         .iter()
         .any(|item| matches!(item, RolloutItem::EventMsg(EventMsg::ThreadRolledBack(_))))
-        && !build_turns_from_rollout_items(&items)
+        && !build_turns_from_rollout_items(items)
             .iter()
             .any(|turn| turn.id == before_turn_id)
     {
@@ -250,8 +282,25 @@ pub fn truncate_rollout_before_turn_id(
         )));
     }
 
-    items.truncate(cut_index);
-    Ok(items)
+    Ok(cut_index)
+}
+
+/// Return the number of canonical user-message boundaries before a persisted turn.
+pub fn user_message_count_before_turn_id(
+    items: &[RolloutItem],
+    before_turn_id: &str,
+) -> CodexResult<usize> {
+    let cut_index = rollout_cut_index_before_turn_id(items, before_turn_id)?;
+    Ok(user_message_positions_in_rollout(&items[..cut_index]).len())
+}
+
+/// Return the number of canonical user-message boundaries through a terminal turn.
+pub fn user_message_count_through_turn_id(
+    items: &[RolloutItem],
+    last_turn_id: &str,
+) -> CodexResult<usize> {
+    let cut_index = rollout_cut_index_after_turn_id(items, last_turn_id)?;
+    Ok(user_message_positions_in_rollout(&items[..cut_index]).len())
 }
 
 /// Return a suffix of `items` that keeps the last `n_from_end` fork turns.

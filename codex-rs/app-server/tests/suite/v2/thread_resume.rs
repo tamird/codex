@@ -170,6 +170,13 @@ async fn thread_resume_paginated_model_context_preserves_original_metadata() -> 
         Some("mock_provider"),
         /*git_info*/ None,
     )?;
+
+    app_test_support::append_fake_paginated_user_message(
+        &rollout_path(codex_home.path(), "2025-01-05T12-00-00", &conversation_id),
+        &conversation_id,
+        "Saved user message",
+    )
+    .await?;
     let path = rollout_path(codex_home.path(), "2025-01-05T12-00-00", &conversation_id);
     append_rollout_item_to_path(
         &path,
@@ -3767,6 +3774,7 @@ async fn thread_resume_prefers_persisted_git_metadata_for_local_threads() -> Res
     let session_meta = SessionMeta {
         session_id: conversation_id.into(),
         id: conversation_id,
+        segment_id: None,
         forked_from_id: None,
         forked_from_ordinal_exclusive: None,
         parent_thread_id: None,
@@ -4643,6 +4651,115 @@ async fn thread_resume_rejoins_running_paginated_thread_with_initial_page() -> R
     .await??;
     server.shutdown().await;
 
+    Ok(())
+}
+
+#[tokio::test]
+async fn thread_resume_rejoins_running_legacy_thread_with_bounded_initial_page() -> Result<()> {
+    let server = responses::start_mock_server().await;
+    let first_response = responses::sse_response(responses::sse(vec![
+        responses::ev_response_created("resp-1"),
+        responses::ev_assistant_message("msg-1", "Done"),
+        responses::ev_completed("resp-1"),
+    ]));
+    let second_response = responses::sse_response(responses::sse(vec![
+        responses::ev_response_created("resp-2"),
+        responses::ev_assistant_message("msg-2", "Done"),
+        responses::ev_completed("resp-2"),
+    ]))
+    .set_delay(std::time::Duration::from_secs(2));
+    let _response_mock =
+        responses::mount_response_sequence(&server, vec![first_response, second_response]).await;
+    let codex_home = TempDir::new()?;
+    mock_responses_config(&server.uri()).write(codex_home.path())?;
+
+    let mut primary = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .build_initialized()
+        .await?;
+    let start_id = primary
+        .send_thread_start_request_with_auto_env(ThreadStartParams {
+            model: Some("gpt-5.4".to_string()),
+            history_mode: Some(ThreadHistoryMode::Legacy),
+            ..Default::default()
+        })
+        .await?;
+    let ThreadStartResponse { thread, .. } =
+        timeout(DEFAULT_READ_TIMEOUT, primary.read_response(start_id)).await??;
+
+    let seed_turn_id = primary
+        .send_turn_start_request(TurnStartParams {
+            thread_id: thread.id.clone(),
+            client_user_message_id: None,
+            input: vec![UserInput::Text {
+                text: "seed history".to_string(),
+                text_elements: Vec::new(),
+            }],
+            ..Default::default()
+        })
+        .await?;
+    let _: TurnStartResponse =
+        timeout(DEFAULT_READ_TIMEOUT, primary.read_response(seed_turn_id)).await??;
+    timeout(
+        DEFAULT_READ_TIMEOUT,
+        primary.read_stream_until_notification_message("turn/completed"),
+    )
+    .await??;
+    primary.clear_message_buffer();
+
+    let running_turn_id = primary
+        .send_turn_start_request(TurnStartParams {
+            thread_id: thread.id.clone(),
+            client_user_message_id: None,
+            input: vec![UserInput::Text {
+                text: "keep running".to_string(),
+                text_elements: Vec::new(),
+            }],
+            ..Default::default()
+        })
+        .await?;
+    let running_turn_response: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        primary.read_stream_until_response_message(RequestId::Integer(running_turn_id)),
+    )
+    .await??;
+    let TurnStartResponse { turn: running_turn } =
+        to_response::<TurnStartResponse>(running_turn_response)?;
+    timeout(
+        DEFAULT_READ_TIMEOUT,
+        primary.read_stream_until_notification_message("turn/started"),
+    )
+    .await??;
+
+    let resume_id = primary
+        .send_thread_resume_request(ThreadResumeParams {
+            thread_id: thread.id,
+            exclude_turns: true,
+            initial_turns_page: Some(ThreadResumeInitialTurnsPageParams {
+                limit: Some(1),
+                sort_direction: Some(SortDirection::Desc),
+                items_view: Some(TurnItemsView::Full),
+            }),
+            ..Default::default()
+        })
+        .await?;
+    let ThreadResumeResponse {
+        thread,
+        initial_turns_page,
+        ..
+    } = timeout(DEFAULT_READ_TIMEOUT, primary.read_response(resume_id)).await??;
+
+    assert!(thread.turns.is_empty());
+    let page = initial_turns_page.expect("resume should include its initial turns page");
+    assert_eq!(page.data.len(), 1);
+    assert_eq!(page.data[0].id, running_turn.id);
+    assert_eq!(page.data[0].status, TurnStatus::InProgress);
+    assert!(page.next_cursor.is_some());
+    timeout(
+        DEFAULT_READ_TIMEOUT,
+        primary.read_stream_until_notification_message("turn/completed"),
+    )
+    .await??;
     Ok(())
 }
 

@@ -213,6 +213,8 @@ pub struct CodexThread {
     pub(crate) session: Arc<Session>,
     pub(crate) io: SessionIo,
     pub(crate) session_source: SessionSource,
+    /// Resumed Paginated sessions may contain only recent segments and cannot seed exact forks.
+    model_history_complete: bool,
     session_configured: SessionConfiguredEvent,
     rollout_path: Option<PathBuf>,
     out_of_band_elicitations: Mutex<OutOfBandElicitations>,
@@ -242,11 +244,13 @@ impl CodexThread {
         session_configured: SessionConfiguredEvent,
         rollout_path: Option<PathBuf>,
         session_source: SessionSource,
+        model_history_complete: bool,
     ) -> Self {
         Self {
             session,
             io,
             session_source,
+            model_history_complete,
             session_configured,
             rollout_path,
             out_of_band_elicitations: Mutex::new(OutOfBandElicitations::default()),
@@ -259,12 +263,26 @@ impl CodexThread {
     }
 
     /// Returns a model-history snapshot only while the source thread is idle.
-    pub async fn model_history_snapshot(&self) -> Option<Arc<Vec<ResponseItem>>> {
+    pub async fn model_history_snapshot(
+        &self,
+    ) -> Option<Arc<Vec<codex_history::ResponseItemEnvelope>>> {
+        if !self.model_history_complete {
+            return None;
+        }
         if self.session.active_turn.lock().await.is_some() {
             return None;
         }
-        let history = Arc::new(self.session.clone_history().await.into_raw_items());
-        if self.session.active_turn.lock().await.is_some() {
+        if self.session.current_auto_compact_window_number().await != 0 {
+            return None;
+        }
+        let history = self.session.clone_history().await.shared_annotated_items();
+        if self.session.active_turn.lock().await.is_some()
+            || self.session.current_auto_compact_window_number().await != 0
+            || !Arc::ptr_eq(
+                &history,
+                &self.session.clone_history().await.shared_annotated_items(),
+            )
+        {
             return None;
         }
         Some(history)

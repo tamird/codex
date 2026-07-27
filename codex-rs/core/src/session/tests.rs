@@ -42,6 +42,7 @@ use codex_config::types::McpServerTransportConfig;
 use codex_config::types::ToolSuggestDisabledTool;
 use codex_config::types::WindowsSandboxModeToml;
 use core_test_support::test_codex::TurnInputRequest as ExternalTurnInputRequest;
+use codex_extension_api::empty_extension_registry;
 
 use codex_features::Feature;
 use codex_file_system::FileSystemSandboxContext;
@@ -157,9 +158,11 @@ use codex_protocol::protocol::RealtimeAudioFrame;
 use codex_protocol::protocol::RealtimeConversationListVoicesResponseEvent;
 use codex_protocol::protocol::RealtimeVoice;
 use codex_protocol::protocol::RealtimeVoicesList;
+use codex_protocol::protocol::RolloutReferenceItem;
 use codex_protocol::protocol::SessionMeta;
 use codex_protocol::protocol::SessionMetaLine;
 use codex_protocol::protocol::Submission;
+use codex_protocol::protocol::ThreadHistoryMode;
 use codex_protocol::protocol::ThreadRolledBackEvent;
 use codex_protocol::protocol::ThreadSettingsOverrides;
 use codex_protocol::protocol::TokenCountEvent;
@@ -181,6 +184,7 @@ use core_test_support::responses::ev_assistant_message;
 use core_test_support::responses::ev_completed;
 use core_test_support::responses::ev_response_created;
 use core_test_support::responses::mount_sse_once;
+use core_test_support::responses::mount_sse_sequence;
 use core_test_support::responses::sse;
 use core_test_support::responses::start_mock_server;
 use core_test_support::responses::strip_metadata_from_items;
@@ -2423,7 +2427,8 @@ async fn record_initial_history_reconstructs_resumed_transcript() {
             history: Arc::new(rollout_items),
             rollout_path: Some(PathBuf::from("/tmp/resume.jsonl")),
         }))
-        .await;
+        .await
+        .expect("record initial history");
 
     let history = session.state.lock().await.clone_history();
     assert_eq!(expected, raw_history_items(&history));
@@ -2606,7 +2611,8 @@ async fn record_inter_agent_communication_sets_turn_id_in_rollout_and_resume() {
     let (resumed_session, _resumed_turn_context) = make_session_and_context().await;
     resumed_session
         .record_initial_history(InitialHistory::Resumed(resumed))
-        .await;
+        .await
+        .expect("record initial history");
     assert_eq!(
         strip_response_item_ids(&raw_history_items(&resumed_session.clone_history().await)),
         strip_response_item_ids(std::slice::from_ref(&expected_item))
@@ -2675,7 +2681,8 @@ async fn record_inter_agent_communication_preserves_item_id_in_rollout_and_resum
         .await;
     resumed_session
         .record_initial_history(InitialHistory::Resumed(resumed))
-        .await;
+        .await
+        .expect("record initial history");
     let resumed_history = resumed_session.clone_history().await;
     let resumed_items = raw_history_items(&resumed_history);
     let [resumed_item] = resumed_items.as_slice() else {
@@ -2795,7 +2802,8 @@ async fn prepares_resumed_history_before_installing_it() {
             })]),
             rollout_path: Some(PathBuf::from("/tmp/resume.jsonl")),
         }))
-        .await;
+        .await
+        .expect("record initial history");
 
     let history = session.state.lock().await.clone_history();
     assert_eq!(
@@ -2901,10 +2909,65 @@ fn resolve_multi_agent_version_handles_unset_and_legacy_history() {
 }
 
 #[tokio::test]
+async fn empty_reference_prefix_continues_after_physical_metadata_ordinal() {
+    let codex_home = tempfile::tempdir().expect("create Codex home");
+    let source_thread_id = ThreadId::default();
+    let source_path = codex_home.path().join(format!(
+        "rollout-2025-01-01T00-00-00-{source_thread_id}.jsonl"
+    ));
+    let source_meta = SessionMetaLine {
+        meta: SessionMeta {
+            session_id: source_thread_id.into(),
+            id: source_thread_id,
+            history_mode: ThreadHistoryMode::Paginated,
+            ..SessionMeta::default()
+        },
+        git: None,
+    };
+    let physical_line = RolloutLine {
+        timestamp: "2025-01-01T00:00:00Z".to_string(),
+        ordinal: Some(7),
+        item: RolloutItem::SessionMeta(source_meta.clone()),
+    };
+    tokio::fs::write(
+        source_path.as_path(),
+        format!(
+            "{}\n",
+            serde_json::to_string(&physical_line).expect("serialize source metadata")
+        ),
+    )
+    .await
+    .expect("write metadata-only source");
+    let history = InitialHistory::Forked(vec![
+        RolloutItem::SessionMeta(source_meta),
+        RolloutItem::RolloutReference(RolloutReferenceItem {
+            rollout_id: Some(source_thread_id),
+            rollout_path: source_path,
+            thread_id: Some(source_thread_id),
+            rollout_timestamp: None,
+            segment_id: None,
+            max_depth: codex_protocol::protocol::DEFAULT_ROLLOUT_REFERENCE_DEPTH,
+            nth_user_message: Some(0),
+            compacted_replacement_history_filter_texts: None,
+        }),
+    ]);
+
+    assert_eq!(
+        initial_rollout_ordinal(&history, ThreadHistoryMode::Paginated, codex_home.path())
+            .await
+            .expect("derive continuation ordinal"),
+        8
+    );
+}
+
+#[tokio::test]
 async fn record_initial_history_new_defers_initial_context_until_first_turn() {
     let (session, _turn_context) = make_session_and_context().await;
 
-    session.record_initial_history(InitialHistory::New).await;
+    session
+        .record_initial_history(InitialHistory::New)
+        .await
+        .expect("record initial history");
 
     let history = session.clone_history().await;
     assert_eq!(raw_history_items(&history), Vec::<ResponseItem>::new());
@@ -2939,7 +3002,8 @@ async fn resumed_history_injects_initial_context_on_first_context_update_only() 
             history: Arc::new(rollout_items),
             rollout_path: Some(PathBuf::from("/tmp/resume.jsonl")),
         }))
-        .await;
+        .await
+        .expect("record initial history");
 
     let history_before_seed = session.state.lock().await.clone_history();
     assert_eq!(expected, raw_history_items(&history_before_seed));
@@ -3049,7 +3113,8 @@ async fn record_initial_history_seeds_token_info_from_rollout() {
             history: Arc::new(rollout_items),
             rollout_path: Some(PathBuf::from("/tmp/resume.jsonl")),
         }))
-        .await;
+        .await
+        .expect("record initial history");
 
     let actual = session.state.lock().await.token_info();
     assert_eq!(actual, Some(info2));
@@ -3574,13 +3639,734 @@ async fn record_initial_history_reconstructs_forked_transcript() {
 
     session
         .record_initial_history(InitialHistory::Forked(rollout_items))
-        .await;
+        .await
+        .expect("record initial history");
 
     let history = session.state.lock().await.clone_history();
     assert_eq!(
         strip_response_item_ids(&expected),
         strip_response_item_ids(&raw_history_items(&history))
     );
+}
+
+#[tokio::test]
+async fn record_initial_history_preserves_all_segmented_legacy_fork_model_messages() {
+    let (mut session, _turn_context) = make_session_and_context().await;
+    attach_thread_persistence(&mut session).await;
+
+    for index in 0..6 {
+        session
+            .persist_rollout_items(&[
+                RolloutItem::ResponseItem(
+                    user_message(&format!("legacy-parent-user-{index}")).into(),
+                ),
+                RolloutItem::ResponseItem(
+                    assistant_message(&format!("legacy-parent-assistant-{index}")).into(),
+                ),
+            ])
+            .await;
+        session.flush_rollout().await.expect("flush parent segment");
+        if index < 5 {
+            session
+                .services
+                .live_thread
+                .as_ref()
+                .expect("live parent persistence")
+                .freeze_local_segment(FreezeRolloutSegmentParams::rotate(Vec::new()))
+                .await
+                .expect("rotate parent segment")
+                .expect("local parent segment");
+        }
+    }
+
+    let frozen = session
+        .services
+        .live_thread
+        .as_ref()
+        .expect("live parent persistence")
+        .freeze_local_segment(FreezeRolloutSegmentParams::snapshot())
+        .await
+        .expect("freeze parent snapshot")
+        .expect("local parent snapshot");
+    session
+        .record_initial_history(InitialHistory::Forked(vec![
+            RolloutItem::SessionMeta(frozen.source_session_meta),
+            RolloutItem::RolloutReference(frozen.reference),
+        ]))
+        .await
+        .expect("reconstruct complete fork model context");
+
+    let history = session.clone_history().await;
+    let user_messages = history
+        .raw_items()
+        .filter_map(|item| match item {
+            ResponseItem::Message { role, content, .. } if role == "user" => {
+                let [ContentItem::InputText { text }] = content.as_slice() else {
+                    return None;
+                };
+                text.starts_with("legacy-parent-user-")
+                    .then_some(text.as_str())
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        user_messages,
+        (0..6)
+            .map(|index| format!("legacy-parent-user-{index}"))
+            .collect::<Vec<_>>()
+    );
+}
+
+#[tokio::test]
+async fn prepared_fork_preserves_parent_cached_model_state_without_copying_history()
+-> anyhow::Result<()> {
+    let (source, source_turn) = make_session_and_context().await;
+    let (mut child, _child_turn) = make_session_and_context().await;
+    attach_thread_persistence(&mut child).await;
+
+    let source_turn = Arc::new(source_turn);
+    let world_state = build_world_state_from_turn_context(&source, &source_turn).await;
+    let source_response_items = Arc::new(vec![ResponseItemEnvelope {
+        item: user_message("authoritative parent message"),
+        metadata: Some(CodexHarnessMetadata {
+            client_authored: true,
+            fallback_token_limit_override: None,
+        }),
+    }]);
+    let reference_context_item = source_turn.to_turn_context_item();
+    let previous_turn_settings = PreviousTurnSettings {
+        model: "authoritative-parent-model".to_string(),
+        comp_hash: Some("authoritative-parent-settings".to_string()),
+        realtime_active: Some(true),
+    };
+    let authoritative_tokens = TokenUsageInfo {
+        total_token_usage: TokenUsage {
+            input_tokens: 100,
+            cached_input_tokens: 20,
+            cache_write_input_tokens: 0,
+            output_tokens: 50,
+            reasoning_output_tokens: 10,
+            total_tokens: 160,
+            codex_rollout_budget_units: None,
+        },
+        last_token_usage: TokenUsage {
+            input_tokens: 12,
+            cached_input_tokens: 2,
+            cache_write_input_tokens: 0,
+            output_tokens: 7,
+            reasoning_output_tokens: 1,
+            total_tokens: 20,
+            codex_rollout_budget_units: None,
+        },
+        model_context_window: Some(8_192),
+    };
+    let stale_tokens = TokenUsageInfo {
+        total_token_usage: TokenUsage {
+            input_tokens: 1,
+            cached_input_tokens: 0,
+            cache_write_input_tokens: 0,
+            output_tokens: 1,
+            reasoning_output_tokens: 0,
+            total_tokens: 2,
+            codex_rollout_budget_units: None,
+        },
+        last_token_usage: TokenUsage::default(),
+        model_context_window: Some(1_024),
+    };
+    let window_ids = AutoCompactWindowIds {
+        first_window_id: Uuid::now_v7(),
+        previous_window_id: Some(Uuid::now_v7()),
+        window_id: Uuid::now_v7(),
+    };
+
+    {
+        let mut state = source.state.lock().await;
+        state.replace_shared_history(
+            Arc::clone(&source_response_items),
+            Some(reference_context_item.clone()),
+        );
+        state.replace_shared_history(
+            Arc::clone(&source_response_items),
+            Some(reference_context_item.clone()),
+        );
+        state.set_token_info(Some(authoritative_tokens.clone()));
+        state
+            .history
+            .set_world_state_baseline(world_state.snapshot());
+        state.set_previous_turn_settings(Some(previous_turn_settings.clone()));
+        state.restore_auto_compact_window(/*window_number*/ 7, window_ids);
+    }
+    let source_model_state = source
+        .capture_fork_model_state(&source_response_items)
+        .await
+        .expect("authoritative idle parent model state");
+    child
+        .record_initial_history_with_fork_startup_items(
+            InitialHistory::Forked(Vec::new()),
+            ForkStartupItems::with_model_history_override(
+                vec![RolloutItem::EventMsg(EventMsg::TokenCount(
+                    TokenCountEvent {
+                        info: Some(stale_tokens),
+                        rate_limits: None,
+                    },
+                ))],
+                Some(Arc::clone(&source_response_items)),
+                Some(source_model_state),
+            ),
+        )
+        .await?;
+
+    let mut child_state = child.state.lock().await;
+    assert!(Arc::ptr_eq(
+        &child_state.history.shared_annotated_items(),
+        &source_response_items
+    ));
+    assert!(
+        child_state.history.shared_annotated_items()[0]
+            .metadata
+            .as_ref()
+            .is_some_and(|metadata| metadata.client_authored)
+    );
+    assert_eq!(
+        child_state.reference_context_item(),
+        Some(reference_context_item)
+    );
+    assert_eq!(
+        child_state.previous_turn_settings(),
+        Some(previous_turn_settings)
+    );
+    assert_eq!(child_state.token_info(), Some(authoritative_tokens));
+    assert_eq!(child_state.auto_compact_window_number(), 7);
+    assert_eq!(child_state.auto_compact_window_ids(), window_ids);
+    assert_eq!(child_state.history.history_version(), 1);
+    assert!(
+        child_state
+            .history
+            .update_world_state(&world_state)
+            .1
+            .is_none(),
+        "an unchanged parent world-state baseline must not be reintroduced"
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn prepared_paginated_fork_preserves_all_segmented_parent_model_messages()
+-> anyhow::Result<()> {
+    assert_prepared_paginated_fork_preserves_parent_model_messages(
+        /*use_shared_model_history*/ false,
+    )
+    .await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn indexed_paginated_fork_shares_all_segmented_parent_model_messages() -> anyhow::Result<()> {
+    assert_prepared_paginated_fork_preserves_parent_model_messages(
+        /*use_shared_model_history*/ true,
+    )
+    .await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn indexed_paginated_fork_appends_interrupted_suffix_after_capturing_parent_state()
+-> anyhow::Result<()> {
+    let home = tempfile::tempdir()?;
+    let mut config = test_config().await;
+    config.codex_home = home.path().join("codex-home").abs();
+    config.cwd = config.codex_home.abs();
+    std::fs::create_dir_all(&config.codex_home)?;
+    let state_db = crate::init_state_db(&config).await;
+    let store = Arc::new(LocalThreadStore::new(
+        codex_thread_store::LocalThreadStoreConfig::from_config(&config),
+        state_db.clone(),
+    ));
+    let auth_manager = codex_login::AuthManager::from_auth_for_testing(CodexAuth::from_api_key(
+        "prepared-fork-test",
+    ));
+    let manager = crate::ThreadManager::new(
+        &config,
+        Arc::clone(&auth_manager),
+        crate::thread_manager::build_models_manager(&config, auth_manager),
+        crate::CodexAppsToolsCache::default(),
+        SessionSource::Exec,
+        Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
+        empty_extension_registry(),
+        Arc::new(crate::test_support::EmptyUserInstructionsProvider),
+        /*analytics_events_client*/ None,
+        store.clone(),
+        crate::thread_manager::local_agent_graph_store_from_state_db(state_db.as_ref()),
+        "prepared-fork-test-installation".to_string(),
+        /*attestation_provider*/ None,
+        /*external_time_provider*/ None,
+    );
+    let mut source_options = crate::thread_manager::StartThreadOptions::new(config.clone());
+    source_options.history_mode = Some(ThreadHistoryMode::Paginated);
+    let source = manager.start_thread(source_options).await?;
+    let source_thread_id = source.thread_id;
+    let injected_item = user_message("prepared injected user message");
+    source
+        .thread
+        .inject_response_items(vec![injected_item])
+        .await?;
+    let shared_parent_items = source
+        .thread
+        .model_history_snapshot()
+        .await
+        .expect("injected source model history");
+    assert!(shared_parent_items.iter().any(|item| matches!(
+        &item.item,
+        ResponseItem::Message { content, .. }
+            if content.iter().any(|content| matches!(
+                content,
+                ContentItem::InputText { text }
+                    if text == "prepared injected user message"
+            ))
+    )));
+    let source_turn = source.thread.session.new_default_turn().await;
+    let world_state =
+        build_world_state_from_turn_context(&source.thread.session, &source_turn).await;
+    let reference_context_item = source
+        .thread
+        .session
+        .reference_context_item()
+        .await
+        .expect("injected source reference context");
+    let previous_turn_settings = PreviousTurnSettings {
+        model: "prepared-parent-model".to_string(),
+        comp_hash: Some("prepared-parent-settings".to_string()),
+        realtime_active: Some(true),
+    };
+    let token_info = TokenUsageInfo {
+        total_token_usage: TokenUsage {
+            input_tokens: 100,
+            cached_input_tokens: 20,
+            cache_write_input_tokens: 0,
+            output_tokens: 50,
+            reasoning_output_tokens: 10,
+            total_tokens: 160,
+            codex_rollout_budget_units: None,
+        },
+        last_token_usage: TokenUsage::default(),
+        model_context_window: Some(8_192),
+    };
+    let window_ids = AutoCompactWindowIds {
+        first_window_id: Uuid::now_v7(),
+        previous_window_id: Some(Uuid::now_v7()),
+        window_id: Uuid::now_v7(),
+    };
+    {
+        let mut state = source.thread.session.state.lock().await;
+        state
+            .history
+            .set_world_state_baseline(world_state.snapshot());
+        state.set_token_info(Some(token_info.clone()));
+        state.set_previous_turn_settings(Some(previous_turn_settings.clone()));
+        state.restore_auto_compact_window(/*window_number*/ 7, window_ids);
+    }
+
+    let expected_position = store
+        .projected_history_position(source_thread_id)
+        .await?
+        .expect("prepared source projection");
+    assert_eq!(
+        source.thread.session.reference_context_item().await,
+        Some(reference_context_item.clone())
+    );
+    let prepared = store
+        .prepare_fork_with_model_context(
+            codex_thread_store::PrepareForkParams {
+                thread_id: source_thread_id,
+                boundary: codex_thread_store::ForkBoundary::Latest,
+            },
+            Arc::clone(&shared_parent_items),
+            expected_position,
+        )
+        .await?;
+    assert!(prepared.shared_model_response_items.is_some());
+    assert_eq!(
+        source.thread.session.reference_context_item().await,
+        Some(reference_context_item.clone())
+    );
+    let captured_source_state = source
+        .thread
+        .session
+        .capture_fork_model_state(&shared_parent_items)
+        .await
+        .expect("source model state before prepared fork");
+    assert_eq!(
+        captured_source_state.history.reference_context_item(),
+        Some(reference_context_item.clone())
+    );
+    let (child, response_history) = manager
+        .fork_prepared_thread(
+            config,
+            prepared,
+            /*thread_source*/ None,
+            /*parent_trace*/ None,
+            ClientMcpExtensions::default(),
+            /*reserved_thread_id*/ None,
+        )
+        .await?;
+
+    let child_items = child
+        .thread
+        .session
+        .clone_history()
+        .await
+        .shared_annotated_items();
+    assert!(!Arc::ptr_eq(&child_items, &shared_parent_items));
+    let child_raw_items = child_items
+        .iter()
+        .map(|item| item.item.clone())
+        .collect::<Vec<_>>();
+    let shared_parent_raw_items = shared_parent_items
+        .iter()
+        .map(|item| item.item.clone())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        strip_response_item_ids(&child_raw_items[..shared_parent_items.len()]),
+        strip_response_item_ids(shared_parent_raw_items.as_slice())
+    );
+    assert!(child_items.iter().any(|item| {
+        matches!(
+            &item.item,
+            ResponseItem::Message { content, .. }
+                if content.iter().any(|content| matches!(
+                    content,
+                    ContentItem::InputText { text }
+                        if TurnAborted::matches_text(text)
+                ))
+        )
+    }));
+    assert!(response_history.iter().any(|item| {
+        matches!(
+            item,
+            RolloutItem::EventMsg(EventMsg::TurnAborted(TurnAbortedEvent {
+                reason: TurnAbortReason::Interrupted,
+                ..
+            }))
+        )
+    }));
+    {
+        let mut child_state = child.thread.session.state.lock().await;
+        assert_eq!(
+            child_state.reference_context_item(),
+            Some(reference_context_item)
+        );
+        assert_eq!(
+            child_state.previous_turn_settings(),
+            Some(previous_turn_settings)
+        );
+        assert_eq!(child_state.token_info(), Some(token_info));
+        assert_eq!(child_state.auto_compact_window_number(), 7);
+        assert_eq!(child_state.auto_compact_window_ids(), window_ids);
+        assert!(
+            child_state
+                .history
+                .update_world_state(&world_state)
+                .1
+                .is_none(),
+            "an unchanged parent world-state baseline must not be reintroduced"
+        );
+    }
+    let child_rollout_path = child.thread.rollout_path().expect("child rollout path");
+    let child_rollout_items = RolloutRecorder::load_rollout_items(child_rollout_path.as_path())
+        .await?
+        .0;
+    assert_eq!(
+        child_rollout_items
+            .iter()
+            .filter(|item| matches!(item, RolloutItem::RolloutReference(_)))
+            .count(),
+        1
+    );
+    let child_response_items = child_rollout_items
+        .iter()
+        .filter_map(|item| match item {
+            RolloutItem::ResponseItem(item) => Some(item),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(child_response_items.len(), 1);
+    assert!(matches!(
+        child_response_items.as_slice(),
+        [ResponseItemEnvelope {
+            item: ResponseItem::Message { content, .. },
+            ..
+        }]
+            if content.iter().any(|content| matches!(
+                content,
+                ContentItem::InputText { text } if TurnAborted::matches_text(text)
+            ))
+    ));
+    assert!(
+        child_response_items.iter().all(|item| !matches!(
+            &item.item,
+            ResponseItem::Message { content, .. }
+                if content.iter().any(|content| matches!(
+                    content,
+                    ContentItem::InputText { text }
+                        if text == "prepared injected user message"
+                ))
+        )),
+        "the child rollout must not copy parent response rows"
+    );
+
+    Ok(())
+}
+
+async fn assert_prepared_paginated_fork_preserves_parent_model_messages(
+    use_shared_model_history: bool,
+) -> anyhow::Result<()> {
+    let server = start_mock_server().await;
+    let response_mock = mount_sse_sequence(
+        &server,
+        vec![sse(vec![
+            ev_response_created("segmented-child-response"),
+            ev_completed("segmented-child-response"),
+        ])],
+    )
+    .await;
+    let mut builder = test_codex().with_history_mode(ThreadHistoryMode::Paginated);
+    let test = builder.build(&server).await?;
+    let source_thread_id = ThreadId::new();
+    let source_store = LocalThreadStore::new(
+        codex_thread_store::LocalThreadStoreConfig::from_config(&test.config),
+        test.codex.state_db(),
+    );
+    source_store
+        .create_thread(codex_thread_store::CreateThreadParams {
+            session_id: source_thread_id.into(),
+            thread_id: source_thread_id,
+            extra_config: None,
+            forked_from_id: None,
+            forked_from_ordinal_exclusive: None,
+            parent_thread_id: None,
+            source: SessionSource::Cli,
+            thread_source: None,
+            originator: "test_originator".to_string(),
+            base_instructions: BaseInstructions::default(),
+            dynamic_tools: Vec::new(),
+            selected_capability_roots: Vec::new(),
+            multi_agent_version: None,
+            history_mode: ThreadHistoryMode::Paginated,
+            history_base: None,
+            subagent_history_start_ordinal: None,
+            persistence_mode: Default::default(),
+            initial_rollout_ordinal: 0,
+            initial_window_id: Uuid::now_v7().to_string(),
+            metadata: codex_thread_store::ThreadPersistenceMetadata {
+                cwd: Some(test.config.cwd.to_path_buf()),
+                model_provider: test.config.model_provider_id.clone(),
+                memory_mode: ThreadMemoryMode::Enabled,
+            },
+        })
+        .await?;
+    source_store
+        .persist_thread(source_thread_id, PersistContext::Standard)
+        .await?;
+    let mut source_model_history = Vec::new();
+
+    for index in 0..6 {
+        let turn_id = format!("paginated-parent-turn-{index}");
+        let message = format!("paginated-parent-message-{index}");
+        source_model_history.push(user_message(&message));
+        source_store
+            .append_items(codex_thread_store::AppendThreadItemsParams {
+                thread_id: source_thread_id,
+                items: vec![
+                    RolloutItem::EventMsg(EventMsg::TurnStarted(TurnStartedEvent {
+                        turn_id: turn_id.clone(),
+                        trace_id: None,
+                        started_at: Some(index),
+                        model_context_window: None,
+                        collaboration_mode_kind: Default::default(),
+                    })),
+                    RolloutItem::EventMsg(EventMsg::ItemCompleted(ItemCompletedEvent {
+                        thread_id: source_thread_id,
+                        turn_id: turn_id.clone(),
+                        item: TurnItem::UserMessage(UserMessageItem {
+                            id: format!("paginated-parent-user-{index}"),
+                            client_id: None,
+                            content: vec![UserInput::Text {
+                                text: message.clone(),
+                                text_elements: Vec::new(),
+                            }],
+                        }),
+                        started_at_ms: Some(index * 1_000),
+                        completed_at_ms: index * 1_000 + 1,
+                    })),
+                    RolloutItem::ResponseItem(user_message(&message).into()),
+                    RolloutItem::EventMsg(EventMsg::TurnComplete(TurnCompleteEvent {
+                        turn_id,
+                        last_agent_message: None,
+                        error: None,
+                        started_at: Some(index),
+                        completed_at: Some(index + 1),
+                        duration_ms: Some(1_000),
+                        time_to_first_token_ms: None,
+                    })),
+                ],
+            })
+            .await?;
+        if index < 5 {
+            source_store
+                .freeze_thread_segment(
+                    source_thread_id,
+                    FreezeRolloutSegmentParams::rotate(Vec::new()),
+                )
+                .await?;
+        }
+    }
+
+    let params = codex_thread_store::PrepareForkParams {
+        thread_id: source_thread_id,
+        boundary: codex_thread_store::ForkBoundary::Latest,
+    };
+    let shared_model_history = Arc::new(
+        source_model_history
+            .into_iter()
+            .map(Into::into)
+            .collect::<Vec<ResponseItemEnvelope>>(),
+    );
+    let prepared = if use_shared_model_history {
+        source_store.flush_thread(source_thread_id).await?;
+        let active_rollout_path = source_store.live_rollout_path(source_thread_id).await?;
+        let state_db = test
+            .codex
+            .state_db()
+            .expect("paginated source state database");
+        let mut metadata = codex_state::ThreadMetadataBuilder::new(
+            source_thread_id,
+            active_rollout_path,
+            chrono::Utc::now(),
+            SessionSource::Cli,
+        );
+        metadata.history_mode = ThreadHistoryMode::Paginated;
+        state_db
+            .upsert_thread(&metadata.build(&test.config.model_provider_id))
+            .await?;
+        let expected_position = source_store
+            .projected_history_position(source_thread_id)
+            .await?
+            .expect("projected paginated source position");
+        let prepared = source_store
+            .prepare_fork_with_model_context(
+                params,
+                Arc::clone(&shared_model_history),
+                expected_position,
+            )
+            .await?;
+        assert!(
+            Arc::ptr_eq(
+                prepared
+                    .shared_model_response_items
+                    .as_ref()
+                    .expect("shared parent model history"),
+                &shared_model_history,
+            ),
+            "indexed fork preparation must preserve the parent's immutable history Arc"
+        );
+        prepared
+    } else {
+        source_store.prepare_fork(params).await?
+    };
+    let prepared_user_messages = prepared
+        .model_context
+        .iter()
+        .filter_map(|item| match item {
+            RolloutItem::ResponseItem(ResponseItemEnvelope {
+                item: ResponseItem::Message { role, content, .. },
+                ..
+            }) if role == "user" => {
+                let [ContentItem::InputText { text }] = content.as_slice() else {
+                    return None;
+                };
+                text.starts_with("paginated-parent-message-")
+                    .then_some(text.as_str())
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    if use_shared_model_history {
+        assert!(prepared_user_messages.len() <= 1);
+    } else {
+        assert_eq!(
+            prepared_user_messages,
+            (0..6)
+                .map(|index| format!("paginated-parent-message-{index}"))
+                .collect::<Vec<_>>()
+        );
+    }
+    let (child, _) = test
+        .thread_manager
+        .fork_prepared_thread(
+            test.config.clone(),
+            prepared,
+            /*thread_source*/ None,
+            /*parent_trace*/ None,
+            ClientMcpExtensions::default(),
+            /*reserved_thread_id*/ None,
+        )
+        .await?;
+    if use_shared_model_history {
+        assert!(
+            Arc::ptr_eq(
+                &child
+                    .thread
+                    .model_history_snapshot()
+                    .await
+                    .expect("complete prepared fork model history"),
+                &shared_model_history,
+            ),
+            "the parent and idle child must share the same immutable model history Arc"
+        );
+    }
+    let child_rollout_path = child.thread.rollout_path().expect("child rollout path");
+    let child_rollout_items = std::fs::read_to_string(&child_rollout_path)?
+        .lines()
+        .map(serde_json::from_str::<RolloutLine>)
+        .collect::<Result<Vec<_>, _>>()?;
+    assert!(
+        child_rollout_items
+            .iter()
+            .any(|line| matches!(line.item, RolloutItem::RolloutReference(_)))
+    );
+    assert!(
+        child_rollout_items
+            .iter()
+            .all(|line| !matches!(line.item, RolloutItem::ResponseItem(_)))
+    );
+
+    child
+        .thread
+        .start_or_steer_turn(ExternalTurnInputRequest::user_input(vec![UserInput::Text {
+                text: "paginated-child-message".to_string(),
+                text_elements: Vec::new(),
+            }]))
+        .await?;
+    wait_for_event(&child.thread, |event| {
+        matches!(event, EventMsg::TurnComplete(_))
+    })
+    .await;
+
+    let model_user_messages = response_mock
+        .last_request()
+        .expect("child model request")
+        .message_input_texts("user")
+        .into_iter()
+        .filter(|message| message.starts_with("paginated-"))
+        .collect::<Vec<_>>();
+    let mut expected_model_user_messages = (0..6)
+        .map(|index| format!("paginated-parent-message-{index}"))
+        .collect::<Vec<_>>();
+    expected_model_user_messages.push("paginated-child-message".to_string());
+    assert_eq!(model_user_messages, expected_model_user_messages);
+
+    Ok(())
 }
 
 #[tokio::test]
@@ -3606,7 +4392,8 @@ async fn start_new_context_window_assigns_and_persists_item_ids() {
 
     session
         .start_new_context_window(&step_context, world_state)
-        .await;
+        .await
+        .expect("persist new context window");
 
     let live_history = session.clone_history().await;
     assert!(live_history.raw_items().next().is_some());
@@ -3622,6 +4409,7 @@ async fn start_new_context_window_assigns_and_persists_item_ids() {
     let persisted_replacement_history = resumed.history.iter().rev().find_map(|item| match item {
         RolloutItem::Compacted(compacted) => compacted.replacement_history.as_ref(),
         RolloutItem::SessionMeta(_)
+        | RolloutItem::RolloutReference(_)
         | RolloutItem::ResponseItem(_)
         | RolloutItem::InterAgentCommunication(_)
         | RolloutItem::InterAgentCommunicationMetadata { .. }
@@ -3672,7 +4460,8 @@ async fn record_initial_history_assigns_and_persists_id_for_forked_response_item
         .record_initial_history(InitialHistory::Forked(vec![RolloutItem::ResponseItem(
             response_item,
         )]))
-        .await;
+        .await
+        .expect("record initial history");
 
     let live_history = session.clone_history().await;
     let live_items = raw_history_items(&live_history);
@@ -3701,6 +4490,7 @@ async fn record_initial_history_assigns_and_persists_id_for_forked_response_item
     let persisted_item = resumed.history.iter().find_map(|item| match item {
         RolloutItem::ResponseItem(response_item) => Some(response_item),
         RolloutItem::SessionMeta(_)
+        | RolloutItem::RolloutReference(_)
         | RolloutItem::InterAgentCommunication(_)
         | RolloutItem::InterAgentCommunicationMetadata { .. }
         | RolloutItem::Compacted(_)
@@ -3927,7 +4717,8 @@ async fn record_initial_history_forked_hydrates_previous_turn_settings() {
 
     session
         .record_initial_history(InitialHistory::Forked(rollout_items))
-        .await;
+        .await
+        .expect("record initial history");
 
     let history = session.clone_history().await;
     assert_eq!(
@@ -5021,6 +5812,13 @@ async fn wait_for_thread_rollback_failed(rx: &async_channel::Receiver<Event>) ->
 }
 
 async fn open_thread_persistence(session: &mut Session) -> PathBuf {
+    open_thread_persistence_with_mode(session, ThreadPersistenceMode::Durable).await
+}
+
+async fn open_thread_persistence_with_mode(
+    session: &mut Session,
+    persistence_mode: ThreadPersistenceMode,
+) -> PathBuf {
     let config = session.get_config().await;
     let live_thread = LiveThread::create(
         Arc::clone(&session.services.thread_store),
@@ -5029,6 +5827,7 @@ async fn open_thread_persistence(session: &mut Session) -> PathBuf {
             thread_id: session.thread_id,
             extra_config: None,
             forked_from_id: None,
+            forked_from_ordinal_exclusive: None,
             parent_thread_id: None,
             source: SessionSource::Exec,
             thread_source: None,
@@ -5040,6 +5839,8 @@ async fn open_thread_persistence(session: &mut Session) -> PathBuf {
             history_mode: Default::default(),
             subagent_history_start_ordinal: None,
             history_base: None,
+            persistence_mode,
+            initial_rollout_ordinal: 0,
             initial_window_id: Uuid::now_v7().to_string(),
             metadata: ThreadPersistenceMetadata {
                 cwd: Some(config.cwd.to_path_buf()),
@@ -5072,6 +5873,127 @@ async fn attach_thread_persistence(session: &mut Session) -> PathBuf {
         .await
         .expect("attached rollout should flush");
     rollout_path
+}
+
+#[tokio::test]
+async fn replace_compacted_history_freezes_the_previous_rollout_segment() {
+    let (mut session, turn_context, _) = make_session_and_context_with_rx().await;
+    let world_state = Arc::new(build_world_state_from_turn_context(&session, &turn_context).await);
+    let expected_world_state = world_state.snapshot();
+    let session = Arc::get_mut(&mut session).expect("session should have one owner");
+    let stable_path = attach_thread_persistence(session).await;
+    session
+        .persist_rollout_items(&[
+            RolloutItem::ResponseItem(user_message("before compaction").into()),
+            RolloutItem::ResponseItem(assistant_message("before compaction answer").into()),
+        ])
+        .await;
+    session
+        .flush_rollout()
+        .await
+        .expect("flush pre-compaction rollout");
+    let (old_items, _, _) = RolloutRecorder::load_rollout_items(stable_path.as_path())
+        .await
+        .expect("load pre-compaction rollout");
+    let old_segment_id = old_items
+        .iter()
+        .find_map(|item| match item {
+            RolloutItem::SessionMeta(meta) => meta.meta.segment_id,
+            _ => None,
+        })
+        .expect("pre-compaction segment id");
+    let replacement_history = vec![ResponseItemEnvelope::new(user_message("compacted summary"))];
+    let (window_number, window_ids) = {
+        let mut state = session.state.lock().await;
+        state.start_new_context_window()
+    };
+
+    session
+        .replace_compacted_history(
+            replacement_history.clone(),
+            Some(turn_context.to_turn_context_item()),
+            Some(world_state),
+            CompactedHistoryMetadata {
+                message: "compacted summary".to_string(),
+                window_number,
+                window_ids,
+            },
+        )
+        .await
+        .expect("persist compacted history");
+
+    let current_path = session
+        .current_rollout_path()
+        .await
+        .expect("load current rollout path")
+        .expect("current rollout path");
+    assert_eq!(current_path, stable_path);
+    let codex_home = session.get_config().await.codex_home.clone();
+    let immutable_path = codex_home
+        .join(codex_rollout::ROTATED_ROLLOUT_SEGMENTS_SUBDIR)
+        .join(session.thread_id.to_string())
+        .join(old_segment_id.to_string())
+        .join(stable_path.file_name().expect("stable rollout file name"));
+    assert!(immutable_path.exists());
+
+    let (replacement_items, replacement_thread_id, parse_errors) =
+        RolloutRecorder::load_rollout_items(current_path.as_path())
+            .await
+            .expect("load replacement rollout");
+    assert_eq!(replacement_thread_id, Some(session.thread_id));
+    assert_eq!(parse_errors, 0);
+    assert!(replacement_items.iter().any(|item| {
+        matches!(
+            item,
+            RolloutItem::RolloutReference(reference)
+                if reference.rollout_path.as_path() == immutable_path.as_path()
+                    && reference.thread_id == Some(session.thread_id)
+                    && reference.segment_id == Some(old_segment_id)
+        )
+    }));
+    assert!(replacement_items.iter().any(|item| {
+        matches!(
+            item,
+            RolloutItem::Compacted(CompactedItem {
+                replacement_history: Some(history),
+                ..
+            }) if strip_response_item_ids(
+                &history.iter().map(|item| item.item.clone()).collect::<Vec<_>>()
+            ) == strip_response_item_ids(
+                &replacement_history
+                    .iter()
+                    .map(|item| item.item.clone())
+                    .collect::<Vec<_>>()
+            )
+        )
+    }));
+
+    let materialized =
+        codex_rollout::materialize_rollout_items(codex_home.as_path(), current_path.as_path())
+            .await
+            .expect("materialize segmented rollout");
+    let reconstructed = session
+        .reconstruct_history_from_rollout(turn_context.as_ref(), &materialized)
+        .await;
+    assert_eq!(
+        strip_response_item_ids(
+            &reconstructed
+                .history
+                .iter()
+                .map(|item| item.item.clone())
+                .collect::<Vec<_>>()
+        ),
+        strip_response_item_ids(
+            &replacement_history
+                .iter()
+                .map(|item| item.item.clone())
+                .collect::<Vec<_>>()
+        )
+    );
+    assert_eq!(
+        reconstructed.world_state_baseline,
+        Some(expected_world_state)
+    );
 }
 
 fn text_block(s: &str) -> serde_json::Value {
@@ -6285,7 +7207,7 @@ async fn session_new_fails_when_zsh_fork_enabled_without_packaged_zsh() {
         tx_event,
         agent_status_tx,
         InitialHistory::New,
-        ForkPersistence::Copied,
+        ForkStartupItems::default(),
         SessionSource::Exec,
         skills_service,
         plugins_manager,
@@ -6575,9 +7497,9 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
         guardian_review_session: crate::guardian::GuardianReviewSessionManager::default(),
         services,
         git_enrichment_policy: GitEnrichmentPolicy::Fresh,
-        fork_persistence: ForkPersistence::Copied,
         forked_from_ordinal_exclusive: None,
         next_internal_sub_id: AtomicU64::new(0),
+        persistence_restart_required: std::sync::atomic::AtomicBool::new(false),
     };
     let per_turn_config =
         session.build_per_turn_config(&session_configuration, session_configuration.cwd().clone());
@@ -6740,7 +7662,7 @@ async fn make_session_with_config_and_rx(
         tx_event,
         agent_status_tx,
         InitialHistory::New,
-        ForkPersistence::Copied,
+        ForkStartupItems::default(),
         SessionSource::Exec,
         skills_service,
         plugins_manager,
@@ -6867,7 +7789,7 @@ async fn make_session_with_history_source_and_agent_control_and_rx(
         tx_event,
         agent_status_tx,
         initial_history,
-        ForkPersistence::Copied,
+        ForkStartupItems::default(),
         session_source,
         skills_service,
         plugins_manager,
@@ -8129,6 +9051,7 @@ async fn shutdown_complete_does_not_append_to_thread_store_after_shutdown() {
             thread_id: session.thread_id,
             extra_config: None,
             forked_from_id: None,
+            forked_from_ordinal_exclusive: None,
             parent_thread_id: None,
             source: SessionSource::Exec,
             thread_source: None,
@@ -8140,6 +9063,8 @@ async fn shutdown_complete_does_not_append_to_thread_store_after_shutdown() {
             history_mode: Default::default(),
             subagent_history_start_ordinal: None,
             history_base: None,
+            persistence_mode: ThreadPersistenceMode::Durable,
+            initial_rollout_ordinal: 0,
             initial_window_id: Uuid::now_v7().to_string(),
             metadata: ThreadPersistenceMetadata {
                 cwd: Some(config.cwd.to_path_buf()),
@@ -8240,6 +9165,7 @@ async fn submission_loop_channel_close_runs_full_thread_teardown() {
             thread_id: session.thread_id,
             extra_config: None,
             forked_from_id: None,
+            forked_from_ordinal_exclusive: None,
             parent_thread_id: None,
             source: SessionSource::Exec,
             thread_source: None,
@@ -8251,6 +9177,8 @@ async fn submission_loop_channel_close_runs_full_thread_teardown() {
             history_mode: Default::default(),
             subagent_history_start_ordinal: None,
             history_base: None,
+            persistence_mode: ThreadPersistenceMode::Durable,
+            initial_rollout_ordinal: 0,
             initial_window_id: Uuid::now_v7().to_string(),
             metadata: ThreadPersistenceMetadata {
                 cwd: Some(config.cwd.to_path_buf()),
@@ -8857,9 +9785,9 @@ where
         guardian_review_session: crate::guardian::GuardianReviewSessionManager::default(),
         services,
         git_enrichment_policy: GitEnrichmentPolicy::Fresh,
-        fork_persistence: ForkPersistence::Copied,
         forked_from_ordinal_exclusive: None,
         next_internal_sub_id: AtomicU64::new(0),
+        persistence_restart_required: std::sync::atomic::AtomicBool::new(false),
     });
     let per_turn_config =
         session.build_per_turn_config(&session_configuration, session_configuration.cwd().clone());
@@ -10877,6 +11805,7 @@ async fn attach_in_memory_thread_store(
             thread_id: session.thread_id,
             extra_config: None,
             forked_from_id: None,
+            forked_from_ordinal_exclusive: None,
             parent_thread_id: None,
             source: SessionSource::Exec,
             thread_source: None,
@@ -10888,6 +11817,8 @@ async fn attach_in_memory_thread_store(
             history_mode: Default::default(),
             subagent_history_start_ordinal: None,
             history_base: None,
+            persistence_mode: ThreadPersistenceMode::Durable,
+            initial_rollout_ordinal: 0,
             initial_window_id: Uuid::now_v7().to_string(),
             metadata: ThreadPersistenceMetadata {
                 cwd: Some(config.cwd.to_path_buf()),
@@ -10940,6 +11871,27 @@ async fn hook_transcript_path_materializes_lazy_local_thread() {
         items.as_slice(),
         [RolloutItem::SessionMeta(meta)] if meta.meta.id == session.thread_id
     ));
+}
+
+#[tokio::test]
+async fn hook_transcript_path_omits_deferred_thread() {
+    let (mut session, _) = make_session_and_context().await;
+    let rollout_path =
+        open_thread_persistence_with_mode(&mut session, ThreadPersistenceMode::Deferred).await;
+    assert!(!rollout_path.exists());
+
+    assert_eq!(session.hook_transcript_path().await, None);
+    assert!(
+        !rollout_path.exists(),
+        "hook path lookup must not materialize deferred persistence"
+    );
+    assert!(
+        session
+            .live_thread()
+            .expect("thread persistence")
+            .is_persistence_deferred()
+            .await
+    );
 }
 
 async fn wait_for_flush_count(

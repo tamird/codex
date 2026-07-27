@@ -72,6 +72,7 @@ impl ModelReplayPlanner {
                 ReplayRecord::UserBoundary
             }
             RolloutItem::SessionMeta(_)
+            | RolloutItem::RolloutReference(_)
             | RolloutItem::ResponseItem(_)
             | RolloutItem::EventMsg(_)
             | RolloutItem::InterAgentCommunicationMetadata { .. }

@@ -115,6 +115,37 @@ pub(super) fn validated_rollout_file_name(
     }
 }
 
+pub(super) fn matching_rollout_file_name(
+    rollout_path: &Path,
+    thread_id: ThreadId,
+    display_path: &Path,
+) -> ThreadStoreResult<std::ffi::OsString> {
+    let Some(file_name) = rollout_path.file_name().map(OsStr::to_owned) else {
+        return Err(ThreadStoreError::InvalidRequest {
+            message: format!(
+                "rollout path `{}` missing file name",
+                display_path.display()
+            ),
+        });
+    };
+    let required_plain_suffix = format!("{thread_id}.jsonl");
+    let required_compressed_suffix = format!("{required_plain_suffix}.zst");
+    let file_name_str = file_name.to_string_lossy();
+    if codex_rollout::thread_id_from_path(rollout_path) == Some(thread_id)
+        || file_name_str.ends_with(required_plain_suffix.as_str())
+        || file_name_str.ends_with(required_compressed_suffix.as_str())
+    {
+        Ok(file_name)
+    } else {
+        Err(ThreadStoreError::InvalidRequest {
+            message: format!(
+                "rollout path `{}` does not match thread id {thread_id}",
+                display_path.display(),
+            ),
+        })
+    }
+}
+
 pub(super) fn touch_modified_time(path: &Path) -> std::io::Result<()> {
     let times = FileTimes::new().set_modified(SystemTime::now());
     OpenOptions::new().append(true).open(path)?.set_times(times)

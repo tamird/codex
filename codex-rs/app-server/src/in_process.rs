@@ -791,7 +791,10 @@ mod tests {
     use codex_app_server_protocol::ClientInfo;
     use codex_app_server_protocol::ConfigRequirementsReadResponse;
     use codex_app_server_protocol::ExternalAgentConfigImportCompletedNotification;
+    use codex_app_server_protocol::InitializeCapabilities;
     use codex_app_server_protocol::SessionSource as ApiSessionSource;
+    use codex_app_server_protocol::ThreadForkParams;
+    use codex_app_server_protocol::ThreadForkResponse;
     use codex_app_server_protocol::ThreadQueueChangedNotification;
     use codex_app_server_protocol::ThreadStartParams;
     use codex_app_server_protocol::ThreadStartResponse;
@@ -800,9 +803,14 @@ mod tests {
     use codex_app_server_protocol::TurnItemsView;
     use codex_app_server_protocol::TurnStatus;
     use codex_core::config::ConfigBuilder;
+    use codex_protocol::protocol::EventMsg;
+    use codex_protocol::protocol::TurnStartedEvent;
+    use codex_protocol::protocol::UserMessageEvent;
+    use codex_rollout::RolloutItem;
     use pretty_assertions::assert_eq;
     use std::path::Path;
     use tempfile::TempDir;
+    use tokio::sync::Semaphore;
 
     async fn build_test_config(codex_home: &Path) -> Config {
         match ConfigBuilder::default()
@@ -826,6 +834,25 @@ mod tests {
     ) -> InProcessClientHandle {
         let codex_home = TempDir::new().expect("temp dir");
         let config = Arc::new(build_test_config(codex_home.path()).await);
+        start_test_client_with_config_loader(
+            codex_home,
+            config,
+            Arc::new(codex_config::NoopThreadConfigLoader),
+            session_source,
+            channel_capacity,
+            /*experimental_api*/ false,
+        )
+        .await
+    }
+
+    async fn start_test_client_with_config_loader(
+        codex_home: TempDir,
+        config: Arc<Config>,
+        thread_config_loader: Arc<dyn ThreadConfigLoader>,
+        session_source: SessionSource,
+        channel_capacity: usize,
+        experimental_api: bool,
+    ) -> InProcessClientHandle {
         let state_db = codex_rollout::state_db::try_init(config.as_ref())
             .await
             .expect("state db should initialize for in-process test");
@@ -836,7 +863,7 @@ mod tests {
             loader_overrides: LoaderOverrides::default(),
             strict_config: false,
             cloud_config_bundle: CloudConfigBundleLoader::default(),
-            thread_config_loader: Arc::new(codex_config::NoopThreadConfigLoader),
+            thread_config_loader,
             feedback: CodexFeedback::new(),
             log_db: None,
             state_db: Some(state_db),
@@ -850,13 +877,74 @@ mod tests {
                     title: None,
                     version: "0.0.0".to_string(),
                 },
-                capabilities: None,
+                capabilities: experimental_api.then(|| InitializeCapabilities {
+                    experimental_api: true,
+                    ..Default::default()
+                }),
             },
             channel_capacity,
         };
         let mut client = start(args).await.expect("in-process runtime should start");
         client._test_codex_home = Some(codex_home);
         client
+    }
+
+    /// Pauses one armed config load after app-server reads fork history and before core freezes it.
+    struct GatedThreadConfigLoader {
+        armed: AtomicBool,
+        entered: Semaphore,
+        release: Semaphore,
+    }
+
+    impl Default for GatedThreadConfigLoader {
+        fn default() -> Self {
+            Self {
+                armed: AtomicBool::new(false),
+                entered: Semaphore::new(0),
+                release: Semaphore::new(0),
+            }
+        }
+    }
+
+    impl GatedThreadConfigLoader {
+        fn arm(&self) {
+            assert!(
+                !self.armed.swap(true, Ordering::SeqCst),
+                "thread config loader gate should not already be armed"
+            );
+        }
+
+        async fn wait_until_entered(&self) {
+            self.entered
+                .acquire()
+                .await
+                .expect("thread config loader gate should remain open")
+                .forget();
+        }
+
+        fn release(&self) {
+            self.release.add_permits(1);
+        }
+    }
+
+    impl ThreadConfigLoader for GatedThreadConfigLoader {
+        fn load(
+            &self,
+            _context: codex_config::ThreadConfigContext,
+        ) -> codex_config::ThreadConfigLoaderFuture<'_, Vec<codex_config::ThreadConfigSource>>
+        {
+            Box::pin(async move {
+                if self.armed.swap(false, Ordering::SeqCst) {
+                    self.entered.add_permits(1);
+                    self.release
+                        .acquire()
+                        .await
+                        .expect("thread config loader gate should remain open")
+                        .forget();
+                }
+                Ok(Vec::new())
+            })
+        }
     }
 
     async fn start_test_client(session_source: SessionSource) -> InProcessClientHandle {
@@ -910,6 +998,246 @@ mod tests {
                 .await
                 .expect("in-process runtime should shutdown cleanly");
         }
+    }
+
+    #[test]
+    fn thread_fork_freezes_source_after_config_load() {
+        let test_thread = std::thread::Builder::new()
+            .name("thread_fork_freezes_source_after_config_load".to_string())
+            .stack_size(32 * 1024 * 1024)
+            .spawn(|| {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("build app-server fork test runtime")
+                    .block_on(thread_fork_freezes_source_after_config_load_inner())
+            })
+            .expect("spawn app-server fork test thread");
+        if let Err(err) = test_thread.join() {
+            std::panic::resume_unwind(err);
+        }
+    }
+
+    async fn thread_fork_freezes_source_after_config_load_inner() {
+        const INTERRUPTED_APPEND: &str = "append before interrupted fork freeze";
+        const EPHEMERAL_APPEND: &str = "append before ephemeral fork freeze";
+        const ROLLBACK_APPEND: &str = "append before rollback fork freeze";
+        const ROLLBACK_TURN_ID: &str = "rollback-boundary";
+
+        let codex_home = TempDir::new().expect("temp dir");
+        let config = Arc::new(build_test_config(codex_home.path()).await);
+        let model_provider = config.model_provider_id.as_str();
+        let interrupted_thread_id = app_test_support::create_fake_rollout(
+            codex_home.path(),
+            "2025-01-05T12-00-00",
+            "2025-01-05T12:00:00Z",
+            "Interrupted fork source",
+            Some(model_provider),
+            /*git_info*/ None,
+        )
+        .expect("create interrupted fork source");
+        let rollback_thread_id = app_test_support::create_fake_rollout(
+            codex_home.path(),
+            "2025-01-05T12-01-00",
+            "2025-01-05T12:01:00Z",
+            "Rollback fork source",
+            Some(model_provider),
+            /*git_info*/ None,
+        )
+        .expect("create rollback fork source");
+        let interrupted_path = app_test_support::rollout_path(
+            codex_home.path(),
+            "2025-01-05T12-00-00",
+            &interrupted_thread_id,
+        );
+        let rollback_path = app_test_support::rollout_path(
+            codex_home.path(),
+            "2025-01-05T12-01-00",
+            &rollback_thread_id,
+        );
+        codex_rollout::append_rollout_item_to_path(
+            &rollback_path,
+            &RolloutItem::EventMsg(EventMsg::TurnStarted(TurnStartedEvent {
+                turn_id: ROLLBACK_TURN_ID.to_string(),
+                trace_id: None,
+                started_at: None,
+                model_context_window: None,
+                collaboration_mode_kind: Default::default(),
+            })),
+        )
+        .await
+        .expect("append rollback turn boundary");
+        codex_rollout::append_rollout_item_to_path(
+            &rollback_path,
+            &RolloutItem::EventMsg(EventMsg::UserMessage(UserMessageEvent {
+                message: "Rollback boundary message".to_string(),
+                ..Default::default()
+            })),
+        )
+        .await
+        .expect("append rollback user message");
+
+        let config_loader = Arc::new(GatedThreadConfigLoader::default());
+        let client = start_test_client_with_config_loader(
+            codex_home,
+            config,
+            config_loader.clone(),
+            SessionSource::Cli,
+            DEFAULT_IN_PROCESS_CHANNEL_CAPACITY,
+            /*experimental_api*/ true,
+        )
+        .await;
+        let codex_home = client
+            ._test_codex_home
+            .as_ref()
+            .expect("test client should retain CODEX_HOME")
+            .path()
+            .to_path_buf();
+
+        config_loader.arm();
+        let sender = client.sender();
+        let durable_thread_id = interrupted_thread_id.clone();
+        let interrupted_request = tokio::spawn(async move {
+            sender
+                .request(ClientRequest::ThreadFork {
+                    request_id: RequestId::Integer(10),
+                    params: ThreadForkParams {
+                        thread_id: durable_thread_id,
+                        ..Default::default()
+                    },
+                })
+                .await
+        });
+        timeout(SHUTDOWN_TIMEOUT, config_loader.wait_until_entered())
+            .await
+            .expect("interrupted fork should reach config loading");
+        codex_rollout::append_rollout_item_to_path(
+            &interrupted_path,
+            &RolloutItem::EventMsg(EventMsg::UserMessage(UserMessageEvent {
+                message: INTERRUPTED_APPEND.to_string(),
+                ..Default::default()
+            })),
+        )
+        .await
+        .expect("append before interrupted freeze");
+        config_loader.release();
+        let interrupted_response = timeout(SHUTDOWN_TIMEOUT, interrupted_request)
+            .await
+            .expect("interrupted fork should complete")
+            .expect("interrupted fork task should join")
+            .expect("interrupted fork transport should remain open")
+            .expect("interrupted fork should succeed");
+        let interrupted_fork: ThreadForkResponse = serde_json::from_value(interrupted_response)
+            .expect("interrupted fork response should parse");
+        let fork_path = interrupted_fork
+            .thread
+            .path
+            .expect("interrupted fork should persist a rollout");
+        let logical_items = codex_rollout::materialize_rollout_items(&codex_home, &fork_path)
+            .await
+            .expect("materialize interrupted fork");
+        assert_eq!(
+            serde_json::to_string(&logical_items)
+                .expect("serialize interrupted fork")
+                .matches(INTERRUPTED_APPEND)
+                .count(),
+            1,
+            "interrupted fork should include the pre-freeze append exactly once"
+        );
+
+        config_loader.arm();
+        let sender = client.sender();
+        let ephemeral_request = tokio::spawn(async move {
+            sender
+                .request(ClientRequest::ThreadFork {
+                    request_id: RequestId::Integer(12),
+                    params: ThreadForkParams {
+                        thread_id: interrupted_thread_id,
+                        ephemeral: true,
+                        ..Default::default()
+                    },
+                })
+                .await
+        });
+        timeout(SHUTDOWN_TIMEOUT, config_loader.wait_until_entered())
+            .await
+            .expect("ephemeral fork should reach config loading");
+        codex_rollout::append_rollout_item_to_path(
+            &interrupted_path,
+            &RolloutItem::EventMsg(EventMsg::UserMessage(UserMessageEvent {
+                message: EPHEMERAL_APPEND.to_string(),
+                ..Default::default()
+            })),
+        )
+        .await
+        .expect("append before ephemeral freeze");
+        config_loader.release();
+        let ephemeral_response = timeout(SHUTDOWN_TIMEOUT, ephemeral_request)
+            .await
+            .expect("ephemeral fork should complete")
+            .expect("ephemeral fork task should join")
+            .expect("ephemeral fork transport should remain open")
+            .expect("ephemeral fork should succeed");
+        let ephemeral_fork: ThreadForkResponse = serde_json::from_value(ephemeral_response)
+            .expect("ephemeral fork response should parse");
+        assert!(
+            ephemeral_fork.thread.path.is_none(),
+            "ephemeral fork should remain pathless"
+        );
+        assert_eq!(
+            serde_json::to_string(&ephemeral_fork.thread)
+                .expect("serialize ephemeral fork response")
+                .matches(EPHEMERAL_APPEND)
+                .count(),
+            1,
+            "ephemeral response should include the canonical pre-freeze append exactly once"
+        );
+
+        config_loader.arm();
+        let sender = client.sender();
+        let rollback_request = tokio::spawn(async move {
+            sender
+                .request(ClientRequest::ThreadFork {
+                    request_id: RequestId::Integer(11),
+                    params: ThreadForkParams {
+                        thread_id: rollback_thread_id,
+                        before_turn_id: Some(ROLLBACK_TURN_ID.to_string()),
+                        ..Default::default()
+                    },
+                })
+                .await
+        });
+        timeout(SHUTDOWN_TIMEOUT, config_loader.wait_until_entered())
+            .await
+            .expect("rollback fork should reach config loading");
+        codex_rollout::append_rollout_item_to_path(
+            &rollback_path,
+            &RolloutItem::EventMsg(EventMsg::UserMessage(UserMessageEvent {
+                message: ROLLBACK_APPEND.to_string(),
+                ..Default::default()
+            })),
+        )
+        .await
+        .expect("append before rollback freeze");
+        config_loader.release();
+        let rollback_error = timeout(SHUTDOWN_TIMEOUT, rollback_request)
+            .await
+            .expect("rollback fork should complete")
+            .expect("rollback fork task should join")
+            .expect("rollback fork transport should remain open")
+            .expect_err("rollback fork should reject stale source history");
+        assert!(
+            rollback_error
+                .message
+                .contains("changed before its snapshot was frozen"),
+            "unexpected rollback fork error: {}",
+            rollback_error.message
+        );
+
+        client
+            .shutdown()
+            .await
+            .expect("in-process runtime should shutdown cleanly");
     }
 
     #[tokio::test]

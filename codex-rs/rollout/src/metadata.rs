@@ -10,6 +10,7 @@ use chrono::NaiveDateTime;
 use chrono::Timelike;
 use chrono::Utc;
 use codex_protocol::RolloutId;
+use codex_protocol::ThreadId;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::SandboxPolicy;
 use codex_protocol::protocol::SessionMeta;
@@ -70,7 +71,8 @@ pub fn builder_from_items(
 ) -> Option<ThreadMetadataBuilder> {
     if let Some(session_meta) = items.iter().find_map(|item| match item {
         RolloutItem::SessionMeta(meta_line) => Some(meta_line),
-        RolloutItem::ResponseItem(_)
+        RolloutItem::RolloutReference(_)
+        | RolloutItem::ResponseItem(_)
         | RolloutItem::InterAgentCommunication(_)
         | RolloutItem::InterAgentCommunicationMetadata { .. }
         | RolloutItem::Compacted(_)
@@ -130,6 +132,16 @@ pub fn forked_from_ordinal_exclusive(
     })
 }
 
+/// Returns the stable thread ID encoded in a canonical rollout filename.
+///
+/// Threads that have been reverted use
+/// `rollout-<timestamp>-<thread-id>_<rollout-id>.jsonl`. This returns the ID before `_`, while
+/// [`rollout_id_from_path`] returns the physical rollout ID after `_`.
+pub fn thread_id_from_path(rollout_path: &Path) -> Option<ThreadId> {
+    let file_name = rollout_path.file_name()?.to_str()?;
+    Some(RolloutFileName::parse(file_name)?.thread_id())
+}
+
 pub async fn extract_metadata_from_rollout(
     rollout_path: &Path,
     default_provider: &str,
@@ -160,7 +172,8 @@ pub async fn extract_metadata_from_rollout(
         metadata,
         memory_mode: items.iter().rev().find_map(|item| match item {
             RolloutItem::SessionMeta(meta_line) => meta_line.meta.memory_mode.clone(),
-            RolloutItem::ResponseItem(_)
+            RolloutItem::RolloutReference(_)
+            | RolloutItem::ResponseItem(_)
             | RolloutItem::InterAgentCommunication(_)
             | RolloutItem::InterAgentCommunicationMetadata { .. }
             | RolloutItem::Compacted(_)

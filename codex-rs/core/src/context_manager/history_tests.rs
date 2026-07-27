@@ -529,6 +529,30 @@ fn annotated_history_apis_preserve_envelopes() {
     assert_eq!(history.into_raw_items(), vec![first_item]);
 }
 
+#[test]
+fn fork_copy_on_write_preserves_harness_metadata() {
+    let inherited = ResponseItemEnvelope {
+        item: assistant_msg("inherited"),
+        metadata: Some(CodexHarnessMetadata {
+            client_authored: true,
+            fallback_token_limit_override: None,
+        }),
+    };
+    let mut parent = ContextManager::new();
+    parent.replace_annotated(vec![inherited.clone()]);
+    let shared = parent.shared_annotated_items();
+    let mut child = ContextManager::new();
+    child.replace_shared_annotated(Arc::clone(&shared));
+
+    assert!(Arc::ptr_eq(&shared, &child.shared_annotated_items()));
+    child.append_fork_items([ResponseItemEnvelope::new(assistant_msg("child"))]);
+
+    assert_eq!(parent.annotated_items(), std::slice::from_ref(&inherited));
+    assert_eq!(child.annotated_items()[0], inherited);
+    assert_eq!(child.annotated_items().len(), 2);
+    assert!(!Arc::ptr_eq(&shared, &child.shared_annotated_items()));
+}
+
 #[test_case(None, 100, 5, true; "model policy")]
 #[test_case(Some(200), 100, 200, false; "configured override")]
 #[test_case(Some(100), 85, 100, true; "saved limit has no additional allowance")]

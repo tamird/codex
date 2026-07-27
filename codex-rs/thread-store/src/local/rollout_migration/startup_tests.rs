@@ -6,6 +6,7 @@ use std::time::Duration;
 
 use codex_protocol::ThreadId;
 use codex_protocol::protocol::EventMsg;
+use codex_protocol::protocol::HistoryPosition;
 use codex_protocol::protocol::SessionMeta;
 use codex_protocol::protocol::SessionMetaLine;
 use codex_protocol::protocol::SessionSource;
@@ -70,6 +71,22 @@ fn write_rollout(home: &Path, thread_id: ThreadId, history_mode: ThreadHistoryMo
         .expect("write legacy record");
     }
     path
+}
+
+fn set_history_base(path: &Path, history_base: HistoryPosition) {
+    let contents = fs::read_to_string(path).expect("read rollout");
+    let mut lines = contents.lines();
+    let mut head: serde_json::Value =
+        serde_json::from_str(lines.next().expect("session metadata")).expect("parse metadata");
+    head["payload"]["history_base"] =
+        serde_json::to_value(history_base).expect("serialize history base");
+    let mut updated = serde_json::to_string(&head).expect("serialize metadata");
+    for line in lines {
+        updated.push('\n');
+        updated.push_str(line);
+    }
+    updated.push('\n');
+    fs::write(path, updated).expect("write history base");
 }
 
 fn move_to_timestamp(
@@ -195,6 +212,50 @@ async fn checks_rollouts_within_the_cursor_lookback() {
             .meta
             .history_mode,
         ThreadHistoryMode::Paginated
+    );
+}
+
+#[tokio::test]
+async fn reference_backed_legacy_rollout_records_terminal_startup_skip() {
+    let home = TempDir::new().expect("create Codex home");
+    let thread_id = ThreadId::new();
+    let parent_thread_id = ThreadId::new();
+    let path = write_rollout(home.path(), thread_id, ThreadHistoryMode::Legacy);
+    let store = indexed_store(home.path()).await;
+    set_history_base(
+        &path,
+        HistoryPosition {
+            thread_id: parent_thread_id,
+            end_ordinal_exclusive: 7,
+            end_byte_offset: 123,
+        },
+    );
+    let original = fs::read(&path).expect("read reference-backed rollout");
+
+    store
+        .migrate_rollouts_on_startup()
+        .await
+        .expect("refuse reference-backed startup migration");
+
+    assert_eq!(fs::read(&path).expect("reread rollout"), original);
+    let state_db = store.state_db().await.expect("state db");
+    let checked_thread = state_db
+        .get_rollout_migration_state(super::LEGACY_TO_PAGINATED_MIGRATION_ID)
+        .await
+        .expect("read migration state")
+        .expect("migration state")
+        .last_checked_thread
+        .expect("checked thread");
+    let skip_reasons = state_db
+        .list_rollout_migration_skipped_rollouts(super::LEGACY_TO_PAGINATED_MIGRATION_ID)
+        .await
+        .expect("read skipped rollouts")
+        .into_iter()
+        .map(|skipped_rollout| skipped_rollout.skip_reason)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        (checked_thread.thread_id, skip_reasons),
+        (thread_id.to_string(), vec![super::FAILED_SKIP_REASON.to_string()]),
     );
 }
 

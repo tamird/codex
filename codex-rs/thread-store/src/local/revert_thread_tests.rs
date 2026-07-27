@@ -153,6 +153,7 @@ async fn create_paginated_thread(store: &LocalThreadStore, thread_id: ThreadId) 
             thread_id,
             extra_config: None,
             forked_from_id: None,
+            forked_from_ordinal_exclusive: None,
             parent_thread_id: None,
             source: SessionSource::Exec,
             thread_source: None,
@@ -164,6 +165,8 @@ async fn create_paginated_thread(store: &LocalThreadStore, thread_id: ThreadId) 
             history_mode: ThreadHistoryMode::Paginated,
             history_base: None,
             subagent_history_start_ordinal: None,
+            persistence_mode: Default::default(),
+            initial_rollout_ordinal: 0,
             initial_window_id: "window-1".to_string(),
             metadata: ThreadPersistenceMetadata {
                 cwd: Some(std::env::current_dir().expect("cwd")),

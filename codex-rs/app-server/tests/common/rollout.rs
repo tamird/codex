@@ -1,8 +1,11 @@
 use anyhow::Result;
 use codex_protocol::SessionId;
 use codex_protocol::ThreadId;
+use codex_protocol::items::TurnItem;
+use codex_protocol::items::UserMessageItem;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::GitInfo;
+use codex_protocol::protocol::ItemCompletedEvent;
 use codex_protocol::protocol::SessionMeta;
 use codex_protocol::protocol::SessionMetaLine;
 use codex_protocol::protocol::SessionSource;
@@ -11,6 +14,10 @@ use codex_protocol::protocol::ThreadSource;
 use codex_protocol::protocol::TokenCountEvent;
 use codex_protocol::protocol::TokenUsage;
 use codex_protocol::protocol::TokenUsageInfo;
+use codex_protocol::protocol::TurnStartedEvent;
+use codex_protocol::user_input::UserInput;
+use codex_rollout::RolloutItem;
+use codex_rollout::append_rollout_item_to_path;
 use core_test_support::test_path_buf;
 use serde_json::json;
 use std::fs;
@@ -81,6 +88,9 @@ pub fn create_fake_paginated_rollout(
         .map(serde_json::from_str::<serde_json::Value>)
         .collect::<Result<Vec<_>, _>>()?;
     lines[0]["payload"]["history_mode"] = serde_json::to_value(ThreadHistoryMode::Paginated)?;
+    // Native rollouts use ItemCompleted for presentation. Keep the model input, but do not
+    // mislabel the legacy UserMessage event as a native paginated record.
+    lines.retain(|line| line["type"] != "event_msg" || line["payload"]["type"] != "user_message");
     for (ordinal, line) in lines.iter_mut().enumerate() {
         line["ordinal"] = serde_json::to_value(ordinal)?;
     }
@@ -91,6 +101,40 @@ pub fn create_fake_paginated_rollout(
         .join("\n");
     fs::write(path, format!("{contents}\n"))?;
     Ok(thread_id)
+}
+
+/// Adds the visible user message to a native fixture that otherwise contains only model input.
+pub async fn append_fake_paginated_user_message(
+    path: &Path,
+    thread_id: &str,
+    text: &str,
+) -> Result<()> {
+    for item in [
+        RolloutItem::EventMsg(EventMsg::TurnStarted(TurnStartedEvent {
+            turn_id: "saved-turn".to_string(),
+            trace_id: None,
+            started_at: Some(0),
+            model_context_window: None,
+            collaboration_mode_kind: Default::default(),
+        })),
+        RolloutItem::EventMsg(EventMsg::ItemCompleted(ItemCompletedEvent {
+            thread_id: ThreadId::from_string(thread_id)?,
+            turn_id: "saved-turn".to_string(),
+            item: TurnItem::UserMessage(UserMessageItem {
+                id: "saved-user".to_string(),
+                client_id: None,
+                content: vec![UserInput::Text {
+                    text: text.to_string(),
+                    text_elements: Vec::new(),
+                }],
+            }),
+            started_at_ms: Some(0),
+            completed_at_ms: 1,
+        })),
+    ] {
+        append_rollout_item_to_path(path, &item).await?;
+    }
+    Ok(())
 }
 
 /// Creates a minimal rollout whose history includes a persisted token usage event.
@@ -255,6 +299,7 @@ fn create_fake_rollout_with_source_and_parent_thread_id(
     let meta = SessionMeta {
         session_id,
         id: conversation_id,
+        segment_id: None,
         forked_from_id: None,
         forked_from_ordinal_exclusive: None,
         parent_thread_id,
@@ -348,6 +393,7 @@ pub fn create_fake_rollout_with_text_elements(
     let meta = SessionMeta {
         session_id: conversation_id.into(),
         id: conversation_id,
+        segment_id: None,
         forked_from_id: None,
         forked_from_ordinal_exclusive: None,
         parent_thread_id: None,

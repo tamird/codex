@@ -30,6 +30,7 @@ use codex_protocol::openai_models::ReasoningEffortPreset;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::HookEventName;
 use codex_protocol::protocol::Op;
+use codex_protocol::turn_input::TurnInputRequest;
 use codex_protocol::user_input::UserInput;
 use core_test_support::hooks::trust_discovered_hooks;
 use core_test_support::responses::ResponseMock;
@@ -228,16 +229,10 @@ async fn submit_prompt_text(
     text: &str,
 ) -> Result<()> {
     test.codex
-        .submit(Op::UserInput {
-            items: vec![UserInput::Text {
-                text: text.to_string(),
-                text_elements: Vec::new(),
-            }],
-            final_output_json_schema: None,
-            responsesapi_client_metadata: None,
-            additional_context: Default::default(),
-            thread_settings: Default::default(),
-        })
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: text.to_string(),
+            text_elements: Vec::new(),
+        }]))
         .await?;
     Ok(())
 }
@@ -687,7 +682,7 @@ async fn cooling_wait_is_interruptible_before_any_provider_request() -> Result<(
         live_history
             .iter()
             .filter(|item| {
-                serde_json::to_string(item)
+                serde_json::to_string(&item.item)
                     .is_ok_and(|serialized| serialized.contains("wait for routing cooldown"))
             })
             .count(),
@@ -1147,7 +1142,12 @@ async fn typed_compaction_failure_falls_through_without_terminating_the_turn() -
         .model_history_snapshot()
         .await
         .expect("idle thread should expose complete model history");
-    let live_history = serde_json::to_string(live_history.as_ref())?;
+    let live_history = serde_json::to_string(
+        &live_history
+            .iter()
+            .map(|item| &item.item)
+            .collect::<Vec<_>>(),
+    )?;
     let rollout_path = test.codex.rollout_path().expect("rollout path");
     let rollout = tokio::fs::read_to_string(rollout_path).await?;
     assert!(!requests[3].body_contains_text(REJECTED_COMPACTION_OUTPUT));

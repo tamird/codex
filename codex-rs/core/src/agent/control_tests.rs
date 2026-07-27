@@ -40,6 +40,7 @@ use codex_protocol::items::TurnItem;
 use codex_protocol::items::UserMessageItem;
 use codex_protocol::mcp::ClientMcpExtensions;
 use codex_protocol::mcp::OPENAI_FORM_EXTENSION_ID;
+use codex_protocol::models::BaseInstructions;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::ContentItemKind;
 use codex_protocol::models::FunctionCallOutputPayload;
@@ -51,22 +52,29 @@ use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::EnvironmentConfigState;
 use codex_protocol::protocol::ErrorEvent;
 use codex_protocol::protocol::EventMsg;
+use codex_protocol::protocol::HistoryPosition;
 use codex_protocol::protocol::InterAgentCommunication;
 use codex_protocol::protocol::ItemCompletedEvent;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::SubAgentSource;
 use codex_protocol::protocol::ThreadHistoryMode;
+use codex_protocol::protocol::ThreadMemoryMode;
 use codex_protocol::protocol::ThreadSettingsAppliedEvent;
 use codex_protocol::protocol::ThreadSettingsSnapshot;
 use codex_protocol::protocol::TurnAbortReason;
 use codex_protocol::protocol::TurnAbortedEvent;
 use codex_protocol::protocol::TurnCompleteEvent;
 use codex_protocol::protocol::TurnStartedEvent;
+use codex_rollout::RolloutRecorder;
+use codex_thread_store::AppendThreadItemsParams;
 use codex_thread_store::ArchiveThreadParams;
+use codex_thread_store::CreateThreadParams;
 use codex_thread_store::InMemoryThreadStore;
 use codex_thread_store::LocalThreadStore;
 use codex_thread_store::LocalThreadStoreConfig;
 use codex_thread_store::PersistContext;
+use codex_thread_store::ThreadPersistenceMetadata;
+use codex_thread_store::ThreadPersistenceMode;
 use codex_thread_store::ThreadStore;
 use codex_utils_path_uri::PathUri;
 use core_test_support::responses::ev_completed;
@@ -234,6 +242,25 @@ impl AgentControlHarness {
         }
     }
 
+    async fn new_without_state_db() -> Self {
+        let (home, config) = test_config().await;
+        let manager = ThreadManager::with_models_provider_home_and_state_for_tests(
+            CodexAuth::from_api_key("dummy"),
+            config.model_provider.clone(),
+            config.codex_home.to_path_buf(),
+            std::sync::Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
+            /*state_db*/ None,
+        );
+        let control = manager.agent_control();
+        Self {
+            _home: home,
+            config,
+            state_db: None,
+            manager,
+            control,
+        }
+    }
+
     async fn start_thread(&self) -> (ThreadId, Arc<CodexThread>) {
         let new_thread = self
             .manager
@@ -299,6 +326,7 @@ async fn persisted_originator(thread: &CodexThread) -> String {
         .find_map(|item| match item {
             RolloutItem::SessionMeta(meta_line) => Some(meta_line.meta.originator.clone()),
             RolloutItem::ResponseItem(_)
+            | RolloutItem::RolloutReference(_)
             | RolloutItem::InterAgentCommunication(_)
             | RolloutItem::InterAgentCommunicationMetadata { .. }
             | RolloutItem::EventMsg(_)
@@ -1374,6 +1402,473 @@ async fn spawn_agent_fork_from_paginated_parent_uses_model_context_prefix() {
 }
 
 #[tokio::test]
+async fn self_contained_paginated_forks_work_without_state_db() {
+    let harness = AgentControlHarness::new_without_state_db().await;
+    let (parent_thread_id, parent_thread) = harness.start_paginated_thread().await;
+    parent_thread
+        .session
+        .inject_no_new_turn(
+            vec![user_message("paginated source without sqlite")],
+            /*current_turn_context*/ None,
+        )
+        .await;
+    let parent_spawn_call_id = "spawn-call-without-sqlite";
+    let turn_context = parent_thread.session.new_default_turn().await;
+    parent_thread
+        .session
+        .record_conversation_items(
+            turn_context.as_ref(),
+            &[spawn_agent_call(parent_spawn_call_id)],
+        )
+        .await;
+    parent_thread.ensure_rollout_materialized().await;
+    parent_thread
+        .flush_rollout()
+        .await
+        .expect("parent rollout should flush");
+
+    let full_history_child_id = harness
+        .spawn_anonymous_child(
+            parent_thread_id,
+            SpawnAgentOptions {
+                fork_parent_spawn_call_id: Some(parent_spawn_call_id.to_string()),
+                fork_mode: Some(SpawnAgentForkMode::FullHistory),
+                ..Default::default()
+            },
+        )
+        .await;
+    let full_history_child = harness
+        .manager
+        .get_thread(full_history_child_id)
+        .await
+        .expect("FullHistory child should exist");
+    assert!(history_contains_text(
+        full_history_child.session.clone_history().await.raw_items(),
+        "paginated source without sqlite",
+    ));
+
+    let snapshot_child = harness
+        .manager
+        .spawn_subagent(
+            parent_thread_id,
+            StartThreadOptions::new(harness.config.clone()),
+        )
+        .await
+        .expect("snapshot child should spawn without sqlite");
+    assert!(history_contains_text(
+        snapshot_child
+            .thread
+            .session
+            .clone_history()
+            .await
+            .raw_items(),
+        "paginated source without sqlite",
+    ));
+}
+
+#[tokio::test]
+async fn full_history_fork_copies_paginated_history_base_lineage_across_resume() {
+    let harness = AgentControlHarness::new().await;
+    let store = LocalThreadStore::new(
+        LocalThreadStoreConfig::from_config(&harness.config),
+        harness.state_db.clone(),
+    );
+    let source_thread_id = ThreadId::new();
+    let lineage_thread_id = ThreadId::new();
+    let create_params =
+        |thread_id: ThreadId, history_base: Option<HistoryPosition>| CreateThreadParams {
+            session_id: source_thread_id.into(),
+            thread_id,
+            extra_config: None,
+            forked_from_id: history_base.map(|_| source_thread_id),
+            forked_from_ordinal_exclusive: None,
+            parent_thread_id: history_base.map(|_| source_thread_id),
+            source: SessionSource::Exec,
+            thread_source: None,
+            originator: "test_originator".to_string(),
+            base_instructions: BaseInstructions::default(),
+            dynamic_tools: Vec::new(),
+            selected_capability_roots: Vec::new(),
+            multi_agent_version: None,
+            history_mode: ThreadHistoryMode::Paginated,
+            history_base,
+            subagent_history_start_ordinal: None,
+            persistence_mode: ThreadPersistenceMode::Durable,
+            initial_rollout_ordinal: 0,
+            initial_window_id: "window-history-base".to_string(),
+            metadata: ThreadPersistenceMetadata {
+                cwd: Some(harness.config.cwd.to_path_buf()),
+                model_provider: harness.config.model_provider_id.clone(),
+                memory_mode: ThreadMemoryMode::Enabled,
+            },
+        };
+    let user_item = |text: &str| {
+        rollout_response_item(ResponseItem::Message {
+            id: None,
+            role: "user".to_string(),
+            content: vec![ContentItem::InputText {
+                text: text.to_string(),
+            }],
+            phase: None,
+            internal_chat_message_metadata_passthrough: None,
+        })
+    };
+
+    store
+        .create_thread(create_params(source_thread_id, None))
+        .await
+        .expect("create history source");
+    store
+        .append_items(AppendThreadItemsParams {
+            thread_id: source_thread_id,
+            items: vec![user_item("source before child boundary")],
+        })
+        .await
+        .expect("append source prefix");
+    store
+        .persist_thread(source_thread_id, PersistContext::Standard)
+        .await
+        .expect("persist source prefix");
+    let source_path = store
+        .live_rollout_path(source_thread_id)
+        .await
+        .expect("source rollout path");
+    let source_bytes = std::fs::read(&source_path).expect("read source prefix");
+    let source_end_ordinal = source_bytes
+        .split_inclusive(|byte| *byte == b'\n')
+        .map(|line| {
+            serde_json::from_slice::<RolloutLine>(line)
+                .expect("parse source rollout line")
+                .ordinal
+                .expect("paginated source ordinal")
+        })
+        .max()
+        .expect("source rollout ordinal")
+        + 1;
+    let history_base = HistoryPosition {
+        thread_id: source_thread_id,
+        end_ordinal_exclusive: source_end_ordinal,
+        end_byte_offset: u64::try_from(source_bytes.len()).expect("source prefix byte offset"),
+    };
+
+    store
+        .create_thread(create_params(lineage_thread_id, Some(history_base)))
+        .await
+        .expect("create history-base child");
+    store
+        .append_items(AppendThreadItemsParams {
+            thread_id: lineage_thread_id,
+            items: vec![user_item("history-base child suffix")],
+        })
+        .await
+        .expect("append history-base child suffix");
+    store
+        .persist_thread(lineage_thread_id, PersistContext::Standard)
+        .await
+        .expect("persist history-base child suffix");
+    store
+        .append_items(AppendThreadItemsParams {
+            thread_id: source_thread_id,
+            items: vec![user_item("source after child boundary")],
+        })
+        .await
+        .expect("append source suffix after child boundary");
+    store
+        .shutdown_thread(source_thread_id)
+        .await
+        .expect("close history source");
+    store
+        .shutdown_thread(lineage_thread_id)
+        .await
+        .expect("close history-base child");
+
+    let lineage_prepared = store
+        .prepare_fork(codex_thread_store::PrepareForkParams {
+            thread_id: lineage_thread_id,
+            boundary: codex_thread_store::ForkBoundary::Latest,
+        })
+        .await
+        .expect("freeze history-base child");
+    let reference_thread_id = ThreadId::new();
+    let mut reference_params = create_params(reference_thread_id, None);
+    reference_params.forked_from_id = Some(lineage_thread_id);
+    reference_params.parent_thread_id = Some(lineage_thread_id);
+    reference_params.initial_rollout_ordinal = lineage_prepared
+        .frozen_segment
+        .next_rollout_ordinal
+        .unwrap_or_default();
+    store
+        .create_thread(reference_params)
+        .await
+        .expect("create pre-fix reference-backed descendant");
+    store
+        .persist_thread(reference_thread_id, PersistContext::Standard)
+        .await
+        .expect("persist pre-fix reference-backed descendant");
+    store
+        .append_items(AppendThreadItemsParams {
+            thread_id: reference_thread_id,
+            items: vec![RolloutItem::RolloutReference(
+                lineage_prepared.frozen_segment.reference.clone(),
+            )],
+        })
+        .await
+        .expect("append pre-fix reference-backed descendant");
+    store
+        .shutdown_thread(reference_thread_id)
+        .await
+        .expect("close pre-fix reference-backed descendant");
+    drop(lineage_prepared);
+
+    let prepared = store
+        .prepare_fork_without_response_history(codex_thread_store::PrepareForkParams {
+            thread_id: reference_thread_id,
+            boundary: codex_thread_store::ForkBoundary::Latest,
+        })
+        .await
+        .expect("prepare excludeTurns history-base child for thread/fork");
+    assert!(
+        prepared.copied_history.as_ref().is_some_and(|history| {
+            let serialized = serde_json::to_string(history.as_slice())
+                .expect("serialize copied persistence history");
+            serialized.contains("source before child boundary")
+                && serialized.contains("history-base child suffix")
+        }),
+        "excludeTurns preparation must retain full copied persistence history"
+    );
+    let (prepared_child, _) = harness
+        .manager
+        .fork_prepared_thread(
+            harness.config.clone(),
+            prepared,
+            /*thread_source*/ None,
+            /*parent_trace*/ None,
+            codex_protocol::mcp::ClientMcpExtensions::default(),
+            /*reserved_thread_id*/ None,
+        )
+        .await
+        .expect("thread/fork should copy the complete history-base lineage");
+    let prepared_child_history = prepared_child.thread.session.clone_history().await;
+    assert!(history_contains_text(
+        prepared_child_history.raw_items(),
+        "source before child boundary"
+    ));
+    assert!(history_contains_text(
+        prepared_child_history.raw_items(),
+        "history-base child suffix"
+    ));
+    assert!(!history_contains_text(
+        prepared_child_history.raw_items(),
+        "source after child boundary"
+    ));
+    prepared_child.thread.ensure_rollout_materialized().await;
+    prepared_child
+        .thread
+        .flush_rollout()
+        .await
+        .expect("persist prepared full-history child");
+    let prepared_child_lines = std::fs::read_to_string(
+        prepared_child
+            .thread
+            .rollout_path()
+            .expect("prepared full-history child rollout path"),
+    )
+    .expect("read prepared full-history child rollout")
+    .lines()
+    .map(|line| serde_json::from_str::<RolloutLine>(line).expect("parse child rollout line"))
+    .collect::<Vec<_>>();
+    assert!(
+        prepared_child_lines
+            .iter()
+            .all(|line| !matches!(line.item, RolloutItem::RolloutReference(_)))
+    );
+    assert!(prepared_child_lines.iter().any(|line| {
+        serde_json::to_string(&line.item)
+            .expect("serialize prepared child item")
+            .contains("source before child boundary")
+    }));
+    assert!(prepared_child_lines.iter().any(|line| {
+        serde_json::to_string(&line.item)
+            .expect("serialize prepared child item")
+            .contains("history-base child suffix")
+    }));
+    prepared_child
+        .thread
+        .submit(Op::Shutdown {})
+        .await
+        .expect("shutdown prepared full-history child");
+
+    harness
+        .control
+        .resume_agent_from_rollout(
+            harness.config.clone(),
+            reference_thread_id,
+            SessionSource::Exec,
+        )
+        .await
+        .expect("resume history-base child");
+    let lineage_thread = harness
+        .manager
+        .get_thread(reference_thread_id)
+        .await
+        .expect("resumed history-base child should exist");
+    let spawn_call_id = "spawn-call-history-base";
+    let turn_context = lineage_thread.session.new_default_turn().await;
+    lineage_thread
+        .session
+        .record_conversation_items(turn_context.as_ref(), &[spawn_agent_call(spawn_call_id)])
+        .await;
+    let full_history_child_id = harness
+        .spawn_anonymous_child(
+            reference_thread_id,
+            SpawnAgentOptions {
+                fork_parent_spawn_call_id: Some(spawn_call_id.to_string()),
+                fork_mode: Some(SpawnAgentForkMode::FullHistory),
+                ..Default::default()
+            },
+        )
+        .await;
+    let full_history_child = harness
+        .manager
+        .get_thread(full_history_child_id)
+        .await
+        .expect("full-history child should exist");
+    let child_history = full_history_child.session.clone_history().await;
+    assert!(history_contains_text(
+        child_history.raw_items(),
+        "source before child boundary"
+    ));
+    assert!(history_contains_text(
+        child_history.raw_items(),
+        "history-base child suffix"
+    ));
+    assert!(!history_contains_text(
+        child_history.raw_items(),
+        "source after child boundary"
+    ));
+    full_history_child.ensure_rollout_materialized().await;
+    full_history_child
+        .flush_rollout()
+        .await
+        .expect("persist full-history child");
+    let persisted_lines = std::fs::read_to_string(
+        full_history_child
+            .rollout_path()
+            .expect("full-history child rollout path"),
+    )
+    .expect("read full-history child rollout")
+    .lines()
+    .map(|line| serde_json::from_str::<RolloutLine>(line).expect("parse child rollout line"))
+    .collect::<Vec<_>>();
+    assert!(
+        persisted_lines
+            .iter()
+            .all(|line| !matches!(line.item, RolloutItem::RolloutReference(_)))
+    );
+
+    let spawned_child = harness
+        .manager
+        .spawn_subagent(
+            reference_thread_id,
+            StartThreadOptions::new(harness.config.clone()),
+        )
+        .await
+        .expect("spawn_subagent should copy the complete history-base lineage");
+    let spawned_history = spawned_child.thread.session.clone_history().await;
+    assert!(history_contains_text(
+        spawned_history.raw_items(),
+        "source before child boundary"
+    ));
+    assert!(history_contains_text(
+        spawned_history.raw_items(),
+        "history-base child suffix"
+    ));
+    assert!(!history_contains_text(
+        spawned_history.raw_items(),
+        "source after child boundary"
+    ));
+    spawned_child.thread.ensure_rollout_materialized().await;
+    spawned_child
+        .thread
+        .flush_rollout()
+        .await
+        .expect("persist spawn_subagent child");
+    let spawned_lines = std::fs::read_to_string(
+        spawned_child
+            .thread
+            .rollout_path()
+            .expect("spawn_subagent child rollout path"),
+    )
+    .expect("read spawn_subagent child rollout")
+    .lines()
+    .map(|line| serde_json::from_str::<RolloutLine>(line).expect("parse child rollout line"))
+    .collect::<Vec<_>>();
+    assert!(
+        spawned_lines
+            .iter()
+            .all(|line| !matches!(line.item, RolloutItem::RolloutReference(_)))
+    );
+    assert!(spawned_lines.iter().any(|line| {
+        serde_json::to_string(&line.item)
+            .expect("serialize spawn_subagent child item")
+            .contains("source before child boundary")
+    }));
+    assert!(spawned_lines.iter().any(|line| {
+        serde_json::to_string(&line.item)
+            .expect("serialize spawn_subagent child item")
+            .contains("history-base child suffix")
+    }));
+    spawned_child
+        .thread
+        .submit(Op::Shutdown {})
+        .await
+        .expect("shutdown spawn_subagent child");
+
+    harness
+        .control
+        .shutdown_live_agent(full_history_child_id)
+        .await
+        .expect("shutdown full-history child");
+    harness
+        .control
+        .shutdown_live_agent(reference_thread_id)
+        .await
+        .expect("shutdown reference-backed parent");
+    harness
+        .control
+        .resume_agent_from_rollout(
+            harness.config.clone(),
+            full_history_child_id,
+            SessionSource::Exec,
+        )
+        .await
+        .expect("reopen full-history child");
+    let reopened_child = harness
+        .manager
+        .get_thread(full_history_child_id)
+        .await
+        .expect("reopened full-history child should exist");
+    let reopened_history = reopened_child.session.clone_history().await;
+    assert!(history_contains_text(
+        reopened_history.raw_items(),
+        "source before child boundary"
+    ));
+    assert!(history_contains_text(
+        reopened_history.raw_items(),
+        "history-base child suffix"
+    ));
+    assert!(!history_contains_text(
+        reopened_history.raw_items(),
+        "source after child boundary"
+    ));
+    harness
+        .control
+        .shutdown_live_agent(full_history_child_id)
+        .await
+        .expect("shutdown reopened full-history child");
+}
+
+#[tokio::test]
 async fn spawn_agent_without_fork_from_paginated_parent_stays_fresh_and_paginated() {
     let harness = AgentControlHarness::new().await;
     let (parent_thread_id, parent_thread) = harness.start_paginated_thread().await;
@@ -1669,7 +2164,7 @@ async fn spawn_agent_can_fork_parent_thread_history_with_sanitized_items() {
     let child_thread_id = harness
         .control
         .spawn_agent_with_metadata(
-            child_config,
+            child_config.clone(),
             text_input("child task"),
             Some(SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
                 parent_thread_id,
@@ -1792,6 +2287,26 @@ async fn spawn_agent_can_fork_parent_thread_history_with_sanitized_items() {
         strip_response_item_ids(&expected_history),
         "full-history forked child history should replace parent usage hints with the child subagent hint while filtering non-final assistant/tool chatter"
     );
+    child_thread.ensure_rollout_materialized().await;
+    child_thread
+        .flush_rollout()
+        .await
+        .expect("sanitized child rollout should flush");
+    let physical_items = RolloutRecorder::load_rollout_items(
+        child_thread
+            .rollout_path()
+            .expect("sanitized child rollout should exist")
+            .as_path(),
+    )
+    .await
+    .expect("load sanitized child rollout")
+    .0;
+    assert!(
+        physical_items
+            .iter()
+            .all(|item| !matches!(item, RolloutItem::RolloutReference(_))),
+        "a changed parent prefix must be copied after sanitization instead of persisted by reference"
+    );
     assert_eq!(
         serde_json::to_value(child_thread.session.reference_context_item().await)
             .expect("serialize child reference context item"),
@@ -1873,6 +2388,57 @@ async fn spawn_agent_can_fork_parent_thread_history_with_sanitized_items() {
         .shutdown_live_agent(child_thread_id)
         .await
         .expect("child shutdown should submit");
+    let resumed_child_thread_id = harness
+        .control
+        .resume_agent_from_rollout(
+            child_config,
+            child_thread_id,
+            SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+                parent_thread_id,
+                depth: 1,
+                agent_path: None,
+                agent_nickname: None,
+                agent_role: None,
+            }),
+        )
+        .await
+        .expect("sanitized child should resume from persisted history");
+    let resumed_child_thread = harness
+        .manager
+        .get_thread(resumed_child_thread_id)
+        .await
+        .expect("resumed sanitized child should be registered");
+    let resumed_history = resumed_child_thread.session.clone_history().await;
+    for retained_text in [
+        "parent seed context",
+        "Child developer instructions.",
+        "parent final answer",
+        "Child subagent guidance.",
+    ] {
+        assert!(
+            history_contains_text(resumed_history.raw_items(), retained_text),
+            "cold resume must retain sanitized inherited text {retained_text:?}"
+        );
+    }
+    for excluded_text in [
+        "Parent root guidance.",
+        "Parent subagent guidance.",
+        "Developer context before.\nParent developer instructions.",
+        "parent commentary",
+        "parent unknown phase",
+        "parent trigger message",
+        "parent-reasoning",
+    ] {
+        assert!(
+            !history_contains_text(resumed_history.raw_items(), excluded_text),
+            "cold resume must not restore parent-only text {excluded_text:?} through the old reference"
+        );
+    }
+    let _ = harness
+        .control
+        .shutdown_live_agent(resumed_child_thread_id)
+        .await
+        .expect("resumed child shutdown should submit");
     let _ = harness
         .control
         .shutdown_live_agent(no_hint_child_thread_id)

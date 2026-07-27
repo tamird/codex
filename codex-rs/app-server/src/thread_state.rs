@@ -40,6 +40,7 @@ pub(crate) struct PendingThreadResumeRequest {
     pub(crate) history_items: Vec<RolloutItem>,
     /// Usage attribution already resolved while cold-loading a paginated child.
     pub(crate) cold_resume_token_usage_turn_id: Option<String>,
+    pub(crate) history_has_older_reference: bool,
     pub(crate) config_snapshot: ThreadConfigSnapshot,
     pub(crate) instruction_sources: Vec<LegacyAppPathString>,
     pub(crate) thread_summary: codex_app_server_protocol::Thread,

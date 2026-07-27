@@ -10,8 +10,9 @@ use codex_models_manager::ModelRoutingCandidate;
 use codex_models_manager::ModelRoutingProfile;
 use codex_protocol::openai_models::ReasoningEffort;
 use codex_protocol::protocol::EventMsg;
-use codex_protocol::protocol::Op;
 use codex_protocol::protocol::ThreadSettingsOverrides;
+use codex_protocol::turn_input::TurnInputRequest;
+use codex_protocol::turn_input::TurnInputSubmission;
 use codex_protocol::user_input::UserInput;
 use core_test_support::responses::ResponseMock;
 use core_test_support::responses::ev_assistant_message;
@@ -85,16 +86,10 @@ async fn build_routed_test(
 
 async fn submit_prompt(test: &TestCodex, text: &str) -> Result<()> {
     test.codex
-        .submit(Op::UserInput {
-            items: vec![UserInput::Text {
-                text: text.to_string(),
-                text_elements: Vec::new(),
-            }],
-            final_output_json_schema: None,
-            responsesapi_client_metadata: None,
-            additional_context: Default::default(),
-            thread_settings: Default::default(),
-        })
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: text.to_string(),
+            text_elements: Vec::new(),
+        }]))
         .await?;
     Ok(())
 }
@@ -251,19 +246,15 @@ async fn steering_during_tool_wait_is_recorded_once_before_midturn_reroute() -> 
         matches!(event, EventMsg::CollabWaitingBegin(_))
     })
     .await;
-    test.codex
-        .steer_input(
-            vec![UserInput::Text {
-                text: STEER_PROMPT.to_string(),
-                text_elements: Vec::new(),
-            }],
-            Default::default(),
-            /*expected_turn_id*/ None,
-            /*client_user_message_id*/ None,
-            /*responsesapi_client_metadata*/ None,
-        )
+    let submission = test
+        .codex
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: STEER_PROMPT.to_string(),
+            text_elements: Vec::new(),
+        }]))
         .await
         .expect("steering should be accepted");
+    assert!(matches!(submission, TurnInputSubmission::Steered { .. }));
     let events = events_until_complete(&test).await;
 
     assert_request_models(&mock, &[PRIMARY, PRIMARY, FALLBACK]);
@@ -363,19 +354,15 @@ async fn steering_required_mcp_survives_precaptured_step_and_midturn_reroute() -
         },
     )
     .await?;
-    test.codex
-        .steer_input(
-            vec![UserInput::Mention {
-                name: MCP_SERVER.to_string(),
-                path: format!("mcp://{MCP_SERVER}"),
-            }],
-            Default::default(),
-            /*expected_turn_id*/ None,
-            /*client_user_message_id*/ None,
-            /*responsesapi_client_metadata*/ None,
-        )
+    let submission = test
+        .codex
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Mention {
+            name: MCP_SERVER.to_string(),
+            path: format!("mcp://{MCP_SERVER}"),
+        }]))
         .await
         .expect("steering should be accepted");
+    assert!(matches!(submission, TurnInputSubmission::Steered { .. }));
 
     tokio::time::sleep(Duration::from_millis(200)).await;
     assert_eq!(

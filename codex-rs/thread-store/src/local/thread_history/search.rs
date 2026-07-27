@@ -3,6 +3,7 @@ use std::collections::HashMap;
 
 use codex_app_server_protocol::ThreadItem;
 use codex_app_server_protocol::UserInput;
+use codex_protocol::RolloutId;
 use codex_protocol::ThreadId;
 use codex_protocol::protocol::strip_user_message_prefix;
 use futures::TryStreamExt;
@@ -30,10 +31,12 @@ use crate::ThreadStoreResult;
 const SNIPPET_CONTEXT_BEFORE_CHARS: usize = 48;
 const SNIPPET_CONTEXT_AFTER_CHARS: usize = 96;
 
+/// A search continuation bound to one logical thread and its selected physical rollout.
 #[derive(Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct SearchCursor {
     thread_id: ThreadId,
+    root_rollout_id: RolloutId,
     search_term: String,
     next_rollout_ordinal: i64,
     next_occurrence_index: usize,
@@ -68,13 +71,15 @@ pub(in crate::local) async fn search_thread_occurrences(
         "thread/searchOccurrences",
     )
     .await?;
+    let lineage = store.resolve_rollout_lineage(params.thread_id).await?;
+    let root_rollout_id = lineage.root_rollout_id();
     let cursor = parse_cursor(
         params.cursor.as_deref(),
         params.thread_id,
+        root_rollout_id,
         &params.search_term,
     )?;
     let matcher = LiteralMatcher::new(params.search_term.as_str());
-    let lineage = store.resolve_rollout_lineage(params.thread_id).await?;
     let cursor_segment = cursor
         .as_ref()
         .map(|cursor| {
@@ -174,6 +179,9 @@ ORDER BY rollout_ordinal ASC
                         message: format!("failed to deserialize stored thread item: {err}"),
                     }
                 })?;
+            if !segment.allows_thread_item(&item) {
+                continue;
+            }
             let Some(text) = searchable_text(&item) else {
                 continue;
             };
@@ -220,6 +228,7 @@ ORDER BY rollout_ordinal ASC
             };
             let turn_cursor = serialize_cursor(
                 params.thread_id,
+                root_rollout_id,
                 CursorScope::Turns,
                 turn_rollout_ordinal,
                 /*include_anchor*/ true,
@@ -232,6 +241,7 @@ ORDER BY rollout_ordinal ASC
                         items,
                         next_cursor: Some(serialize_cursor_for_search(SearchCursor {
                             thread_id: params.thread_id,
+                            root_rollout_id,
                             search_term: params.search_term,
                             next_rollout_ordinal: row.rollout_ordinal,
                             next_occurrence_index: occurrence_index,
@@ -275,6 +285,7 @@ fn candidate_row(row: sqlx::sqlite::SqliteRow) -> ThreadStoreResult<CandidateRow
 fn parse_cursor(
     cursor: Option<&str>,
     thread_id: ThreadId,
+    root_rollout_id: RolloutId,
     search_term: &str,
 ) -> ThreadStoreResult<Option<SearchCursor>> {
     let Some(cursor) = cursor else {
@@ -283,6 +294,7 @@ fn parse_cursor(
     let cursor_value: SearchCursor =
         serde_json::from_str(cursor).map_err(|_| invalid_cursor(cursor))?;
     if cursor_value.thread_id != thread_id
+        || cursor_value.root_rollout_id != root_rollout_id
         || cursor_value.search_term != search_term
         || cursor_value.next_rollout_ordinal < 0
     {

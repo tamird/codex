@@ -395,14 +395,13 @@ impl ThreadHistoryBuilder {
             RolloutItem::ResponseItem(item) => self.handle_response_item(&item.item),
             RolloutItem::InterAgentCommunication(communication) => {
                 let id = self.next_item_id();
-                self.ensure_turn()
-                    .items
-                    .push(ThreadItem::InterAgentCommunication {
-                        id,
-                        communication: communication.clone(),
-                    });
+                self.push_item_in_current_turn(ThreadItem::InterAgentCommunication {
+                    id,
+                    communication: communication.clone(),
+                });
             }
             RolloutItem::InterAgentCommunicationMetadata { .. }
+            | RolloutItem::RolloutReference(_)
             | RolloutItem::TurnContext(_)
             | RolloutItem::WorldState(_)
             | RolloutItem::RealtimeItem(_)
@@ -4233,6 +4232,86 @@ mod tests {
                 id: "item-1".into(),
                 communication,
             }],
+        );
+    }
+
+    #[test]
+    fn changed_rollout_inter_agent_communication_reports_new_item_snapshot() {
+        let mut builder = ThreadHistoryBuilder::new();
+        builder.handle_rollout_item_with_changes(&RolloutItem::EventMsg(EventMsg::UserMessage(
+            UserMessageEvent {
+                client_id: None,
+                message: "delegate the task".into(),
+                images: None,
+                text_elements: Vec::new(),
+                local_images: Vec::new(),
+                ..Default::default()
+            },
+        )));
+
+        let first_communication = InterAgentCommunication::new(
+            AgentPath::try_from("/root/worker").expect("valid agent path"),
+            AgentPath::root(),
+            Vec::new(),
+            "ready for review".to_string(),
+            /*trigger_turn*/ true,
+        );
+        let first_changes = builder.handle_rollout_item_with_changes(
+            &RolloutItem::InterAgentCommunication(first_communication.clone()),
+        );
+        assert_eq!(
+            first_changes,
+            ThreadHistoryChangeSet {
+                changed_items: vec![ThreadHistoryItemChange {
+                    turn_id: "rollout-0".into(),
+                    item: ThreadItem::InterAgentCommunication {
+                        id: "item-2".into(),
+                        communication: first_communication.clone(),
+                    },
+                    started_at_ms: None,
+                    completed_at_ms: None,
+                }],
+                changed_turns: Vec::new(),
+                removed_turn_ids: Vec::new(),
+            }
+        );
+
+        let second_communication = InterAgentCommunication::new(
+            AgentPath::try_from("/root/worker").expect("valid agent path"),
+            AgentPath::root(),
+            Vec::new(),
+            "review complete".to_string(),
+            /*trigger_turn*/ false,
+        );
+        let second_changes = builder.handle_rollout_item_with_changes(
+            &RolloutItem::InterAgentCommunication(second_communication.clone()),
+        );
+        assert_eq!(
+            second_changes.changed_items,
+            vec![ThreadHistoryItemChange {
+                turn_id: "rollout-0".into(),
+                item: ThreadItem::InterAgentCommunication {
+                    id: "item-3".into(),
+                    communication: second_communication.clone(),
+                },
+                started_at_ms: None,
+                completed_at_ms: None,
+            }],
+        );
+
+        let turns = builder.finish();
+        assert_eq!(
+            turns[0].items[1..],
+            [
+                ThreadItem::InterAgentCommunication {
+                    id: "item-2".into(),
+                    communication: first_communication,
+                },
+                ThreadItem::InterAgentCommunication {
+                    id: "item-3".into(),
+                    communication: second_communication,
+                },
+            ],
         );
     }
 

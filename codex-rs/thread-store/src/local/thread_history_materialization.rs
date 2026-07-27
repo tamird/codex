@@ -2,12 +2,17 @@ use std::io::SeekFrom;
 use std::path::Path;
 
 use chrono::DateTime;
+use codex_app_server_protocol::ThreadHistoryBuilder;
 use codex_app_server_protocol::ThreadHistoryChangeSet;
 use codex_app_server_protocol::project_rollout_line;
 use codex_protocol::ThreadId;
+use codex_protocol::protocol::ThreadHistoryMode;
 use codex_rollout::RolloutItem;
+use codex_rollout::RolloutLine;
+use tokio::io::AsyncBufReadExt;
 use tokio::io::AsyncReadExt;
 use tokio::io::AsyncSeekExt;
+use tokio::io::BufReader;
 use tracing::warn;
 
 use super::LocalThreadStore;
@@ -25,9 +30,23 @@ pub(super) async fn materialize_to_sqlite(
         return Ok(());
     }
     let projection_state = super::thread_history::projection_state(store, thread_id).await?;
-    let start_offset = projection_state
+    let mut start_offset = projection_state
         .as_ref()
         .map_or(0, |state| state.next_byte_offset);
+    if let Some(state) = projection_state.as_ref()
+        && start_offset != 0
+        && first_rollout_ordinal(rollout_path).await? == Some(state.next_ordinal)
+    {
+        // The stable rollout was replaced after its immutable prefix was projected. Recover the
+        // physical cursor without changing the lineage ordinal or deleting the existing rows.
+        super::thread_history::reset_projection_for_replacement(
+            store,
+            thread_id,
+            state.next_ordinal,
+        )
+        .await?;
+        start_offset = 0;
+    }
     if projection_state.is_none()
         && codex_rollout::existing_rollout_path(rollout_path)
             .await
@@ -39,9 +58,10 @@ pub(super) async fn materialize_to_sqlite(
         .await
         .map_err(thread_store_io_error)?
         .meta;
-    let initial_ordinal = session_meta
-        .history_base
-        .map_or(0, |base| base.end_ordinal_exclusive);
+    let initial_ordinal = match session_meta.history_base {
+        Some(base) => base.end_ordinal_exclusive,
+        None => first_rollout_ordinal(rollout_path).await?.unwrap_or(0),
+    };
     let subagent_history_start_ordinal = session_meta.subagent_history_start_ordinal;
     let expected_ordinal = projection_state
         .as_ref()
@@ -67,6 +87,206 @@ pub(super) async fn materialize_to_sqlite(
         projections,
     )
     .await
+}
+
+/// Project legacy-visible history without changing canonical rollout records or their ordinals.
+pub(super) async fn materialize_legacy_to_sqlite(
+    store: &LocalThreadStore,
+    thread_id: ThreadId,
+    rollout_path: &Path,
+    builder: &mut ThreadHistoryBuilder,
+) -> ThreadStoreResult<()> {
+    materialize_legacy_to_sqlite_backfill(store, thread_id, rollout_path, builder, true).await
+}
+
+pub(super) async fn materialize_legacy_to_sqlite_backfill(
+    store: &LocalThreadStore,
+    thread_id: ThreadId,
+    rollout_path: &Path,
+    builder: &mut ThreadHistoryBuilder,
+    complete: bool,
+) -> ThreadStoreResult<()> {
+    let result =
+        materialize_legacy_to_sqlite_inner(store, thread_id, rollout_path, builder, complete).await;
+    if result.is_err() {
+        builder.reset();
+    }
+    result
+}
+
+async fn materialize_legacy_to_sqlite_inner(
+    store: &LocalThreadStore,
+    thread_id: ThreadId,
+    rollout_path: &Path,
+    builder: &mut ThreadHistoryBuilder,
+    complete: bool,
+) -> ThreadStoreResult<()> {
+    const MAX_PROJECTION_BATCH_RECORDS: usize = 256;
+    const MAX_PROJECTION_BATCH_BYTES: u64 = 4 * 1024 * 1024;
+
+    let projection_state = super::thread_history::projection_state(store, thread_id).await?;
+    let mut batch_start_offset = projection_state.as_ref().map_or(0, |state| {
+        if state.next_byte_offset
+            == super::thread_history::INCOMPLETE_LEGACY_PROJECTION_BYTE_OFFSET.unsigned_abs()
+        {
+            0
+        } else {
+            state.next_byte_offset
+        }
+    });
+    let mut next_rollout_ordinal = projection_state
+        .as_ref()
+        .map_or(0, |state| state.next_ordinal);
+    let initial_ordinal = next_rollout_ordinal;
+    let path = rollout_path.to_path_buf();
+    let file =
+        tokio::task::spawn_blocking(move || codex_rollout::open_rollout_seekable_reader(&path))
+            .await
+            .map_err(|err| ThreadStoreError::Internal {
+                message: format!("failed to join legacy rollout projection read: {err}"),
+            })?;
+    let mut file = match file {
+        Ok(file) => tokio::fs::File::from_std(file),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound && batch_start_offset == 0 => {
+            return Ok(());
+        }
+        Err(err) => return Err(thread_store_io_error(err)),
+    };
+    let end_offset = file.metadata().await.map_err(thread_store_io_error)?.len();
+    let byte_count =
+        end_offset
+            .checked_sub(batch_start_offset)
+            .ok_or_else(|| ThreadStoreError::Internal {
+                message: "durable rollout shrank before legacy projection".to_string(),
+            })?;
+    if byte_count == 0 {
+        return Ok(());
+    }
+
+    file.seek(SeekFrom::Start(batch_start_offset))
+        .await
+        .map_err(thread_store_io_error)?;
+    let mut reader = BufReader::new(file.take(byte_count));
+    let mut line_bytes = Vec::new();
+    let mut next_offset = batch_start_offset;
+    let mut projections = Vec::with_capacity(MAX_PROJECTION_BATCH_RECORDS);
+
+    loop {
+        line_bytes.clear();
+        let bytes_read = reader
+            .read_until(b'\n', &mut line_bytes)
+            .await
+            .map_err(thread_store_io_error)?;
+        if bytes_read == 0 || !line_bytes.ends_with(b"\n") {
+            break;
+        }
+
+        let start_byte_offset = next_offset;
+        next_offset = next_offset
+            .checked_add(
+                u64::try_from(bytes_read).map_err(|_| ThreadStoreError::Internal {
+                    message: "legacy rollout line exceeds addressable range".to_string(),
+                })?,
+            )
+            .ok_or_else(|| ThreadStoreError::Internal {
+                message: "legacy rollout byte offset overflow".to_string(),
+            })?;
+
+        if !line_bytes.iter().all(u8::is_ascii_whitespace) {
+            match serde_json::from_slice::<RolloutLine>(&line_bytes) {
+                Ok(line) => {
+                    let created_at_ms = DateTime::parse_from_rfc3339(line.timestamp.as_str())
+                        .map(|timestamp| timestamp.timestamp_millis())
+                        .map_err(thread_history_error)?;
+                    let is_physical_rollout_record =
+                        matches!(&line.item, RolloutItem::SessionMeta(_))
+                            && next_rollout_ordinal != 0
+                            || matches!(&line.item, RolloutItem::RolloutReference(_));
+                    let changes = if !is_physical_rollout_record
+                        && codex_rollout::is_persisted_rollout_item(
+                            &line.item,
+                            ThreadHistoryMode::Legacy,
+                        ) {
+                        builder.handle_rollout_item_with_changes(&line.item)
+                    } else {
+                        ThreadHistoryChangeSet::default()
+                    };
+                    projections.push(RolloutProjectionStep::Line(Box::new(ProjectedRolloutLine {
+                        ordinal: next_rollout_ordinal,
+                        start_byte_offset,
+                        end_byte_offset: next_offset,
+                        fallback_created_at_ms: Some(created_at_ms),
+                        changes,
+                        realtime_item: match line.item {
+                            RolloutItem::RealtimeItem(item) => Some(item),
+                            _ => None,
+                        },
+                    })));
+                    next_rollout_ordinal =
+                        next_rollout_ordinal.checked_add(1).ok_or_else(|| {
+                            ThreadStoreError::Internal {
+                                message: "legacy rollout projection ordinal overflow".to_string(),
+                            }
+                        })?;
+                }
+                Err(err) => {
+                    warn!(
+                        "skipping rejected legacy rollout line while projecting {rollout_path:?}: {err}"
+                    );
+                }
+            }
+        }
+
+        if projections.len() >= MAX_PROJECTION_BATCH_RECORDS
+            || next_offset - batch_start_offset >= MAX_PROJECTION_BATCH_BYTES
+        {
+            let batch = std::mem::replace(
+                &mut projections,
+                Vec::with_capacity(MAX_PROJECTION_BATCH_RECORDS),
+            );
+            super::thread_history::apply_legacy_projection(
+                store,
+                thread_id,
+                batch_start_offset,
+                next_offset,
+                initial_ordinal,
+                batch,
+                false,
+            )
+            .await?;
+            batch_start_offset = next_offset;
+        }
+    }
+
+    if next_offset != batch_start_offset || complete {
+        super::thread_history::apply_legacy_projection(
+            store,
+            thread_id,
+            batch_start_offset,
+            next_offset,
+            initial_ordinal,
+            projections,
+            complete,
+        )
+        .await?;
+    }
+
+    Ok(())
+}
+
+async fn first_rollout_ordinal(rollout_path: &Path) -> ThreadStoreResult<Option<u64>> {
+    let mut reader = codex_rollout::open_rollout_line_reader(rollout_path)
+        .await
+        .map_err(thread_store_io_error)?;
+    while let Some(line) = reader.next_line().await.map_err(thread_store_io_error)? {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let line =
+            serde_json::from_str::<RolloutLine>(line.as_str()).map_err(thread_history_error)?;
+        return Ok(line.ordinal);
+    }
+    Ok(None)
 }
 
 async fn read_projection_steps(
@@ -287,6 +507,12 @@ async fn read_projection_steps(
         line_start_offset = line_end_offset;
     }
     Ok((projections, next_offset))
+}
+
+fn thread_history_error(err: impl std::fmt::Display) -> ThreadStoreError {
+    ThreadStoreError::Internal {
+        message: format!("failed to project thread history: {err}"),
+    }
 }
 
 fn thread_store_io_error(err: std::io::Error) -> ThreadStoreError {

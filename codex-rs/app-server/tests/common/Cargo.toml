@@ -23,6 +23,7 @@ codex-features = { workspace = true }
 codex-login = { workspace = true }
 codex-models-manager = { workspace = true }
 codex-protocol = { workspace = true }
+codex-rollout = { workspace = true }
 codex-utils-cargo-bin = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

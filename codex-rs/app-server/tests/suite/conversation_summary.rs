@@ -126,6 +126,7 @@ async fn get_conversation_summary_by_thread_id_reads_pathless_store_thread() -> 
             thread_id,
             extra_config: None,
             forked_from_id: None,
+            forked_from_ordinal_exclusive: None,
             parent_thread_id: None,
             source: SessionSource::Cli,
             thread_source: None,
@@ -137,6 +138,8 @@ async fn get_conversation_summary_by_thread_id_reads_pathless_store_thread() -> 
             history_mode: Default::default(),
             history_base: None,
             subagent_history_start_ordinal: None,
+            persistence_mode: Default::default(),
+            initial_rollout_ordinal: 0,
             initial_window_id: Uuid::now_v7().to_string(),
             metadata: ThreadPersistenceMetadata {
                 cwd: None,

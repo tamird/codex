@@ -151,6 +151,7 @@ impl ModelContextScan {
                 self.active_segment.has_user_turn = true;
             }
             RolloutItem::EventMsg(_)
+            | RolloutItem::RolloutReference(_)
             | RolloutItem::SessionMeta(_)
             | RolloutItem::InterAgentCommunicationMetadata { .. }
             | RolloutItem::RealtimeItem(_)

@@ -243,6 +243,19 @@ impl ContextManager {
         &self.items
     }
 
+    /// Shares the current immutable annotated history without copying the parent transcript.
+    pub(crate) fn shared_annotated_items(&self) -> Arc<Vec<ResponseItemEnvelope>> {
+        Arc::clone(&self.items)
+    }
+
+    /// Appends child-only fork items while retaining inherited history metadata.
+    pub(crate) fn append_fork_items(
+        &mut self,
+        items: impl IntoIterator<Item = ResponseItemEnvelope>,
+    ) {
+        Arc::make_mut(&mut self.items).extend(items);
+    }
+
     /// Returns raw items in the history and consumes the snapshot.
     pub(crate) fn into_raw_items(self) -> Vec<ResponseItem> {
         self.into_annotated_items()
@@ -310,9 +323,30 @@ impl ContextManager {
     }
 
     pub(crate) fn replace_annotated(&mut self, items: Vec<ResponseItemEnvelope>) {
-        self.items = Arc::new(items);
+        self.replace_shared_annotated(Arc::new(items));
+    }
+
+    /// Installs an immutable parent snapshot while preserving copy-on-write mutation behavior.
+    pub(crate) fn replace_shared_annotated(&mut self, items: Arc<Vec<ResponseItemEnvelope>>) {
+        self.items = items;
         self.history_version = self.history_version.saturating_add(1);
         self.world_state_baseline = None;
+    }
+
+    /// Preserves parent model state while retaining the child's history generation.
+    pub(crate) fn replace_shared_snapshot(&mut self, source: &Self) {
+        let history_version = self.history_version.saturating_add(1);
+        *self = source.clone();
+        self.history_version = history_version;
+    }
+
+    /// Detects any parent model-state change between optimistic fork snapshot checks.
+    pub(crate) fn has_same_fork_metadata(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.items, &other.items)
+            && self.history_version == other.history_version
+            && self.token_info == other.token_info
+            && self.reference_context_item == other.reference_context_item
+            && self.world_state_baseline == other.world_state_baseline
     }
 
     /// Drop the last `num_turns` instruction turns from this history.

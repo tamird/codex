@@ -6,6 +6,8 @@ use super::*;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::ContextCompactedEvent;
+use codex_protocol::protocol::DEFAULT_ROLLOUT_REFERENCE_DEPTH;
+use codex_protocol::protocol::RolloutReferenceItem;
 use codex_protocol::protocol::ThreadRolledBackEvent;
 use codex_protocol::security_risk::SecurityRiskScore;
 use pretty_assertions::assert_eq;
@@ -100,6 +102,35 @@ fn requires_a_strict_nonempty_model_prefix() {
         .into(),
     ));
     assert!(plan_append(&source, &with_tool_call).is_none());
+}
+
+#[test]
+fn rejects_unmaterialized_rollout_references() {
+    let history = rollout(&[(MessageRole::User, "first request")]);
+    let source = rollout(&[
+        (MessageRole::User, "first request"),
+        (MessageRole::User, "follow-up request"),
+    ]);
+    let reference = RolloutItem::RolloutReference(RolloutReferenceItem {
+        rollout_id: None,
+        rollout_path: "segment.jsonl".into(),
+        thread_id: None,
+        rollout_timestamp: None,
+        segment_id: None,
+        max_depth: DEFAULT_ROLLOUT_REFERENCE_DEPTH,
+        nth_user_message: None,
+        compacted_replacement_history_filter_texts: None,
+    });
+
+    let mut source_with_reference = source.clone();
+    source_with_reference.insert(1, reference.clone());
+    assert!(plan_append(&source_with_reference, &history).is_none());
+    assert!(!model_transcripts_match(&source_with_reference, &history));
+
+    let mut history_with_reference = history;
+    history_with_reference.push(reference);
+    assert!(plan_append(&source, &history_with_reference).is_none());
+    assert!(!model_transcripts_match(&source, &history_with_reference));
 }
 
 fn rollout(messages: &[(MessageRole, &str)]) -> Vec<RolloutItem> {

@@ -175,14 +175,16 @@ async fn resolve_path(
     let rollout_id = match codex_rollout::rollout_id_from_path(path.as_path()) {
         Some(rollout_id) => rollout_id,
         None => {
-            let history_mode = codex_rollout::read_session_meta_line(path.as_path())
+            let session_meta = codex_rollout::read_session_meta_line(path.as_path())
                 .await
                 .map_err(|err| ThreadStoreError::Internal {
                     message: format!("failed to read session metadata {}: {err}", path.display()),
-                })?
-                .meta
-                .history_mode;
-            rollout_id_from_path_or_legacy_thread_id(path.as_path(), thread_id, history_mode)?
+                })?;
+            rollout_id_from_path_or_authenticated_thread_id(
+                path.as_path(),
+                thread_id,
+                session_meta.meta.id,
+            )?
         }
     };
     Ok(ResolvedThreadRollout {
@@ -191,6 +193,30 @@ async fn resolve_path(
         path,
         location,
     })
+}
+
+/// Returns the physical rollout ID for a canonical filename or the authenticated stable thread
+/// ID for a legacy noncanonical filename.
+///
+/// The metadata identity check is what makes the noncanonical fallback safe for paginated files:
+/// callers cannot select an arbitrary path and cause another thread's projection to be used.
+pub(super) fn rollout_id_from_path_or_authenticated_thread_id(
+    path: &std::path::Path,
+    thread_id: ThreadId,
+    metadata_thread_id: ThreadId,
+) -> ThreadStoreResult<ThreadId> {
+    if let Some(rollout_id) = codex_rollout::rollout_id_from_path(path) {
+        return Ok(rollout_id);
+    }
+    if metadata_thread_id != thread_id {
+        return Err(ThreadStoreError::InvalidRequest {
+            message: format!(
+                "rollout path `{}` belongs to thread {metadata_thread_id}, not {thread_id}",
+                path.display()
+            ),
+        });
+    }
+    Ok(thread_id)
 }
 
 /// Returns the immutable rollout ID for a path while preserving legacy noncanonical filenames.

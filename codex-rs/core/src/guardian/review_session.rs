@@ -63,6 +63,7 @@ use crate::session::GitEnrichmentPolicy;
 use crate::session::SessionIo;
 use crate::session::session::Session;
 use crate::session::turn_context::TurnContext;
+use crate::thread_manager::full_history_from_frozen_segment;
 use codex_config::types::McpServerConfig;
 use codex_features::Feature;
 use codex_model_provider_info::ModelProviderInfo;
@@ -71,6 +72,7 @@ use codex_protocol::turn_input::TurnInputRequest;
 use codex_protocol::turn_input::TurnInputSubmission;
 use codex_protocol::turn_input::TurnStartOptions;
 use codex_protocol::user_input::UserInput;
+use codex_thread_store::FreezeRolloutSegmentParams;
 use codex_thread_store::PersistContext;
 use codex_tools::normalize_output_image_detail;
 use codex_utils_path_uri::PathUri;
@@ -328,21 +330,20 @@ impl GuardianReviewSession {
     }
 
     async fn refresh_last_committed_fork_snapshot(&self) {
-        match load_rollout_items_for_fork(&self.session).await {
-            Ok(Some(items)) if !items.is_empty() => {
+        match load_reference_history_for_fork(&self.session).await {
+            Ok(Some(initial_history)) => {
                 let mut state = self.state.lock().await;
                 let prior_review_count = state.prior_review_count;
                 let last_reviewed_transcript_cursor = state.last_reviewed_transcript_cursor;
                 let last_admitted_node_repl_response_sequence =
                     state.last_admitted_node_repl_response_sequence;
                 state.last_committed_fork_snapshot = Some(GuardianReviewForkSnapshot {
-                    initial_history: InitialHistory::Forked(items),
+                    initial_history,
                     prior_review_count,
                     last_reviewed_transcript_cursor,
                     last_admitted_node_repl_response_sequence,
                 });
             }
-            Ok(Some(_)) => {}
             Ok(None) => {}
             Err(err) => {
                 warn!("failed to refresh guardian trunk rollout snapshot: {err}");
@@ -1376,16 +1377,17 @@ async fn ensure_guardian_node_repl_policy(
     Ok(())
 }
 
-async fn load_rollout_items_for_fork(
+async fn load_reference_history_for_fork(
     session: &Session,
-) -> anyhow::Result<Option<Vec<RolloutItem>>> {
-    session
-        .try_ensure_rollout_materialized(PersistContext::Standard)
-        .await?;
-    session.flush_rollout().await?;
+) -> anyhow::Result<Option<InitialHistory>> {
     let live_thread = session.live_thread_for_persistence("guardian review fork")?;
-    let history = live_thread.load_history(/*include_archived*/ true).await?;
-    Ok(Some(history.items))
+    let Some(frozen) = live_thread
+        .freeze_local_segment(FreezeRolloutSegmentParams::snapshot())
+        .await?
+    else {
+        return Ok(None);
+    };
+    Ok(Some(full_history_from_frozen_segment(frozen)))
 }
 
 async fn wait_for_guardian_review(

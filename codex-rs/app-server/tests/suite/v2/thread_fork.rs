@@ -23,6 +23,7 @@ use codex_app_server_protocol::SandboxMode;
 use codex_app_server_protocol::SandboxPolicy;
 use codex_app_server_protocol::ServerNotification;
 use codex_app_server_protocol::SessionSource;
+use codex_app_server_protocol::SortDirection;
 use codex_app_server_protocol::ThreadForkParams;
 use codex_app_server_protocol::ThreadForkResponse;
 use codex_app_server_protocol::ThreadHistoryMode;
@@ -52,22 +53,44 @@ use codex_config::types::AuthCredentialsStoreMode;
 use codex_features::Feature;
 use codex_login::REFRESH_TOKEN_URL_OVERRIDE_ENV_VAR;
 use codex_protocol::ThreadId;
+use codex_protocol::config_types::ReasoningSummary;
+use codex_protocol::items::AgentMessageContent;
+use codex_protocol::items::AgentMessageItem;
+use codex_protocol::items::ReasoningItem;
 use codex_protocol::items::TurnItem as CoreTurnItem;
 use codex_protocol::items::UserMessageItem;
+use codex_protocol::models::BaseInstructions;
 use codex_protocol::models::ContentItem;
+use codex_protocol::models::MessagePhase;
 use codex_protocol::models::ResponseItem;
+use codex_protocol::protocol::AskForApproval as ProtocolAskForApproval;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::ItemCompletedEvent;
 use codex_protocol::protocol::MultiAgentVersion;
+use codex_protocol::protocol::SandboxPolicy as ProtocolSandboxPolicy;
+use codex_protocol::protocol::SessionSource as ProtocolSessionSource;
+use codex_protocol::protocol::ThreadMemoryMode;
 use codex_protocol::protocol::TurnCompleteEvent;
+use codex_protocol::protocol::TurnContextItem;
 use codex_protocol::protocol::TurnStartedEvent;
 use codex_protocol::protocol::UserMessageEvent;
+use codex_rollout::CompactedItem;
 use codex_rollout::RolloutItem;
 use codex_rollout::RolloutLine;
+use codex_rollout::RolloutRecorder;
 use codex_rollout::append_rollout_item_to_path;
 use codex_rollout::append_thread_name;
+use codex_rollout::materialize_rollout_items;
 use codex_rollout::read_session_meta_line;
 use codex_state::StateRuntime;
+use codex_thread_store::AppendThreadItemsParams;
+use codex_thread_store::CreateThreadParams;
+use codex_thread_store::FreezeRolloutSegmentParams;
+use codex_thread_store::LocalThreadStore;
+use codex_thread_store::LocalThreadStoreConfig;
+use codex_thread_store::PersistContext;
+use codex_thread_store::ThreadPersistenceMetadata;
+use codex_thread_store::ThreadStore;
 use codex_utils_absolute_path::test_support::PathExt;
 use core_test_support::responses;
 use pretty_assertions::assert_eq;
@@ -75,6 +98,7 @@ use serde_json::Value;
 use serde_json::json;
 use tempfile::TempDir;
 use tokio::time::timeout;
+use uuid::Uuid;
 use wiremock::Mock;
 use wiremock::MockServer;
 use wiremock::ResponseTemplate;
@@ -203,12 +227,31 @@ async fn thread_fork_creates_new_thread_and_emits_started() -> Result<()> {
     assert_ne!(thread.id, conversation_id);
     assert_eq!(thread.session_id, thread.id);
     assert_eq!(thread.forked_from_id, Some(conversation_id.clone()));
-    assert_eq!(thread.preview, preview);
     assert_eq!(thread.model_provider, "mock_provider");
     assert_eq!(thread.status, ThreadStatus::Idle);
     let thread_path = thread.path.clone().expect("thread path");
     assert!(thread_path.as_path().is_absolute());
     assert_ne!(thread_path.as_path(), original_path);
+    let physical_items = RolloutRecorder::load_rollout_items(thread_path.as_path())
+        .await?
+        .0;
+    assert!(matches!(
+        physical_items.as_slice(),
+        [
+            RolloutItem::SessionMeta(_),
+            RolloutItem::RolloutReference(_),
+            ..
+        ]
+    ));
+    let RolloutItem::RolloutReference(reference) = &physical_items[1] else {
+        unreachable!("physical fork layout checked above")
+    };
+    assert_eq!(reference.nth_user_message, None);
+    assert_eq!(thread.preview, preview);
+    assert!(
+        !std::fs::read_to_string(thread_path.as_path())?.contains(preview),
+        "forked rollout must not copy inherited source messages"
+    );
     assert!(thread.cwd.as_path().is_absolute());
     assert_eq!(thread.source, SessionSource::VsCode);
     assert_eq!(thread.thread_source, Some(ThreadSource::User));
@@ -649,9 +692,7 @@ async fn assert_thread_fork_at_named_boundary_keeps_only_terminal_prefix(
             .all(|turn| turn.status == TurnStatus::Completed)
     );
     assert_eq!(forked_thread.forked_from_id, Some(source_thread_id.clone()));
-    if history_mode == ThreadHistoryMode::Legacy {
-        assert_eq!(forked_thread.preview, "first");
-    }
+    assert_eq!(forked_thread.preview, "first");
     assert_eq!(
         std::fs::read_to_string(source_path.as_path())?,
         original_contents,
@@ -659,20 +700,38 @@ async fn assert_thread_fork_at_named_boundary_keeps_only_terminal_prefix(
     );
 
     let forked_path = forked_thread.path.clone().expect("forked thread path");
-    let forked_contents = std::fs::read_to_string(forked_path.as_path())?;
-    if history_mode == ThreadHistoryMode::Paginated {
-        assert!(
-            read_session_meta_line(forked_path.as_path())
-                .await?
-                .meta
-                .history_base
-                .is_some()
-        );
-        assert!(!forked_contents.contains(turn_ids[1].as_str()));
-    } else {
-        assert!(forked_contents.contains(turn_ids[1].as_str()));
-    }
-    assert!(!forked_contents.contains(turn_ids[2].as_str()));
+    let forked_physical_items = RolloutRecorder::load_rollout_items(forked_path.as_path())
+        .await?
+        .0;
+    assert!(matches!(
+        forked_physical_items.as_slice(),
+        [
+            RolloutItem::SessionMeta(_),
+            RolloutItem::RolloutReference(_),
+            RolloutItem::EventMsg(EventMsg::ThreadSettingsApplied(_))
+        ]
+    ));
+    let RolloutItem::RolloutReference(reference) = &forked_physical_items[1] else {
+        unreachable!("physical fork layout checked above")
+    };
+    assert_eq!(
+        reference.nth_user_message,
+        (history_mode == ThreadHistoryMode::Legacy).then_some(2)
+    );
+    assert_eq!(forked_thread.preview, "first");
+    let forked_logical_items =
+        materialize_rollout_items(codex_home.path(), forked_path.as_path()).await?;
+    let forked_logical_json = serde_json::to_string(&forked_logical_items)?;
+    assert!(forked_logical_json.contains(turn_ids[1].as_str()));
+    assert!(!forked_logical_json.contains(turn_ids[2].as_str()));
+    assert_eq!(
+        read_session_meta_line(forked_path.as_path())
+            .await?
+            .meta
+            .history_base,
+        None,
+        "new forks persist canonical rollout references rather than history_base"
+    );
 
     let started = loop {
         let notification = timeout(
@@ -691,7 +750,7 @@ async fn assert_thread_fork_at_named_boundary_keeps_only_terminal_prefix(
     if history_mode == ThreadHistoryMode::Paginated {
         let before_fork_id = mcp
             .send_thread_fork_request(ThreadForkParams {
-                thread_id: source_thread_id,
+                thread_id: source_thread_id.clone(),
                 before_turn_id: Some(turn_ids[2].clone()),
                 ..Default::default()
             })
@@ -738,6 +797,41 @@ async fn assert_thread_fork_at_named_boundary_keeps_only_terminal_prefix(
             .await?;
         assert_eq!(ephemeral_fork.preview, "first");
     }
+
+    let ephemeral_fork_id = mcp
+        .send_thread_fork_request(ThreadForkParams {
+            thread_id: source_thread_id,
+            last_turn_id: Some(turn_ids[1].clone()),
+            ephemeral: true,
+            exclude_turns: history_mode == ThreadHistoryMode::Paginated,
+            ..Default::default()
+        })
+        .await?;
+    let ephemeral_fork_resp: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(ephemeral_fork_id)),
+    )
+    .await??;
+    let ThreadForkResponse {
+        thread: ephemeral_fork,
+        ..
+    } = to_response::<ThreadForkResponse>(ephemeral_fork_resp)?;
+    assert!(ephemeral_fork.ephemeral);
+    assert_eq!(ephemeral_fork.path, None);
+    if history_mode == ThreadHistoryMode::Paginated {
+        assert!(ephemeral_fork.turns.is_empty());
+    } else {
+        assert_eq!(
+            ephemeral_fork
+                .turns
+                .iter()
+                .map(|turn| turn.id.clone())
+                .collect::<Vec<_>>(),
+            turn_ids[..2],
+            "a bounded ephemeral fork must not expose the excluded source suffix"
+        );
+    }
+    assert_eq!(ephemeral_fork.preview, "first");
 
     Ok(())
 }
@@ -1013,7 +1107,7 @@ async fn thread_fork_inherits_explicit_source_name_from_session_index() -> Resul
 
     let fork_id = mcp
         .send_thread_fork_request(ThreadForkParams {
-            thread_id: conversation_id.clone(),
+            thread_id: conversation_id,
             ..Default::default()
         })
         .await?;
@@ -1138,7 +1232,7 @@ async fn thread_fork_can_cut_before_unfinished_stored_turn() -> Result<()> {
 
     let fork_id = mcp
         .send_thread_fork_request(ThreadForkParams {
-            thread_id: conversation_id,
+            thread_id: conversation_id.clone(),
             before_turn_id: Some(unfinished_turn_id.to_string()),
             ..Default::default()
         })
@@ -1202,6 +1296,174 @@ async fn thread_fork_emits_restored_token_usage_before_next_turn() -> Result<()>
     assert_eq!(notification.token_usage.total.reasoning_output_tokens, 10);
     assert_eq!(notification.token_usage.last.total_tokens, 90);
     assert_eq!(notification.token_usage.model_context_window, Some(200_000));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn live_paginated_fork_preserves_model_history_and_token_usage() -> Result<()> {
+    let server = create_mock_responses_server_sequence_unchecked(vec![
+        responses::sse(vec![
+            responses::ev_response_created("live-parent-first"),
+            responses::ev_assistant_message("live-parent-first-message", "first parent answer"),
+            responses::ev_completed_with_tokens("live-parent-first", /*total_tokens*/ 120),
+        ]),
+        responses::sse(vec![
+            responses::ev_response_created("live-parent-second"),
+            responses::ev_assistant_message("live-parent-second-message", "second parent answer"),
+            responses::ev_completed_with_tokens("live-parent-second", /*total_tokens*/ 30),
+        ]),
+        responses::sse(vec![
+            responses::ev_response_created("live-fork-child"),
+            responses::ev_assistant_message("live-fork-child-message", "child answer"),
+            responses::ev_completed_with_tokens("live-fork-child", /*total_tokens*/ 5),
+        ]),
+    ])
+    .await;
+    let codex_home = TempDir::new()?;
+    MockResponsesConfig::new(&server.uri()).write(codex_home.path())?;
+
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .build_initialized()
+        .await?;
+    let start_id = mcp
+        .send_thread_start_request_with_auto_env(ThreadStartParams {
+            history_mode: Some(ThreadHistoryMode::Paginated),
+            ..Default::default()
+        })
+        .await?;
+    let ThreadStartResponse {
+        thread: source_thread,
+        ..
+    } = timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(start_id)).await??;
+
+    let mut parent_token_usage = None;
+    let mut latest_parent_turn_id = None;
+    for message in [
+        "oldest continuously live parent",
+        "newest continuously live parent",
+    ] {
+        let turn_request_id = mcp
+            .send_turn_start_request(TurnStartParams {
+                thread_id: source_thread.id.clone(),
+                input: vec![UserInput::Text {
+                    text: message.to_string(),
+                    text_elements: Vec::new(),
+                }],
+                ..Default::default()
+            })
+            .await?;
+        let TurnStartResponse { turn } =
+            timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(turn_request_id)).await??;
+        latest_parent_turn_id = Some(turn.id);
+
+        let notification = timeout(
+            DEFAULT_READ_TIMEOUT,
+            mcp.read_stream_until_notification_message("thread/tokenUsage/updated"),
+        )
+        .await??;
+        let ServerNotification::ThreadTokenUsageUpdated(notification) = notification.try_into()?
+        else {
+            panic!("expected parent thread/tokenUsage/updated notification");
+        };
+        assert_eq!(notification.thread_id, source_thread.id);
+        parent_token_usage = Some(notification.token_usage);
+        timeout(
+            DEFAULT_READ_TIMEOUT,
+            mcp.read_stream_until_notification_message("turn/completed"),
+        )
+        .await??;
+    }
+    let parent_token_usage = parent_token_usage.expect("completed live parent token usage");
+    assert_eq!(parent_token_usage.total.total_tokens, 150);
+    assert_eq!(parent_token_usage.last.total_tokens, 30);
+
+    let fork_id = mcp
+        .send_thread_fork_request(ThreadForkParams {
+            thread_id: source_thread.id.clone(),
+            ..Default::default()
+        })
+        .await?;
+    let ThreadForkResponse {
+        thread: forked_thread,
+        ..
+    } = timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(fork_id)).await??;
+    assert_eq!(forked_thread.turns.len(), 2);
+
+    let notification = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_notification_message("thread/tokenUsage/updated"),
+    )
+    .await??;
+    let ServerNotification::ThreadTokenUsageUpdated(notification) = notification.try_into()? else {
+        panic!("expected inherited child thread/tokenUsage/updated notification");
+    };
+    assert_eq!(notification.thread_id, forked_thread.id);
+    assert_eq!(
+        notification.turn_id,
+        latest_parent_turn_id.expect("latest live parent turn")
+    );
+    assert_eq!(notification.token_usage, parent_token_usage);
+
+    let child_rollout_path = forked_thread.path.as_ref().expect("forked rollout path");
+    let child_rollout_items = RolloutRecorder::load_rollout_items(child_rollout_path.as_path())
+        .await?
+        .0;
+    assert_eq!(
+        child_rollout_items
+            .iter()
+            .filter(|item| matches!(item, RolloutItem::RolloutReference(_)))
+            .count(),
+        1,
+        "live fork must persist exactly one immutable parent rollout reference"
+    );
+    assert!(
+        !child_rollout_items.iter().any(|item| {
+            matches!(
+                item,
+                RolloutItem::ResponseItem(_) | RolloutItem::EventMsg(EventMsg::ItemCompleted(_))
+            )
+        }),
+        "live fork must not copy inherited model or visible parent messages into child storage"
+    );
+
+    let child_turn_id = mcp
+        .send_turn_start_request(TurnStartParams {
+            thread_id: forked_thread.id.clone(),
+            input: vec![UserInput::Text {
+                text: "child follow-up".to_string(),
+                text_elements: Vec::new(),
+            }],
+            ..Default::default()
+        })
+        .await?;
+    let _: TurnStartResponse =
+        timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(child_turn_id)).await??;
+    timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_notification_message("turn/completed"),
+    )
+    .await??;
+    let model_requests = server
+        .received_requests()
+        .await
+        .expect("mock model requests");
+    let child_request = model_requests
+        .iter()
+        .filter(|request| request.url.path().ends_with("/responses"))
+        .nth(2)
+        .expect("live child model request");
+    let child_request_body: Value = serde_json::from_slice(&child_request.body)?;
+    let child_model_input = serde_json::to_string(&child_request_body["input"])?;
+    assert!(
+        child_model_input.contains("oldest continuously live parent"),
+        "live fork model request must retain the oldest parent message"
+    );
+    assert!(
+        child_model_input.contains("newest continuously live parent"),
+        "live fork model request must retain the newest parent message"
+    );
 
     Ok(())
 }
@@ -1354,7 +1616,7 @@ async fn thread_fork_rejects_unmaterialized_thread() -> Result<()> {
 }
 
 #[tokio::test]
-async fn thread_fork_creates_reference_backed_paginated_thread() -> Result<()> {
+async fn thread_fork_preserves_reference_backed_paginated_history() -> Result<()> {
     let server = create_mock_responses_server_repeating_assistant("Done").await;
     let codex_home = TempDir::new()?;
     MockResponsesConfig::new(&server.uri()).write(codex_home.path())?;
@@ -1414,11 +1676,25 @@ async fn thread_fork_creates_reference_backed_paginated_thread() -> Result<()> {
     let forked_path = forked_thread.path.expect("forked rollout path");
     assert!(!std::fs::read_to_string(forked_path.as_path())?.contains("Saved user message"));
     let meta = read_session_meta_line(forked_path.as_path()).await?;
-    let history_base = meta.meta.history_base.expect("history base");
+    let logical_cutoff = meta
+        .meta
+        .forked_from_ordinal_exclusive
+        .expect("logical fork cutoff");
     assert_eq!(
-        history_base.thread_id,
-        ThreadId::from_string(conversation_id.as_str())?
+        meta.meta.history_base, None,
+        "new paginated forks persist a rollout reference, not history_base"
     );
+    let forked_physical_items = RolloutRecorder::load_rollout_items(forked_path.as_path())
+        .await?
+        .0;
+    assert!(matches!(
+        forked_physical_items.as_slice(),
+        [
+            RolloutItem::SessionMeta(_),
+            RolloutItem::RolloutReference(_),
+            ..
+        ]
+    ));
 
     let turn_id = mcp
         .send_turn_start_request(TurnStartParams {
@@ -1453,7 +1729,7 @@ async fn thread_fork_creates_reference_backed_paginated_thread() -> Result<()> {
     );
     assert_eq!(
         turn_metadata["forked_from_ordinal_exclusive"].as_u64(),
-        Some(history_base.end_ordinal_exclusive)
+        Some(logical_cutoff)
     );
     let model_input = request_body["input"]
         .as_array()
@@ -1477,7 +1753,19 @@ async fn thread_fork_creates_reference_backed_paginated_thread() -> Result<()> {
     assert!(excluded_turns_thread.turns.is_empty());
     let excluded_turns_path = excluded_turns_thread.path.expect("forked rollout path");
     let excluded_turns_meta = read_session_meta_line(excluded_turns_path.as_path()).await?;
-    assert_eq!(excluded_turns_meta.meta.history_base, Some(history_base));
+    assert_eq!(excluded_turns_meta.meta.history_base, None);
+    let excluded_physical_items =
+        RolloutRecorder::load_rollout_items(excluded_turns_path.as_path())
+            .await?
+            .0;
+    assert!(matches!(
+        excluded_physical_items.as_slice(),
+        [
+            RolloutItem::SessionMeta(_),
+            RolloutItem::RolloutReference(_),
+            ..
+        ]
+    ));
 
     let ThreadForkResponse {
         thread: nested_thread,
@@ -1497,15 +1785,572 @@ async fn thread_fork_creates_reference_backed_paginated_thread() -> Result<()> {
     assert!(nested_thread.turns.is_empty());
     let nested_path = nested_thread.path.expect("nested fork rollout path");
     let nested_meta = read_session_meta_line(nested_path.as_path()).await?;
+    assert_eq!(nested_meta.meta.history_base, None);
+    let nested_physical_items = RolloutRecorder::load_rollout_items(nested_path.as_path())
+        .await?
+        .0;
+    assert!(matches!(
+        nested_physical_items.as_slice(),
+        [
+            RolloutItem::SessionMeta(_),
+            RolloutItem::RolloutReference(_),
+            ..
+        ]
+    ));
+    Ok(())
+}
+
+#[tokio::test]
+async fn paginated_thread_fork_preserves_completed_items_and_updated_item_snapshots() -> Result<()>
+{
+    let server = create_mock_responses_server_repeating_assistant("Done").await;
+    let codex_home = TempDir::new()?;
+    MockResponsesConfig::new(&server.uri()).write(codex_home.path())?;
+
+    let source_thread_id = create_fake_paginated_rollout(
+        codex_home.path(),
+        "2025-01-05T12-00-00",
+        "2025-01-05T12:00:00Z",
+        "Saved user message",
+        Some("mock_provider"),
+        /*git_info*/ None,
+    )?;
+    let source_path = rollout_path(
+        codex_home.path(),
+        "2025-01-05T12-00-00",
+        source_thread_id.as_str(),
+    );
+    let source_id = ThreadId::from_string(source_thread_id.as_str())?;
+
+    for index in 0..101 {
+        let turn_id = format!("turn-{index}");
+        let started_at = 100 + index;
+        append_rollout_item_to_path(
+            source_path.as_path(),
+            &RolloutItem::EventMsg(EventMsg::TurnStarted(TurnStartedEvent {
+                turn_id: turn_id.clone(),
+                trace_id: None,
+                started_at: Some(started_at),
+                model_context_window: None,
+                collaboration_mode_kind: Default::default(),
+            })),
+        )
+        .await?;
+
+        let user_item = CoreTurnItem::UserMessage(UserMessageItem {
+            id: format!("user-{index}"),
+            client_id: None,
+            content: vec![codex_protocol::user_input::UserInput::Text {
+                text: format!("question {index}"),
+                text_elements: Vec::new(),
+            }],
+        });
+        let draft_agent_item = CoreTurnItem::AgentMessage(AgentMessageItem {
+            id: format!("agent-{index}"),
+            content: vec![AgentMessageContent::Text {
+                text: format!("draft answer {index}"),
+            }],
+            phase: Some(MessagePhase::Commentary),
+            delivery: None,
+            memory_citation: None,
+        });
+        let final_agent_item = CoreTurnItem::AgentMessage(AgentMessageItem {
+            id: format!("agent-{index}"),
+            content: vec![AgentMessageContent::Text {
+                text: format!("final answer {index}"),
+            }],
+            phase: Some(MessagePhase::FinalAnswer),
+            delivery: None,
+            memory_citation: None,
+        });
+        let reasoning_item = CoreTurnItem::Reasoning(ReasoningItem {
+            id: format!("reasoning-{index}"),
+            summary_text: vec![format!("reasoning summary {index}")],
+            raw_content: Vec::new(),
+        });
+
+        for (item_index, item) in [
+            user_item,
+            reasoning_item,
+            draft_agent_item,
+            final_agent_item,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            append_rollout_item_to_path(
+                source_path.as_path(),
+                &RolloutItem::EventMsg(EventMsg::ItemCompleted(ItemCompletedEvent {
+                    thread_id: source_id,
+                    turn_id: turn_id.clone(),
+                    item,
+                    started_at_ms: Some(started_at * 1_000),
+                    completed_at_ms: started_at * 1_000 + item_index as i64 + 1,
+                })),
+            )
+            .await?;
+        }
+
+        append_rollout_item_to_path(
+            source_path.as_path(),
+            &RolloutItem::EventMsg(EventMsg::TurnComplete(TurnCompleteEvent {
+                turn_id,
+                last_agent_message: None,
+                error: None,
+                started_at: Some(started_at),
+                completed_at: Some(started_at + 1),
+                duration_ms: Some(1_000),
+                time_to_first_token_ms: None,
+            })),
+        )
+        .await?;
+    }
+
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .without_auto_env()
+        .with_env_overrides(&[("FRODEX_HISTORY_IO_TRACE", Some("1"))])
+        .with_json_logging("warn,codex_history_io=trace")
+        .build_initialized()
+        .await?;
+    let mut source_turns = Vec::new();
+    let mut cursor = None;
+    loop {
+        let response: ThreadTurnsListResponse = mcp
+            .request(|request_id| ClientRequest::ThreadTurnsList {
+                request_id,
+                params: ThreadTurnsListParams {
+                    thread_id: source_thread_id.clone(),
+                    cursor: cursor.clone(),
+                    limit: Some(100),
+                    sort_direction: Some(SortDirection::Asc),
+                    items_view: Some(TurnItemsView::Full),
+                },
+            })
+            .await?;
+        source_turns.extend(response.data);
+        let Some(next_cursor) = response.next_cursor else {
+            break;
+        };
+        cursor = Some(next_cursor);
+    }
+    assert_eq!(source_turns.len(), 101);
+    assert!(source_turns.iter().all(|turn| turn.items.len() == 3));
+
+    let ThreadForkResponse {
+        thread: forked_thread,
+        ..
+    } = mcp
+        .request(|request_id| ClientRequest::ThreadFork {
+            request_id,
+            params: ThreadForkParams {
+                thread_id: source_thread_id,
+                ..Default::default()
+            },
+        })
+        .await?;
+
+    assert_eq!(forked_thread.turns, source_turns);
+
+    mcp.wait_for_json_log_event("codex.history.fork.complete")
+        .await?;
+    let events = mcp.json_log_events()?;
+    let item_reads = events
+        .iter()
+        .filter(|event| {
+            event["fields"]["event.name"] == "codex.history.turn_items.read"
+                && event["fields"]["thread.id"] == forked_thread.id
+        })
+        .count();
     assert_eq!(
-        nested_meta
-            .meta
-            .history_base
-            .expect("nested fork history base")
-            .thread_id,
-        ThreadId::from_string(forked_thread_id.as_str())?
+        item_reads, 0,
+        "full Paginated forks must reuse prepared history instead of loading every child turn"
     );
     Ok(())
+}
+
+const MAX_INDEXED_FORK_ROLLOUT_READER_OPENS: usize = 48;
+
+/// Describes whether complete model context is already available without old rollout files.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum IndexedForkSource {
+    ColdUncompacted,
+    ResumedUncompacted,
+    ColdCompacted,
+}
+
+/// Selects the public durable fork or the ephemeral side-thread presentation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum IndexedForkPresentation {
+    Durable,
+    Ephemeral,
+}
+
+#[tokio::test]
+async fn compacted_paginated_fork_rollout_file_opens_are_bounded() -> Result<()> {
+    assert_indexed_paginated_fork_rollout_file_opens_are_bounded(IndexedForkSource::ColdCompacted)
+        .await
+}
+
+async fn assert_indexed_paginated_fork_rollout_file_opens_are_bounded(
+    source: IndexedForkSource,
+) -> Result<()> {
+    for segment_count in [8, 32, 128] {
+        for presentation in [
+            IndexedForkPresentation::Durable,
+            IndexedForkPresentation::Ephemeral,
+        ] {
+            let file_open_count =
+                paginated_fork_rollout_file_open_count(segment_count, source, presentation).await?;
+            assert!(
+                file_open_count <= MAX_INDEXED_FORK_ROLLOUT_READER_OPENS,
+                "{source:?} {presentation:?} fork with {segment_count} physical segments \
+                 opened {file_open_count} rollout files; indexed history must require at most \
+                 {MAX_INDEXED_FORK_ROLLOUT_READER_OPENS} opens regardless of segment count"
+            );
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn cold_uncompacted_paginated_fork_rollout_file_opens_grow_linearly() -> Result<()> {
+    assert_uncompacted_paginated_fork_rollout_file_opens_grow_linearly(
+        IndexedForkSource::ColdUncompacted,
+    )
+    .await
+}
+
+#[tokio::test]
+async fn resumed_uncompacted_paginated_fork_rollout_file_opens_grow_linearly() -> Result<()> {
+    assert_uncompacted_paginated_fork_rollout_file_opens_grow_linearly(
+        IndexedForkSource::ResumedUncompacted,
+    )
+    .await
+}
+
+async fn assert_uncompacted_paginated_fork_rollout_file_opens_grow_linearly(
+    source: IndexedForkSource,
+) -> Result<()> {
+    for segment_count in [8, 32] {
+        for presentation in [
+            IndexedForkPresentation::Durable,
+            IndexedForkPresentation::Ephemeral,
+        ] {
+            let file_open_count =
+                paginated_fork_rollout_file_open_count(segment_count, source, presentation).await?;
+            assert!(
+                file_open_count <= 2 * segment_count + 48,
+                "{source:?} {presentation:?} fork with {segment_count} physical segments \
+                 opened {file_open_count} rollout files; reconstructing complete model \
+                 history must not repeatedly reopen each immutable segment"
+            );
+        }
+    }
+    Ok(())
+}
+
+async fn paginated_fork_rollout_file_open_count(
+    segment_count: usize,
+    source: IndexedForkSource,
+    presentation: IndexedForkPresentation,
+) -> Result<usize> {
+    let server = create_mock_responses_server_repeating_assistant("Done").await;
+    let codex_home = TempDir::new()?;
+    MockResponsesConfig::new(&server.uri()).write(codex_home.path())?;
+    let source_thread_id = ThreadId::new();
+    let sqlite = codex_state::SqliteConfig::new_for_testing(codex_home.path().abs());
+    let state_db = StateRuntime::init(sqlite.clone(), "mock_provider".to_string()).await?;
+    let store = LocalThreadStore::new(
+        LocalThreadStoreConfig {
+            codex_home: codex_home.path().to_path_buf(),
+            sqlite,
+            default_model_provider_id: "mock_provider".to_string(),
+        },
+        Some(state_db),
+    );
+    store
+        .create_thread(CreateThreadParams {
+            session_id: source_thread_id.into(),
+            thread_id: source_thread_id,
+            extra_config: None,
+            forked_from_id: None,
+            forked_from_ordinal_exclusive: None,
+            parent_thread_id: None,
+            source: ProtocolSessionSource::Cli,
+            thread_source: None,
+            originator: "test_originator".to_string(),
+            base_instructions: BaseInstructions::default(),
+            dynamic_tools: Vec::new(),
+            selected_capability_roots: Vec::new(),
+            multi_agent_version: None,
+            history_mode: codex_protocol::protocol::ThreadHistoryMode::Paginated,
+            history_base: None,
+            subagent_history_start_ordinal: None,
+            persistence_mode: Default::default(),
+            initial_rollout_ordinal: 0,
+            initial_window_id: Uuid::now_v7().to_string(),
+            metadata: ThreadPersistenceMetadata {
+                cwd: Some(codex_home.path().to_path_buf()),
+                model_provider: "mock_provider".to_string(),
+                memory_mode: ThreadMemoryMode::Enabled,
+            },
+        })
+        .await?;
+    store
+        .persist_thread(source_thread_id, PersistContext::Standard)
+        .await?;
+
+    for index in 0..segment_count {
+        let turn_id = format!("turn-{index}");
+        let started_at = i64::try_from(index)? + 100;
+        let user_item = CoreTurnItem::UserMessage(UserMessageItem {
+            id: format!("user-{index}"),
+            client_id: None,
+            content: vec![codex_protocol::user_input::UserInput::Text {
+                text: format!("user {index}"),
+                text_elements: Vec::new(),
+            }],
+        });
+        let agent_item = CoreTurnItem::AgentMessage(AgentMessageItem {
+            id: format!("agent-{index}"),
+            content: vec![AgentMessageContent::Text {
+                text: format!("answer {index}"),
+            }],
+            phase: Some(MessagePhase::FinalAnswer),
+            delivery: None,
+            memory_citation: None,
+        });
+        let mut items = vec![RolloutItem::EventMsg(EventMsg::TurnStarted(
+            TurnStartedEvent {
+                turn_id: turn_id.clone(),
+                trace_id: None,
+                started_at: Some(started_at),
+                model_context_window: None,
+                collaboration_mode_kind: Default::default(),
+            },
+        ))];
+        if source == IndexedForkSource::ColdCompacted && index + 1 == segment_count {
+            items.extend([
+                RolloutItem::Compacted(CompactedItem {
+                    message: "latest indexed parent checkpoint".to_string(),
+                    replacement_history: Some(vec![ResponseItem::Message {
+                        id: None,
+                        role: "user".to_string(),
+                        content: vec![ContentItem::InputText {
+                            text: "checkpoint replacement history".to_string(),
+                        }],
+                        phase: None,
+                        internal_chat_message_metadata_passthrough: None,
+                    }
+                    .into()]),
+                    mcp_resource_origins: None,
+                    window_number: Some(1),
+                    first_window_id: None,
+                    previous_window_id: None,
+                    window_id: None,
+                }),
+                RolloutItem::TurnContext(TurnContextItem {
+                    turn_id: Some(turn_id.clone()),
+                    cwd: codex_home.path().abs(),
+                    workspace_roots: None,
+                    current_date: None,
+                    timezone: None,
+                    approval_policy: ProtocolAskForApproval::Never,
+                    approvals_reviewer: None,
+                    sandbox_policy: ProtocolSandboxPolicy::new_read_only_policy(),
+                    permission_profile: None,
+                    active_permission_profile: None,
+                    network: None,
+                    file_system_sandbox_policy: None,
+                    model: "mock-model".to_string(),
+                    model_profile: None,
+                    cyber_access_program: None,
+                    service_tier: None,
+                    comp_hash: None,
+                    personality: None,
+                    collaboration_mode: None,
+                    multi_agent_version: None,
+                    multi_agent_mode: None,
+                    realtime_active: None,
+                    effort: None,
+                    summary: ReasoningSummary::Auto,
+                }),
+            ]);
+        }
+        for (item_index, item) in [user_item, agent_item].into_iter().enumerate() {
+            items.push(RolloutItem::EventMsg(EventMsg::ItemCompleted(
+                ItemCompletedEvent {
+                    thread_id: source_thread_id,
+                    turn_id: turn_id.clone(),
+                    item,
+                    started_at_ms: Some(started_at * 1_000),
+                    completed_at_ms: started_at * 1_000 + i64::try_from(item_index)? + 1,
+                },
+            )));
+        }
+        items.push(RolloutItem::EventMsg(EventMsg::TurnComplete(
+            TurnCompleteEvent {
+                turn_id,
+                last_agent_message: None,
+                error: None,
+                started_at: Some(started_at),
+                completed_at: Some(started_at + 1),
+                duration_ms: Some(1_000),
+                time_to_first_token_ms: None,
+            },
+        )));
+        store
+            .append_items(AppendThreadItemsParams {
+                thread_id: source_thread_id,
+                items,
+            })
+            .await?;
+        if index + 1 < segment_count {
+            store
+                .freeze_thread_segment(
+                    source_thread_id,
+                    FreezeRolloutSegmentParams::rotate(Vec::new()),
+                )
+                .await?;
+        }
+    }
+    store.shutdown_thread(source_thread_id).await?;
+    drop(store);
+
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .without_auto_env()
+        .with_env_overrides(&[("FRODEX_HISTORY_IO_TRACE", Some("1"))])
+        .with_json_logging("warn,codex_history_io=trace")
+        .build_initialized()
+        .await?;
+    let _: ThreadReadResponse = mcp
+        .request(|request_id| ClientRequest::ThreadRead {
+            request_id,
+            params: ThreadReadParams {
+                thread_id: source_thread_id.to_string(),
+                include_turns: false,
+            },
+        })
+        .await?;
+    if source == IndexedForkSource::ResumedUncompacted {
+        let _: ThreadResumeResponse = mcp
+            .request(|request_id| ClientRequest::ThreadResume {
+                request_id,
+                params: ThreadResumeParams {
+                    thread_id: source_thread_id.to_string(),
+                    ..Default::default()
+                },
+            })
+            .await?;
+    }
+    let ThreadForkResponse {
+        thread: forked_thread,
+        ..
+    } = mcp
+        .request(|request_id| ClientRequest::ThreadFork {
+            request_id,
+            params: ThreadForkParams {
+                thread_id: source_thread_id.to_string(),
+                ephemeral: presentation == IndexedForkPresentation::Ephemeral,
+                exclude_turns: presentation == IndexedForkPresentation::Ephemeral,
+                ..Default::default()
+            },
+        })
+        .await?;
+    match presentation {
+        IndexedForkPresentation::Durable => {
+            assert_eq!(forked_thread.turns.len(), segment_count);
+            for (index, turn) in forked_thread.turns.iter().enumerate() {
+                assert_eq!(turn.id, format!("turn-{index}"));
+                assert_eq!(turn.items.len(), 2);
+            }
+            let child_rollout_path = forked_thread.path.as_ref().expect("forked rollout path");
+            let child_rollout_items =
+                RolloutRecorder::load_rollout_items(child_rollout_path.as_path())
+                    .await?
+                    .0;
+            assert!(
+                matches!(
+                    child_rollout_items.as_slice(),
+                    [
+                        RolloutItem::SessionMeta(_),
+                        RolloutItem::RolloutReference(_),
+                        ..
+                    ]
+                ),
+                "forked child must inherit history by reference rather than copying parent items"
+            );
+            assert!(
+                !child_rollout_items
+                    .iter()
+                    .any(|item| matches!(item, RolloutItem::EventMsg(EventMsg::ItemCompleted(_)))),
+                "forked child must not persist inherited parent item records"
+            );
+        }
+        IndexedForkPresentation::Ephemeral => {
+            assert!(forked_thread.ephemeral);
+            assert!(forked_thread.path.is_none());
+            assert!(forked_thread.turns.is_empty());
+        }
+    }
+
+    mcp.wait_for_json_log_event("codex.history.fork.complete")
+        .await?;
+    let events = mcp.json_log_events()?;
+    let fork_start_index = events
+        .iter()
+        .position(|event| {
+            event["fields"]["event.name"] == "codex.history.fork.start"
+                && event["fields"]["source_thread.id"] == source_thread_id.to_string()
+        })
+        .expect("fork start event for source thread");
+    assert!(
+        events[..fork_start_index].iter().any(|event| {
+            event["fields"]["event.name"] == "codex.history.rollout.open"
+                && event["fields"]["rollout_path"]
+                    .as_str()
+                    .is_some_and(|rollout_path| {
+                        rollout_path.contains(source_thread_id.to_string().as_str())
+                    })
+        }),
+        "thread/read must prove rollout reader observation is active before fork measurement"
+    );
+    let fork_complete_index = events
+        .iter()
+        .position(|event| {
+            event["fields"]["event.name"] == "codex.history.fork.complete"
+                && event["fields"]["thread.id"] == forked_thread.id
+        })
+        .expect("fork completion event for child thread");
+    let fork_events = &events[fork_start_index..=fork_complete_index];
+
+    let item_reads = fork_events
+        .iter()
+        .filter(|event| {
+            event["fields"]["event.name"] == "codex.history.turn_items.read"
+                && event["fields"]["thread.id"] == forked_thread.id
+        })
+        .count();
+    assert_eq!(
+        item_reads, 0,
+        "forking {segment_count} physical segments must not read each inherited child turn"
+    );
+    let source_thread_id = source_thread_id.to_string();
+    let file_open_count = fork_events
+        .iter()
+        .filter(|event| {
+            event["fields"]["event.name"] == "codex.history.rollout.open"
+                && event["fields"]["rollout_path"]
+                    .as_str()
+                    .is_some_and(|rollout_path| {
+                        rollout_path.contains(source_thread_id.as_str())
+                            || rollout_path.contains(forked_thread.id.as_str())
+                    })
+        })
+        .count();
+    Ok(file_open_count)
 }
 
 #[tokio::test]
@@ -1600,7 +2445,7 @@ async fn assert_thread_fork_freezes_active_paginated_turn_as_interrupted(
             "developer",
             Some(ThreadSource::Subagent),
         ),
-        MultiAgentVersion::V1 => (config, "user", None),
+        MultiAgentVersion::V1 => (config.disable_feature(Feature::MultiAgentV2), "user", None),
         MultiAgentVersion::Disabled => unreachable!("interruption markers require agent support"),
     };
     config.write(codex_home.path())?;
@@ -1725,27 +2570,31 @@ async fn assert_thread_fork_freezes_active_paginated_turn_as_interrupted(
         .map(serde_json::from_str::<RolloutLine>)
         .collect::<Result<Vec<_>, _>>()?;
     assert!(matches!(
-        child_rollout.as_slice(),
-        [
-            RolloutLine { item: RolloutItem::SessionMeta(_), .. },
-            RolloutLine {
-                item: RolloutItem::EventMsg(EventMsg::ThreadSettingsApplied(_)),
-                ..
-            },
-            RolloutLine {
-                item: RolloutItem::ResponseItem(response_item),
-                ..
-            },
-            RolloutLine {
-                item: RolloutItem::EventMsg(EventMsg::TurnAborted(aborted)),
-                ..
-            },
-        ] if matches!(
-            &response_item.item,
-            codex_protocol::models::ResponseItem::Message { role, .. }
-                if role == expected_marker_role
-        ) && aborted.turn_id.as_deref() == Some("active-turn")
+        child_rollout.first(),
+        Some(RolloutLine {
+            item: RolloutItem::SessionMeta(_),
+            ..
+        })
     ));
+    assert!(
+        child_rollout
+            .iter()
+            .any(|line| matches!(line.item, RolloutItem::RolloutReference(_)))
+    );
+    assert!(child_rollout.iter().any(|line| matches!(
+        &line.item,
+        RolloutItem::ResponseItem(response_item)
+            if matches!(
+                &response_item.item,
+                codex_protocol::models::ResponseItem::Message { role, .. }
+                    if role == expected_marker_role
+            )
+    )));
+    assert!(child_rollout.iter().any(|line| matches!(
+        &line.item,
+        RolloutItem::EventMsg(EventMsg::TurnAborted(aborted))
+            if aborted.turn_id.as_deref() == Some("active-turn")
+    )));
 
     append_rollout_item_to_path(source_path.as_path(), &user_response_item("after-fork")).await?;
     append_rollout_item_to_path(
@@ -1980,7 +2829,6 @@ async fn assert_thread_fork_freezes_active_paginated_turn_as_interrupted(
     assert!(serialized_input.contains("before-fork model input"));
     assert!(!serialized_input.contains("after-fork model input"));
     assert!(serialized_input.contains("Continue after cold resume"));
-
     Ok(())
 }
 
@@ -2148,6 +2996,11 @@ async fn assert_thread_fork_ephemeral_remains_pathless_and_omits_listing(
         Some("mock_provider"),
         /*git_info*/ None,
     )?;
+    if history_mode == ThreadHistoryMode::Paginated {
+        let path = rollout_path(codex_home.path(), "2025-01-05T12-00-00", &conversation_id);
+        app_test_support::append_fake_paginated_user_message(&path, &conversation_id, preview)
+            .await?;
+    }
 
     let mut mcp = TestAppServer::builder()
         .with_codex_home(codex_home.path())
@@ -2208,7 +3061,7 @@ async fn assert_thread_fork_ephemeral_remains_pathless_and_omits_listing(
         assert_eq!(thread.turns.len(), 1, "expected copied fork history");
 
         let turn = &thread.turns[0];
-        assert_eq!(turn.status, TurnStatus::Completed);
+        assert_eq!(turn.status, TurnStatus::Interrupted);
         assert_eq!(turn.items.len(), 1, "expected user message item");
         match &turn.items[0] {
             ThreadItem::UserMessage { content, .. } => {
@@ -2318,6 +3171,104 @@ async fn assert_thread_fork_ephemeral_remains_pathless_and_omits_listing(
 
     let ThreadListResponse { data, .. } = list_threads(&mut mcp).await?;
     assert!(data.iter().all(|thread| thread.id != fork_thread_id));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn thread_fork_system_ephemeral_stays_unpersisted_with_debug_materialization() -> Result<()> {
+    let server = create_mock_responses_server_repeating_assistant("Done").await;
+    let codex_home = TempDir::new()?;
+    MockResponsesConfig::new(&server.uri()).write(codex_home.path())?;
+
+    let source_thread_id = create_fake_rollout(
+        codex_home.path(),
+        "2025-01-05T12-00-00",
+        "2025-01-05T12:00:00Z",
+        "Saved user message",
+        Some("mock_provider"),
+        /*git_info*/ None,
+    )?;
+
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .with_env_overrides(&[("CODEX_MATERIALIZE_EPHEMERAL_ROLLOUTS", Some("1"))])
+        .build_initialized()
+        .await?;
+
+    let request_id = mcp
+        .send_thread_fork_request(ThreadForkParams {
+            thread_id: source_thread_id.clone(),
+            ephemeral: true,
+            thread_source: Some(ThreadSource::Feature("system".to_string())),
+            ..Default::default()
+        })
+        .await?;
+    let ThreadForkResponse { thread, .. } =
+        timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(request_id)).await??;
+
+    assert!(thread.ephemeral);
+    assert_eq!(thread.path, None);
+
+    timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.start_turn_and_wait_for_completion(TurnStartParams {
+            thread_id: thread.id.clone(),
+            input: vec![UserInput::Text {
+                text: "Generate a task title".to_string(),
+                text_elements: Vec::new(),
+            }],
+            ..Default::default()
+        }),
+    )
+    .await??;
+
+    let state_db = StateRuntime::init(
+        codex_state::SqliteConfig::new_for_testing(codex_home.path().abs()),
+        "mock_provider".to_string(),
+    )
+    .await?;
+    assert_eq!(
+        state_db
+            .get_thread(ThreadId::from_string(&thread.id)?)
+            .await?,
+        None,
+        "a system ephemeral fork must not create a persisted thread"
+    );
+
+    for archived in [false, true] {
+        let list_id = mcp
+            .send_thread_list_request(ThreadListParams {
+                cursor: None,
+                limit: Some(50),
+                sort_key: None,
+                sort_direction: None,
+                model_providers: None,
+                source_kinds: None,
+                archived: Some(archived),
+                project_id: None,
+                cwd: None,
+                use_state_db_only: false,
+                search_term: None,
+                parent_thread_id: None,
+                ancestor_thread_id: None,
+                section_id: None,
+            })
+            .await?;
+        let ThreadListResponse { data, .. } =
+            timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(list_id)).await??;
+        assert!(
+            data.iter().all(|candidate| candidate.id != thread.id),
+            "a system ephemeral fork must not appear in the archived={archived} list"
+        );
+        if !archived {
+            assert!(
+                data.iter()
+                    .any(|candidate| candidate.id == source_thread_id),
+                "the persistent source thread must remain listed"
+            );
+        }
+    }
 
     Ok(())
 }

@@ -228,6 +228,11 @@ impl TestAppServer {
         self.json_logs.wait_for_event(event_name).await
     }
 
+    /// Returns the JSON stderr events already drained from the child process.
+    pub fn json_log_events(&self) -> anyhow::Result<Vec<serde_json::Value>> {
+        self.json_logs.events()
+    }
+
     async fn new_with_program_env_and_args(
         codex_home: &Path,
         program: &Path,

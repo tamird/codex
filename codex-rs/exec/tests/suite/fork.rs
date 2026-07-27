@@ -80,6 +80,17 @@ fn extract_forked_from_id(path: &std::path::Path) -> Option<String> {
         .map(ToString::to_string)
 }
 
+fn rollout_contains_reference(path: &std::path::Path) -> anyhow::Result<bool> {
+    let content = std::fs::read_to_string(path)?;
+    Ok(content.lines().skip(1).any(|line| {
+        serde_json::from_str::<Value>(line)
+            .ok()
+            .is_some_and(|item| {
+                item.get("type").and_then(Value::as_str) == Some("rollout_reference")
+            })
+    }))
+}
+
 fn exec_sse_response(index: usize) -> String {
     responses::sse(vec![
         responses::ev_response_created(&format!("resp-fork-{index}")),
@@ -89,12 +100,12 @@ fn exec_sse_response(index: usize) -> String {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn exec_fork_by_id_creates_new_session_with_copied_history() -> anyhow::Result<()> {
+async fn exec_fork_by_id_creates_new_session_with_reference_backed_history() -> anyhow::Result<()> {
     skip_if_no_network!(Ok(()));
 
     let test = test_codex_exec();
     let server = MockServer::start().await;
-    let _response_mock =
+    let response_mock =
         responses::mount_sse_sequence(&server, (0..2).map(exec_sse_response).collect()).await;
 
     let marker = format!("fork-base-{}", Uuid::new_v4());
@@ -135,11 +146,16 @@ async fn exec_fork_by_id_creates_new_session_with_copied_history() -> anyhow::Re
         extract_forked_from_id(&forked_path).as_deref(),
         Some(session_id.as_str())
     );
-    assert!(
-        forked_content.contains(&marker),
-        "forked session should copy ancestor rollout history"
-    );
+    assert!(!rollout_response_items_contain_marker(
+        &forked_path,
+        &marker
+    )?);
+    assert!(rollout_contains_reference(&forked_path)?);
     assert!(forked_content.contains(&marker2));
+
+    let requests = response_mock.requests();
+    assert_eq!(requests.len(), 2);
+    assert!(requests[1].body_json().to_string().contains(&marker));
 
     let original_content = std::fs::read_to_string(&original_path)?;
     assert!(original_content.contains(&marker));

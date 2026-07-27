@@ -22,7 +22,8 @@ pub fn apply_rollout_item(
         RolloutItem::TurnContext(turn_ctx) => apply_turn_context(metadata, turn_ctx),
         RolloutItem::EventMsg(event) => apply_event_msg(metadata, event),
         RolloutItem::ResponseItem(item) => apply_response_item(metadata, &item.item),
-        RolloutItem::InterAgentCommunication(_)
+        RolloutItem::RolloutReference(_)
+        | RolloutItem::InterAgentCommunication(_)
         | RolloutItem::InterAgentCommunicationMetadata { .. } => {}
         RolloutItem::Compacted(_) => {}
         RolloutItem::WorldState(_) => {}
@@ -50,6 +51,7 @@ pub fn rollout_item_affects_thread_metadata(item: &RolloutItem) -> bool {
             true
         }
         RolloutItem::EventMsg(_)
+        | RolloutItem::RolloutReference(_)
         | RolloutItem::ResponseItem(_)
         | RolloutItem::InterAgentCommunication(_)
         | RolloutItem::InterAgentCommunicationMetadata { .. }
@@ -391,6 +393,7 @@ mod tests {
                 meta: SessionMeta {
                     session_id: thread_id.into(),
                     id: thread_id,
+                    segment_id: None,
                     forked_from_id: Some(
                         ThreadId::from_string(&Uuid::now_v7().to_string()).expect("thread id"),
                     ),
@@ -659,6 +662,7 @@ mod tests {
                 meta: SessionMeta {
                     session_id: thread_id.into(),
                     id: thread_id,
+                    segment_id: None,
                     forked_from_id: None,
                     forked_from_ordinal_exclusive: None,
                     parent_thread_id: None,

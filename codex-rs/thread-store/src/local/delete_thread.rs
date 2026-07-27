@@ -8,57 +8,29 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 use std::io::ErrorKind;
 use std::path::Path;
-use std::path::PathBuf;
 
+use codex_protocol::RolloutId;
+use codex_protocol::ThreadId;
 use codex_rollout::ARCHIVED_SESSIONS_SUBDIR;
 use codex_rollout::RolloutReferenceIndex;
 use codex_rollout::SESSIONS_SUBDIR;
-use codex_rollout::find_archived_thread_path_by_id_str;
-use codex_rollout::find_thread_path_by_id_str;
+use codex_rollout::find_all_rollout_paths_by_thread_id;
 use codex_rollout::remove_thread_name_entries;
 
 use super::LocalThreadStore;
+use super::helpers::matching_rollout_file_name;
 use super::helpers::scoped_rollout_path;
-use super::helpers::validated_rollout_file_name;
 use crate::DeleteThreadParams;
 use crate::DeleteThreadsParams;
 use crate::ThreadStoreError;
 use crate::ThreadStoreResult;
 
-struct ThreadRollouts {
-    thread_id: codex_protocol::ThreadId,
-    rollout_ids: HashSet<codex_protocol::ThreadId>,
-    paths: Vec<PathBuf>,
-}
-
-impl ThreadRollouts {
-    fn from_index(
-        reference_index: &RolloutReferenceIndex,
-        thread_id: codex_protocol::ThreadId,
-    ) -> Self {
-        let mut rollout_ids = HashSet::new();
-        let paths = reference_index
-            .rollouts_for_thread(thread_id)
-            .map(|(rollout_id, path)| {
-                rollout_ids.insert(rollout_id);
-                path.to_path_buf()
-            })
-            .collect();
-        Self {
-            thread_id,
-            rollout_ids,
-            paths,
-        }
-    }
-
-    fn add_path(&mut self, path: PathBuf) {
-        if let Some(rollout_id) = codex_rollout::rollout_id_from_path(path.as_path()) {
-            self.rollout_ids.insert(rollout_id);
-        }
-        if !self.paths.contains(&path) {
-            self.paths.push(path);
-        }
-    }
+#[derive(Clone)]
+struct OwnedRollout {
+    path: std::path::PathBuf,
+    rollout_id: RolloutId,
+    /// Noncanonical files are authenticated individually and must not authorize sibling deletion.
+    authenticated_noncanonical: bool,
 }
 
 pub(super) async fn delete_thread(
@@ -68,11 +40,19 @@ pub(super) async fn delete_thread(
     let thread_id = params.thread_id;
     let _lifecycle_guard = store.live_writer_locks.lock_lifecycle(thread_id).await;
     let _live_writer_guard = store.live_writer_locks.lock(thread_id).await;
-    let reference_index = scan_reference_index(store).await?;
-    let thread_rollouts = ThreadRollouts::from_index(&reference_index, thread_id);
-    ensure_no_external_references(&reference_index, std::slice::from_ref(&thread_rollouts))?;
     let mut writer_guards = store.acquire_writer_locks(&[thread_id]).await?;
-    delete_thread_after_reference_check(store, thread_rollouts, &mut writer_guards).await
+    let owned_rollouts = owned_rollouts_for_thread(store, thread_id).await?;
+    let reference_index = scan_reference_index(store).await?;
+    if owned_rollouts
+        .iter()
+        .map(|rollout| rollout.rollout_id)
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .any(|rollout_id| reference_index.reference_count(rollout_id) > 0)
+    {
+        return Err(referenced_thread_error(thread_id));
+    }
+    delete_thread_after_reference_check(store, thread_id, owned_rollouts, &mut writer_guards).await
 }
 
 pub(super) async fn delete_threads(
@@ -84,9 +64,9 @@ pub(super) async fn delete_threads(
         return Ok(());
     }
 
-    let mut lock_thread_ids = thread_ids.clone();
+    let deletion_set: HashSet<_> = thread_ids.iter().copied().collect();
+    let mut lock_thread_ids: Vec<_> = deletion_set.iter().copied().collect();
     lock_thread_ids.sort_unstable_by_key(ToString::to_string);
-    lock_thread_ids.dedup();
     let mut _lifecycle_guards = Vec::with_capacity(lock_thread_ids.len());
     for thread_id in &lock_thread_ids {
         _lifecycle_guards.push(store.live_writer_locks.lock_lifecycle(*thread_id).await);
@@ -95,53 +75,70 @@ pub(super) async fn delete_threads(
     for &thread_id in &lock_thread_ids {
         _live_writer_guards.push(store.live_writer_locks.lock(thread_id).await);
     }
-
-    let reference_index = scan_reference_index(store).await?;
-    let thread_rollouts = thread_ids
-        .iter()
-        .map(|thread_id| ThreadRollouts::from_index(&reference_index, *thread_id))
-        .collect::<Vec<_>>();
-    ensure_no_external_references(&reference_index, thread_rollouts.as_slice())?;
-
     let mut writer_guards = store.acquire_writer_locks(&lock_thread_ids).await?;
-    for thread_rollouts in thread_rollouts {
-        match delete_thread_after_reference_check(store, thread_rollouts, &mut writer_guards).await
+
+    let mut owned_rollouts_by_thread = HashMap::new();
+    let mut targeted_rollout_ids = HashSet::new();
+    for thread_id in &deletion_set {
+        let owned_rollouts = owned_rollouts_for_thread(store, *thread_id).await?;
+        targeted_rollout_ids.extend(owned_rollouts.iter().map(|rollout| rollout.rollout_id));
+        owned_rollouts_by_thread.insert(*thread_id, owned_rollouts);
+    }
+    let reference_index = scan_reference_index(store).await?;
+    // References from children in this delete set are removed by the same request, so only
+    // references from children outside the set should block it.
+    let mut internal_reference_counts = HashMap::new();
+    for child_rollouts in owned_rollouts_by_thread.values() {
+        for child_rollout_id in child_rollouts
+            .iter()
+            .map(|rollout| rollout.rollout_id)
+            .collect::<HashSet<_>>()
+        {
+            if let Some(direct_references) = reference_index.direct_references(child_rollout_id) {
+                for referenced_rollout_id in direct_references {
+                    if *referenced_rollout_id != child_rollout_id
+                        && targeted_rollout_ids.contains(referenced_rollout_id)
+                    {
+                        *internal_reference_counts
+                            .entry(*referenced_rollout_id)
+                            .or_default() += 1;
+                    }
+                }
+            }
+        }
+    }
+    for thread_id in &thread_ids {
+        for rollout_id in owned_rollouts_by_thread
+            .get(thread_id)
+            .into_iter()
+            .flatten()
+            .map(|rollout| rollout.rollout_id)
+            .collect::<HashSet<_>>()
+        {
+            let internal_reference_count = internal_reference_counts
+                .get(&rollout_id)
+                .copied()
+                .unwrap_or_default();
+            if reference_index.reference_count(rollout_id) > internal_reference_count {
+                return Err(referenced_thread_error(*thread_id));
+            }
+        }
+    }
+
+    for thread_id in thread_ids {
+        let owned_rollouts = owned_rollouts_by_thread
+            .remove(&thread_id)
+            .unwrap_or_default();
+        match delete_thread_after_reference_check(
+            store,
+            thread_id,
+            owned_rollouts,
+            &mut writer_guards,
+        )
+        .await
         {
             Ok(()) | Err(ThreadStoreError::ThreadNotFound { .. }) => {}
             Err(err) => return Err(err),
-        }
-    }
-    Ok(())
-}
-
-fn ensure_no_external_references(
-    reference_index: &RolloutReferenceIndex,
-    thread_rollouts: &[ThreadRollouts],
-) -> ThreadStoreResult<()> {
-    let deletion_rollout_ids = thread_rollouts
-        .iter()
-        .flat_map(|thread_rollouts| thread_rollouts.rollout_ids.iter().copied())
-        .collect::<HashSet<_>>();
-    let mut internal_reference_counts = HashMap::new();
-    for source_rollout_id in &deletion_rollout_ids {
-        if let Some(history_base) = reference_index.history_base(*source_rollout_id)
-            && history_base.thread_id != *source_rollout_id
-            && deletion_rollout_ids.contains(&history_base.thread_id)
-        {
-            *internal_reference_counts
-                .entry(history_base.thread_id)
-                .or_default() += 1;
-        }
-    }
-    for thread_rollouts in thread_rollouts {
-        if thread_rollouts.rollout_ids.iter().any(|rollout_id| {
-            let internal_reference_count = internal_reference_counts
-                .get(rollout_id)
-                .copied()
-                .unwrap_or_default();
-            reference_index.reference_count(*rollout_id) > internal_reference_count
-        }) {
-            return Err(referenced_thread_error(thread_rollouts.thread_id));
         }
     }
     Ok(())
@@ -163,56 +160,151 @@ fn referenced_thread_error(thread_id: codex_protocol::ThreadId) -> ThreadStoreEr
     }
 }
 
+async fn owned_rollouts_for_thread(
+    store: &LocalThreadStore,
+    thread_id: ThreadId,
+) -> ThreadStoreResult<Vec<OwnedRollout>> {
+    let mut owned_rollouts =
+        find_all_rollout_paths_by_thread_id(store.config.codex_home.as_path(), thread_id)
+            .await
+            .map_err(|err| ThreadStoreError::InvalidRequest {
+                message: format!("failed to enumerate rollout files for thread {thread_id}: {err}"),
+            })?
+            .into_iter()
+            .filter_map(|path| {
+                codex_rollout::rollout_id_from_path(path.as_path()).map(|rollout_id| OwnedRollout {
+                    path,
+                    rollout_id,
+                    authenticated_noncanonical: false,
+                })
+            })
+            .collect::<Vec<_>>();
+
+    if let Some(state_db) = store.state_db().await
+        && let Some(selected_path) = state_db
+            .find_rollout_path_by_id(thread_id, /*archived_only*/ None)
+            .await
+            .map_err(|err| ThreadStoreError::Internal {
+                message: format!("failed to read selected rollout for {thread_id}: {err}"),
+            })?
+    {
+        let existing_path = codex_rollout::existing_rollout_path(selected_path.as_path())
+            .await
+            .ok_or_else(|| ThreadStoreError::InvalidRequest {
+                message: format!(
+                    "selected rollout `{}` for thread {thread_id} does not exist",
+                    selected_path.display()
+                ),
+            })?;
+        let canonical_path = scoped_rollout_path(
+            store.config.codex_home.join(SESSIONS_SUBDIR),
+            existing_path.as_path(),
+            "sessions",
+        )
+        .or_else(|_| {
+            scoped_rollout_path(
+                store.config.codex_home.join(ARCHIVED_SESSIONS_SUBDIR),
+                existing_path.as_path(),
+                "archived sessions",
+            )
+        })?;
+        if let Some(encoded_thread_id) = codex_rollout::thread_id_from_path(&canonical_path) {
+            if encoded_thread_id != thread_id {
+                return Err(ThreadStoreError::InvalidRequest {
+                    message: format!(
+                        "selected rollout `{}` encodes thread {encoded_thread_id}, not {thread_id}",
+                        existing_path.display()
+                    ),
+                });
+            }
+        } else {
+            let mut sibling_paths = vec![codex_rollout::plain_rollout_path(&canonical_path)];
+            sibling_paths.push(sibling_paths[0].with_extension("jsonl.zst"));
+            for sibling_path in sibling_paths {
+                if !sibling_path.exists() {
+                    continue;
+                }
+                let sibling_path = scoped_rollout_path(
+                    store.config.codex_home.join(SESSIONS_SUBDIR),
+                    sibling_path.as_path(),
+                    "sessions",
+                )
+                .or_else(|_| {
+                    scoped_rollout_path(
+                        store.config.codex_home.join(ARCHIVED_SESSIONS_SUBDIR),
+                        sibling_path.as_path(),
+                        "archived sessions",
+                    )
+                })?;
+                let metadata = codex_rollout::read_session_meta_line_exact(sibling_path.as_path())
+                    .await
+                    .map_err(|err| ThreadStoreError::InvalidRequest {
+                        message: format!(
+                            "selected noncanonical rollout `{}` could not be authenticated: {err}",
+                            sibling_path.display()
+                        ),
+                    })?;
+                if metadata.meta.id != thread_id {
+                    return Err(ThreadStoreError::InvalidRequest {
+                        message: format!(
+                            "selected noncanonical rollout `{}` belongs to thread {}, not {thread_id}",
+                            sibling_path.display(),
+                            metadata.meta.id
+                        ),
+                    });
+                }
+                if !owned_rollouts
+                    .iter()
+                    .any(|rollout| rollout.path == sibling_path)
+                {
+                    owned_rollouts.push(OwnedRollout {
+                        path: sibling_path,
+                        rollout_id: thread_id,
+                        authenticated_noncanonical: true,
+                    });
+                }
+            }
+        }
+        if codex_rollout::thread_id_from_path(&canonical_path).is_none()
+            && !owned_rollouts
+                .iter()
+                .any(|rollout| rollout.authenticated_noncanonical)
+        {
+            return Err(ThreadStoreError::InvalidRequest {
+                message: format!(
+                    "selected noncanonical rollout `{}` has no readable representation",
+                    existing_path.display()
+                ),
+            });
+        }
+    }
+
+    owned_rollouts.sort_by(|left, right| left.path.cmp(&right.path));
+    Ok(owned_rollouts)
+}
+
 async fn delete_thread_after_reference_check(
     store: &LocalThreadStore,
-    mut thread_rollouts: ThreadRollouts,
+    thread_id: codex_protocol::ThreadId,
+    owned_rollouts: Vec<OwnedRollout>,
     writer_guards: &mut Vec<super::writer_lock::WriterLockGuard>,
 ) -> ThreadStoreResult<()> {
-    let thread_id = thread_rollouts.thread_id;
-    let thread_id_str = thread_id.to_string();
-    let state_db_ctx = store.state_db().await;
-    match find_thread_path_by_id_str(
-        store.config.codex_home.as_path(),
-        thread_id_str.as_str(),
-        state_db_ctx.as_deref(),
-    )
-    .await
-    {
-        Ok(Some(path)) => thread_rollouts.add_path(path),
-        Ok(None) => {}
-        Err(err) => {
-            return Err(ThreadStoreError::InvalidRequest {
-                message: format!("failed to locate thread id {thread_id}: {err}"),
-            });
-        }
-    }
-    match find_archived_thread_path_by_id_str(
-        store.config.codex_home.as_path(),
-        thread_id_str.as_str(),
-        state_db_ctx.as_deref(),
-    )
-    .await
-    {
-        Ok(Some(path)) => thread_rollouts.add_path(path),
-        Ok(None) => {}
-        Err(err) => {
-            return Err(ThreadStoreError::InvalidRequest {
-                message: format!("failed to locate archived thread id {thread_id}: {err}"),
-            });
-        }
-    }
-    thread_rollouts.rollout_ids.insert(thread_id);
-    for rollout_id in thread_rollouts.rollout_ids {
-        super::thread_history::delete_thread(store, rollout_id).await?;
-    }
+    let mut rollout_ids = owned_rollouts
+        .iter()
+        .map(|rollout| rollout.rollout_id)
+        .collect::<HashSet<_>>();
+    // Remove rows created before rollout replacement used the physical rollout ID as its key.
+    rollout_ids.insert(thread_id);
+    super::thread_history::delete_threads(store, &rollout_ids.into_iter().collect::<Vec<_>>())
+        .await?;
 
     // Drop the recorder before removing files, but retain its writer lock until cleanup finishes.
     if let Some(entry) = store.live_recorders.lock().await.remove(&thread_id) {
         writer_guards.push(entry.writer_lock);
     }
-    let found_rollout_path = !thread_rollouts.paths.is_empty();
-    for rollout_path in thread_rollouts.paths {
-        delete_rollout_file(store, rollout_path.as_path())?;
+    let found_rollout_path = !owned_rollouts.is_empty();
+    for rollout in owned_rollouts {
+        delete_rollout_file(store, &rollout, thread_id)?;
     }
     remove_thread_name_entries(store.config.codex_home.as_path(), thread_id)
         .await
@@ -227,15 +319,42 @@ async fn delete_thread_after_reference_check(
     Ok(())
 }
 
-fn delete_rollout_file(store: &LocalThreadStore, rollout_path: &Path) -> ThreadStoreResult<bool> {
-    let plain_path = codex_rollout::plain_rollout_path(rollout_path);
+fn delete_rollout_file(
+    store: &LocalThreadStore,
+    rollout: &OwnedRollout,
+    thread_id: codex_protocol::ThreadId,
+) -> ThreadStoreResult<bool> {
+    if rollout.authenticated_noncanonical {
+        return delete_rollout_path(
+            store,
+            rollout.path.as_path(),
+            thread_id,
+            /*authenticated_noncanonical*/ true,
+        );
+    }
+    let plain_path = codex_rollout::plain_rollout_path(rollout.path.as_path());
     let compressed_path = plain_path.with_extension("jsonl.zst");
-    let deleted_plain = delete_rollout_path(store, plain_path.as_path())?;
-    let deleted_compressed = delete_rollout_path(store, compressed_path.as_path())?;
+    let deleted_plain = delete_rollout_path(
+        store,
+        plain_path.as_path(),
+        thread_id,
+        rollout.authenticated_noncanonical,
+    )?;
+    let deleted_compressed = delete_rollout_path(
+        store,
+        compressed_path.as_path(),
+        thread_id,
+        rollout.authenticated_noncanonical,
+    )?;
     Ok(deleted_plain || deleted_compressed)
 }
 
-fn delete_rollout_path(store: &LocalThreadStore, rollout_path: &Path) -> ThreadStoreResult<bool> {
+fn delete_rollout_path(
+    store: &LocalThreadStore,
+    rollout_path: &Path,
+    thread_id: codex_protocol::ThreadId,
+    authenticated_noncanonical: bool,
+) -> ThreadStoreResult<bool> {
     let canonical_rollout_path = scoped_rollout_path(
         store.config.codex_home.join(SESSIONS_SUBDIR),
         rollout_path,
@@ -252,7 +371,9 @@ fn delete_rollout_path(store: &LocalThreadStore, rollout_path: &Path) -> ThreadS
         Ok(false) => Ok(rollout_path.to_path_buf()),
         Ok(true) | Err(_) => Err(err),
     })?;
-    validated_rollout_file_name(&canonical_rollout_path, rollout_path)?;
+    if !authenticated_noncanonical {
+        matching_rollout_file_name(&canonical_rollout_path, thread_id, rollout_path)?;
+    }
     match std::fs::remove_file(&canonical_rollout_path) {
         Ok(()) => Ok(true),
         Err(err) if err.kind() == ErrorKind::NotFound => Ok(false),
@@ -269,8 +390,11 @@ fn delete_rollout_path(store: &LocalThreadStore, rollout_path: &Path) -> ThreadS
 mod tests {
     use codex_protocol::ThreadId;
     use codex_protocol::protocol::HistoryPosition;
+    use codex_protocol::protocol::RolloutReferenceItem;
     use codex_protocol::protocol::ThreadHistoryMode;
     use codex_protocol::protocol::ThreadMemoryMode;
+    use codex_rollout::RolloutItem;
+    use codex_rollout::RolloutLine;
     use codex_utils_absolute_path::test_support::PathExt;
     use pretty_assertions::assert_eq;
     use tempfile::TempDir;
@@ -511,6 +635,328 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn delete_thread_checks_every_physical_rollout_reference_before_deleting() {
+        let home = TempDir::new().expect("temp dir");
+        let thread_uuid = Uuid::from_u128(320);
+        let thread_id = ThreadId::from_string(&thread_uuid.to_string()).expect("thread id");
+        let first_rollout_id =
+            ThreadId::from_string(&Uuid::from_u128(321).to_string()).expect("first rollout id");
+        let second_rollout_id =
+            ThreadId::from_string(&Uuid::from_u128(322).to_string()).expect("second rollout id");
+        let source = write_session_file_with_history_mode(
+            home.path(),
+            "2025-01-03T12-00-00",
+            thread_uuid,
+            ThreadHistoryMode::Paginated,
+        )
+        .expect("source session file");
+        let first_path = source.with_file_name(format!(
+            "rollout-2025-01-03T12-00-00-{thread_id}_{first_rollout_id}.jsonl"
+        ));
+        std::fs::rename(&source, &first_path).expect("rename first physical rollout");
+        let archived_root = home.path().join(ARCHIVED_SESSIONS_SUBDIR);
+        std::fs::create_dir_all(&archived_root).expect("archived root");
+        let second_path = archived_root.join(format!(
+            "rollout-2025-01-03T12-00-01-{thread_id}_{second_rollout_id}.jsonl"
+        ));
+        std::fs::copy(&first_path, &second_path).expect("copy second physical rollout");
+
+        let child_uuid = Uuid::from_u128(323);
+        let child_id = ThreadId::from_string(&child_uuid.to_string()).expect("child id");
+        let child_path = write_session_file_with_history_mode(
+            home.path(),
+            "2025-01-03T12-00-02",
+            child_uuid,
+            ThreadHistoryMode::Paginated,
+        )
+        .expect("child session file");
+        let reference = RolloutLine {
+            timestamp: "2025-01-03T12:00:02Z".to_string(),
+            ordinal: Some(1),
+            item: RolloutItem::RolloutReference(RolloutReferenceItem {
+                rollout_path: first_path.clone(),
+                thread_id: Some(thread_id),
+                rollout_id: Some(first_rollout_id),
+                rollout_timestamp: None,
+                segment_id: None,
+                max_depth: 2,
+                nth_user_message: None,
+                compacted_replacement_history_filter_texts: None,
+            }),
+        };
+        let contents = std::fs::read_to_string(&child_path).expect("read child rollout");
+        let (head, tail) = contents
+            .split_once('\n')
+            .expect("child rollout has session metadata");
+        std::fs::write(
+            &child_path,
+            format!(
+                "{head}\n{}\n{tail}",
+                serde_json::to_string(&reference).expect("serialize reference")
+            ),
+        )
+        .expect("insert child reference");
+        let archived_child_path =
+            archived_root.join(child_path.file_name().expect("child rollout filename"));
+        std::fs::copy(&child_path, &archived_child_path)
+            .expect("copy duplicate child physical rollout");
+        let external_uuid = Uuid::from_u128(325);
+        let external_id = ThreadId::from_string(&external_uuid.to_string()).expect("external id");
+        let external_path = write_session_file_with_history_mode(
+            home.path(),
+            "2025-01-03T12-00-03",
+            external_uuid,
+            ThreadHistoryMode::Paginated,
+        )
+        .expect("external child session file");
+        let contents = std::fs::read_to_string(&external_path).expect("read external rollout");
+        let (head, tail) = contents
+            .split_once('\n')
+            .expect("external rollout has session metadata");
+        std::fs::write(
+            &external_path,
+            format!(
+                "{head}\n{}\n{tail}",
+                serde_json::to_string(&reference).expect("serialize external reference")
+            ),
+        )
+        .expect("insert external reference");
+        let config = test_config(home.path());
+        let rollout_config = codex_rollout::RolloutConfig {
+            codex_home: config.codex_home.clone(),
+            sqlite: config.sqlite.clone(),
+            cwd: home.path().to_path_buf(),
+            model_provider_id: config.default_model_provider_id.clone(),
+            generate_memories: false,
+        };
+        let state_db = codex_rollout::state_db::try_init(&rollout_config)
+            .await
+            .expect("backfill physical rollouts");
+        let store = LocalThreadStore::new(config, Some(state_db));
+        for rollout_id in [thread_id, first_rollout_id, second_rollout_id] {
+            super::super::thread_history::apply_projection(
+                &store,
+                rollout_id,
+                /*start_offset*/ 0,
+                /*next_offset*/ 0,
+                /*initial_ordinal*/ 0,
+                Vec::new(),
+            )
+            .await
+            .expect("seed physical projection");
+        }
+
+        let error = store
+            .delete_thread(DeleteThreadParams { thread_id })
+            .await
+            .expect_err("old physical rollout reference must block deletion");
+        assert!(matches!(error, ThreadStoreError::InvalidRequest { .. }));
+        assert!(first_path.exists());
+        assert!(second_path.exists());
+        assert!(child_path.exists());
+
+        let error = store
+            .delete_threads(DeleteThreadsParams {
+                thread_ids: vec![thread_id, child_id],
+            })
+            .await
+            .expect_err("external reference must survive duplicate internal child subtraction");
+        assert!(matches!(error, ThreadStoreError::InvalidRequest { .. }));
+        assert!(first_path.exists());
+        assert!(second_path.exists());
+        assert!(child_path.exists());
+        assert!(archived_child_path.exists());
+
+        store
+            .delete_threads(DeleteThreadsParams {
+                thread_ids: vec![thread_id, child_id, external_id],
+            })
+            .await
+            .expect("batch deletion should discount each direct reference once");
+        assert!(!first_path.exists());
+        assert!(!second_path.exists());
+        assert!(!child_path.exists());
+        assert!(!archived_child_path.exists());
+        assert!(!external_path.exists());
+        for rollout_id in [thread_id, first_rollout_id, second_rollout_id] {
+            assert!(
+                super::super::thread_history::projection_state(&store, rollout_id)
+                    .await
+                    .expect("read deleted projection")
+                    .is_none()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn delete_thread_accepts_authenticated_selected_noncanonical_rollout() {
+        let home = TempDir::new().expect("temp dir");
+        let uuid = Uuid::from_u128(324);
+        let thread_id = ThreadId::from_string(&uuid.to_string()).expect("thread id");
+        let canonical_path =
+            write_session_file(home.path(), "2025-01-03T12-00-00", uuid).expect("session file");
+        let imported_path = canonical_path.with_file_name("rollout-imported.jsonl");
+        std::fs::rename(&canonical_path, &imported_path).expect("rename imported rollout");
+        let config = test_config(home.path());
+        let rollout_config = codex_rollout::RolloutConfig {
+            codex_home: config.codex_home.clone(),
+            sqlite: config.sqlite.clone(),
+            cwd: home.path().to_path_buf(),
+            model_provider_id: config.default_model_provider_id.clone(),
+            generate_memories: false,
+        };
+        let state_db = codex_rollout::state_db::try_init(&rollout_config)
+            .await
+            .expect("backfill imported rollout");
+        let store = LocalThreadStore::new(config, Some(state_db));
+
+        store
+            .delete_thread(DeleteThreadParams { thread_id })
+            .await
+            .expect("delete authenticated imported rollout");
+
+        assert!(!imported_path.exists());
+    }
+
+    #[tokio::test]
+    async fn delete_thread_rejects_mismatched_noncanonical_sibling_before_mutation() {
+        let home = TempDir::new().expect("temp dir");
+        let uuid = Uuid::from_u128(326);
+        let thread_id = ThreadId::from_string(&uuid.to_string()).expect("thread id");
+        let canonical_path =
+            write_session_file(home.path(), "2025-01-03T12-00-00", uuid).expect("session file");
+        let imported_path = canonical_path.with_file_name("rollout-imported.jsonl");
+        std::fs::rename(&canonical_path, &imported_path).expect("rename imported rollout");
+        let config = test_config(home.path());
+        let rollout_config = codex_rollout::RolloutConfig {
+            codex_home: config.codex_home.clone(),
+            sqlite: config.sqlite.clone(),
+            cwd: home.path().to_path_buf(),
+            model_provider_id: config.default_model_provider_id.clone(),
+            generate_memories: false,
+        };
+        let state_db = codex_rollout::state_db::try_init(&rollout_config)
+            .await
+            .expect("backfill imported rollout");
+
+        let sibling_uuid = Uuid::from_u128(327);
+        let sibling_source = write_session_file(home.path(), "2025-01-03T12-00-01", sibling_uuid)
+            .expect("sibling session file");
+        let compressed_sibling = imported_path.with_extension("jsonl.zst");
+        let sibling_bytes = std::fs::read(&sibling_source).expect("read sibling rollout");
+        std::fs::write(
+            &compressed_sibling,
+            zstd::stream::encode_all(sibling_bytes.as_slice(), 3).expect("compress sibling"),
+        )
+        .expect("write mismatched compressed sibling");
+        let store = LocalThreadStore::new(config, Some(state_db));
+
+        let error = store
+            .delete_thread(DeleteThreadParams { thread_id })
+            .await
+            .expect_err("mismatched sibling must fail before deletion");
+        assert!(matches!(error, ThreadStoreError::InvalidRequest { .. }));
+        assert!(imported_path.exists());
+        assert!(compressed_sibling.exists());
+    }
+
+    #[tokio::test]
+    async fn delete_thread_rejects_missing_selected_rollout_before_mutation() {
+        let home = TempDir::new().expect("temp dir");
+        let uuid = Uuid::from_u128(328);
+        let thread_id = ThreadId::from_string(&uuid.to_string()).expect("thread id");
+        let rollout_path =
+            write_session_file(home.path(), "2025-01-03T12-00-00", uuid).expect("session file");
+        let config = test_config(home.path());
+        let rollout_config = codex_rollout::RolloutConfig {
+            codex_home: config.codex_home.clone(),
+            sqlite: config.sqlite.clone(),
+            cwd: home.path().to_path_buf(),
+            model_provider_id: config.default_model_provider_id.clone(),
+            generate_memories: false,
+        };
+        let state_db = codex_rollout::state_db::try_init(&rollout_config)
+            .await
+            .expect("backfill rollout");
+        let mut metadata = state_db
+            .get_thread(thread_id)
+            .await
+            .expect("read selected rollout")
+            .expect("thread metadata");
+        metadata.rollout_path = rollout_path.with_file_name("rollout-missing.jsonl");
+        state_db
+            .upsert_thread(&metadata)
+            .await
+            .expect("select missing rollout");
+        let store = LocalThreadStore::new(config, Some(state_db));
+
+        let error = store
+            .delete_thread(DeleteThreadParams { thread_id })
+            .await
+            .expect_err("missing selected rollout must fail before deletion");
+        assert!(matches!(error, ThreadStoreError::InvalidRequest { .. }));
+        assert!(rollout_path.exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn delete_thread_rejects_out_of_scope_noncanonical_sibling_before_mutation() {
+        use std::os::unix::fs::symlink;
+
+        let home = TempDir::new().expect("temp dir");
+        let uuid = Uuid::from_u128(329);
+        let thread_id = ThreadId::from_string(&uuid.to_string()).expect("thread id");
+        let canonical_path =
+            write_session_file(home.path(), "2025-01-03T12-00-00", uuid).expect("session file");
+        let imported_path = canonical_path.with_file_name("rollout-imported.jsonl");
+        std::fs::rename(&canonical_path, &imported_path).expect("rename imported rollout");
+        let config = test_config(home.path());
+        let rollout_config = codex_rollout::RolloutConfig {
+            codex_home: config.codex_home.clone(),
+            sqlite: config.sqlite.clone(),
+            cwd: home.path().to_path_buf(),
+            model_provider_id: config.default_model_provider_id.clone(),
+            generate_memories: false,
+        };
+        let state_db = codex_rollout::state_db::try_init(&rollout_config)
+            .await
+            .expect("backfill imported rollout");
+        let outside_sibling = home.path().join("outside-rollout.jsonl.zst");
+        std::fs::create_dir_all(home.path().join(ARCHIVED_SESSIONS_SUBDIR))
+            .expect("create archived sessions root");
+        std::fs::write(
+            &outside_sibling,
+            zstd::stream::encode_all(
+                std::fs::read(&imported_path)
+                    .expect("read imported rollout")
+                    .as_slice(),
+                3,
+            )
+            .expect("compress outside sibling"),
+        )
+        .expect("write outside sibling");
+        let sibling_link = imported_path.with_extension("jsonl.zst");
+        symlink(&outside_sibling, &sibling_link).expect("link outside sibling");
+        let store = LocalThreadStore::new(config, Some(state_db));
+        super::super::thread_history::apply_projection(&store, thread_id, 0, 0, 0, Vec::new())
+            .await
+            .expect("seed projection");
+
+        let error = store
+            .delete_thread(DeleteThreadParams { thread_id })
+            .await
+            .expect_err("out-of-scope sibling must fail before deletion");
+        assert!(matches!(error, ThreadStoreError::InvalidRequest { .. }));
+        assert!(imported_path.exists());
+        assert!(
+            super::super::thread_history::projection_state(&store, thread_id)
+                .await
+                .expect("read projection")
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
     async fn delete_threads_rejects_owned_descendants_before_deleting_anything() {
         let home = TempDir::new().expect("temp dir");
         let store = LocalThreadStore::new(test_config(home.path()), /*state_db*/ None);
@@ -609,11 +1055,23 @@ mod tests {
         let home = TempDir::new().expect("temp dir");
         let store = LocalThreadStore::new(test_config(home.path()), /*state_db*/ None);
         let uuid = Uuid::from_u128(305);
+        let thread_id = ThreadId::from_string(&uuid.to_string()).expect("valid thread id");
         let path =
             write_session_file(home.path(), "2025-01-03T12-00-00", uuid).expect("session file");
         std::fs::remove_file(&path).expect("remove session file");
 
-        assert!(!delete_rollout_file(&store, path.as_path()).expect("delete rollout"));
+        assert!(
+            !delete_rollout_file(
+                &store,
+                &OwnedRollout {
+                    path,
+                    rollout_id: thread_id,
+                    authenticated_noncanonical: false,
+                },
+                thread_id,
+            )
+            .expect("delete rollout")
+        );
     }
 
     #[tokio::test]

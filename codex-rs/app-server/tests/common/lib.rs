@@ -43,6 +43,7 @@ pub use responses::create_exec_command_sse_response;
 pub use responses::create_final_assistant_message_sse_response;
 pub use responses::create_request_permissions_sse_response;
 pub use responses::create_request_user_input_sse_response;
+pub use rollout::append_fake_paginated_user_message;
 pub use rollout::create_fake_paginated_rollout;
 pub use rollout::create_fake_parented_rollout_with_source;
 pub use rollout::create_fake_rollout;

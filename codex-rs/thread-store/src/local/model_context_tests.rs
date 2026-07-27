@@ -3,6 +3,7 @@ use std::io::Write;
 use std::path::Path;
 use std::path::PathBuf;
 
+use codex_protocol::SegmentId;
 use codex_protocol::ThreadId;
 use codex_protocol::config_types::ReasoningSummary;
 use codex_protocol::items::TurnItem;
@@ -14,6 +15,7 @@ use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::HistoryPosition;
 use codex_protocol::protocol::ItemCompletedEvent;
+use codex_protocol::protocol::RolloutReferenceItem;
 use codex_protocol::protocol::SandboxPolicy;
 use codex_protocol::protocol::ThreadHistoryMode;
 use codex_protocol::protocol::TurnCompleteEvent;
@@ -30,6 +32,7 @@ use uuid::Uuid;
 use super::*;
 use crate::ThreadStore;
 use crate::local::test_support::test_config;
+use crate::local::test_support::write_session_file_with_fork;
 use crate::local::test_support::write_session_file_with_history_mode;
 
 #[tokio::test]
@@ -91,6 +94,413 @@ async fn loads_latest_checkpoint_with_required_turn_metadata() {
                     && context.model_profile.as_deref() == Some("balanced")
         )
     }));
+}
+
+#[tokio::test]
+async fn projected_checkpoint_resume_does_not_expand_513_older_segments() {
+    const SEGMENT_COUNT: usize = 514;
+    let home = TempDir::new().expect("temp dir");
+    let uuid = Uuid::from_u128(/*v*/ 2015);
+    let thread_id = ThreadId::from_string(&uuid.to_string()).expect("thread id");
+    let active_path = write_session_file_with_history_mode(
+        home.path(),
+        "2025-01-03T13-15-00",
+        uuid,
+        ThreadHistoryMode::Paginated,
+    )
+    .expect("write active rollout");
+    let session_meta = codex_rollout::read_session_meta_line(active_path.as_path())
+        .await
+        .expect("read active metadata");
+    let segment_ids = (0..SEGMENT_COUNT)
+        .map(|_| SegmentId::new())
+        .collect::<Vec<_>>();
+    let paths = segment_ids
+        .iter()
+        .enumerate()
+        .map(|(index, segment_id)| {
+            if index + 1 == SEGMENT_COUNT {
+                active_path.clone()
+            } else {
+                home.path()
+                    .join(codex_rollout::ROTATED_ROLLOUT_SEGMENTS_SUBDIR)
+                    .join(thread_id.to_string())
+                    .join(segment_id.to_string())
+                    .join(active_path.file_name().expect("active rollout file name"))
+            }
+        })
+        .collect::<Vec<_>>();
+
+    for index in 0..SEGMENT_COUNT {
+        let mut meta = session_meta.clone();
+        meta.meta.segment_id = Some(segment_ids[index]);
+        let mut items = vec![RolloutItem::SessionMeta(meta)];
+        if let Some(previous_index) = index.checked_sub(1) {
+            items.push(RolloutItem::RolloutReference(RolloutReferenceItem {
+                rollout_id: Some(thread_id),
+                rollout_path: paths[previous_index].clone(),
+                thread_id: Some(thread_id),
+                rollout_timestamp: None,
+                segment_id: Some(segment_ids[previous_index]),
+                max_depth: codex_protocol::protocol::DEFAULT_ROLLOUT_REFERENCE_DEPTH,
+                nth_user_message: None,
+                compacted_replacement_history_filter_texts: None,
+            }));
+        }
+        if index + 1 == SEGMENT_COUNT {
+            items.extend([
+                turn_started("latest-turn"),
+                user_message("latest user"),
+                completed_user_message("latest-turn", "latest user"),
+                turn_context(home.path(), "latest-turn"),
+                compacted("latest checkpoint", Some(Vec::new())),
+                turn_complete("latest-turn"),
+            ]);
+        }
+        let start_ordinal = u64::try_from(index).expect("segment index") * 16;
+        let lines = items
+            .into_iter()
+            .enumerate()
+            .map(|(offset, item)| RolloutLine {
+                timestamp: "2025-01-03T13:15:00Z".to_string(),
+                ordinal: Some(start_ordinal + u64::try_from(offset).expect("line offset")),
+                item,
+            })
+            .map(|line| serde_json::to_string(&line).expect("serialize rollout line"))
+            .collect::<Vec<_>>();
+        if let Some(parent) = paths[index].parent() {
+            std::fs::create_dir_all(parent).expect("create segment directory");
+        }
+        std::fs::write(paths[index].as_path(), format!("{}\n", lines.join("\n")))
+            .expect("write segment");
+    }
+
+    let active_len = std::fs::metadata(active_path.as_path())
+        .expect("active metadata")
+        .len();
+    let store = projected_thread_store(
+        home.path(),
+        thread_id,
+        active_len,
+        u64::try_from(SEGMENT_COUNT * 16).expect("ordinal"),
+    )
+    .await;
+
+    let context = store
+        .load_latest_model_context(LoadThreadHistoryParams {
+            thread_id,
+            include_archived: false,
+        })
+        .await
+        .expect("resume from current active checkpoint");
+
+    assert!(context.items.iter().any(|item| {
+        matches!(item, RolloutItem::Compacted(item) if item.message == "latest checkpoint")
+    }));
+    assert!(context.items.iter().any(|item| {
+        matches!(item, RolloutItem::TurnContext(item) if item.turn_id.as_deref() == Some("latest-turn"))
+    }));
+}
+
+#[tokio::test]
+async fn projected_forked_legacy_checkpoint_does_not_expand_513_older_segments() {
+    const SEGMENT_COUNT: usize = 514;
+    let home = TempDir::new().expect("temp dir");
+    let uuid = Uuid::from_u128(/*v*/ 2018);
+    let thread_id = ThreadId::from_string(&uuid.to_string()).expect("thread id");
+    let active_path = write_session_file_with_fork(
+        home.path(),
+        home.path().join("sessions/2025/01/03"),
+        "2025-01-03T13-18-00",
+        uuid,
+        "historical inherited request",
+        Some("test-provider"),
+        Some(Uuid::from_u128(/*v*/ 2019)),
+        ThreadHistoryMode::Legacy,
+    )
+    .expect("write historically forked legacy rollout");
+    let session_meta = codex_rollout::read_session_meta_line(&active_path)
+        .await
+        .expect("read active metadata");
+    assert!(session_meta.meta.forked_from_id.is_some());
+    let segment_ids = (0..SEGMENT_COUNT)
+        .map(|_| SegmentId::new())
+        .collect::<Vec<_>>();
+    let paths = segment_ids
+        .iter()
+        .enumerate()
+        .map(|(index, segment_id)| {
+            if index + 1 == SEGMENT_COUNT {
+                active_path.clone()
+            } else {
+                home.path()
+                    .join(codex_rollout::ROTATED_ROLLOUT_SEGMENTS_SUBDIR)
+                    .join(thread_id.to_string())
+                    .join(segment_id.to_string())
+                    .join(active_path.file_name().expect("active rollout file name"))
+            }
+        })
+        .collect::<Vec<_>>();
+
+    for index in 0..SEGMENT_COUNT {
+        let mut meta = session_meta.clone();
+        meta.meta.segment_id = Some(segment_ids[index]);
+        let mut items = vec![RolloutItem::SessionMeta(meta)];
+        if let Some(previous_index) = index.checked_sub(1) {
+            items.push(RolloutItem::RolloutReference(RolloutReferenceItem {
+                rollout_id: Some(thread_id),
+                rollout_path: paths[previous_index].clone(),
+                thread_id: Some(thread_id),
+                rollout_timestamp: None,
+                segment_id: Some(segment_ids[previous_index]),
+                max_depth: codex_protocol::protocol::DEFAULT_ROLLOUT_REFERENCE_DEPTH,
+                nth_user_message: None,
+                compacted_replacement_history_filter_texts: None,
+            }));
+        }
+        if matches!(index, 1 | 2) {
+            let mut historical_checkpoint =
+                compacted("historical legacy checkpoint", Some(Vec::new()));
+            if let RolloutItem::Compacted(compacted) = &mut historical_checkpoint {
+                compacted.window_number = Some(u64::try_from(index).expect("window number"));
+            }
+            items.push(historical_checkpoint);
+        }
+        if index + 1 == SEGMENT_COUNT {
+            let mut latest_checkpoint = compacted("latest legacy checkpoint", Some(Vec::new()));
+            if let RolloutItem::Compacted(compacted) = &mut latest_checkpoint {
+                compacted.window_number = Some(1);
+            }
+            items.extend([
+                turn_started("latest-turn"),
+                user_message("latest user"),
+                completed_user_message("latest-turn", "latest user"),
+                turn_context(home.path(), "latest-turn"),
+                latest_checkpoint,
+                turn_complete("latest-turn"),
+            ]);
+        }
+        let lines = items
+            .into_iter()
+            .map(|item| RolloutLine {
+                timestamp: "2025-01-03T13:18:00Z".to_string(),
+                ordinal: None,
+                item,
+            })
+            .map(|line| serde_json::to_string(&line).expect("serialize rollout line"))
+            .collect::<Vec<_>>();
+        if let Some(parent) = paths[index].parent() {
+            std::fs::create_dir_all(parent).expect("create segment directory");
+        }
+        std::fs::write(&paths[index], format!("{}\n", lines.join("\n"))).expect("write segment");
+    }
+
+    let active_len = std::fs::metadata(&active_path)
+        .expect("active metadata")
+        .len();
+    let store = projected_thread_store(
+        home.path(),
+        thread_id,
+        active_len,
+        u64::try_from(SEGMENT_COUNT * 16).expect("ordinal"),
+    )
+    .await;
+    let canonical_compaction_count = read_thread::load_history_items(home.path(), &active_path)
+        .await
+        .expect("load complete canonical legacy history")
+        .iter()
+        .filter(|item| matches!(item, RolloutItem::Compacted(_)))
+        .count();
+    assert_eq!(canonical_compaction_count, 1);
+
+    let context = store
+        .load_latest_model_context(LoadThreadHistoryParams {
+            thread_id,
+            include_archived: false,
+        })
+        .await
+        .expect("resume forked legacy history from its indexed active checkpoint");
+
+    assert!(context.items.iter().any(|item| {
+        matches!(
+            item,
+            RolloutItem::Compacted(item)
+                if item.message == "latest legacy checkpoint" && item.window_number == Some(1)
+        )
+    }));
+    assert!(context.items.iter().any(|item| {
+        matches!(
+            item,
+            RolloutItem::TurnContext(item)
+                if item.turn_id.as_deref() == Some("latest-turn")
+        )
+    }));
+}
+
+#[tokio::test]
+async fn projected_legacy_checkpoint_without_window_replays_canonical_history() {
+    let home = TempDir::new().expect("temp dir");
+    let uuid = Uuid::from_u128(/*v*/ 2021);
+    let thread_id = ThreadId::from_string(&uuid.to_string()).expect("thread id");
+    let path = write_session_file_with_fork(
+        home.path(),
+        home.path().join("sessions/2025/01/03"),
+        "2025-01-03T13-21-00",
+        uuid,
+        "historical inherited request",
+        Some("test-provider"),
+        Some(Uuid::from_u128(/*v*/ 2022)),
+        ThreadHistoryMode::Legacy,
+    )
+    .expect("write historically forked legacy rollout");
+    let contents = std::fs::read_to_string(&path).expect("read active legacy rollout");
+    let mut lines = contents.lines();
+    let mut meta: serde_json::Value =
+        serde_json::from_str(lines.next().expect("session metadata")).expect("parse metadata");
+    meta["payload"]["segment_id"] =
+        serde_json::to_value(SegmentId::new()).expect("serialize active legacy segment identity");
+    let mut updated = serde_json::to_string(&meta).expect("serialize metadata");
+    for line in lines {
+        updated.push('\n');
+        updated.push_str(line);
+    }
+    updated.push('\n');
+    std::fs::write(&path, updated).expect("write active segment identity");
+    append_items(
+        &path,
+        [
+            turn_started("older-turn"),
+            user_message("older request"),
+            completed_user_message("older-turn", "older request"),
+            turn_context(home.path(), "older-turn"),
+            turn_complete("older-turn"),
+            turn_started("latest-turn"),
+            user_message("latest request"),
+            completed_user_message("latest-turn", "latest request"),
+            turn_context(home.path(), "latest-turn"),
+            compacted_without_window("legacy checkpoint without window", Some(Vec::new())),
+            turn_complete("latest-turn"),
+        ],
+    );
+
+    let active_len = std::fs::metadata(&path)
+        .expect("active legacy rollout metadata")
+        .len();
+    let store =
+        projected_thread_store(home.path(), thread_id, active_len, /*next_ordinal*/ 32).await;
+    let metadata = codex_rollout::read_session_meta_line(&path)
+        .await
+        .expect("read active legacy metadata");
+    assert!(
+        scan_projected_active_model_context(&store, thread_id, &path, &metadata)
+            .await
+            .expect("inspect unsupported legacy checkpoint")
+            .is_none()
+    );
+
+    let expected = read_thread::load_history_items(home.path(), &path)
+        .await
+        .expect("load complete canonical legacy history");
+    let actual = store
+        .load_latest_model_context(LoadThreadHistoryParams {
+            thread_id,
+            include_archived: false,
+        })
+        .await
+        .expect("fallback to complete canonical legacy history")
+        .items;
+    assert_eq!(
+        serde_json::to_value(actual).expect("serialize actual legacy context"),
+        serde_json::to_value(expected).expect("serialize canonical legacy context")
+    );
+}
+
+#[tokio::test]
+async fn projected_active_checkpoint_matches_complete_lineage() {
+    let home = TempDir::new().expect("temp dir");
+    let uuid = Uuid::from_u128(/*v*/ 2016);
+    let thread_id = ThreadId::from_string(&uuid.to_string()).expect("thread id");
+    let path = write_ordinaled_paginated_rollout(
+        home.path(),
+        "2025-01-03T13-16-00",
+        uuid,
+        [
+            turn_started("older-turn"),
+            user_message("older user"),
+            completed_user_message("older-turn", "older user"),
+            turn_context(home.path(), "older-turn"),
+            compacted("older checkpoint", Some(Vec::new())),
+            turn_complete("older-turn"),
+            turn_started("latest-turn"),
+            user_message("latest user"),
+            completed_user_message("latest-turn", "latest user"),
+            turn_context(home.path(), "latest-turn"),
+            compacted("latest checkpoint", Some(Vec::new())),
+            turn_complete("latest-turn"),
+        ],
+    );
+    let active_len = std::fs::metadata(&path).expect("rollout metadata").len();
+    let store =
+        projected_thread_store(home.path(), thread_id, active_len, /*next_ordinal*/ 32).await;
+    let session_meta = codex_rollout::read_session_meta_line(&path)
+        .await
+        .expect("read active metadata");
+    let expected = scan_model_context_from_lineage(
+        store
+            .resolve_rollout_lineage(thread_id)
+            .await
+            .expect("resolve complete lineage"),
+        session_meta.clone(),
+    )
+    .await
+    .expect("scan complete lineage");
+    let actual = scan_projected_active_model_context(&store, thread_id, &path, &session_meta)
+        .await
+        .expect("scan indexed checkpoint")
+        .expect("complete indexed checkpoint");
+
+    assert_eq!(
+        serde_json::to_value(actual).expect("serialize indexed context"),
+        serde_json::to_value(expected).expect("serialize complete-lineage context")
+    );
+}
+
+#[tokio::test]
+async fn stale_projection_does_not_use_active_checkpoint() {
+    let home = TempDir::new().expect("temp dir");
+    let uuid = Uuid::from_u128(/*v*/ 2017);
+    let thread_id = ThreadId::from_string(&uuid.to_string()).expect("thread id");
+    let path = write_ordinaled_paginated_rollout(
+        home.path(),
+        "2025-01-03T13-17-00",
+        uuid,
+        [
+            turn_started("latest-turn"),
+            user_message("latest user"),
+            completed_user_message("latest-turn", "latest user"),
+            turn_context(home.path(), "latest-turn"),
+            compacted("latest checkpoint", Some(Vec::new())),
+            turn_complete("latest-turn"),
+        ],
+    );
+    let active_len = std::fs::metadata(&path).expect("rollout metadata").len();
+    let store = projected_thread_store(
+        home.path(),
+        thread_id,
+        active_len.saturating_sub(1),
+        /*next_ordinal*/ 16,
+    )
+    .await;
+    let session_meta = codex_rollout::read_session_meta_line(&path)
+        .await
+        .expect("read active metadata");
+
+    assert!(
+        scan_projected_active_model_context(&store, thread_id, &path, &session_meta)
+            .await
+            .expect("evaluate stale projection")
+            .is_none()
+    );
 }
 
 #[tokio::test]
@@ -194,6 +604,32 @@ async fn returns_scanned_full_history_for_unsupported_compaction() {
             compacted("usable checkpoint", Some(Vec::new())),
             compacted("legacy checkpoint", /*replacement_history*/ None),
             turn_complete("turn-1"),
+        ],
+    );
+
+    assert_reverse_scan_matches_full_history(home.path(), path.as_path()).await;
+}
+
+#[tokio::test]
+async fn paginated_model_context_without_compaction_window_scans_full_history() {
+    let home = TempDir::new().expect("temp dir");
+    let uuid = Uuid::from_u128(/*v*/ 2020);
+    let path = write_paginated_rollout(
+        home.path(),
+        "2025-01-03T13-20-00",
+        uuid,
+        [
+            turn_started("older-turn"),
+            user_message("older request"),
+            completed_user_message("older-turn", "older request"),
+            turn_context(home.path(), "older-turn"),
+            turn_complete("older-turn"),
+            turn_started("current-turn"),
+            user_message("current request"),
+            completed_user_message("current-turn", "current request"),
+            turn_context(home.path(), "current-turn"),
+            compacted_without_window("unsupported paginated checkpoint", Some(Vec::new())),
+            turn_complete("current-turn"),
         ],
     );
 
@@ -441,6 +877,34 @@ fn write_paginated_rollout<const N: usize>(
     path
 }
 
+async fn projected_thread_store(
+    home: &Path,
+    thread_id: ThreadId,
+    next_byte_offset: u64,
+    next_ordinal: u64,
+) -> LocalThreadStore {
+    let config = test_config(home);
+    let state_db = codex_state::StateRuntime::init(
+        config.sqlite.clone(),
+        config.default_model_provider_id.clone(),
+    )
+    .await
+    .expect("initialize state database");
+    let store = LocalThreadStore::new(config, Some(state_db));
+    let pool = store.thread_history_db().await.expect("thread history db");
+    sqlx::query(
+        "INSERT INTO thread_history_projection_state \
+         (thread_id, next_rollout_byte_offset, next_rollout_ordinal) VALUES (?, ?, ?)",
+    )
+    .bind(thread_id.to_string())
+    .bind(i64::try_from(next_byte_offset).expect("active length"))
+    .bind(i64::try_from(next_ordinal).expect("rollout ordinal"))
+    .execute(pool)
+    .await
+    .expect("write projection state");
+    store
+}
+
 fn write_ordinaled_paginated_rollout<const N: usize>(
     home: &Path,
     timestamp: &str,
@@ -525,7 +989,7 @@ async fn assert_reverse_scan_matches_full_history(home: &Path, path: &Path) {
         .await
         .expect("scan model context")
         .items;
-    let full_items = read_thread::load_history_items(path)
+    let full_items = read_thread::load_history_items(home, path)
         .await
         .expect("load full history");
 
@@ -665,6 +1129,22 @@ fn compacted(message: &str, replacement_history: Option<Vec<ResponseItem>>) -> R
             .map(|items| items.into_iter().map(Into::into).collect()),
         mcp_resource_origins: None,
         window_number: Some(1),
+        first_window_id: None,
+        previous_window_id: None,
+        window_id: None,
+    })
+}
+
+fn compacted_without_window(
+    message: &str,
+    replacement_history: Option<Vec<ResponseItem>>,
+) -> RolloutItem {
+    RolloutItem::Compacted(CompactedItem {
+        message: message.to_string(),
+        replacement_history: replacement_history
+            .map(|items| items.into_iter().map(Into::into).collect()),
+        mcp_resource_origins: None,
+        window_number: None,
         first_window_id: None,
         previous_window_id: None,
         window_id: None,

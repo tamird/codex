@@ -38,7 +38,6 @@ use codex_extension_api::WorldStateContributionInput;
 use codex_extension_api::WorldStateSectionContribution;
 use codex_features::Feature;
 use codex_history::RolloutItem;
-use codex_history::RolloutLine;
 use codex_http_client::HttpClientFactory;
 use codex_http_client::OutboundProxyPolicy;
 use codex_network_proxy::NetworkProxyConfig;
@@ -76,6 +75,7 @@ use codex_protocol::request_permissions::RequestPermissionsResponse;
 use codex_protocol::request_user_input::RequestUserInputAnswer;
 use codex_protocol::request_user_input::RequestUserInputResponse;
 use codex_protocol::user_input::UserInput;
+use codex_rollout::materialize_rollout_items;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_path_uri::PathUri;
 use core_test_support::PathBufExt;
@@ -1075,20 +1075,19 @@ async fn deferred_executor_promotes_primary_environment_when_startup_completes()
 
     test.codex.ensure_rollout_materialized().await;
     test.codex.flush_rollout().await?;
-    let rollout = fs::read_to_string(test.codex.rollout_path().context("rollout path")?)?;
-    let world_state_patch = rollout
-        .lines()
-        .map(serde_json::from_str::<RolloutLine>)
-        .collect::<serde_json::Result<Vec<_>>>()?
-        .into_iter()
-        .filter_map(|line| match line.item {
-            RolloutItem::WorldState(item) if !item.full => Some(Value::Object(item.state)),
-            _ => None,
-        })
-        .find(|patch| {
-            patch.pointer("/environments/environments/remote/is_primary") == Some(&json!(true))
-        })
-        .context("primary environment World State patch")?;
+    let rollout_path = test.codex.rollout_path().context("rollout path")?;
+    let world_state_patch =
+        materialize_rollout_items(test.config.codex_home.as_path(), rollout_path.as_path())
+            .await?
+            .into_iter()
+            .filter_map(|item| match item {
+                RolloutItem::WorldState(item) if !item.full => Some(Value::Object(item.state)),
+                _ => None,
+            })
+            .find(|patch| {
+                patch.pointer("/environments/environments/remote/is_primary") == Some(&json!(true))
+            })
+            .context("primary environment World State patch")?;
     assert_eq!(
         world_state_patch.pointer("/environments/environments/local/is_primary"),
         Some(&Value::Null)
@@ -2763,17 +2762,15 @@ async fn deferred_executor_compaction_preserves_then_updates_environment_once() 
     test.codex.ensure_rollout_materialized().await;
     test.codex.flush_rollout().await?;
     let rollout_path = test.codex.rollout_path().context("rollout path")?;
-    let rollout = fs::read_to_string(rollout_path)?;
-    let world_state_items = rollout
-        .lines()
-        .map(serde_json::from_str::<RolloutLine>)
-        .collect::<serde_json::Result<Vec<_>>>()?
-        .into_iter()
-        .filter_map(|line| match line.item {
-            RolloutItem::WorldState(item) => Some(item),
-            _ => None,
-        })
-        .collect::<Vec<_>>();
+    let world_state_items =
+        materialize_rollout_items(test.config.codex_home.as_path(), rollout_path.as_path())
+            .await?
+            .into_iter()
+            .filter_map(|item| match item {
+                RolloutItem::WorldState(item) => Some(item),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
     assert_eq!(
         world_state_items
             .iter()

@@ -15,6 +15,7 @@ use crate::DeleteThreadParams;
 use crate::DeleteThreadSectionParams;
 use crate::DeleteThreadsParams;
 use crate::DeletedProject;
+use crate::FreezeRolloutSegmentParams;
 use crate::ItemPage;
 use crate::ListItemsParams;
 use crate::ListProjectsParams;
@@ -34,6 +35,7 @@ use crate::ResumeThreadParams;
 use crate::RevertThreadParams;
 use crate::SearchThreadOccurrencesParams;
 use crate::SearchThreadsParams;
+use crate::SegmentCheckpointPersistenceOutcome;
 use crate::StoredModelContext;
 use crate::StoredProject;
 use crate::StoredProjectsPage;
@@ -113,6 +115,24 @@ pub trait ThreadStore: Any + Send + Sync {
     /// Implementations should apply the shared rollout persistence policy before writing durable
     /// replay history and before updating any implementation-owned projections.
     fn append_items(&self, params: AppendThreadItemsParams) -> ThreadStoreFuture<'_, ()>;
+
+    /// Persists a segment-state checkpoint as one authority change.
+    ///
+    /// An implementation must not return `NotCommitted` after making any checkpoint item durable.
+    /// Stores that cannot make that guarantee must return `Indeterminate` instead.
+    fn persist_segment_checkpoint(
+        &self,
+        _thread_id: ThreadId,
+        _params: FreezeRolloutSegmentParams,
+    ) -> Pin<Box<dyn Future<Output = SegmentCheckpointPersistenceOutcome> + Send + '_>> {
+        Box::pin(async {
+            SegmentCheckpointPersistenceOutcome::NotCommitted {
+                error: ThreadStoreError::Unsupported {
+                    operation: "persist_segment_checkpoint",
+                },
+            }
+        })
+    }
 
     /// Materializes the thread if persistence is lazy, then persists all queued items.
     ///

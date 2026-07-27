@@ -414,6 +414,40 @@ ON CONFLICT(child_thread_id) DO NOTHING
         Ok(result.rows_affected() == 1)
     }
 
+    /// Lists the stable thread ID and selected rollout path for one archive collection.
+    pub async fn list_selected_rollout_paths(
+        &self,
+        archived: bool,
+    ) -> anyhow::Result<Vec<(ThreadId, PathBuf)>> {
+        let rows = sqlx::query("SELECT id, rollout_path FROM threads WHERE archived = ?")
+            .bind(archived)
+            .fetch_all(self.pool.as_ref())
+            .await?;
+        rows.into_iter()
+            .map(|row| {
+                let id = ThreadId::try_from(row.try_get::<String, _>("id")?)?;
+                let path = PathBuf::from(row.try_get::<String, _>("rollout_path")?);
+                Ok((id, path))
+            })
+            .collect()
+    }
+
+    /// Lists every stable thread ID with its authoritative selected rollout path.
+    pub async fn list_selected_rollout_paths_all(
+        &self,
+    ) -> anyhow::Result<Vec<(ThreadId, PathBuf)>> {
+        let rows = sqlx::query("SELECT id, rollout_path FROM threads")
+            .fetch_all(self.pool.as_ref())
+            .await?;
+        rows.into_iter()
+            .map(|row| {
+                let id = ThreadId::try_from(row.try_get::<String, _>("id")?)?;
+                let path = PathBuf::from(row.try_get::<String, _>("rollout_path")?);
+                Ok((id, path))
+            })
+            .collect()
+    }
+
     /// Find the newest thread whose user-facing title exactly matches `title`.
     #[allow(clippy::too_many_arguments)]
     pub async fn find_thread_by_exact_title(
@@ -1318,6 +1352,7 @@ pub(super) fn extract_memory_mode(items: &[RolloutItem]) -> Option<String> {
     items.iter().rev().find_map(|item| match item {
         RolloutItem::SessionMeta(meta_line) => meta_line.meta.memory_mode.clone(),
         RolloutItem::ResponseItem(_)
+        | RolloutItem::RolloutReference(_)
         | RolloutItem::InterAgentCommunication(_)
         | RolloutItem::InterAgentCommunicationMetadata { .. }
         | RolloutItem::Compacted(_)
@@ -2580,6 +2615,7 @@ mod tests {
         );
         let items = vec![RolloutItem::SessionMeta(SessionMetaLine {
             meta: SessionMeta {
+                segment_id: None,
                 session_id: thread_id.into(),
                 id: thread_id,
                 forked_from_id: None,
@@ -2651,6 +2687,7 @@ mod tests {
         );
         let items = vec![RolloutItem::SessionMeta(SessionMetaLine {
             meta: SessionMeta {
+                segment_id: None,
                 session_id: thread_id.into(),
                 id: thread_id,
                 forked_from_id: None,

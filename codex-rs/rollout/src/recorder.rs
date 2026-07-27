@@ -15,6 +15,7 @@ use std::sync::Mutex;
 
 use chrono::SecondsFormat;
 use codex_protocol::RolloutId;
+use codex_protocol::SegmentId;
 use codex_protocol::SessionId;
 use codex_protocol::ThreadId;
 use codex_protocol::capabilities::SelectedCapabilityRoot;
@@ -45,8 +46,8 @@ use super::list::ThreadListConfig;
 use super::list::ThreadListLayout;
 use super::list::ThreadSortKey;
 use super::list::ThreadsPage;
-use super::list::get_threads;
-use super::list::get_threads_in_root;
+use super::list::get_threads_in_root_with_state_db;
+use super::list::get_threads_with_state_db;
 use super::list::parse_cursor;
 use super::list::parse_timestamp_uuid_from_filename;
 use super::metadata;
@@ -57,6 +58,7 @@ use super::session_index::find_thread_names_by_ids;
 use crate::InitialHistory;
 use crate::ResumedHistory;
 use crate::RolloutItem;
+use crate::RolloutLine;
 use crate::config::RolloutConfigView;
 use crate::state_db;
 use crate::state_db::StateDbHandle;
@@ -115,7 +117,17 @@ pub enum RolloutRecorderParams {
         history_mode: ThreadHistoryMode,
         history_base: Option<HistoryPosition>,
         subagent_history_start_ordinal: Option<u64>,
+        /// First lineage-relative ordinal written to this rollout.
+        initial_rollout_ordinal: u64,
         initial_window_id: Option<String>,
+    },
+    /// Creates a replacement or fork rollout at a specific path without resetting its ordinal.
+    CreateAtPath {
+        path: PathBuf,
+        session_meta: Box<SessionMeta>,
+        base_instructions: BaseInstructions,
+        dynamic_tools: Vec<DynamicToolSpec>,
+        initial_rollout_ordinal: u64,
     },
     Resume {
         path: PathBuf,
@@ -124,6 +136,9 @@ pub enum RolloutRecorderParams {
 
 enum RolloutCmd {
     AddItems(Vec<RolloutItem>),
+    BufferedItems {
+        ack: oneshot::Sender<Vec<RolloutItem>>,
+    },
     Persist {
         ack: oneshot::Sender<std::io::Result<()>>,
     },
@@ -212,6 +227,7 @@ impl RolloutRecorderParams {
             history_mode: Default::default(),
             history_base: None,
             subagent_history_start_ordinal: None,
+            initial_rollout_ordinal: 0,
             initial_window_id: None,
         }
     }
@@ -318,6 +334,18 @@ impl RolloutRecorderParams {
         } = &mut self
         {
             *window_id = Some(initial_window_id);
+        }
+        self
+    }
+
+    /// Sets the first lineage-relative ordinal for a newly created paginated rollout.
+    pub fn with_initial_rollout_ordinal(mut self, initial_rollout_ordinal: u64) -> Self {
+        if let Self::Create {
+            initial_rollout_ordinal: ordinal,
+            ..
+        } = &mut self
+        {
+            *ordinal = initial_rollout_ordinal;
         }
         self
     }
@@ -538,6 +566,7 @@ impl RolloutRecorder {
                     default_provider,
                     archived,
                     search_term,
+                    state_db_ctx.as_deref(),
                 )
                 .await?
             }
@@ -553,6 +582,7 @@ impl RolloutRecorder {
                     default_provider,
                     archived,
                     search_term,
+                    state_db_ctx.as_deref(),
                 )
                 .await?
             }
@@ -805,7 +835,7 @@ impl RolloutRecorder {
 
         let mut cursor = cursor.cloned();
         loop {
-            let page = get_threads(
+            let page = get_threads_with_state_db(
                 codex_home,
                 page_size,
                 cursor.as_ref(),
@@ -814,6 +844,7 @@ impl RolloutRecorder {
                 model_providers,
                 cwd_filter.as_ref().map(std::slice::from_ref),
                 default_provider,
+                state_db_ctx.as_deref(),
             )
             .await?;
             if let Some(path) = select_resume_path(&page, filter_cwd, default_provider).await {
@@ -856,10 +887,13 @@ impl RolloutRecorder {
                 history_mode,
                 history_base,
                 subagent_history_start_ordinal,
+                initial_rollout_ordinal,
                 initial_window_id,
             } => {
+                let initial_rollout_ordinal =
+                    history_base.map_or(initial_rollout_ordinal, |base| base.end_ordinal_exclusive);
                 let ordinal_state =
-                    RolloutOrdinalState::for_new_rollout(history_mode, history_base);
+                    RolloutOrdinalState::for_new_rollout_at(history_mode, initial_rollout_ordinal);
                 let (path, started_at) =
                     precompute_new_rollout_path(config, conversation_id, rollout_id_override)?;
 
@@ -874,6 +908,7 @@ impl RolloutRecorder {
                 let session_meta = SessionMeta {
                     session_id,
                     id: conversation_id,
+                    segment_id: Some(SegmentId::new()),
                     forked_from_id,
                     forked_from_ordinal_exclusive: forked_from_ordinal_exclusive
                         .filter(|_| forked_from_id.is_some()),
@@ -902,6 +937,38 @@ impl RolloutRecorder {
                     multi_agent_version,
                     context_window: initial_window_id.map(SessionContextWindow::new),
                 };
+
+                RolloutWriterState {
+                    writer: None,
+                    deferred_creation: true,
+                    pending_items: Vec::new(),
+                    meta: Some(session_meta),
+                    cwd: cwd.clone(),
+                    rollout_path: path,
+                    ordinal_state,
+                    last_logged_error: None,
+                }
+            }
+            RolloutRecorderParams::CreateAtPath {
+                path,
+                session_meta,
+                base_instructions,
+                dynamic_tools,
+                initial_rollout_ordinal,
+            } => {
+                let mut session_meta = *session_meta;
+                let ordinal_state = RolloutOrdinalState::for_new_rollout_at(
+                    session_meta.history_mode,
+                    initial_rollout_ordinal,
+                );
+                session_meta.segment_id = Some(SegmentId::new());
+                session_meta.cwd = cwd.clone();
+                session_meta.cli_version = env!("CARGO_PKG_VERSION").to_string();
+                session_meta.model_provider = Some(config.model_provider_id().to_string());
+                session_meta.base_instructions = Some(base_instructions);
+                session_meta.dynamic_tools = (!dynamic_tools.is_empty()).then_some(dynamic_tools);
+                session_meta.memory_mode =
+                    (!config.generate_memories()).then_some("disabled".to_string());
 
                 RolloutWriterState {
                     writer: None,
@@ -981,6 +1048,29 @@ impl RolloutRecorder {
             })
     }
 
+    /// Returns canonical items that have not been written successfully yet.
+    ///
+    /// The response is ordered after every earlier recorder command, so callers can combine it
+    /// with the rollout file while they hold the surrounding thread-writer reservation.
+    pub async fn buffered_canonical_items(&self) -> std::io::Result<Vec<RolloutItem>> {
+        let (tx, rx) = oneshot::channel();
+        self.tx
+            .send(RolloutCmd::BufferedItems { ack: tx })
+            .await
+            .map_err(|error| {
+                self.writer_task.terminal_failure().unwrap_or_else(|| {
+                    IoError::other(format!("failed to inspect buffered rollout items: {error}"))
+                })
+            })?;
+        rx.await.map_err(|error| {
+            self.writer_task.terminal_failure().unwrap_or_else(|| {
+                IoError::other(format!(
+                    "failed waiting to inspect buffered rollout items: {error}"
+                ))
+            })
+        })
+    }
+
     /// Materialize the rollout file and persist all buffered items.
     ///
     /// This is idempotent. If materialization fails, the recorder keeps all pending items in memory
@@ -1026,8 +1116,20 @@ impl RolloutRecorder {
     pub async fn load_rollout_items(
         path: &Path,
     ) -> std::io::Result<(Vec<RolloutItem>, Option<ThreadId>, usize)> {
+        let (lines, thread_id, parse_errors) = Self::load_rollout_lines(path).await?;
+        Ok((
+            lines.into_iter().map(|line| line.item).collect(),
+            thread_id,
+            parse_errors,
+        ))
+    }
+
+    /// Loads physical rollout records without discarding their lineage ordinals.
+    pub async fn load_rollout_lines(
+        path: &Path,
+    ) -> std::io::Result<(Vec<RolloutLine>, Option<ThreadId>, usize)> {
         trace!("Resuming rollout from {path:?}");
-        let mut items: Vec<RolloutItem> = Vec::new();
+        let mut lines: Vec<RolloutLine> = Vec::new();
         let mut thread_id: Option<ThreadId> = None;
         let mut parse_errors = 0usize;
         let mut reader = compression::open_rollout_line_reader(path).await?;
@@ -1049,6 +1151,9 @@ impl RolloutRecorder {
                 trace!("skipping legacy ghost_snapshot rollout line");
                 continue;
             }
+            if normalize_legacy_sleep_item_completed_rollout_line(&mut value) {
+                trace!("normalized legacy item_completed Sleep rollout line");
+            }
             if thread_id.is_none() {
                 // The first SessionMeta belongs to this rollout. Later SessionMeta lines
                 // can be copied from fork history, so only validate unknown history modes
@@ -1056,24 +1161,33 @@ impl RolloutRecorder {
                 reject_unknown_thread_history_mode(&value)?;
             }
 
+            let is_rollout_reference = matches!(
+                value.get("type").and_then(Value::as_str),
+                Some("rollout_reference" | "fork_reference")
+            );
             let rollout_line = match crate::decode_rollout_line(value) {
                 Ok(rollout_line) => rollout_line,
                 Err(e) => {
+                    if is_rollout_reference {
+                        return Err(IoError::new(
+                            std::io::ErrorKind::InvalidData,
+                            "invalid rollout reference record",
+                        ));
+                    }
                     trace!("failed to parse rollout line: {e}");
                     parse_errors = parse_errors.saturating_add(1);
                     continue;
                 }
             };
 
-            let item = rollout_line.item;
             // Use the FIRST SessionMeta encountered in the file as the canonical
             // thread id and main session information. Keep all items intact.
             if thread_id.is_none()
-                && let RolloutItem::SessionMeta(session_meta_line) = &item
+                && let RolloutItem::SessionMeta(session_meta_line) = &rollout_line.item
             {
                 thread_id = Some(session_meta_line.meta.id);
             }
-            items.push(item);
+            lines.push(rollout_line);
         }
         if !saw_non_empty_line {
             return Err(IoError::other("empty session file"));
@@ -1081,11 +1195,11 @@ impl RolloutRecorder {
 
         tracing::debug!(
             "Resumed rollout with {} items, thread ID: {:?}, parse errors: {}",
-            items.len(),
+            lines.len(),
             thread_id,
             parse_errors,
         );
-        Ok((items, thread_id, parse_errors))
+        Ok((lines, thread_id, parse_errors))
     }
 
     pub async fn get_rollout_history(path: &Path) -> std::io::Result<InitialHistory> {
@@ -1209,6 +1323,33 @@ fn retain_entries_not_marked(entries: &mut Vec<Value>, remove: &[bool]) {
 
 fn is_legacy_ghost_snapshot_response_item(value: &Value) -> bool {
     value.get("type").and_then(Value::as_str) == Some("ghost_snapshot")
+}
+
+fn normalize_legacy_sleep_item_completed_rollout_line(value: &mut Value) -> bool {
+    if value.get("type").and_then(Value::as_str) != Some("event_msg") {
+        return false;
+    }
+    let Some(payload) = value.get_mut("payload").and_then(Value::as_object_mut) else {
+        return false;
+    };
+    if payload.get("type").and_then(Value::as_str) != Some("item_completed") {
+        return false;
+    }
+    let Some(item) = payload.get_mut("item").and_then(Value::as_object_mut) else {
+        return false;
+    };
+    if item.get("type").and_then(Value::as_str) != Some("Sleep")
+        || !item.contains_key("duration_ms")
+    {
+        return false;
+    }
+
+    item.insert("type".to_string(), Value::String("Extension".to_string()));
+    item.insert("kind".to_string(), Value::String("clock.sleep".to_string()));
+    if let Some(duration_ms) = item.remove("duration_ms") {
+        item.insert("durationMs".to_string(), duration_ms);
+    }
+    true
 }
 
 fn truncate_fs_page(
@@ -1365,6 +1506,7 @@ async fn list_threads_from_files_desc(
     default_provider: &str,
     archived: bool,
     search_term: Option<&str>,
+    state_db: Option<&StateRuntime>,
 ) -> std::io::Result<ThreadsPage> {
     if let Some(search_term) = search_term {
         let mut matching_items = Vec::new();
@@ -1384,6 +1526,7 @@ async fn list_threads_from_files_desc(
                 cwd_filters,
                 default_provider,
                 archived,
+                state_db,
             )
             .await?;
             scanned_files = scanned_files.saturating_add(page.num_scanned_files);
@@ -1426,6 +1569,7 @@ async fn list_threads_from_files_desc(
         cwd_filters,
         default_provider,
         archived,
+        state_db,
     )
     .await
 }
@@ -1441,10 +1585,11 @@ async fn list_threads_from_files_desc_unfiltered(
     cwd_filters: Option<&[PathBuf]>,
     default_provider: &str,
     archived: bool,
+    state_db: Option<&StateRuntime>,
 ) -> std::io::Result<ThreadsPage> {
     if archived {
         let root = codex_home.join(ARCHIVED_SESSIONS_SUBDIR);
-        get_threads_in_root(
+        get_threads_in_root_with_state_db(
             root,
             page_size,
             cursor,
@@ -1456,10 +1601,12 @@ async fn list_threads_from_files_desc_unfiltered(
                 default_provider,
                 layout: ThreadListLayout::Flat,
             },
+            state_db,
+            Some(true),
         )
         .await
     } else {
-        get_threads(
+        get_threads_with_state_db(
             codex_home,
             page_size,
             cursor,
@@ -1468,6 +1615,7 @@ async fn list_threads_from_files_desc_unfiltered(
             model_providers,
             cwd_filters,
             default_provider,
+            state_db,
         )
         .await
     }
@@ -1485,6 +1633,7 @@ async fn list_threads_from_files_asc(
     default_provider: &str,
     archived: bool,
     search_term: Option<&str>,
+    state_db: Option<&StateRuntime>,
 ) -> std::io::Result<ThreadsPage> {
     let mut all_items = Vec::new();
     let mut scanned_files = 0usize;
@@ -1503,6 +1652,7 @@ async fn list_threads_from_files_asc(
             default_provider,
             archived,
             /*search_term*/ None,
+            state_db,
         )
         .await?;
         scanned_files = scanned_files.saturating_add(page.num_scanned_files);
@@ -1845,6 +1995,9 @@ async fn rollout_writer(
                 state.add_items(items);
                 state.flush_if_materialized().await;
             }
+            RolloutCmd::BufferedItems { ack } => {
+                let _ = ack.send(state.pending_items.clone());
+            }
             RolloutCmd::Persist { ack } => {
                 let _ = ack.send(state.persist().await);
             }
@@ -2086,6 +2239,7 @@ async fn resume_candidate_matches_cwd(
         && let Some(latest_turn_context_cwd) = items.iter().rev().find_map(|item| match item {
             RolloutItem::TurnContext(turn_context) => Some(&turn_context.cwd),
             RolloutItem::SessionMeta(_)
+            | RolloutItem::RolloutReference(_)
             | RolloutItem::ResponseItem(_)
             | RolloutItem::InterAgentCommunication(_)
             | RolloutItem::InterAgentCommunicationMetadata { .. }

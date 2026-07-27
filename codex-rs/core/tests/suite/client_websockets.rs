@@ -1036,16 +1036,10 @@ async fn routed_profile_rebases_websocket_after_partial_commentary() {
     let test = routed_websocket_test(&server).await;
 
     test.codex
-        .submit(Op::UserInput {
-            items: vec![UserInput::Text {
-                text: "stream the routing test commentary".to_string(),
-                text_elements: Vec::new(),
-            }],
-            final_output_json_schema: None,
-            responsesapi_client_metadata: None,
-            additional_context: Default::default(),
-            thread_settings: Default::default(),
-        })
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: "stream the routing test commentary".to_string(),
+            text_elements: Vec::new(),
+        }]))
         .await
         .expect("submit routed websocket commentary turn");
     let mut events = Vec::new();

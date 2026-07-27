@@ -182,6 +182,11 @@ pub(crate) async fn run_turn(
     provider_startup: RunTurnProviderStartup,
     cancellation_token: CancellationToken,
 ) -> CodexResult<Option<String>> {
+    if sess.persistence_restart_required() {
+        return Err(CodexErr::Fatal(
+            "thread persistence requires a restart before another turn can begin".to_string(),
+        ));
+    }
     // Record results from hooks that finished after the previous turn before this turn's user prompt.
     drain_async_hook_results(&sess, &turn_context, /*before_user_prompt*/ true).await;
 

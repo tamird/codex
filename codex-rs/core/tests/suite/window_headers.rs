@@ -48,19 +48,27 @@ async fn window_id_advances_after_compact_persists_on_resume_and_resets_on_fork(
     });
     let initial = builder.build(&server).await?;
     let initial_thread = Arc::clone(&initial.codex);
-    let rollout_path = initial
-        .session_configured
-        .rollout_path
-        .clone()
-        .expect("rollout path");
 
     submit_user_turn(&initial_thread, "before compact").await?;
     submit_compact_turn(&initial_thread).await?;
     submit_user_turn(&initial_thread, "after compact").await?;
+    let rollout_path = codex_rollout::find_thread_path_by_id_str(
+        initial.config.codex_home.as_path(),
+        &initial.session_configured.session_id.to_string(),
+        /*state_db_ctx*/ None,
+    )
+    .await?
+    .expect("current rollout path");
     shutdown_thread(&initial_thread).await?;
 
     let resumed = builder
-        .resume(&server, initial.home.clone(), rollout_path.clone())
+        .resume(
+            &server,
+            initial.home.clone(),
+            rollout_path
+                .strip_prefix(initial.home.path())?
+                .to_path_buf(),
+        )
         .await?;
     submit_user_turn(&resumed.codex, "after resume").await?;
     shutdown_thread(&resumed.codex).await?;

@@ -63,6 +63,7 @@ async fn timeline_pages_mix_items_and_resolve_the_opening_realtime_session() -> 
             thread_id,
             extra_config: None,
             forked_from_id: None,
+            forked_from_ordinal_exclusive: None,
             parent_thread_id: None,
             source: SessionSource::Cli,
             thread_source: None,
@@ -74,6 +75,8 @@ async fn timeline_pages_mix_items_and_resolve_the_opening_realtime_session() -> 
             history_mode: ThreadHistoryMode::Paginated,
             history_base: None,
             subagent_history_start_ordinal: None,
+            persistence_mode: Default::default(),
+            initial_rollout_ordinal: 0,
             initial_window_id: Uuid::now_v7().to_string(),
             metadata: ThreadPersistenceMetadata {
                 cwd: Some(codex_home.path().to_path_buf()),

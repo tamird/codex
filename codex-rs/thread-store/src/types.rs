@@ -17,16 +17,21 @@ use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::GitInfo;
 use codex_protocol::protocol::HistoryPosition;
 use codex_protocol::protocol::MultiAgentVersion;
+use codex_protocol::protocol::RolloutReferenceItem;
+use codex_protocol::protocol::SessionMetaLine;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::ThreadHistoryMode;
 use codex_protocol::protocol::ThreadMemoryMode as MemoryMode;
 use codex_protocol::protocol::ThreadSource;
 use codex_protocol::protocol::TokenUsage;
+use codex_rollout::ResponseItemEnvelope;
 use codex_rollout::RolloutItem;
 use serde::Deserialize;
 use serde::Deserializer;
 use serde::Serialize;
 use serde::Serializer;
+
+use crate::ThreadStoreError;
 
 mod optional_option {
     use super::*;
@@ -79,6 +84,9 @@ pub struct CreateThreadParams {
     pub extra_config: Option<ExtraConfig>,
     /// Source thread id when this thread is created as a fork.
     pub forked_from_id: Option<ThreadId>,
+    /// Exclusive ordinal inherited from the logical fork parent, independent of physical ancestry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub forked_from_ordinal_exclusive: Option<u64>,
     /// The ID of the parent thread. This will only be set if this thread is a subagent.
     pub parent_thread_id: Option<ThreadId>,
     /// Runtime source for the thread.
@@ -102,10 +110,33 @@ pub struct CreateThreadParams {
     pub history_base: Option<HistoryPosition>,
     /// First rollout ordinal that belongs to this subagent's projected history.
     pub subagent_history_start_ordinal: Option<u64>,
+    /// Controls when a newly created thread becomes durable.
+    #[serde(default)]
+    pub persistence_mode: ThreadPersistenceMode,
+    /// First lineage-relative ordinal written to a new paginated rollout.
+    ///
+    /// Full-history forks continue after their immutable inherited prefix. Legacy rollouts ignore
+    /// this value.
+    #[serde(default)]
+    pub initial_rollout_ordinal: u64,
     /// Initial context-window identity captured when the thread was created.
     pub initial_window_id: String,
     /// Metadata captured for the newly created thread.
     pub metadata: ThreadPersistenceMetadata,
+}
+
+/// Persistence policy for a newly created live thread.
+///
+/// Deferred threads use the rollout recorder's canonical in-memory queue until an explicit
+/// persist or local segment freeze. Materialization is a one-way transition shared by every clone
+/// of the live thread.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ThreadPersistenceMode {
+    /// Append, flush, and metadata behavior remains durable as normal.
+    #[default]
+    Durable,
+    /// Append and flush remain pathless until persist or local segment freeze.
+    Deferred,
 }
 
 /// Parameters required to reopen persistence for an existing thread.
@@ -126,8 +157,9 @@ pub struct ResumeThreadParams {
 pub(crate) fn canonical_history_mode_from_rollout_items(
     items: &[RolloutItem],
 ) -> ThreadHistoryMode {
-    // Forked rollouts keep copied source SessionMeta items after the new thread's
-    // canonical SessionMeta, so the thread contract comes from the first one.
+    // A reference-backed fork keeps only its own canonical SessionMeta in the child rollout. Older
+    // copied-history forks can still contain additional source metadata, so the first item remains
+    // authoritative for both representations.
     items
         .iter()
         .find_map(|item| match item {
@@ -147,6 +179,77 @@ pub struct AppendThreadItemsParams {
     /// Store implementations are responsible for applying the shared rollout persistence policy
     /// before writing durable replay history or any implementation-owned projections.
     pub items: Vec<RolloutItem>,
+}
+
+/// Parameters for freezing a local rollout prefix.
+#[derive(Clone, Debug)]
+pub struct FreezeRolloutSegmentParams {
+    mode: FreezeRolloutSegmentMode,
+    initial_items: Vec<RolloutItem>,
+}
+
+/// Authoritative result of persisting one segment-state checkpoint.
+///
+/// `NotCommitted` guarantees that no checkpoint item became durable. `Indeterminate` means the
+/// store cannot prove whether the checkpoint became authoritative, so the live thread must reject
+/// later persistence until it is reopened from durable history.
+#[derive(Debug)]
+pub enum SegmentCheckpointPersistenceOutcome {
+    /// The complete checkpoint is durable and authoritative.
+    Committed,
+    /// No checkpoint item became durable.
+    NotCommitted { error: ThreadStoreError },
+    /// The store cannot determine whether the checkpoint became authoritative.
+    Indeterminate { error: ThreadStoreError },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FreezeRolloutSegmentMode {
+    Snapshot,
+    Rotate,
+}
+
+impl FreezeRolloutSegmentParams {
+    /// Creates an immutable snapshot without replacing the source rollout.
+    pub fn snapshot() -> Self {
+        Self {
+            mode: FreezeRolloutSegmentMode::Snapshot,
+            initial_items: Vec::new(),
+        }
+    }
+
+    /// Rotates the source rollout and writes `initial_items` after its reference.
+    pub fn rotate(initial_items: Vec<RolloutItem>) -> Self {
+        Self {
+            mode: FreezeRolloutSegmentMode::Rotate,
+            initial_items,
+        }
+    }
+
+    pub(crate) fn is_snapshot(&self) -> bool {
+        matches!(self.mode, FreezeRolloutSegmentMode::Snapshot)
+    }
+
+    pub(crate) fn initial_items(&self) -> &[RolloutItem] {
+        self.initial_items.as_slice()
+    }
+}
+
+/// Immutable rollout prefix produced by [`crate::LocalThreadStore::freeze_thread_segment`].
+///
+/// Segmentation shares immutable inherited history across full-history forks and bounds the
+/// mutable live rollout after compaction. It is independent of [`ThreadHistoryMode`] and is not a
+/// legacy compatibility mechanism.
+#[derive(Clone, Debug)]
+pub struct FrozenRolloutSegment {
+    /// Reference to the immutable source prefix.
+    pub reference: RolloutReferenceItem,
+    /// Canonical metadata line copied from the source segment before it was frozen.
+    pub source_session_meta: SessionMetaLine,
+    /// Persisted history mode inherited by continuations and full-history forks.
+    pub history_mode: ThreadHistoryMode,
+    /// First lineage-relative ordinal available after the frozen prefix.
+    pub next_rollout_ordinal: Option<u64>,
 }
 
 /// Parameters for loading persisted history for resume, fork, rollback, and memory jobs.
@@ -214,26 +317,66 @@ pub struct RevertThreadParams {
 pub struct PreparedFork {
     /// Immediate source thread, even when the normalized history base names an ancestor.
     pub source_thread_id: ThreadId,
-    /// Frozen physical rollout prefix inherited by the child.
+    /// Compatibility position selected while normalizing the paginated lineage.
     pub history_base: Option<HistoryPosition>,
+    /// Canonical immutable rollout prefix inherited by the child.
+    pub frozen_segment: FrozenRolloutSegment,
     /// Bounded model context selected by the requested fork boundary.
     pub model_context: Arc<Vec<RolloutItem>>,
+    /// Latest source context used for settings that follow the source thread rather than the
+    /// selected history boundary.
+    pub latest_model_context: Arc<Vec<RolloutItem>>,
+    /// Complete logical history selected by the requested fork boundary.
+    pub response_history: Arc<Vec<RolloutItem>>,
+    /// Complete logical history that must be copied because a `history_base` edge cannot be
+    /// represented by the frozen segment reference.
+    pub copied_history: Option<Arc<Vec<RolloutItem>>>,
+    /// Complete projected parent turns when indexed fork preparation avoids JSONL replay.
+    pub projected_response_turns: Option<Arc<Vec<StoredTurn>>>,
+    /// Authoritative copy-on-write model history retained without copying parent response items.
+    pub shared_model_response_items: Option<Arc<Vec<ResponseItemEnvelope>>>,
+    /// Whether a latest-state fork should synthesize an interruption for an open turn.
+    pub interrupt_if_open: bool,
     /// Blocks source deletion until the child's history reference is durable.
     _source_reservation: Box<dyn std::fmt::Debug + Send>,
 }
 
+/// Shared source-thread lease held while a child rollout reference is becoming durable.
+#[derive(Debug)]
+pub struct ThreadLifecycleReservation {
+    _guard: tokio::sync::OwnedRwLockReadGuard<()>,
+}
+
+impl ThreadLifecycleReservation {
+    pub(crate) fn new(guard: tokio::sync::OwnedRwLockReadGuard<()>) -> Self {
+        Self { _guard: guard }
+    }
+}
+
 impl PreparedFork {
     /// Creates a frozen fork snapshot while retaining a backend-owned source reservation.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         source_thread_id: ThreadId,
         history_base: Option<HistoryPosition>,
+        frozen_segment: FrozenRolloutSegment,
         model_context: Arc<Vec<RolloutItem>>,
+        latest_model_context: Arc<Vec<RolloutItem>>,
+        response_history: Arc<Vec<RolloutItem>>,
+        interrupt_if_open: bool,
         source_reservation: impl std::fmt::Debug + Send + 'static,
     ) -> Self {
         Self {
             source_thread_id,
             history_base,
+            frozen_segment,
             model_context,
+            latest_model_context,
+            response_history,
+            copied_history: None,
+            projected_response_turns: None,
+            shared_model_response_items: None,
+            interrupt_if_open,
             _source_reservation: Box::new(source_reservation),
         }
     }

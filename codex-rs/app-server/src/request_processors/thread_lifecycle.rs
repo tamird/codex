@@ -701,6 +701,7 @@ pub(super) async fn handle_pending_thread_resume_request(
             has_live_in_progress_turn,
             active_turn,
             params,
+            pending.history_has_older_reference,
         ) {
             Ok(page) => Some(page),
             Err(error) => {
@@ -925,7 +926,7 @@ pub(super) fn merge_turn_history_with_active_turn(turns: &mut Vec<Turn>, active_
     turns.push(active_turn);
 }
 
-fn merge_active_turn_into_page(
+pub(super) fn merge_active_turn_into_page(
     page: &mut codex_app_server_protocol::TurnsPage,
     mut active_turn: Turn,
     params: &codex_app_server_protocol::ThreadResumeInitialTurnsPageParams,

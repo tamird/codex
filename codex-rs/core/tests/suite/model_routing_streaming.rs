@@ -13,6 +13,8 @@ use codex_protocol::items::TurnItem;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::Op;
 use codex_protocol::protocol::ThreadSettingsOverrides;
+use codex_protocol::turn_input::TurnInputRequest;
+use codex_protocol::turn_input::TurnInputSubmission;
 use codex_protocol::user_input::UserInput;
 use core_test_support::PathBufExt;
 use core_test_support::responses::ResponseMock;
@@ -93,16 +95,13 @@ async fn submit_prompt_with_settings(
     thread_settings: ThreadSettingsOverrides,
 ) -> Result<()> {
     test.codex
-        .submit(Op::UserInput {
-            items: vec![UserInput::Text {
+        .start_or_steer_turn(
+            TurnInputRequest::user_input(vec![UserInput::Text {
                 text: "stream this request".to_string(),
                 text_elements: Vec::new(),
-            }],
-            final_output_json_schema: None,
-            responsesapi_client_metadata: None,
-            additional_context: Default::default(),
-            thread_settings,
-        })
+            }])
+            .with_thread_settings(thread_settings),
+        )
         .await?;
     Ok(())
 }
@@ -700,35 +699,25 @@ async fn queued_steer_follows_untagged_partial_message_into_reroute() -> Result<
     let test = build_routed_streaming_test(&server).await?;
 
     test.codex
-        .submit(Op::UserInput {
-            items: vec![UserInput::Text {
-                text: INITIAL_PROMPT.to_string(),
-                text_elements: Vec::new(),
-            }],
-            final_output_json_schema: None,
-            responsesapi_client_metadata: None,
-            additional_context: Default::default(),
-            thread_settings: Default::default(),
-        })
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: INITIAL_PROMPT.to_string(),
+            text_elements: Vec::new(),
+        }]))
         .await?;
     wait_for_event(
         &test.codex,
         |event| matches!(event, EventMsg::AgentMessageContentDelta(event) if event.delta == PREFIX),
     )
     .await;
-    test.codex
-        .steer_input(
-            vec![UserInput::Text {
-                text: STEER_PROMPT.to_string(),
-                text_elements: Vec::new(),
-            }],
-            Default::default(),
-            /*expected_turn_id*/ None,
-            /*client_user_message_id*/ None,
-            /*responsesapi_client_metadata*/ None,
-        )
+    let submission = test
+        .codex
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: STEER_PROMPT.to_string(),
+            text_elements: Vec::new(),
+        }]))
         .await
         .map_err(|err| anyhow::anyhow!("steer input failed: {err:?}"))?;
+    assert!(matches!(submission, TurnInputSubmission::Steered { .. }));
     release_failure
         .send(())
         .expect("streaming failure gate should still be waiting");

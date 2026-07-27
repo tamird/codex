@@ -21,7 +21,7 @@ use tokio_util::sync::CancellationToken;
 use crate::config::Config;
 use crate::config::Constrained;
 use crate::environment_selection::TurnEnvironmentSnapshot;
-use crate::session::ForkPersistence;
+use crate::session::ForkStartupItems;
 use crate::session::GitEnrichmentPolicy;
 use crate::session::SUBMISSION_CHANNEL_CAPACITY;
 use crate::session::SessionIo;
@@ -128,8 +128,8 @@ pub(crate) async fn run_codex_thread_interactive(
         code_mode_session_provider: parent_session.services.code_mode_service.session_provider(),
         extensions,
         conversation_history,
+        fork_startup_items: ForkStartupItems::default(),
         requested_history_mode: None,
-        fork_persistence: ForkPersistence::Copied,
         session_source,
         forked_from_thread_id,
         parent_thread_id: Some(parent_session.thread_id),

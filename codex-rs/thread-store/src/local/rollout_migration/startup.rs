@@ -32,7 +32,6 @@ use super::migration_error;
 use super::publish::migration_journal_path;
 use super::publish::pending_migration_thread_ids;
 use super::telemetry::RolloutMigrationTrigger;
-use super::thread_id_from_rollout_filename;
 use crate::ThreadStoreError;
 use crate::ThreadStoreResult;
 
@@ -139,7 +138,7 @@ async fn migrate_all_rollouts(
         .filter(|path| {
             !plain_rollout_file_name(path)
                 .is_some_and(|file_name| skipped_file_names.contains(&file_name))
-                || thread_id_from_rollout_filename(path)
+                || codex_rollout::thread_id_from_path(path)
                     .is_some_and(|thread_id| pending_thread_ids.contains(&thread_id))
         })
         .cloned()

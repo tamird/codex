@@ -436,7 +436,7 @@ async fn run_compact_task_inner_impl(
             window_ids,
         },
     )
-    .await;
+    .await?;
     sess.recompute_token_usage(&turn_context).await;
 
     if reporting.defers_lifecycle() {

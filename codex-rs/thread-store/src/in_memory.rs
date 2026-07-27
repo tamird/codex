@@ -62,6 +62,7 @@ mod tests {
     use crate::SortDirection;
     use crate::StoredTurnItemsView;
     use crate::ThreadPersistenceMetadata;
+    use crate::ThreadPersistenceMode;
     use crate::ThreadSortKey;
     use codex_protocol::models::BaseInstructions;
     use codex_protocol::protocol::SessionSource;
@@ -132,6 +133,7 @@ mod tests {
                     thread_id,
                     extra_config: None,
                     forked_from_id: None,
+                    forked_from_ordinal_exclusive: None,
                     parent_thread_id,
                     source: SessionSource::Exec,
                     thread_source: None,
@@ -143,6 +145,8 @@ mod tests {
                     history_mode: ThreadHistoryMode::Legacy,
                     history_base: None,
                     subagent_history_start_ordinal: None,
+                    persistence_mode: ThreadPersistenceMode::Durable,
+                    initial_rollout_ordinal: 0,
                     initial_window_id: uuid::Uuid::now_v7().to_string(),
                     metadata: ThreadPersistenceMetadata {
                         cwd: None,
@@ -425,6 +429,7 @@ mod tests {
             thread_id,
             extra_config: None,
             forked_from_id: None,
+            forked_from_ordinal_exclusive: None,
             parent_thread_id: None,
             source: SessionSource::Exec,
             thread_source: None,
@@ -436,6 +441,8 @@ mod tests {
             history_mode,
             history_base: None,
             subagent_history_start_ordinal: None,
+            persistence_mode: ThreadPersistenceMode::Durable,
+            initial_rollout_ordinal: 0,
             initial_window_id: uuid::Uuid::now_v7().to_string(),
             metadata: thread_metadata(),
         }

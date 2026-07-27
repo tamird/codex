@@ -107,6 +107,29 @@ fn fork_cutoff_distinguishes_logical_parent_from_reverted_rollout() {
     }
 }
 
+#[test]
+fn canonical_path_parsing_distinguishes_stable_and_physical_ids() {
+    let thread_id =
+        ThreadId::from_string("019ff1a2-b3c4-7d5e-8f60-112233445566").expect("thread id");
+    let rollout_id =
+        ThreadId::from_string("019ff1a2-b3c4-7d5e-8f60-667788990011").expect("rollout id");
+    for suffix in ["", ".zst"] {
+        let path = PathBuf::from(format!(
+            "rollout-2026-08-11T18-42-07-{thread_id}_{rollout_id}.jsonl{suffix}"
+        ));
+        assert_eq!(thread_id_from_path(&path), Some(thread_id));
+        assert_eq!(rollout_id_from_path(&path), Some(rollout_id));
+    }
+    assert_eq!(
+        thread_id_from_path(Path::new("rollout-imported.jsonl")),
+        None
+    );
+    assert_eq!(
+        rollout_id_from_path(Path::new("rollout-imported.jsonl")),
+        None
+    );
+}
+
 #[tokio::test]
 async fn extract_metadata_from_rollout_uses_session_meta() {
     let dir = tempdir().expect("tempdir");
@@ -119,6 +142,7 @@ async fn extract_metadata_from_rollout_uses_session_meta() {
     let session_meta = SessionMeta {
         session_id: id.into(),
         id,
+        segment_id: None,
         forked_from_id: None,
         forked_from_ordinal_exclusive: None,
         parent_thread_id: None,
@@ -218,6 +242,7 @@ async fn extract_metadata_from_rollout_returns_latest_memory_mode() {
     let session_meta = SessionMeta {
         session_id: id.into(),
         id,
+        segment_id: None,
         forked_from_id: None,
         forked_from_ordinal_exclusive: None,
         parent_thread_id: None,
@@ -559,6 +584,7 @@ fn write_rollout_in_sessions_with_cwd(
     let session_meta = SessionMeta {
         session_id: id.into(),
         id,
+        segment_id: None,
         forked_from_id: None,
         forked_from_ordinal_exclusive: None,
         parent_thread_id: None,

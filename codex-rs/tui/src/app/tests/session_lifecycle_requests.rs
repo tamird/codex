@@ -338,6 +338,49 @@ fn create_history_rollout(
         /*git_info*/ None,
     )
     .map_err(|err| color_eyre::eyre::eyre!("failed to create history rollout: {err}"))?;
+    if history_mode == ThreadHistoryMode::Paginated {
+        let path = rollout_path(
+            config.codex_home.as_path(),
+            "2026-01-02T00-00-00",
+            &thread_id,
+        );
+        let mut records = std::fs::read_to_string(&path)?
+            .lines()
+            .map(serde_json::from_str::<serde_json::Value>)
+            .collect::<Result<Vec<_>, _>>()?;
+        let start = EventMsg::TurnStarted(TurnStartedEvent {
+            turn_id: "fixture-turn".to_string(),
+            trace_id: None,
+            started_at: None,
+            model_context_window: None,
+            collaboration_mode_kind: Default::default(),
+        });
+        records.push(serde_json::json!({"timestamp": "2026-01-02T00:00:00Z", "ordinal": records.len(), "type": "event_msg", "payload": start}));
+        let event = EventMsg::ItemCompleted(codex_protocol::protocol::ItemCompletedEvent {
+            thread_id: ThreadId::from_string(&thread_id)?,
+            turn_id: "fixture-turn".to_string(),
+            item: TurnItem::UserMessage(UserMessageItem {
+                id: "fixture-user".to_string(),
+                client_id: None,
+                content: vec![CoreUserInput::Text {
+                    text: preview.to_string(),
+                    text_elements: Vec::new(),
+                }],
+            }),
+            started_at_ms: None,
+            completed_at_ms: 0,
+        });
+        records.push(serde_json::json!({"timestamp": "2026-01-02T00:00:00Z", "ordinal": records.len(), "type": "event_msg", "payload": event}));
+        std::fs::write(
+            path,
+            records
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join("\n")
+                + "\n",
+        )?;
+    }
     Ok(ThreadId::from_string(&thread_id)?)
 }
 
@@ -1826,7 +1869,7 @@ async fn remote_legacy_history_start_negotiates_once_for_resume_and_fork() -> Re
     )
     .await
     .map_err(|error| color_eyre::eyre::eyre!(error))?;
-    assert_eq!(exported[0].raw_lines()[0].to_string(), "visible");
+    assert_eq!(exported[0].raw_lines()[0].to_string(), "paginated history");
     assert!(
         recorded_params(&requests, "thread/read")[initial_read_count..]
             .iter()

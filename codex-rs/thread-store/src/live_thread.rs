@@ -1,5 +1,8 @@
+use std::panic::AssertUnwindSafe;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
 
 use codex_protocol::ThreadId;
 use codex_protocol::protocol::ThreadHistoryMode;
@@ -8,19 +11,24 @@ use codex_rollout::RolloutItem;
 use codex_rollout::RolloutPersistenceTelemetry;
 use codex_rollout::measure_and_filter_rollout_items;
 use codex_rollout::persisted_rollout_items;
+use futures::FutureExt;
 use tokio::sync::Mutex;
 use tracing::warn;
 
 use crate::AppendThreadItemsParams;
 use crate::CreateThreadParams;
+use crate::FreezeRolloutSegmentParams;
+use crate::FrozenRolloutSegment;
 use crate::LoadThreadHistoryParams;
 use crate::LocalThreadStore;
 use crate::PersistContext;
 use crate::ReadThreadParams;
 use crate::ResumeThreadParams;
+use crate::SegmentCheckpointPersistenceOutcome;
 use crate::StoredThread;
 use crate::StoredThreadHistory;
 use crate::ThreadMetadataPatch;
+use crate::ThreadPersistenceMode;
 use crate::ThreadStore;
 use crate::ThreadStoreError;
 use crate::ThreadStoreResult;
@@ -38,7 +46,37 @@ pub struct LiveThread {
     history_mode: ThreadHistoryMode,
     thread_store: Arc<dyn ThreadStore>,
     metadata_sync: Arc<Mutex<ThreadMetadataSync>>,
+    persistence_mode: Arc<Mutex<ThreadPersistenceMode>>,
+    /// Rejects later persistence after a checkpoint may have committed ambiguously.
+    persistence_restart_required: Arc<AtomicBool>,
     persistence_telemetry: RolloutPersistenceTelemetry,
+}
+
+/// Arms the restart fence until checkpoint persistence returns a classified outcome.
+struct CheckpointPersistenceRestartGuard {
+    restart_required: Arc<AtomicBool>,
+    armed: bool,
+}
+
+impl CheckpointPersistenceRestartGuard {
+    fn new(restart_required: Arc<AtomicBool>) -> Self {
+        Self {
+            restart_required,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for CheckpointPersistenceRestartGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            self.restart_required.store(true, Ordering::Release);
+        }
+    }
 }
 
 /// Owns a live thread while session initialization is still fallible.
@@ -97,6 +135,7 @@ impl LiveThread {
     ) -> ThreadStoreResult<Self> {
         let thread_id = params.thread_id;
         let history_mode = params.history_mode;
+        let persistence_mode = params.persistence_mode;
         let metadata_sync = ThreadMetadataSync::for_create(&params).await;
         thread_store.create_thread(params).await?;
         Ok(Self {
@@ -104,6 +143,8 @@ impl LiveThread {
             history_mode,
             thread_store,
             metadata_sync: Arc::new(Mutex::new(metadata_sync)),
+            persistence_mode: Arc::new(Mutex::new(persistence_mode)),
+            persistence_restart_required: Arc::new(AtomicBool::new(false)),
             persistence_telemetry: RolloutPersistenceTelemetry::new(thread_id),
         })
     }
@@ -117,21 +158,29 @@ impl LiveThread {
         mut params: CreateThreadParams,
         inherited_model_context: &[RolloutItem],
     ) -> ThreadStoreResult<Self> {
+        let inherited_model_context = inherited_model_context
+            .iter()
+            .filter(|item| !matches!(item, RolloutItem::SessionMeta(_)))
+            .cloned()
+            .collect::<Vec<_>>();
         let persisted_prefix_item_count =
-            persisted_rollout_items(inherited_model_context, params.history_mode).len();
+            persisted_rollout_items(&inherited_model_context, params.history_mode).len();
+        let persisted_prefix_item_count =
+            u64::try_from(persisted_prefix_item_count).map_err(|_| ThreadStoreError::Internal {
+                message: "inherited model context is too large".to_string(),
+            })?;
         params.subagent_history_start_ordinal = Some(
-            u64::try_from(persisted_prefix_item_count)
-                .map_err(|_| ThreadStoreError::Internal {
-                    message: "inherited model context is too large".to_string(),
-                })?
+            params
+                .initial_rollout_ordinal
                 .checked_add(1)
+                .and_then(|ordinal| ordinal.checked_add(persisted_prefix_item_count))
                 .ok_or_else(|| ThreadStoreError::Internal {
                     message: "inherited model context is too large".to_string(),
                 })?,
         );
         let live_thread = Self::create(thread_store, params).await?;
         if let Err(err) = live_thread
-            .persist_appended_items(inherited_model_context)
+            .persist_appended_items(&inherited_model_context)
             .await
         {
             if let Err(discard_err) = live_thread.discard().await {
@@ -191,6 +240,8 @@ impl LiveThread {
             history_mode,
             thread_store,
             metadata_sync: Arc::new(Mutex::new(metadata_sync)),
+            persistence_mode: Arc::new(Mutex::new(ThreadPersistenceMode::Durable)),
+            persistence_restart_required: Arc::new(AtomicBool::new(false)),
             persistence_telemetry: RolloutPersistenceTelemetry::new(thread_id),
         })
     }
@@ -200,7 +251,13 @@ impl LiveThread {
         skip_all,
         fields(item_count = raw_items.len())
     )]
+    #[expect(
+        clippy::await_holding_invalid_type,
+        reason = "item persistence and metadata publication must observe one persistence mode"
+    )]
     pub async fn append_items(&self, raw_items: &[RolloutItem]) -> ThreadStoreResult<()> {
+        let persistence_mode = self.persistence_mode.lock().await;
+        self.ensure_persistence_available("append rollout items")?;
         let items = self.persist_appended_items(raw_items).await?;
         if items.is_empty() {
             return Ok(());
@@ -210,6 +267,9 @@ impl LiveThread {
             .lock()
             .await
             .observe_appended_items(items.as_slice());
+        if matches!(*persistence_mode, ThreadPersistenceMode::Deferred) {
+            return Ok(());
+        }
         if let Some(update) = update {
             self.thread_store
                 .update_thread_metadata(UpdateThreadMetadataParams {
@@ -254,7 +314,13 @@ impl LiveThread {
         Ok(items)
     }
 
+    #[expect(
+        clippy::await_holding_invalid_type,
+        reason = "the durable transition must serialize with other persistence-mode operations"
+    )]
     pub async fn persist(&self, context: PersistContext) -> ThreadStoreResult<()> {
+        let mut persistence_mode = self.persistence_mode.lock().await;
+        self.ensure_persistence_available("persist the thread")?;
         if context == PersistContext::TurnStart {
             self.flush_pending_metadata_update_for_existing_history()
                 .await?;
@@ -262,19 +328,199 @@ impl LiveThread {
         self.thread_store
             .persist_thread(self.thread_id, context)
             .await?;
+        *persistence_mode = ThreadPersistenceMode::Durable;
+        drop(persistence_mode);
         self.flush_pending_metadata_update().await
     }
 
+    #[expect(
+        clippy::await_holding_invalid_type,
+        reason = "flush and metadata publication must observe one persistence mode"
+    )]
     pub async fn flush(&self) -> ThreadStoreResult<()> {
+        let persistence_mode = self.persistence_mode.lock().await;
+        self.ensure_persistence_available("flush the thread")?;
         self.thread_store.flush_thread(self.thread_id).await?;
+        if matches!(*persistence_mode, ThreadPersistenceMode::Deferred) {
+            return Ok(());
+        }
+        drop(persistence_mode);
         self.flush_pending_metadata_update_for_existing_history()
             .await
     }
 
-    pub async fn shutdown(&self) -> ThreadStoreResult<()> {
-        let metadata_result = self
-            .flush_pending_metadata_update_for_existing_history()
+    /// Returns whether this thread should remain memory-only until explicitly persisted.
+    pub async fn is_persistence_deferred(&self) -> bool {
+        matches!(
+            *self.persistence_mode.lock().await,
+            ThreadPersistenceMode::Deferred
+        )
+    }
+
+    /// Freezes the current local prefix for compaction or a full-history fork.
+    ///
+    /// Remote stores do not expose local rollout segments and return `Ok(None)`.
+    #[expect(
+        clippy::await_holding_invalid_type,
+        reason = "segment freezing must serialize with persistence-mode transitions"
+    )]
+    pub async fn freeze_local_segment(
+        &self,
+        params: FreezeRolloutSegmentParams,
+    ) -> ThreadStoreResult<Option<FrozenRolloutSegment>> {
+        let mut persistence_mode = self.persistence_mode.lock().await;
+        self.ensure_persistence_available("freeze a rollout segment")?;
+        let Some(local_store) = self
+            .thread_store
+            .as_any()
+            .downcast_ref::<LocalThreadStore>()
+        else {
+            return Ok(None);
+        };
+        let freeze_result = local_store
+            .freeze_thread_segment(self.thread_id, params)
             .await;
+        if matches!(
+            local_store.live_persistence_mode(self.thread_id).await,
+            Some(ThreadPersistenceMode::Durable)
+        ) {
+            *persistence_mode = ThreadPersistenceMode::Durable;
+        }
+        let frozen = freeze_result.map(Some)?;
+        drop(persistence_mode);
+        self.flush_pending_metadata_update().await?;
+        Ok(frozen)
+    }
+
+    /// Persists a complete segment-state checkpoint without interpreting an ordinary write error
+    /// as proof that the checkpoint was not published.
+    pub async fn persist_segment_checkpoint(
+        &self,
+        params: FreezeRolloutSegmentParams,
+    ) -> SegmentCheckpointPersistenceOutcome {
+        let live_thread = self.clone();
+        let checkpoint_owner = tokio::spawn(async move {
+            let result = AssertUnwindSafe(live_thread.persist_segment_checkpoint_inner(params))
+                .catch_unwind()
+                .await;
+            match result {
+                Ok(outcome) => outcome,
+                Err(_) => {
+                    let _ = live_thread.require_restart_and_discard().await;
+                    SegmentCheckpointPersistenceOutcome::Indeterminate {
+                        error: ThreadStoreError::Internal {
+                            message: format!(
+                                "checkpoint persistence owner for thread {} panicked at an indeterminate commit point",
+                                live_thread.thread_id
+                            ),
+                        },
+                    }
+                }
+            }
+        });
+        match checkpoint_owner.await {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                let _ = self.require_restart_and_discard().await;
+                SegmentCheckpointPersistenceOutcome::Indeterminate {
+                    error: ThreadStoreError::Internal {
+                        message: format!(
+                            "checkpoint persistence owner for thread {} failed: {error}",
+                            self.thread_id
+                        ),
+                    },
+                }
+            }
+        }
+    }
+
+    #[expect(
+        clippy::await_holding_invalid_type,
+        reason = "checkpoint persistence must serialize with persistence-mode transitions"
+    )]
+    async fn persist_segment_checkpoint_inner(
+        &self,
+        params: FreezeRolloutSegmentParams,
+    ) -> SegmentCheckpointPersistenceOutcome {
+        let mut persistence_mode = self.persistence_mode.lock().await;
+        if let Err(error) = self.ensure_persistence_available("persist a segment checkpoint") {
+            return SegmentCheckpointPersistenceOutcome::Indeterminate { error };
+        }
+        let mut restart_guard =
+            CheckpointPersistenceRestartGuard::new(Arc::clone(&self.persistence_restart_required));
+        let raw_items = params.initial_items().to_vec();
+        let outcome = self
+            .thread_store
+            .persist_segment_checkpoint(self.thread_id, params)
+            .await;
+        let persisted_items = if matches!(outcome, SegmentCheckpointPersistenceOutcome::Committed) {
+            let (items, measurement) = if self.persistence_telemetry.is_enabled() {
+                let (items, measurement) =
+                    measure_and_filter_rollout_items(raw_items.as_slice(), self.history_mode);
+                (items, Some(measurement))
+            } else {
+                (
+                    persisted_rollout_items(raw_items.as_slice(), self.history_mode),
+                    None,
+                )
+            };
+            if let Some(measurement) = measurement.as_ref() {
+                self.persistence_telemetry
+                    .record_batch(raw_items.as_slice(), measurement);
+            }
+            Some(items)
+        } else {
+            None
+        };
+        if let Some(local_store) = self
+            .thread_store
+            .as_any()
+            .downcast_ref::<LocalThreadStore>()
+            && matches!(
+                local_store.live_persistence_mode(self.thread_id).await,
+                Some(ThreadPersistenceMode::Durable)
+            )
+        {
+            *persistence_mode = ThreadPersistenceMode::Durable;
+        }
+        match &outcome {
+            SegmentCheckpointPersistenceOutcome::Indeterminate { .. } => {
+                self.persistence_restart_required
+                    .store(true, Ordering::Release);
+                let _ = self.thread_store.discard_thread(self.thread_id).await;
+            }
+            SegmentCheckpointPersistenceOutcome::NotCommitted { .. } => restart_guard.disarm(),
+            SegmentCheckpointPersistenceOutcome::Committed => {
+                if let Some(items) = persisted_items
+                    && !items.is_empty()
+                {
+                    self.metadata_sync
+                        .lock()
+                        .await
+                        .observe_appended_items(items.as_slice());
+                }
+                if let Err(error) = self.flush_pending_metadata_update().await {
+                    warn!(%error, "segment-state checkpoint committed but metadata publication failed");
+                }
+                restart_guard.disarm();
+            }
+        }
+        outcome
+    }
+
+    #[expect(
+        clippy::await_holding_invalid_type,
+        reason = "shutdown must serialize its metadata decision with persistence-mode transitions"
+    )]
+    pub async fn shutdown(&self) -> ThreadStoreResult<()> {
+        let persistence_mode = self.persistence_mode.lock().await;
+        self.ensure_persistence_available("shut down thread persistence")?;
+        let metadata_result = if matches!(*persistence_mode, ThreadPersistenceMode::Durable) {
+            self.flush_pending_metadata_update_for_existing_history()
+                .await
+        } else {
+            Ok(())
+        };
         let shutdown_result = self.thread_store.shutdown_thread(self.thread_id).await;
         match (metadata_result, shutdown_result) {
             (Err(metadata_error), Err(shutdown_error)) => Err(ThreadStoreError::Internal {
@@ -289,6 +535,37 @@ impl LiveThread {
 
     pub async fn discard(&self) -> ThreadStoreResult<()> {
         self.thread_store.discard_thread(self.thread_id).await
+    }
+
+    #[expect(
+        clippy::await_holding_invalid_type,
+        reason = "restart fencing and writer discard must exclude concurrent persistence"
+    )]
+    async fn require_restart_and_discard(&self) -> ThreadStoreResult<()> {
+        self.persistence_restart_required
+            .store(true, Ordering::Release);
+        let _persistence_mode = self.persistence_mode.lock().await;
+        self.thread_store.discard_thread(self.thread_id).await
+    }
+
+    fn ensure_persistence_available(&self, operation: &str) -> ThreadStoreResult<()> {
+        if self.persistence_restart_required.load(Ordering::Acquire) {
+            return Err(ThreadStoreError::Conflict {
+                message: format!(
+                    "cannot {operation} for thread {}; checkpoint persistence is indeterminate and the thread must be restarted",
+                    self.thread_id
+                ),
+            });
+        }
+        Ok(())
+    }
+
+    /// Returns whether checkpoint publication lost a durability acknowledgement.
+    ///
+    /// Session code uses the same fence before starting a new turn so cancellation of the
+    /// compaction caller cannot hide an indeterminate background publication.
+    pub fn persistence_restart_required(&self) -> bool {
+        self.persistence_restart_required.load(Ordering::Acquire)
     }
 
     pub async fn load_history(

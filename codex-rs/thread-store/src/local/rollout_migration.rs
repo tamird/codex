@@ -16,6 +16,7 @@ use std::time::Duration;
 
 use chrono::DateTime;
 use codex_app_server_protocol::project_rollout_line;
+use codex_protocol::RolloutId;
 use codex_protocol::ThreadId;
 use codex_protocol::protocol::InternalSessionSource;
 use codex_protocol::protocol::SessionSource;
@@ -25,6 +26,7 @@ use codex_protocol::protocol::ThreadSource;
 use codex_rollout::RolloutItem;
 use codex_rollout::RolloutLine;
 use serde::Serialize;
+use serde_json::Value;
 use tokio::fs::File;
 use tokio::io::AsyncBufReadExt;
 use tokio::io::AsyncReadExt;
@@ -334,16 +336,46 @@ impl LocalThreadStore {
         };
         if options.mode == RolloutMigrationMode::Apply {
             let pending_thread_ids = pending_migration_thread_ids(&self.config.codex_home).await?;
+            let mut pending_paths = std::collections::HashMap::new();
+            if let Some(state_db) = &self.state_db {
+                for thread_id in &pending_thread_ids {
+                    let Some(metadata) = state_db
+                        .get_thread(*thread_id)
+                        .await
+                        .map_err(migration_error)?
+                    else {
+                        continue;
+                    };
+                    let Some(existing_path) =
+                        codex_rollout::existing_rollout_path(&metadata.rollout_path).await
+                    else {
+                        continue;
+                    };
+                    if codex_rollout::read_session_meta_line(&existing_path)
+                        .await
+                        .is_ok_and(|session_meta| session_meta.meta.id == *thread_id)
+                    {
+                        pending_paths.insert(
+                            codex_rollout::plain_rollout_path(&existing_path),
+                            *thread_id,
+                        );
+                    }
+                }
+            }
             paths.sort_by_key(|path| {
-                !thread_id_from_rollout_filename(path)
-                    .is_some_and(|thread_id| pending_thread_ids.contains(&thread_id))
+                let thread_id = codex_rollout::thread_id_from_path(path).or_else(|| {
+                    pending_paths
+                        .get(&codex_rollout::plain_rollout_path(path))
+                        .copied()
+                });
+                !thread_id.is_some_and(|thread_id| pending_thread_ids.contains(&thread_id))
             });
         }
         // The name index is global, so read it once before either migrating or repairing names.
         let legacy_names = if options.mode == RolloutMigrationMode::Apply {
             let thread_ids = paths
                 .iter()
-                .filter_map(|path| thread_id_from_rollout_filename(path))
+                .filter_map(|path| codex_rollout::thread_id_from_path(path))
                 .collect();
             codex_rollout::find_thread_names_by_ids(&self.config.codex_home, &thread_ids)
                 .await
@@ -398,7 +430,7 @@ impl LocalThreadStore {
                 }
                 Err(error) => error,
             };
-            let thread_id = thread_id_from_rollout_filename(&path);
+            let thread_id = codex_rollout::thread_id_from_path(&path);
             if !matches_selection(&options.thread_ids, thread_id) {
                 return Ok(None);
             }
@@ -452,6 +484,18 @@ impl LocalThreadStore {
         };
         let thread_id = metadata.meta.id;
         if !matches_selection(&options.thread_ids, Some(thread_id)) {
+            return Ok(None);
+        }
+        if let Some(state_db) = &self.state_db
+            && let Some(selected) = state_db
+                .get_thread(thread_id)
+                .await
+                .map_err(migration_error)?
+            && codex_rollout::plain_rollout_path(selected.rollout_path.as_path())
+                != codex_rollout::plain_rollout_path(path.as_path())
+        {
+            // A stable thread can retain older physical rollouts after a revert. Migrating one of
+            // those files would overwrite the selected thread's history mode and migration journal.
             return Ok(None);
         }
         let is_memory_consolidation = matches!(
@@ -526,6 +570,17 @@ impl LocalThreadStore {
         }
 
         if options.mode == RolloutMigrationMode::DryRun {
+            if let Some(message) = legacy_reference_migration_blocker(&path, &metadata).await? {
+                return Ok(Some(migration_outcome(
+                    thread_id,
+                    path,
+                    Err(RolloutMigrationFailure::new(
+                        RolloutMigrationFailureReason::LegacyRolloutConversionFailed,
+                        migration_error(message),
+                    )),
+                    /*bytes_processed*/ 0,
+                )));
+            }
             return Ok(Some(migration_outcome(
                 thread_id,
                 path,
@@ -563,6 +618,43 @@ impl LocalThreadStore {
                 find_current_rollout_path(&self.config.codex_home, &path).await?
         {
             path = current_path;
+        }
+        let locked_metadata = codex_rollout::read_session_meta_line(&path)
+            .await
+            .map_err(migration_error)?;
+        if let Some(state_db) = &self.state_db
+            && let Some(selected) = state_db
+                .get_thread(thread_id)
+                .await
+                .map_err(migration_error)?
+            && codex_rollout::plain_rollout_path(selected.rollout_path.as_path())
+                != codex_rollout::plain_rollout_path(path.as_path())
+        {
+            return Ok(None);
+        }
+        if locked_metadata.meta.id != thread_id
+            || locked_metadata.meta.history_mode != ThreadHistoryMode::Legacy
+        {
+            return Ok(Some(migration_outcome(
+                thread_id,
+                path,
+                Err(RolloutMigrationFailure::new(
+                    RolloutMigrationFailureReason::InvalidSessionMetadata,
+                    migration_error("rollout metadata changed while waiting for the writer lock"),
+                )),
+                /*bytes_processed*/ 0,
+            )));
+        }
+        if let Some(message) = legacy_reference_migration_blocker(&path, &locked_metadata).await? {
+            return Ok(Some(migration_outcome(
+                thread_id,
+                path,
+                Err(RolloutMigrationFailure::new(
+                    RolloutMigrationFailureReason::LegacyRolloutConversionFailed,
+                    migration_error(message),
+                )),
+                /*bytes_processed*/ 0,
+            )));
         }
         let bytes_before = limiter.bytes_processed;
         let result = match self
@@ -622,6 +714,7 @@ impl LocalThreadStore {
             ));
         }
 
+        let rollout_id = migration_rollout_id(rollout_path, thread_id);
         let compressed = rollout_path_is_compressed(rollout_path);
         let staged_path = with_failure_reason(
             staged_rollout_path(rollout_path),
@@ -634,7 +727,7 @@ impl LocalThreadStore {
             RolloutMigrationFailureReason::Unknown,
         )?;
         with_failure_reason(
-            thread_history::delete_thread(self, thread_id).await,
+            thread_history::delete_thread(self, rollout_id).await,
             RolloutMigrationFailureReason::SqliteMaterializationFailed,
         )?;
         with_failure_reason(
@@ -764,9 +857,9 @@ impl LocalThreadStore {
 
         // SQLite sees only the final staged bytes, so all projection failures share one reason.
         let projection_result = async {
-            self.project_rollout_in_batches(thread_id, &staged_path, limiter)
+            self.project_rollout_in_batches(rollout_id, &staged_path, limiter)
                 .await?;
-            let projection = thread_history::projection_state(self, thread_id)
+            let projection = thread_history::projection_state(self, rollout_id)
                 .await?
                 .ok_or_else(|| migration_error("completed rollout has no SQLite projection"))?;
             if projection.next_byte_offset != expected_length
@@ -1004,6 +1097,34 @@ impl LocalThreadStore {
         limiter: &mut RolloutMigrationRateLimiter,
     ) -> ThreadStoreResult<PathBuf> {
         let _writer_guard = self.writer_lock_coordinator.acquire(thread_id)?;
+        let locked_metadata = codex_rollout::read_session_meta_line(rollout_path)
+            .await
+            .map_err(migration_error)?;
+        if locked_metadata.meta.id != thread_id
+            || locked_metadata.meta.history_mode != ThreadHistoryMode::Paginated
+        {
+            return Err(migration_error(
+                "published rollout metadata changed while waiting for the writer lock",
+            ));
+        }
+        if let Some(state_db) = &self.state_db {
+            let selected = state_db
+                .get_thread(thread_id)
+                .await
+                .map_err(migration_error)?
+                .ok_or_else(|| {
+                    migration_error(format!(
+                        "thread {thread_id} is missing its SQLite metadata during recovery"
+                    ))
+                })?;
+            if codex_rollout::plain_rollout_path(selected.rollout_path.as_path())
+                != codex_rollout::plain_rollout_path(rollout_path)
+            {
+                return Err(migration_error(
+                    "selected rollout changed while waiting for published migration recovery",
+                ));
+            }
+        }
         let decompressed_path = rollout_path_is_compressed(rollout_path)
             .then(|| decompressed_staged_rollout_path(rollout_path))
             .transpose()?;
@@ -1026,14 +1147,15 @@ impl LocalThreadStore {
         } else {
             rollout_path
         };
+        let rollout_id = migration_rollout_id(rollout_path, thread_id);
         let expected_length = tokio::fs::metadata(projection_path)
             .await
             .map_err(migration_error)?
             .len();
-        let projection = thread_history::projection_state(self, thread_id).await?;
+        let projection = thread_history::projection_state(self, rollout_id).await?;
         if projection.is_none_or(|state| state.next_byte_offset != expected_length) {
-            thread_history::delete_thread(self, thread_id).await?;
-            self.project_rollout_in_batches(thread_id, projection_path, limiter)
+            thread_history::delete_thread(self, rollout_id).await?;
+            self.project_rollout_in_batches(rollout_id, projection_path, limiter)
                 .await?;
         }
         remove_file_if_present(&staged_rollout_path(rollout_path)?).await?;
@@ -1058,8 +1180,15 @@ impl LocalThreadStore {
         if metadata.meta.history_mode == ThreadHistoryMode::Paginated {
             return Ok(());
         }
+        if metadata.meta.id != thread_id {
+            return Err(migration_error(format!(
+                "rollout metadata changed ownership from {thread_id} to {} during migration cleanup",
+                metadata.meta.id
+            )));
+        }
 
-        thread_history::delete_thread(self, thread_id).await?;
+        let rollout_id = migration_rollout_id(rollout_path, thread_id);
+        thread_history::delete_thread(self, rollout_id).await?;
         let staged_path = staged_rollout_path(rollout_path)?;
         remove_file_if_present(&staged_path).await?;
         remove_file_if_present(&rewritten_staged_rollout_path(&staged_path)?).await?;
@@ -1121,7 +1250,7 @@ impl LocalThreadStore {
 
     async fn project_rollout_in_batches(
         &self,
-        thread_id: ThreadId,
+        rollout_id: RolloutId,
         rollout_path: &Path,
         limiter: &mut RolloutMigrationRateLimiter,
     ) -> ThreadStoreResult<()> {
@@ -1178,7 +1307,7 @@ impl LocalThreadStore {
             if offset.saturating_sub(batch_start) >= PROJECTION_BATCH_BYTES {
                 thread_history::apply_projection(
                     self,
-                    thread_id,
+                    rollout_id,
                     batch_start,
                     offset,
                     /*initial_ordinal*/ 0,
@@ -1192,7 +1321,7 @@ impl LocalThreadStore {
         if batch_start != offset {
             thread_history::apply_projection(
                 self,
-                thread_id,
+                rollout_id,
                 batch_start,
                 offset,
                 /*initial_ordinal*/ 0,
@@ -1202,6 +1331,36 @@ impl LocalThreadStore {
         }
         Ok(())
     }
+}
+
+async fn legacy_reference_migration_blocker(
+    rollout_path: &Path,
+    metadata: &codex_protocol::protocol::SessionMetaLine,
+) -> ThreadStoreResult<Option<String>> {
+    if metadata.meta.history_base.is_some() {
+        return Ok(Some(
+            "segmented legacy rollout migration requires an atomic lineage conversion".to_string(),
+        ));
+    }
+
+    let mut reader = codex_rollout::open_rollout_line_reader(rollout_path)
+        .await
+        .map_err(migration_error)?;
+    while let Some(line) = reader.next_line().await.map_err(migration_error)? {
+        let Ok(value) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        if matches!(
+            value.get("type").and_then(Value::as_str),
+            Some("rollout_reference" | "fork_reference")
+        ) {
+            return Ok(Some(
+                "reference-backed legacy rollout migration requires an atomic lineage conversion"
+                    .to_string(),
+            ));
+        }
+    }
+    Ok(None)
 }
 
 async fn read_rollout_record(
@@ -1325,13 +1484,8 @@ fn rollout_path_is_compressed(path: &Path) -> bool {
         .is_some_and(|name| name.ends_with(".jsonl.zst"))
 }
 
-fn thread_id_from_rollout_filename(path: &Path) -> Option<ThreadId> {
-    let name = path.file_name()?.to_str()?;
-    let stem = name
-        .strip_suffix(".jsonl.zst")
-        .or_else(|| name.strip_suffix(".jsonl"))?;
-    let start = stem.len().checked_sub(36)?;
-    ThreadId::from_string(stem.get(start..)?).ok()
+fn migration_rollout_id(rollout_path: &Path, authenticated_thread_id: ThreadId) -> RolloutId {
+    codex_rollout::rollout_id_from_path(rollout_path).unwrap_or(authenticated_thread_id)
 }
 
 fn migration_outcome(

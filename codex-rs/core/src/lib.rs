@@ -1,5 +1,6 @@
 //! Root of the `codex-core` library.
 
+#![recursion_limit = "256"]
 // Prevent accidental direct writes to stdout/stderr in library code. All
 // user-visible output must go through the appropriate abstraction (e.g.,
 // the TUI or the tracing stack).
@@ -153,6 +154,8 @@ pub use state_db_bridge::init_state_db;
 mod thread_rollout_truncation;
 pub use thread_rollout_truncation::truncate_rollout_after_turn_id;
 pub use thread_rollout_truncation::truncate_rollout_before_turn_id;
+pub use thread_rollout_truncation::user_message_count_before_turn_id;
+pub use thread_rollout_truncation::user_message_count_through_turn_id;
 mod tools;
 pub(crate) mod turn_diff_tracker;
 mod turn_metadata;
