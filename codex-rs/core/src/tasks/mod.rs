@@ -893,6 +893,11 @@ impl Session {
         }
         if cleared_active_turn {
             self.maybe_start_turn_for_pending_work().await;
+            self.services.agent_control.schedule_agent_residency_trim(
+                turn_context.config.as_ref(),
+                turn_context.multi_agent_version,
+                &turn_context.session_source,
+            );
         }
     }
 

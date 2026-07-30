@@ -2,6 +2,7 @@ use super::AgentControl;
 use crate::agent::AgentStatus;
 use crate::codex_thread::CodexThread;
 use crate::config::Config;
+use crate::goal_supervisor::is_goal_supervisor_helper_source;
 use crate::thread_manager::ThreadManagerState;
 use codex_protocol::ThreadId;
 use codex_protocol::error::CodexErr;
@@ -12,13 +13,23 @@ use codex_protocol::protocol::SessionSource;
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering;
 use tracing::warn;
+
+/// Idle agents remain warm without making the execution limit a memory-retention limit.
+const DEFAULT_AGENT_RESIDENCY_LIMIT: usize = 8;
 
 /// Session-scoped LRU of loaded V1 and V2 agents that can be reconstructed from persisted rollout.
 #[derive(Default)]
 pub(super) struct AgentResidency {
     /// Loaded residents plus in-flight reservations for new or reloaded agents.
     state: Mutex<AgentResidencyState>,
+    /// Prevents simultaneous completed agents from starting redundant eviction tasks.
+    trim_scheduled: AtomicBool,
+    /// Records completion notices that arrive while an eviction task is already running.
+    trim_generation: AtomicUsize,
 }
 
 /// Mutable residency accounting protected by `AgentResidency::state`.
@@ -61,12 +72,66 @@ impl AgentControl {
         multi_agent_version: MultiAgentVersion,
         protected_thread_id: Option<ThreadId>,
     ) -> CodexResult<AgentResidencySlot> {
-        let capacity = config
+        let protected_thread_ids = protected_thread_id.into_iter().collect();
+        let execution_capacity = config
             .effective_agent_max_threads(multi_agent_version)
             .unwrap_or(usize::MAX);
+        let resident_capacity = execution_capacity.min(DEFAULT_AGENT_RESIDENCY_LIMIT);
         Arc::clone(&self.agent_residency)
-            .reserve_slot(self, state, capacity, protected_thread_id)
+            .reserve_slot(
+                self,
+                state,
+                resident_capacity,
+                execution_capacity,
+                protected_thread_ids,
+            )
             .await
+    }
+
+    /// Unloads completed residents after their turn and completion notification finish.
+    pub(crate) fn schedule_agent_residency_trim(
+        &self,
+        config: &Config,
+        multi_agent_version: MultiAgentVersion,
+        session_source: &SessionSource,
+    ) {
+        if !is_resident_session_source(session_source) {
+            return;
+        }
+
+        let execution_capacity = config
+            .effective_agent_max_threads(multi_agent_version)
+            .unwrap_or(usize::MAX);
+        let resident_capacity = execution_capacity.min(DEFAULT_AGENT_RESIDENCY_LIMIT);
+        if self.agent_residency.resident_count() <= resident_capacity {
+            return;
+        }
+        let residency = Arc::clone(&self.agent_residency);
+        residency.trim_generation.fetch_add(1, Ordering::AcqRel);
+        if residency.trim_scheduled.swap(true, Ordering::AcqRel) {
+            return;
+        }
+
+        let control = self.clone();
+        tokio::spawn(async move {
+            loop {
+                let observed_generation = residency.trim_generation.load(Ordering::Acquire);
+                if let Ok(manager) = control.upgrade() {
+                    residency
+                        .trim_idle_residents(&control, &manager, resident_capacity)
+                        .await;
+                }
+                residency.trim_scheduled.store(false, Ordering::Release);
+                if residency.trim_generation.load(Ordering::Acquire) == observed_generation
+                    || residency
+                        .trim_scheduled
+                        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                        .is_err()
+                {
+                    return;
+                }
+            }
+        });
     }
 
     pub(super) fn touch_loaded_agent_residency(&self, thread: &CodexThread) {
@@ -92,26 +157,52 @@ impl AgentResidency {
         self: Arc<Self>,
         control: &AgentControl,
         manager: &Arc<ThreadManagerState>,
-        capacity: usize,
-        protected_thread_id: Option<ThreadId>,
+        resident_capacity: usize,
+        execution_capacity: usize,
+        protected_thread_ids: Vec<ThreadId>,
     ) -> CodexResult<AgentResidencySlot> {
         loop {
-            if self.try_reserve_pending_slot(capacity) {
+            if self.try_reserve_pending_slot(resident_capacity) {
                 return Ok(AgentResidencySlot {
                     residency: self,
                     active: true,
                 });
             }
             match self
-                .try_unload_one_resident(control, manager, protected_thread_id)
+                .try_unload_one_resident(control, manager, &protected_thread_ids)
                 .await
             {
-                EvictionResult::Unloaded | EvictionResult::Retry => {}
+                EvictionResult::Unloaded => {}
+                EvictionResult::Retry => {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
                 EvictionResult::Unavailable => {
+                    if self.try_reserve_pending_slot(execution_capacity) {
+                        return Ok(AgentResidencySlot {
+                            residency: self,
+                            active: true,
+                        });
+                    }
                     return Err(CodexErr::new(CodexErrorDetails::AgentLimitReached {
-                        max_threads: capacity,
+                        max_threads: execution_capacity,
                     }));
                 }
+            }
+        }
+    }
+
+    async fn trim_idle_residents(
+        &self,
+        control: &AgentControl,
+        manager: &Arc<ThreadManagerState>,
+        resident_capacity: usize,
+    ) {
+        while self.resident_count() > resident_capacity {
+            if matches!(
+                self.try_unload_one_resident(control, manager, &[]).await,
+                EvictionResult::Retry | EvictionResult::Unavailable
+            ) {
+                return;
             }
         }
     }
@@ -132,12 +223,17 @@ impl AgentResidency {
         &self,
         control: &AgentControl,
         manager: &Arc<ThreadManagerState>,
-        protected_thread_id: Option<ThreadId>,
+        protected_thread_ids: &[ThreadId],
     ) -> EvictionResult {
         let candidates_to_scan = self.resident_count();
+        let mut saw_active_watcher = false;
         for _ in 0..candidates_to_scan {
-            let Some(candidate_thread_id) = self.pop_lru_candidate(protected_thread_id) else {
-                return EvictionResult::Unavailable;
+            let Some(candidate_thread_id) = self.pop_lru_candidate(protected_thread_ids) else {
+                return if saw_active_watcher {
+                    EvictionResult::Retry
+                } else {
+                    EvictionResult::Unavailable
+                };
             };
             let registered_lifecycle = control
                 .get_agent_metadata(candidate_thread_id)
@@ -184,9 +280,8 @@ impl AgentResidency {
             }
             if lifecycle.completion_watcher_active() {
                 self.touch(candidate_thread_id);
-                drop(_transition);
-                lifecycle.wait_for_completion_watcher().await;
-                return EvictionResult::Retry;
+                saw_active_watcher = true;
+                continue;
             }
             let status = candidate_thread.agent_status().await;
             if matches!(
@@ -213,7 +308,11 @@ impl AgentResidency {
             }
             return EvictionResult::Unloaded;
         }
-        EvictionResult::Unavailable
+        if saw_active_watcher {
+            EvictionResult::Retry
+        } else {
+            EvictionResult::Unavailable
+        }
     }
 
     fn resident_count(&self) -> usize {
@@ -224,7 +323,7 @@ impl AgentResidency {
             .len()
     }
 
-    fn pop_lru_candidate(&self, protected_thread_id: Option<ThreadId>) -> Option<ThreadId> {
+    fn pop_lru_candidate(&self, protected_thread_ids: &[ThreadId]) -> Option<ThreadId> {
         let mut state = self
             .state
             .lock()
@@ -232,7 +331,7 @@ impl AgentResidency {
         let candidates_to_scan = state.residents.len();
         for _ in 0..candidates_to_scan {
             let candidate_thread_id = state.residents.pop_front()?;
-            if Some(candidate_thread_id) == protected_thread_id {
+            if protected_thread_ids.contains(&candidate_thread_id) {
                 state.residents.push_back(candidate_thread_id);
                 continue;
             }
@@ -286,7 +385,7 @@ fn is_resident_candidate(thread: &CodexThread) -> bool {
 
 pub(super) fn is_resident_session_source(session_source: &SessionSource) -> bool {
     matches!(session_source, SessionSource::SubAgent(_))
-        && !crate::goal_supervisor::is_goal_supervisor_helper_source(session_source)
+        && !is_goal_supervisor_helper_source(session_source)
 }
 
 pub(super) async fn is_unloadable(thread: &CodexThread) -> bool {
