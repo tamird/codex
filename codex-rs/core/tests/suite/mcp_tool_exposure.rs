@@ -1,5 +1,6 @@
 use anyhow::Result;
 use codex_config::Constrained;
+use codex_core::CodexThread;
 use codex_core::EnvironmentConfig;
 use codex_core::TurnInputRequest;
 use codex_core::config::Config;
@@ -89,6 +90,95 @@ struct AppsMcpServerContributor {
 
 struct SessionSourceMcpContributor {
     observed_sources: Arc<Mutex<Vec<SessionSource>>>,
+}
+
+async fn wait_for_mcp_startup(codex: &CodexThread, server_name: &str) -> Result<String> {
+    loop {
+        let event = tokio::time::timeout(Duration::from_secs(5), codex.next_event()).await??;
+        if matches!(
+            &event.msg,
+            EventMsg::McpStartupUpdate(update)
+                if update.server == server_name
+                    && matches!(update.status, codex_protocol::protocol::McpStartupStatus::Starting)
+        ) {
+            return Ok(event.id);
+        }
+    }
+}
+
+async fn finish_single_mcp_startup_and_turn(
+    codex: &CodexThread,
+    server_name: &str,
+    startup_submit_id: &str,
+    refreshed_servers: &[&str],
+    prompt: &str,
+) -> Result<()> {
+    let mut statuses = vec!["starting"];
+    let mut completed = false;
+    let mut refreshed_completed = refreshed_servers.is_empty();
+
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let event = codex.next_event().await?;
+            match event.msg {
+                EventMsg::McpStartupUpdate(update) if update.server == server_name => {
+                    assert_eq!(event.id, startup_submit_id);
+                    match update.status {
+                        codex_protocol::protocol::McpStartupStatus::Starting => {
+                            statuses.push("starting");
+                        }
+                        codex_protocol::protocol::McpStartupStatus::Ready => {
+                            statuses.push("ready");
+                        }
+                        status @ (codex_protocol::protocol::McpStartupStatus::Cancelled
+                        | codex_protocol::protocol::McpStartupStatus::Failed { .. }) => {
+                            anyhow::bail!(
+                                "MCP server {server_name} unexpectedly returned {status:?}"
+                            )
+                        }
+                    }
+                }
+                EventMsg::McpStartupComplete(summary)
+                    if summary.ready.iter().any(|name| name == server_name) =>
+                {
+                    assert!(summary.cancelled.is_empty());
+                    if event.id == startup_submit_id {
+                        assert!(!completed);
+                        completed = true;
+                    } else {
+                        assert!(!refreshed_completed);
+                        let mut ready =
+                            summary.ready.iter().map(String::as_str).collect::<Vec<_>>();
+                        ready.sort_unstable();
+                        assert_eq!(ready, refreshed_servers);
+                        refreshed_completed = true;
+                    }
+                    if completed && refreshed_completed {
+                        codex
+                            .start_or_steer_turn(TurnInputRequest::user_input(vec![
+                                UserInput::Text {
+                                    text: prompt.to_string(),
+                                    text_elements: Vec::new(),
+                                },
+                            ]))
+                            .await?;
+                    }
+                }
+                EventMsg::TurnComplete(_) if completed && refreshed_completed => {
+                    break;
+                }
+                _ => {}
+            }
+        }
+        Ok::<_, anyhow::Error>(())
+    })
+    .await
+    .expect("MCP startup and subsequent turn should complete")?;
+
+    assert_eq!(statuses, vec!["starting", "ready"]);
+    assert!(completed);
+
+    Ok(())
 }
 
 impl CoalescingMcpContributor {
@@ -263,9 +353,11 @@ fn config_with_mcp_marker(base: &Config, marker: &str) -> Config {
         "enabled": false,
     }))
     .expect("test MCP server config");
+    let mut servers = config.mcp_servers.get().clone();
+    servers.insert(marker.to_string(), server);
     config
         .mcp_servers
-        .set(HashMap::from([(marker.to_string(), server)]))
+        .set(servers)
         .expect("test config should allow MCP servers");
     config
 }
@@ -655,6 +747,187 @@ async fn timeout_refresh_replaces_pending_startup_and_reuses_ready_connection() 
             ready_startup.initialize_attempts(),
         ),
         (2, 1)
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn runtime_refresh_reuses_apps_connection_while_startup_is_pending() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let server = responses::start_mock_server().await;
+    let apps_server_mock = responses::start_mock_server().await;
+    let (gated_apps_server, startup_control) =
+        AppsTestServer::mount_with_startup_control(&apps_server_mock).await?;
+    let apps_server = AppsTestServer::mount_searchable(&server).await?;
+    let release_startup = startup_control.hold_next_successful_initialize();
+    let response = responses::mount_sse_once(
+        &server,
+        sse(vec![
+            ev_response_created("resp-1"),
+            ev_assistant_message("msg-1", "done"),
+            ev_completed("resp-1"),
+        ]),
+    )
+    .await;
+    let contributor = Arc::new(CoalescingMcpContributor::new());
+    let mut extensions = ExtensionRegistryBuilder::new();
+    extensions.mcp_server_contributor(Arc::new(AppsMcpServerContributor {
+        id: "runtime_refresh_pending_apps_test",
+        url: format!("{}/api/codex/ps/mcp", gated_apps_server.chatgpt_base_url),
+        root_resolved: None,
+    }));
+    extensions.mcp_server_contributor(contributor.clone());
+    let mut builder = search_capable_apps_builder(apps_server.chatgpt_base_url)
+        .with_config(enable_deferred_tool_world_state_without_agents)
+        .with_extensions(Arc::new(extensions.build()));
+    let test = builder.build_with_auto_env(&server).await?;
+
+    let startup_submit_id = wait_for_mcp_startup(&test.codex, CODEX_APPS_MCP_SERVER_NAME).await?;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while startup_control.initialize_attempts() == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the initial Apps connection should enter its held startup");
+
+    test.codex
+        .refresh_runtime_config(config_with_mcp_marker(&test.config, "refresh"))
+        .await;
+    tokio::time::timeout(Duration::from_secs(5), contributor.entered.acquire())
+        .await
+        .expect("the changed runtime config should trigger MCP reconciliation")
+        .expect("entered semaphore should remain open")
+        .forget();
+    let error = test
+        .codex
+        .read_mcp_resource(
+            "missing-test-server",
+            ReadResourceRequestParams::new("test://unused"),
+        )
+        .await
+        .expect_err("the unknown server should force MCP runtime publication");
+    assert!(error.to_string().contains("unknown MCP server"));
+    assert_eq!(startup_control.initialize_attempts(), 1);
+
+    release_startup
+        .send(())
+        .expect("the reused Apps connection should still be waiting for release");
+    finish_single_mcp_startup_and_turn(
+        &test.codex,
+        CODEX_APPS_MCP_SERVER_NAME,
+        &startup_submit_id,
+        &[],
+        "use Apps after the pending connection finishes",
+    )
+    .await?;
+    assert_eq!(startup_control.initialize_attempts(), 1);
+    let request = response.single_request();
+    assert!(
+        tools_state_sections(&request)
+            .iter()
+            .any(|tools| tools.contains(SEARCH_CALENDAR_NAMESPACE)),
+        "the completed Apps connection should expose Calendar to the model"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn runtime_refresh_reuses_regular_mcp_connection_while_startup_is_pending() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let server = responses::start_mock_server().await;
+    let mcp_server_mock = responses::start_mock_server().await;
+    let (mcp_server, startup_control) =
+        AppsTestServer::mount_with_startup_control(&mcp_server_mock).await?;
+    let ready_server_mock = responses::start_mock_server().await;
+    let ready_server = AppsTestServer::mount(&ready_server_mock).await?;
+    let ready_url = format!("{}/api/codex/ps/mcp", ready_server.chatgpt_base_url);
+    let release_startup = startup_control.hold_next_successful_initialize();
+    let response = responses::mount_sse_once(
+        &server,
+        sse(vec![
+            ev_response_created("resp-1"),
+            ev_assistant_message("msg-1", "done"),
+            ev_completed("resp-1"),
+        ]),
+    )
+    .await;
+    let initial_ready_url = ready_url.clone();
+    let mut builder = core_test_support::test_codex::test_codex()
+        .with_model_info_override("gpt-5.4", |model| model.supports_search_tool = false)
+        .with_config(move |config| {
+            let regular_server = serde_json::from_value(json!({
+                "url": format!("{}/api/codex/ps/mcp", mcp_server.chatgpt_base_url),
+            }))
+            .expect("test MCP server config should be valid");
+            let mut servers = config.mcp_servers.get().clone();
+            servers.insert("docs".to_string(), regular_server);
+            servers.insert(
+                "ready".to_string(),
+                serde_json::from_value(json!({ "url": initial_ready_url }))
+                    .expect("ready MCP server config should be valid"),
+            );
+            config
+                .mcp_servers
+                .set(servers)
+                .expect("test config should allow MCP servers");
+        });
+    let test = builder.build_with_auto_env(&server).await?;
+
+    let startup_submit_id = wait_for_mcp_startup(&test.codex, "docs").await?;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while startup_control.initialize_attempts() == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the regular MCP connection should enter its held startup");
+    test.codex
+        .read_mcp_resource("ready", ReadResourceRequestParams::new("test://unused"))
+        .await
+        .expect_err("the ready server should reject unsupported resource reads");
+
+    let mut refresh_config = config_with_mcp_marker(&test.config, "refresh");
+    let mut servers = refresh_config.mcp_servers.get().clone();
+    servers.insert(
+        "fresh".to_string(),
+        serde_json::from_value(json!({ "url": ready_url }))
+            .expect("fresh MCP server config should be valid"),
+    );
+    refresh_config
+        .mcp_servers
+        .set(servers)
+        .expect("test config should allow refreshed MCP servers");
+    test.codex.refresh_runtime_config(refresh_config).await;
+    let error = test
+        .codex
+        .read_mcp_resource(
+            "missing-test-server",
+            ReadResourceRequestParams::new("test://unused"),
+        )
+        .await
+        .expect_err("the unknown server should force MCP runtime publication");
+    assert!(error.to_string().contains("unknown MCP server"));
+    assert_eq!(startup_control.initialize_attempts(), 1);
+
+    release_startup
+        .send(())
+        .expect("the reused MCP connection should still be waiting for release");
+    finish_single_mcp_startup_and_turn(
+        &test.codex,
+        "docs",
+        &startup_submit_id,
+        &["docs", "fresh", "ready"],
+        "use the regular MCP server after its pending connection finishes",
+    )
+    .await?;
+    assert_eq!(startup_control.initialize_attempts(), 1);
+    let body = response.single_request().body_json();
+    assert!(
+        namespace_child_tool(&body, "mcp__docs", "calendar_create_event").is_some(),
+        "the completed regular MCP connection should expose its tools: {body}"
     );
     Ok(())
 }
