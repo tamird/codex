@@ -2,6 +2,10 @@ use super::*;
 use crate::agent::status::is_final;
 use crate::context::SubagentNotification;
 use crate::session_prefix::format_inter_agent_completion_message;
+use std::time::Duration;
+use std::time::Instant;
+
+const SLOW_AGENT_DELIVERY_PHASE_THRESHOLD: Duration = Duration::from_millis(10);
 
 /// Input whose submission remains paired with any required communication telemetry context.
 enum AgentDeliveryInput {
@@ -74,8 +78,32 @@ impl AgentControl {
     ) -> CodexResult<String> {
         let metadata = self.ensure_agent_known(agent_id)?;
         let lifecycle = metadata.lifecycle;
+        let communication_mode = match &input {
+            AgentDeliveryInput::UserInput(_) => None,
+            AgentDeliveryInput::InterAgentCommunication { communication, .. } => {
+                Some(if communication.trigger_turn {
+                    "followup"
+                } else {
+                    "message"
+                })
+            }
+        };
         loop {
+            let phase_started_at = communication_mode.map(|_| Instant::now());
             let transition = lifecycle.lock_transition().await;
+            if let (Some(mode), Some(started_at)) = (communication_mode, phase_started_at) {
+                let duration = started_at.elapsed();
+                if duration >= SLOW_AGENT_DELIVERY_PHASE_THRESHOLD {
+                    tracing::debug!(
+                        target: "codex.performance",
+                        operation = "agent.delivery",
+                        phase = "lifecycle_lock",
+                        mode,
+                        duration_us = duration.as_micros(),
+                        "slow inter-agent delivery phase"
+                    );
+                }
+            }
             let state = self.upgrade()?;
             let completion_transition_pending = if lifecycle.completion_watcher_active() {
                 match state.get_thread(agent_id).await {

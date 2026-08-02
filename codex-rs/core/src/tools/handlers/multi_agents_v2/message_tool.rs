@@ -12,6 +12,10 @@ use crate::tools::context::FunctionToolOutput;
 use codex_protocol::ThreadId;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::SubAgentSource;
+use std::time::Duration;
+use std::time::Instant;
+
+const SLOW_AGENT_COMMUNICATION_THRESHOLD: Duration = Duration::from_millis(10);
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum MessageDeliveryMode {
@@ -69,6 +73,7 @@ pub(super) async fn handle_message_string_tool(
         source,
         ..
     } = invocation;
+    let target_resolution_started_at = Instant::now();
     let direct_parent_thread_id = direct_parent_thread_id(&turn.session_source);
     // Persisted pre-validation paths can exceed current AgentPath limits. Resolve the target first
     // so an owned child named `parent` remains addressable, then use the direct parent ID only as a
@@ -80,6 +85,18 @@ pub(super) async fn handle_message_string_tool(
         Err(err) => return Err(err),
     };
     analytics.set_receiver(receiver_thread_id);
+    let target_resolution_duration = target_resolution_started_at.elapsed();
+    if target_resolution_duration >= SLOW_AGENT_COMMUNICATION_THRESHOLD {
+        tracing::debug!(
+            target: "codex.performance",
+            thread_id = %session.thread_id,
+            receiver_thread_id = %receiver_thread_id,
+            operation = "agent.message",
+            phase = "resolve",
+            duration_us = target_resolution_duration.as_micros(),
+            "slow inter-agent target resolution"
+        );
+    }
     let is_direct_parent = direct_parent_thread_id == Some(receiver_thread_id);
     let receiver_agent = if is_direct_parent {
         session
@@ -142,6 +159,7 @@ pub(super) async fn handle_message_string_tool(
         cyber_access_program: turn.cyber_access_program,
         ..Default::default()
     };
+    let delivery_started_at = Instant::now();
     let result = match resume_config {
         Some(resume_config) => {
             session
@@ -171,6 +189,25 @@ pub(super) async fn handle_message_string_tool(
         }
     }
     .map_err(|err| collab_agent_error(receiver_thread_id, err));
+    let delivery_duration = delivery_started_at.elapsed();
+    if delivery_duration >= SLOW_AGENT_COMMUNICATION_THRESHOLD {
+        let delivery_mode = match mode {
+            MessageDeliveryMode::QueueOnly => "message",
+            MessageDeliveryMode::TriggerTurn => "followup",
+        };
+        let outcome = if result.is_ok() { "ok" } else { "error" };
+        tracing::debug!(
+            target: "codex.performance",
+            thread_id = %session.thread_id,
+            receiver_thread_id = %receiver_thread_id,
+            operation = "agent.message",
+            phase = "deliver",
+            mode = delivery_mode,
+            outcome,
+            duration_us = delivery_duration.as_micros(),
+            "slow inter-agent message delivery"
+        );
+    }
     result?;
     emit_sub_agent_activity(
         &session,

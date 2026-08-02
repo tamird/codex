@@ -6,6 +6,8 @@ use std::future::Future;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 use std::sync::Weak;
+use std::time::Duration;
+use std::time::Instant;
 
 use crate::elicitation::ElicitationRequestManager;
 use crate::elicitation::SendEvent;
@@ -19,6 +21,8 @@ use codex_rmcp_client::SendElicitation;
 use futures::FutureExt;
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
+
+const SLOW_ROUTE_ACQUISITION_THRESHOLD: Duration = Duration::from_millis(10);
 
 /// Session-specific state that must not be owned by a shared MCP connection.
 pub(crate) struct McpSessionRoute {
@@ -262,6 +266,7 @@ impl McpConnectionRequestRouter {
         route: Arc<McpSessionRoute>,
     ) -> std::result::Result<ActiveRoute, McpRouteAcquireError> {
         let mut waiter = None;
+        let mut queued_at: Option<(Instant, usize)> = None;
         loop {
             if route.is_closed() {
                 return Err(McpRouteAcquireError::RouteClosed);
@@ -315,11 +320,27 @@ impl McpConnectionRequestRouter {
                             });
                         }
                     }
-                    return Ok(ActiveRoute {
+                    let live_routes = state.live.len();
+                    let active_route = ActiveRoute {
                         route,
                         state: Arc::clone(&self.state),
                         route_available: Arc::clone(&self.route_available),
-                    });
+                    };
+                    drop(state);
+                    if let Some((queued_at, queue_depth)) = queued_at {
+                        let queue_duration = queued_at.elapsed();
+                        if queue_duration >= SLOW_ROUTE_ACQUISITION_THRESHOLD {
+                            tracing::debug!(
+                                target: "codex.performance",
+                                operation = "mcp.route.acquire",
+                                duration_us = queue_duration.as_micros(),
+                                queue_depth,
+                                live_routes,
+                                "slow shared MCP route acquisition"
+                            );
+                        }
+                    }
+                    return Ok(active_route);
                 }
 
                 if waiter.is_none() {
@@ -330,6 +351,7 @@ impl McpConnectionRequestRouter {
                         route: Arc::downgrade(&route),
                     });
                     waiter = Some(id);
+                    queued_at = Some((Instant::now(), state.waiters.len()));
                 }
             }
 
