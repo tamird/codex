@@ -2,6 +2,36 @@ use super::*;
 
 const LOG_RETENTION_DAYS: i64 = 10;
 
+/// Queries an existing logs database without initializing other Codex state.
+pub struct ReadOnlyLogReader {
+    pool: SqlitePool,
+}
+
+impl ReadOnlyLogReader {
+    /// Open the existing logs database without initializing Codex state.
+    pub async fn open(sqlite: &SqliteConfig) -> anyhow::Result<Self> {
+        Self::open_path(sqlite, &sqlite.logs_db_path()).await
+    }
+
+    /// Open an explicitly selected logs database without rewriting its path.
+    pub async fn open_path(sqlite: &SqliteConfig, path: &Path) -> anyhow::Result<Self> {
+        let pool = sqlite
+            .open_read_only_pool(path, /*busy_timeout*/ None)
+            .await?;
+        Ok(Self { pool })
+    }
+
+    /// Query retained log entries using the same filters as the state runtime.
+    pub async fn query_logs(&self, query: &LogQuery) -> anyhow::Result<Vec<LogRow>> {
+        query_logs_in_pool(&self.pool, query).await
+    }
+
+    /// Return the greatest retained log identifier matching the supplied filters.
+    pub async fn max_log_id(&self, query: &LogQuery) -> anyhow::Result<i64> {
+        max_log_id_in_pool(&self.pool, query).await
+    }
+}
+
 impl StateRuntime {
     pub async fn insert_log(&self, entry: &LogEntry) -> anyhow::Result<()> {
         self.insert_logs(std::slice::from_ref(entry)).await
@@ -306,24 +336,7 @@ WHERE id IN (
 
     /// Query logs with optional filters.
     pub async fn query_logs(&self, query: &LogQuery) -> anyhow::Result<Vec<LogRow>> {
-        let mut builder = QueryBuilder::<Sqlite>::new(
-            "SELECT id, ts, ts_nanos, level, target, feedback_log_body AS message, thread_id, process_uuid, file, line FROM logs WHERE 1 = 1",
-        );
-        push_log_filters(&mut builder, query);
-        if query.descending {
-            builder.push(" ORDER BY id DESC");
-        } else {
-            builder.push(" ORDER BY id ASC");
-        }
-        if let Some(limit) = query.limit {
-            builder.push(" LIMIT ").push_bind(limit as i64);
-        }
-
-        let rows = builder
-            .build_query_as::<LogRow>()
-            .fetch_all(self.logs_pool.as_ref())
-            .await?;
-        Ok(rows)
+        query_logs_in_pool(&self.logs_pool, query).await
     }
 
     /// Query feedback logs for a set of threads, capped to the SQLite retention budget.
@@ -432,13 +445,33 @@ WHERE cumulative_estimated_bytes <=
 
     /// Return the max log id matching optional filters.
     pub async fn max_log_id(&self, query: &LogQuery) -> anyhow::Result<i64> {
-        let mut builder =
-            QueryBuilder::<Sqlite>::new("SELECT MAX(id) AS max_id FROM logs WHERE 1 = 1");
-        push_log_filters(&mut builder, query);
-        let row = builder.build().fetch_one(self.logs_pool.as_ref()).await?;
-        let max_id: Option<i64> = row.try_get("max_id")?;
-        Ok(max_id.unwrap_or(0))
+        max_log_id_in_pool(&self.logs_pool, query).await
     }
+}
+
+async fn query_logs_in_pool(pool: &SqlitePool, query: &LogQuery) -> anyhow::Result<Vec<LogRow>> {
+    let mut builder = QueryBuilder::<Sqlite>::new(
+        "SELECT id, ts, ts_nanos, level, target, feedback_log_body AS message, thread_id, process_uuid, file, line FROM logs WHERE 1 = 1",
+    );
+    push_log_filters(&mut builder, query);
+    if query.descending {
+        builder.push(" ORDER BY id DESC");
+    } else {
+        builder.push(" ORDER BY id ASC");
+    }
+    if let Some(limit) = query.limit {
+        builder.push(" LIMIT ").push_bind(limit as i64);
+    }
+
+    Ok(builder.build_query_as::<LogRow>().fetch_all(pool).await?)
+}
+
+async fn max_log_id_in_pool(pool: &SqlitePool, query: &LogQuery) -> anyhow::Result<i64> {
+    let mut builder = QueryBuilder::<Sqlite>::new("SELECT MAX(id) AS max_id FROM logs WHERE 1 = 1");
+    push_log_filters(&mut builder, query);
+    let row = builder.build().fetch_one(pool).await?;
+    let max_id: Option<i64> = row.try_get("max_id")?;
+    Ok(max_id.unwrap_or(0))
 }
 
 #[derive(sqlx::FromRow)]
@@ -474,6 +507,16 @@ fn push_log_filters(builder: &mut QueryBuilder<Sqlite>, query: &LogQuery) {
             let mut separated = builder.separated(", ");
             for level_upper in &query.levels_upper {
                 separated.push_bind(level_upper.as_str());
+            }
+        }
+        builder.push(")");
+    }
+    if !query.targets.is_empty() {
+        builder.push(" AND target IN (");
+        {
+            let mut separated = builder.separated(", ");
+            for target in &query.targets {
+                separated.push_bind(target.as_str());
             }
         }
         builder.push(")");
@@ -535,6 +578,7 @@ fn push_like_filters(builder: &mut QueryBuilder<Sqlite>, column: &str, filters: 
 
 #[cfg(test)]
 mod tests {
+    use super::ReadOnlyLogReader;
     use super::StateRuntime;
     use super::format_feedback_log_line;
     use super::test_support::unique_temp_dir;
@@ -564,6 +608,128 @@ mod tests {
             .expect("count log rows");
         pool.close().await;
         count
+    }
+
+    #[tokio::test]
+    async fn read_only_log_reader_does_not_initialize_other_databases() {
+        let codex_home = unique_temp_dir();
+        tokio::fs::create_dir_all(&codex_home)
+            .await
+            .expect("create SQLite home");
+        let sqlite = crate::SqliteConfig::new_for_testing(codex_home.as_path().abs());
+        let pool = sqlite
+            .open_read_write_pool(&sqlite.logs_db_path())
+            .await
+            .expect("create logs database");
+        LOGS_MIGRATOR
+            .run(&pool)
+            .await
+            .expect("migrate logs database");
+        sqlx::query(
+            "INSERT INTO logs (ts, ts_nanos, level, target, feedback_log_body, thread_id) VALUES (?, ?, ?, ?, ?, ?)",
+        )
+        .bind(1_i64)
+        .bind(0_i64)
+        .bind("DEBUG")
+        .bind("codex.performance")
+        .bind("duration_us=250 thread_id=agent-1")
+        .bind("agent-1")
+        .execute(&pool)
+        .await
+        .expect("insert performance log");
+        sqlx::query(
+            "INSERT INTO logs (ts, ts_nanos, level, target, feedback_log_body, thread_id) VALUES (?, ?, ?, ?, ?, ?)",
+        )
+        .bind(2_i64)
+        .bind(0_i64)
+        .bind("DEBUG")
+        .bind("codex.private")
+        .bind("unrelated private message")
+        .bind("agent-1")
+        .execute(&pool)
+        .await
+        .expect("insert unrelated log");
+        pool.close().await;
+
+        let reader = ReadOnlyLogReader::open(&sqlite)
+            .await
+            .expect("open read-only log reader");
+        let query = LogQuery {
+            targets: vec!["codex.performance".to_string()],
+            thread_ids: vec!["agent-1".to_string()],
+            ..Default::default()
+        };
+        let rows = reader.query_logs(&query).await.expect("query logs");
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].message.as_deref(),
+            Some("duration_us=250 thread_id=agent-1")
+        );
+        assert_eq!(
+            reader.max_log_id(&query).await.expect("max log id"),
+            rows[0].id
+        );
+        assert!(!sqlite.state_db_path().exists());
+        assert!(!sqlite.goals_db_path().exists());
+        assert!(!sqlite.memories_db_path().exists());
+        assert!(!sqlite.thread_history_db_path().exists());
+
+        drop(reader);
+        let _ = tokio::fs::remove_dir_all(codex_home).await;
+    }
+
+    #[tokio::test]
+    async fn read_only_log_reader_does_not_create_missing_database() {
+        let codex_home = unique_temp_dir();
+        tokio::fs::create_dir_all(&codex_home)
+            .await
+            .expect("create SQLite home");
+        let sqlite = crate::SqliteConfig::new_for_testing(codex_home.as_path().abs());
+
+        assert!(ReadOnlyLogReader::open(&sqlite).await.is_err());
+        assert!(!sqlite.logs_db_path().exists());
+        assert!(!sqlite.state_db_path().exists());
+        assert!(!sqlite.goals_db_path().exists());
+        assert!(!sqlite.memories_db_path().exists());
+
+        let _ = tokio::fs::remove_dir_all(codex_home).await;
+    }
+
+    #[tokio::test]
+    async fn read_only_log_reader_preserves_explicit_database_filename() {
+        let codex_home = unique_temp_dir();
+        tokio::fs::create_dir_all(&codex_home)
+            .await
+            .expect("create SQLite home");
+        let sqlite = crate::SqliteConfig::new_for_testing(codex_home.as_path().abs());
+        let logs_path = codex_home.join("captured-performance.sqlite");
+        let pool = sqlite
+            .open_read_write_pool(&logs_path)
+            .await
+            .expect("create explicitly named logs database");
+        LOGS_MIGRATOR
+            .run(&pool)
+            .await
+            .expect("migrate explicitly named logs database");
+        pool.close().await;
+
+        let reader = ReadOnlyLogReader::open_path(&sqlite, &logs_path)
+            .await
+            .expect("open explicitly named logs database");
+
+        assert!(
+            reader
+                .query_logs(&LogQuery::default())
+                .await
+                .expect("query explicitly named logs database")
+                .is_empty()
+        );
+        assert!(!sqlite.logs_db_path().exists());
+        assert!(!sqlite.state_db_path().exists());
+
+        drop(reader);
+        let _ = tokio::fs::remove_dir_all(codex_home).await;
     }
 
     #[tokio::test]

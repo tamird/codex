@@ -8,14 +8,17 @@ use clap::ValueEnum;
 use codex_core::config::ConfigBuilder;
 use codex_state::LogQuery;
 use codex_state::LogRow;
+use codex_state::ReadOnlyLogReader;
 use codex_state::SqliteConfig;
-use codex_state::StateRuntime;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use owo_colors::OwoColorize;
 
+/// Cap returned rows to keep shared-database reads bounded.
+const MAX_LOG_QUERY_ROWS: usize = 10_000;
+
 #[derive(Debug, Parser)]
 #[command(name = "codex-state-logs")]
-#[command(about = "Tail Codex logs from the dedicated logs SQLite DB with simple filters")]
+#[command(about = "Read or tail Codex logs from the dedicated logs SQLite database")]
 struct Args {
     /// Path to CODEX_HOME. Defaults to $CODEX_HOME or ~/.codex.
     #[arg(long, env = "CODEX_HOME")]
@@ -28,6 +31,10 @@ struct Args {
     /// Minimum log level to include.
     #[arg(long, value_enum, ignore_case = true)]
     level: Option<LogLevelThreshold>,
+
+    /// Match an exact tracing target. Repeat to include multiple targets.
+    #[arg(long = "target")]
+    target: Vec<String>,
 
     /// Start timestamp (RFC3339 or unix seconds).
     #[arg(long, value_name = "RFC3339|UNIX")]
@@ -57,7 +64,7 @@ struct Args {
     #[arg(long)]
     threadless: bool,
 
-    /// Number of matching rows to show before tailing.
+    /// Maximum matching rows to show initially, capped at 10,000.
     #[arg(long, default_value_t = 200)]
     backfill: usize,
 
@@ -68,11 +75,20 @@ struct Args {
     /// Show compact output with only time, level, and rendered log body.
     #[arg(long)]
     compact: bool,
+
+    /// Print matching retained entries and exit without tailing.
+    #[arg(long)]
+    once: bool,
+
+    /// Emit one machine-readable JSON object per matching log entry.
+    #[arg(long, conflicts_with = "compact")]
+    json: bool,
 }
 
 #[derive(Debug, Clone)]
 struct LogFilter {
     levels_upper: Vec<String>,
+    targets: Vec<String>,
     from_ts: Option<i64>,
     to_ts: Option<i64>,
     module_like: Vec<String>,
@@ -89,6 +105,13 @@ enum LogLevelThreshold {
     Info,
     Warn,
     Error,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LogOutputFormat {
+    Pretty,
+    Compact,
+    Json,
 }
 
 impl LogLevelThreshold {
@@ -109,20 +132,33 @@ async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
     let sqlite = resolve_sqlite_config(&args).await?;
     let filter = build_filter(&args)?;
-    let runtime = StateRuntime::init(sqlite, "logs-client".to_string()).await?;
+    let reader = match args.db.as_deref() {
+        Some(path) => ReadOnlyLogReader::open_path(&sqlite, path).await,
+        None => ReadOnlyLogReader::open(&sqlite).await,
+    }
+    .context("failed to open existing logs database")?;
+    let output_format = if args.json {
+        LogOutputFormat::Json
+    } else if args.compact {
+        LogOutputFormat::Compact
+    } else {
+        LogOutputFormat::Pretty
+    };
 
-    let mut last_id =
-        print_backfill(runtime.as_ref(), &filter, args.backfill, args.compact).await?;
+    let mut last_id = print_backfill(&reader, &filter, args.backfill, output_format).await?;
+    if args.once {
+        return Ok(());
+    }
     if last_id == 0 {
-        last_id = fetch_max_id(runtime.as_ref(), &filter).await?;
+        last_id = fetch_max_id(&reader, &filter).await?;
     }
 
     let poll_interval = Duration::from_millis(args.poll_ms);
     loop {
-        let rows = fetch_new_rows(runtime.as_ref(), &filter, last_id).await?;
+        let rows = fetch_new_rows(&reader, &filter, last_id).await?;
         for row in rows {
             last_id = last_id.max(row.id);
-            println!("{}", format_row(&row, args.compact));
+            println!("{}", format_row(&row, output_format));
         }
         tokio::time::sleep(poll_interval).await;
     }
@@ -164,6 +200,12 @@ fn build_filter(args: &Args) -> anyhow::Result<LogFilter> {
     let levels_upper = args
         .level
         .map_or_else(Vec::new, LogLevelThreshold::levels_upper);
+    let targets = args
+        .target
+        .iter()
+        .filter(|target| !target.is_empty())
+        .cloned()
+        .collect::<Vec<_>>();
     let module_like = args
         .module
         .iter()
@@ -185,6 +227,7 @@ fn build_filter(args: &Args) -> anyhow::Result<LogFilter> {
 
     Ok(LogFilter {
         levels_upper,
+        targets,
         from_ts,
         to_ts,
         module_like,
@@ -206,28 +249,28 @@ fn parse_timestamp(value: &str) -> anyhow::Result<i64> {
 }
 
 async fn print_backfill(
-    runtime: &StateRuntime,
+    reader: &ReadOnlyLogReader,
     filter: &LogFilter,
     backfill: usize,
-    compact: bool,
+    output_format: LogOutputFormat,
 ) -> anyhow::Result<i64> {
     if backfill == 0 {
         return Ok(0);
     }
 
-    let mut rows = fetch_backfill(runtime, filter, backfill).await?;
+    let mut rows = fetch_backfill(reader, filter, backfill).await?;
     rows.reverse();
 
     let mut last_id = 0;
     for row in rows {
         last_id = last_id.max(row.id);
-        println!("{}", format_row(&row, compact));
+        println!("{}", format_row(&row, output_format));
     }
     Ok(last_id)
 }
 
 async fn fetch_backfill(
-    runtime: &StateRuntime,
+    reader: &ReadOnlyLogReader,
     filter: &LogFilter,
     backfill: usize,
 ) -> anyhow::Result<Vec<LogRow>> {
@@ -237,34 +280,34 @@ async fn fetch_backfill(
         /*after_id*/ None,
         /*descending*/ true,
     );
-    runtime
+    reader
         .query_logs(&query)
         .await
         .context("failed to fetch backfill logs")
 }
 
 async fn fetch_new_rows(
-    runtime: &StateRuntime,
+    reader: &ReadOnlyLogReader,
     filter: &LogFilter,
     last_id: i64,
 ) -> anyhow::Result<Vec<LogRow>> {
     let query = to_log_query(
         filter,
-        /*limit*/ None,
+        Some(MAX_LOG_QUERY_ROWS),
         Some(last_id),
         /*descending*/ false,
     );
-    runtime
+    reader
         .query_logs(&query)
         .await
         .context("failed to fetch new logs")
 }
 
-async fn fetch_max_id(runtime: &StateRuntime, filter: &LogFilter) -> anyhow::Result<i64> {
+async fn fetch_max_id(reader: &ReadOnlyLogReader, filter: &LogFilter) -> anyhow::Result<i64> {
     let query = to_log_query(
         filter, /*limit*/ None, /*after_id*/ None, /*descending*/ false,
     );
-    runtime
+    reader
         .max_log_id(&query)
         .await
         .context("failed to fetch max log id")
@@ -278,6 +321,7 @@ fn to_log_query(
 ) -> LogQuery {
     LogQuery {
         levels_upper: filter.levels_upper.clone(),
+        targets: filter.targets.clone(),
         from_ts: filter.from_ts,
         to_ts: filter.to_ts,
         module_like: filter.module_like.clone(),
@@ -286,13 +330,32 @@ fn to_log_query(
         search: filter.search.clone(),
         include_threadless: filter.include_threadless,
         after_id,
-        limit,
+        limit: limit.map(|limit| limit.min(MAX_LOG_QUERY_ROWS)),
         descending,
     }
 }
 
-fn format_row(row: &LogRow, compact: bool) -> String {
-    let timestamp = formatter::ts(row.ts, row.ts_nanos, compact);
+fn format_row(row: &LogRow, output_format: LogOutputFormat) -> String {
+    if output_format == LogOutputFormat::Json {
+        return serde_json::json!({
+            "id": row.id,
+            "timestamp": formatter::ts(row.ts, row.ts_nanos, /*compact*/ false),
+            "level": &row.level,
+            "target": &row.target,
+            "thread_id": &row.thread_id,
+            "process_uuid": &row.process_uuid,
+            "file": &row.file,
+            "line": row.line,
+            "message": &row.message,
+        })
+        .to_string();
+    }
+
+    let timestamp = formatter::ts(
+        row.ts,
+        row.ts_nanos,
+        output_format == LogOutputFormat::Compact,
+    );
     let level = row.level.as_str();
     let target = row.target.as_str();
     let message = row.message.as_deref().unwrap_or("");
@@ -302,7 +365,7 @@ fn format_row(row: &LogRow, compact: bool) -> String {
     let thread_id_colored = thread_id.blue().dimmed().to_string();
     let target_colored = target.dimmed().to_string();
     let message_colored = heuristic_formatting(message);
-    if compact {
+    if output_format == LogOutputFormat::Compact {
         format!("{timestamp_colored} {level_colored} {message_colored}")
     } else {
         format!(
@@ -414,6 +477,85 @@ mod tests {
             .expect("parse uppercase log level");
 
         assert_eq!(args.level, Some(LogLevelThreshold::Warn));
+    }
+
+    #[test]
+    fn exact_target_filter_is_applied_before_reading_rows() {
+        let args = Args::try_parse_from([
+            "codex-state-logs",
+            "--target",
+            "codex.performance",
+            "--target",
+            "codex.agent.performance",
+            "--once",
+        ])
+        .expect("parse exact performance targets");
+        let filter = build_filter(&args).expect("build performance filter");
+        let query = to_log_query(
+            &filter,
+            /*limit*/ Some(10),
+            /*after_id*/ None,
+            /*descending*/ true,
+        );
+
+        assert_eq!(
+            query.targets,
+            vec![
+                "codex.performance".to_string(),
+                "codex.agent.performance".to_string(),
+            ]
+        );
+        assert!(args.once);
+    }
+
+    #[test]
+    fn oversized_backfill_is_bounded_before_querying_shared_logs() {
+        let args = Args::try_parse_from(["codex-state-logs", "--backfill", "10001", "--once"])
+            .expect("parse oversized backfill");
+        let filter = build_filter(&args).expect("build filter");
+        let query = to_log_query(
+            &filter,
+            Some(args.backfill),
+            /*after_id*/ None,
+            /*descending*/ true,
+        );
+
+        assert_eq!(query.limit, Some(MAX_LOG_QUERY_ROWS));
+    }
+
+    #[test]
+    fn json_output_preserves_machine_readable_performance_metadata() {
+        let row = LogRow {
+            id: 7,
+            ts: 1_700_000_000,
+            ts_nanos: 250_000_000,
+            level: "DEBUG".to_string(),
+            target: "codex.performance".to_string(),
+            message: Some("operation=draw duration_us=250".to_string()),
+            thread_id: Some("thread-1".to_string()),
+            process_uuid: Some("process-1".to_string()),
+            file: Some("app.rs".to_string()),
+            line: Some(42),
+        };
+
+        let actual: serde_json::Value =
+            serde_json::from_str(&format_row(&row, LogOutputFormat::Json))
+                .expect("parse performance log JSON");
+
+        assert_eq!(
+            actual,
+            serde_json::json!({
+                "id": 7,
+                "timestamp": "2023-11-14T22:13:20.250Z",
+                "level": "DEBUG",
+                "target": "codex.performance",
+                "thread_id": "thread-1",
+                "process_uuid": "process-1",
+                "file": "app.rs",
+                "line": 42,
+                "message": "operation=draw duration_us=250",
+            })
+        );
     }
 
     /// Explicit database selection must not parse an overridden Codex home.

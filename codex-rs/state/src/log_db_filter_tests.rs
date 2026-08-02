@@ -80,6 +80,7 @@ async fn sqlite_sink_filters_noisy_targets_without_dropping_useful_diagnostics()
         target: "codex_tui::streaming::commit_tick",
         "retained-commit-tick-trace"
     );
+    tracing::debug!(target: "codex.performance", "retained-performance-debug");
     tracing::trace!(
         target: "codex_api::responses_websocket_timing",
         payload = "complete timing payload",
@@ -145,6 +146,11 @@ async fn sqlite_sink_filters_noisy_targets_without_dropping_useful_diagnostics()
                 "TRACE",
                 "codex_tui::streaming::commit_tick",
                 Some("retained-commit-tick-trace"),
+            ),
+            (
+                "DEBUG",
+                "codex.performance",
+                Some("retained-performance-debug"),
             ),
         ]
     );
