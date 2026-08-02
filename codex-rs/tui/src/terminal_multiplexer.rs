@@ -601,6 +601,7 @@ async fn run_multiplexer_spawn_config(
 mod tests {
     use super::*;
     use crate::legacy_core::config::ConfigBuilder;
+    use codex_config::LoaderOverrides;
     use codex_protocol::openai_models::ReasoningEffort;
     use codex_protocol::protocol::GranularApprovalConfig;
     use codex_utils_absolute_path::AbsolutePathBuf;
@@ -692,6 +693,7 @@ mod tests {
     async fn tmux_spawn_config_targets_origin_pane() {
         let codex_home = tempdir().expect("temp codex home");
         let config = ConfigBuilder::default()
+            .loader_overrides(LoaderOverrides::without_managed_config_for_tests())
             .codex_home(codex_home.path().to_path_buf())
             .build()
             .await
@@ -726,6 +728,7 @@ mod tests {
     async fn tmux_spawn_config_rejects_missing_or_malformed_origin_pane() {
         let codex_home = tempdir().expect("temp codex home");
         let config = ConfigBuilder::default()
+            .loader_overrides(LoaderOverrides::without_managed_config_for_tests())
             .codex_home(codex_home.path().to_path_buf())
             .build()
             .await
@@ -762,6 +765,7 @@ mod tests {
     async fn zellij_0_44_spawn_config_stays_near_invoking_pane() {
         let codex_home = tempdir().expect("temp codex home");
         let config = ConfigBuilder::default()
+            .loader_overrides(LoaderOverrides::without_managed_config_for_tests())
             .codex_home(codex_home.path().to_path_buf())
             .build()
             .await
@@ -797,6 +801,7 @@ mod tests {
     async fn zellij_standalone_side_spawn_config_names_and_launches_hidden_child() {
         let codex_home = tempdir().expect("temp codex home");
         let config = ConfigBuilder::default()
+            .loader_overrides(LoaderOverrides::without_managed_config_for_tests())
             .codex_home(codex_home.path().to_path_buf())
             .build()
             .await
@@ -847,6 +852,7 @@ mod tests {
     async fn older_or_unknown_zellij_uses_compatible_pane_arguments() {
         let codex_home = tempdir().expect("temp codex home");
         let config = ConfigBuilder::default()
+            .loader_overrides(LoaderOverrides::without_managed_config_for_tests())
             .codex_home(codex_home.path().to_path_buf())
             .build()
             .await
@@ -884,6 +890,7 @@ mod tests {
     async fn windows_fork_pane_launch_fails_before_building_a_posix_env_command() {
         let codex_home = tempdir().expect("temp codex home");
         let config = ConfigBuilder::default()
+            .loader_overrides(LoaderOverrides::without_managed_config_for_tests())
             .codex_home(codex_home.path().to_path_buf())
             .build()
             .await
@@ -940,6 +947,7 @@ mod tests {
     async fn fork_command_parts_include_current_session_overrides() {
         let codex_home = tempdir().expect("temp codex home");
         let mut config = ConfigBuilder::default()
+            .loader_overrides(LoaderOverrides::without_managed_config_for_tests())
             .codex_home(codex_home.path().to_path_buf())
             .build()
             .await
@@ -1018,6 +1026,7 @@ mod tests {
     async fn standalone_side_command_parts_include_live_settings_without_fork_subcommand() {
         let codex_home = tempdir().expect("temp codex home");
         let mut config = ConfigBuilder::default()
+            .loader_overrides(LoaderOverrides::without_managed_config_for_tests())
             .codex_home(codex_home.path().to_path_buf())
             .build()
             .await
@@ -1079,6 +1088,7 @@ mod tests {
     async fn fork_command_parts_preserve_granular_approval_policy() {
         let codex_home = tempdir().expect("temp codex home");
         let mut config = ConfigBuilder::default()
+            .loader_overrides(LoaderOverrides::without_managed_config_for_tests())
             .codex_home(codex_home.path().to_path_buf())
             .build()
             .await
