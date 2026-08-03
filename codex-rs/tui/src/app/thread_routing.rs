@@ -114,8 +114,20 @@ impl App {
         let Some(channel) = self.thread_event_channels.get(&thread_id) else {
             return;
         };
-        let mut store = channel.store.lock().await;
-        store.note_outbound_op(op);
+        let (has_pending_approvals, pending_status) = {
+            let mut store = channel.store.lock().await;
+            store.note_outbound_op(op);
+            (
+                store.has_pending_thread_approvals(),
+                store.side_parent_pending_status(),
+            )
+        };
+        self.update_pending_thread_approval(thread_id, has_pending_approvals);
+        if let Some(status) = pending_status {
+            self.set_side_parent_status(thread_id, Some(status));
+        } else {
+            self.clear_side_parent_action_status(thread_id);
+        }
     }
 
     pub(super) async fn note_active_thread_outbound_op(&mut self, op: &AppCommand) {
@@ -462,8 +474,6 @@ impl App {
         {
             if ThreadEventStore::op_can_change_pending_replay_state(&op) {
                 self.note_thread_outbound_op(thread_id, &op).await;
-                self.refresh_pending_thread_approvals().await;
-                self.refresh_side_parent_status_from_store(thread_id).await;
             }
             return Ok(());
         }
@@ -887,8 +897,6 @@ impl App {
             Ok(()) => {
                 if ThreadEventStore::op_can_change_pending_replay_state(op) {
                     self.note_thread_outbound_op(thread_id, op).await;
-                    self.refresh_pending_thread_approvals().await;
-                    self.refresh_side_parent_status_from_store(thread_id).await;
                 }
                 Ok(true)
             }
@@ -898,21 +906,6 @@ impl App {
                 ));
                 Ok(false)
             }
-        }
-    }
-
-    pub(super) async fn refresh_side_parent_status_from_store(&mut self, thread_id: ThreadId) {
-        let Some(channel) = self.thread_event_channels.get(&thread_id) else {
-            return;
-        };
-        let status = {
-            let store = channel.store.lock().await;
-            store.side_parent_pending_status()
-        };
-        if let Some(status) = status {
-            self.set_side_parent_status(thread_id, Some(status));
-        } else {
-            self.clear_side_parent_action_status(thread_id);
         }
     }
 

@@ -77,6 +77,54 @@ async fn agent_message_delta_does_not_wait_for_unrelated_approval_store() -> Res
 }
 
 #[tokio::test]
+#[expect(
+    clippy::await_holding_invalid_type,
+    reason = "the locked unrelated store proves approval resolution does not wait for it"
+)]
+async fn resolving_approval_does_not_wait_for_unrelated_thread_store() -> Result<()> {
+    let (mut app, agent_thread_id) = app_with_pending_approval(/*capacity*/ 4).await?;
+    let request = exec_approval_request(
+        agent_thread_id,
+        "turn-approval",
+        "call-approval",
+        /*approval_id*/ None,
+    );
+    assert_eq!(
+        app.pending_app_server_requests
+            .note_server_request(&request),
+        None
+    );
+
+    let unrelated_channel = ThreadEventChannel::new(/*capacity*/ 1);
+    let unrelated_store = Arc::clone(&unrelated_channel.store);
+    app.thread_event_channels
+        .insert(ThreadId::new(), unrelated_channel);
+    let unrelated_store_lock = unrelated_store.lock().await;
+    let mut app_server = Box::pin(crate::start_embedded_app_server_for_picker(&app.config)).await?;
+
+    tokio::time::timeout(
+        std::time::Duration::from_secs(/*secs*/ 5),
+        app.submit_thread_op(
+            &mut app_server,
+            agent_thread_id,
+            AppCommand::exec_approval(
+                "call-approval".to_string(),
+                Some("turn-approval".to_string()),
+                codex_app_server_protocol::CommandExecutionApprovalDecision::Accept,
+            ),
+        ),
+    )
+    .await
+    .expect("approval resolution must not wait for an unrelated thread store")?;
+
+    assert!(app.chat_widget.pending_thread_approvals().is_empty());
+    drop(unrelated_store_lock);
+    app_server.shutdown().await?;
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn pending_approval_label_updates_the_thread_with_a_duplicate_label() -> Result<()> {
     let (mut app, first_thread_id) = app_with_pending_approval(/*capacity*/ 4).await?;
     assert_eq!(
