@@ -1448,7 +1448,7 @@ index 1111111..2222222
     let contents = std::fs::read_to_string(&capture_path).expect("read captured analytics events");
     let event_types = contents
         .lines()
-        .flat_map(|line| {
+        .map(|line| {
             serde_json::from_str::<serde_json::Value>(line)
                 .expect("parse captured analytics events")["events"]
                 .as_array()
@@ -1463,11 +1463,15 @@ index 1111111..2222222
                 .collect::<Vec<_>>()
         })
         .collect::<Vec<_>>();
-    assert!(event_types.iter().any(|event| event == "codex_turn_event"));
-    assert!(
-        event_types
-            .iter()
-            .any(|event| event == "codex_accepted_line_fingerprints")
+    assert_eq!(
+        event_types,
+        vec![
+            vec![
+                "codex_thread_initialized".to_string(),
+                "codex_turn_event".to_string(),
+            ],
+            vec!["codex_accepted_line_fingerprints".to_string()],
+        ]
     );
 
     std::fs::remove_file(capture_path).expect("remove analytics capture file");
@@ -1621,6 +1625,7 @@ fn app_used_dedupe_is_keyed_by_turn_and_connector() {
     let (sender, _receiver) = mpsc::channel(1);
     let queue = AnalyticsEventsQueue {
         sender,
+        dropped_events: Arc::default(),
         app_used_emitted_keys: Arc::new(Mutex::new(HashSet::new())),
         plugin_used_emitted_keys: Arc::new(Mutex::new(HashSet::new())),
     };
@@ -4087,6 +4092,7 @@ fn plugin_used_dedupe_is_keyed_by_turn_and_plugin() {
     let (sender, _receiver) = mpsc::channel(1);
     let queue = AnalyticsEventsQueue {
         sender,
+        dropped_events: Arc::default(),
         app_used_emitted_keys: Arc::new(Mutex::new(HashSet::new())),
         plugin_used_emitted_keys: Arc::new(Mutex::new(HashSet::new())),
     };

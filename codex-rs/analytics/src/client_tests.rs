@@ -99,6 +99,7 @@ use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::atomic::Ordering;
 #[cfg(debug_assertions)]
 use std::time::SystemTime;
 use tokio::sync::mpsc;
@@ -281,6 +282,7 @@ fn client_with_receiver() -> (
     let (sender, receiver) = mpsc::channel(8);
     let queue = AnalyticsEventsQueue {
         sender,
+        dropped_events: Arc::default(),
         app_used_emitted_keys: Arc::new(Mutex::new(HashSet::new())),
         plugin_used_emitted_keys: Arc::new(Mutex::new(HashSet::new())),
     };
@@ -805,6 +807,29 @@ fn track_request_only_enqueues_analytics_relevant_requests() {
         &sample_turn_interrupt_request(""),
     );
     assert!(matches!(receiver.try_recv(), Err(TryRecvError::Empty)));
+
+    let cloned_client = client.clone();
+    let queue_capacity = receiver.max_capacity();
+    for _ in 0..queue_capacity + 3 {
+        cloned_client.track_request(
+            /*connection_id*/ 7,
+            RequestId::Integer(5),
+            &sample_turn_start_request(),
+        );
+    }
+    let queue = client.queue.as_ref().expect("analytics queue should exist");
+    assert_eq!(queue.dropped_events.load(Ordering::Relaxed), 3);
+    assert_eq!(receiver.len(), queue_capacity);
+    receiver
+        .try_recv()
+        .expect("queued fact should remain available");
+    client.track_request(
+        /*connection_id*/ 7,
+        RequestId::Integer(6),
+        &sample_turn_start_request(),
+    );
+    assert_eq!(receiver.len(), queue_capacity);
+    assert_eq!(queue.dropped_events.load(Ordering::Relaxed), 3);
 }
 
 #[test]
@@ -952,4 +977,14 @@ fn track_event_request_batches_only_isolates_accepted_line_fingerprint_events() 
     assert_eq!(batches[3].len(), 2);
     assert!(batches[1][0].should_send_in_isolated_request());
     assert!(batches[2][0].should_send_in_isolated_request());
+
+    let batches = track_event_request_batches(
+        (0..=super::ANALYTICS_EVENTS_QUEUE_SIZE)
+            .map(|index| sample_regular_track_event(&index.to_string()))
+            .collect(),
+    );
+    assert_eq!(
+        batches.iter().map(Vec::len).collect::<Vec<_>>(),
+        vec![super::ANALYTICS_EVENTS_QUEUE_SIZE, 1]
+    );
 }

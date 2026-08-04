@@ -72,6 +72,8 @@ use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
@@ -90,6 +92,7 @@ pub(crate) enum AnalyticsEventsQueueMessage {
 #[derive(Clone)]
 pub(crate) struct AnalyticsEventsQueue {
     pub(crate) sender: mpsc::Sender<AnalyticsEventsQueueMessage>,
+    pub(crate) dropped_events: Arc<AtomicU64>,
     pub(crate) app_used_emitted_keys: Arc<Mutex<HashSet<(String, String)>>>,
     pub(crate) plugin_used_emitted_keys: Arc<Mutex<HashSet<(String, String)>>>,
 }
@@ -157,26 +160,44 @@ fn analytics_capture_file_from_env() -> Option<PathBuf> {
 impl AnalyticsEventsQueue {
     fn new(auth_manager: Arc<AuthManager>, destination: AnalyticsEventsDestination) -> Self {
         let (sender, mut receiver) = mpsc::channel(ANALYTICS_EVENTS_QUEUE_SIZE);
+        let dropped_events = Arc::new(AtomicU64::new(0));
+        let worker_dropped_events = Arc::clone(&dropped_events);
         tokio::spawn(async move {
             let mut reducer = AnalyticsReducer::default();
-            while let Some(input) = receiver.recv().await {
-                let input = match input {
-                    AnalyticsEventsQueueMessage::Fact(input) => *input,
-                    AnalyticsEventsQueueMessage::Flush(done_tx) => {
-                        let mut events = Vec::new();
-                        reducer.flush(&mut events);
-                        send_track_events(&auth_manager, &destination, events).await;
-                        let _ = done_tx.send(());
-                        continue;
-                    }
-                };
+            let mut inputs = Vec::with_capacity(ANALYTICS_EVENTS_QUEUE_SIZE);
+            while receiver
+                .recv_many(&mut inputs, ANALYTICS_EVENTS_QUEUE_SIZE)
+                .await
+                != 0
+            {
                 let mut events = Vec::new();
-                reducer.ingest(input, &mut events).await;
+                for input in inputs.drain(..) {
+                    match input {
+                        AnalyticsEventsQueueMessage::Fact(input) => {
+                            reducer.ingest(*input, &mut events).await;
+                        }
+                        AnalyticsEventsQueueMessage::Flush(done_tx) => {
+                            reducer.flush(&mut events);
+                            send_track_events(
+                                &auth_manager,
+                                &destination,
+                                std::mem::take(&mut events),
+                            )
+                            .await;
+                            let _ = done_tx.send(());
+                        }
+                    }
+                }
                 send_track_events(&auth_manager, &destination, events).await;
+                let dropped_events = worker_dropped_events.swap(0, Ordering::Relaxed);
+                if dropped_events > 0 {
+                    tracing::warn!(dropped_events, "dropping analytics events: queue is full");
+                }
             }
         });
         Self {
             sender,
+            dropped_events,
             app_used_emitted_keys: Arc::new(Mutex::new(HashSet::new())),
             plugin_used_emitted_keys: Arc::new(Mutex::new(HashSet::new())),
         }
@@ -188,8 +209,7 @@ impl AnalyticsEventsQueue {
             .try_send(AnalyticsEventsQueueMessage::Fact(Box::new(input)))
             .is_err()
         {
-            //TODO: add a metric for this
-            tracing::warn!("dropping analytics events: queue is full");
+            self.dropped_events.fetch_add(1, Ordering::Relaxed);
         }
     }
 
@@ -855,6 +875,9 @@ fn track_event_request_batches(events: Vec<TrackEventRequest>) -> Vec<Vec<TrackE
             batches.push(vec![event]);
         } else {
             current_batch.push(event);
+            if current_batch.len() == ANALYTICS_EVENTS_QUEUE_SIZE {
+                batches.push(std::mem::take(&mut current_batch));
+            }
         }
     }
 

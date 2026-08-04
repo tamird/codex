@@ -150,7 +150,7 @@ use codex_app_server_protocol::TurnSteerResponse;
 use codex_app_server_protocol::UserInput;
 use codex_app_server_protocol::WebSearchAction;
 use codex_git_utils::SanitizedGitUrl;
-use codex_git_utils::collect_git_info;
+use codex_git_utils::get_git_remote_urls_assume_git_repo;
 use codex_git_utils::get_git_repo_root;
 use codex_login::default_client::originator;
 use codex_protocol::config_types::ModeKind;
@@ -1230,9 +1230,9 @@ impl AnalyticsReducer {
                     };
                     let repo_root = get_git_repo_root(path.as_path());
                     let repo_url = if let Some(root) = repo_root.as_ref() {
-                        collect_git_info(root)
+                        get_git_remote_urls_assume_git_repo(root)
                             .await
-                            .and_then(|info| info.repository_url)
+                            .and_then(|remotes| remotes.get("origin").cloned())
                     } else {
                         None
                     };
