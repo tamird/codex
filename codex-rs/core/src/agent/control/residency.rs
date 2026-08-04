@@ -466,7 +466,11 @@ impl AgentControl {
         let Ok(thread) = manager.get_thread(thread_id).await else {
             return Ok(false);
         };
-        thread.ensure_rollout_materialized().await;
+        if let Some(live_thread) = thread.session.live_thread()
+            && live_thread.is_persistence_deferred().await
+        {
+            thread.ensure_rollout_materialized().await;
+        }
         thread.flush_rollout().await?;
         let environments = thread.environment_selections().await;
         thread.shutdown_and_wait().await?;

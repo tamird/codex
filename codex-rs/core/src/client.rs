@@ -342,7 +342,7 @@ struct LastResponse {
 
 #[derive(Debug, Clone)]
 pub(crate) struct ResponseContinuation {
-    request: ResponsesApiRequest,
+    request: Arc<ResponsesApiRequest>,
     last_response: LastResponse,
     endpoint: ResponsesEndpoint,
 }
@@ -351,7 +351,7 @@ pub(crate) struct ResponseContinuation {
 struct WebsocketSession {
     connection: Option<ApiWebSocketConnection>,
     endpoint: Option<ResponsesEndpoint>,
-    last_request: Option<ResponsesApiRequest>,
+    last_request: Option<Arc<ResponsesApiRequest>>,
     last_response_rx: Option<oneshot::Receiver<LastResponse>>,
     last_response_from_untraced_warmup: bool,
     connection_reused: StdMutex<bool>,
@@ -464,7 +464,7 @@ impl WebsocketSession {
 
 impl ResponseContinuation {
     pub(crate) fn for_fork(mut self) -> Self {
-        self.request
+        Arc::make_mut(&mut self.request)
             .input
             .retain(|item| !matches!(item, ResponseItem::Reasoning { .. }));
         self
@@ -1981,7 +1981,11 @@ impl ModelClientSession {
                 let original_item_ids = request
                     .input
                     .iter()
-                    .map(|item| item.id().cloned())
+                    .enumerate()
+                    .filter_map(|(index, item)| {
+                        let id = item.id()?;
+                        (!id.is_prefixed()).then(|| (index, id.clone()))
+                    })
                     .collect::<Vec<_>>();
                 self.client
                     .prepare_response_items_for_request(&mut request.input);
@@ -2017,11 +2021,11 @@ impl ModelClientSession {
                 )
                 .await;
             if let Some(original_item_ids) = original_item_ids {
-                for (item, original_item_id) in request.input.iter_mut().zip(original_item_ids) {
-                    item.set_id(original_item_id);
+                for (index, original_item_id) in original_item_ids {
+                    request.input[index].set_id(Some(original_item_id));
                 }
             }
-            self.websocket_session.last_request = Some(request);
+            self.websocket_session.last_request = Some(Arc::new(request));
             self.websocket_session.last_response_from_untraced_warmup = warmup;
             let stream_result = stream_result.map_err(|err| {
                 let response_debug_context = extract_response_debug_context_from_api_error(&err);
@@ -2041,8 +2045,8 @@ impl ModelClientSession {
                 Some(Arc::clone(&self.client.state)),
                 self.websocket_session
                     .last_request
-                    .clone()
-                    .map(|request| (request, endpoint)),
+                    .as_ref()
+                    .map(|request| (Arc::clone(request), endpoint)),
             );
             self.websocket_session.last_response_rx = Some(last_request_rx);
             return Ok(WebsocketStreamOutcome::Stream(stream));
@@ -2277,7 +2281,7 @@ fn map_response_stream(
     inference_trace_attempt: InferenceTraceAttempt,
     provider: SharedModelProvider,
     client_state: Option<Arc<ModelClientState>>,
-    request: Option<(ResponsesApiRequest, ResponsesEndpoint)>,
+    request: Option<(Arc<ResponsesApiRequest>, ResponsesEndpoint)>,
 ) -> (ResponseStream, oneshot::Receiver<LastResponse>) {
     let codex_api::ResponseStream {
         rx_event,
@@ -2305,7 +2309,7 @@ fn map_response_events<S>(
     inference_trace_attempt: InferenceTraceAttempt,
     provider: SharedModelProvider,
     client_state: Option<Arc<ModelClientState>>,
-    request: Option<(ResponsesApiRequest, ResponsesEndpoint)>,
+    request: Option<(Arc<ResponsesApiRequest>, ResponsesEndpoint)>,
 ) -> (ResponseStream, oneshot::Receiver<LastResponse>)
 where
     S: futures::Stream<Item = std::result::Result<ResponseEvent, ApiError>>
@@ -2380,7 +2384,8 @@ where
                         response_id: response_id.clone(),
                         items_added: std::mem::take(&mut items_added),
                     };
-                    if let (Some(client_state), Some((request, endpoint))) = (&client_state, &request)
+                    if let (Some(client_state), Some((request, endpoint))) =
+                        (&client_state, &request)
                         && !last_response.response_id.is_empty()
                     {
                         *client_state
@@ -2388,7 +2393,7 @@ where
                             .lock()
                             .unwrap_or_else(std::sync::PoisonError::into_inner) =
                             Some(ResponseContinuation {
-                                request: request.clone(),
+                                request: Arc::clone(request),
                                 last_response: last_response.clone(),
                                 endpoint: *endpoint,
                             });

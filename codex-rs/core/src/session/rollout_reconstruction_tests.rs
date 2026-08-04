@@ -1492,6 +1492,9 @@ async fn reconstruct_history_replays_world_state_from_latest_compaction_window()
     let rollout_items = completed_user_turn_rollout(
         turn_context.to_turn_context_item(),
         vec![
+            RolloutItem::WorldState(WorldStateItem::patch(object!({
+                "environment": {"status": "before-baseline"}
+            }))),
             RolloutItem::WorldState(WorldStateItem::full(object!({
                 "environment": {"status": "old"}
             }))),
@@ -1505,6 +1508,9 @@ async fn reconstruct_history_replays_world_state_from_latest_compaction_window()
                 window_id: None,
                 segment_state_checkpoint: None,
             }),
+            RolloutItem::WorldState(WorldStateItem::patch(object!({
+                "environment": {"status": "after-compaction"}
+            }))),
             RolloutItem::WorldState(WorldStateItem::full(object!({
                 "environment": {"status": "starting", "cwd": "/workspace"}
             }))),

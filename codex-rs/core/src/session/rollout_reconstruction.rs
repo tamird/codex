@@ -164,22 +164,26 @@ impl Session {
         // stopping once a surviving replacement-history checkpoint and the required resume metadata
         // are both known; then replay only the buffered surviving tail forward to preserve exact
         // history semantics.
-        let has_legacy_compaction_without_window_number =
-            rollout_items.iter().any(|item| {
-                matches!(item, RolloutItem::Compacted(compacted) if compacted.window_number.is_none())
-            });
-        let initial_window = if has_legacy_compaction_without_window_number {
-            None
-        } else {
-            rollout_items.iter().find_map(|item| match item {
-                RolloutItem::SessionMeta(session_meta) => session_meta
+        let mut initial_window = None;
+        let mut fallback_window_number = 0u64;
+        let mut has_legacy_compaction_without_window_number = false;
+        for item in rollout_items {
+            if let RolloutItem::Compacted(compacted) = item {
+                fallback_window_number = fallback_window_number.saturating_add(1);
+                has_legacy_compaction_without_window_number |= compacted.window_number.is_none();
+            } else if initial_window.is_none()
+                && let RolloutItem::SessionMeta(session_meta) = item
+            {
+                initial_window = session_meta
                     .meta
                     .context_window
                     .as_ref()
-                    .and_then(reconstructed_window_from_session_context_window),
-                _ => None,
-            })
-        };
+                    .and_then(reconstructed_window_from_session_context_window);
+            }
+        }
+        if has_legacy_compaction_without_window_number {
+            initial_window = None;
+        }
         let mut base_replacement_history: Option<&[ResponseItemEnvelope]> = None;
         let mut previous_turn_settings = None;
         let mut previous_turn_settings_resolved = false;
@@ -426,14 +430,6 @@ impl Session {
             );
         }
 
-        let fallback_window_number = u64::try_from(
-            rollout_items
-                .iter()
-                .filter(|item| matches!(item, RolloutItem::Compacted(_)))
-                .count(),
-        )
-        .unwrap_or(u64::MAX);
-
         let mut history = ContextManager::new();
         let mut saw_legacy_compaction_without_replacement_history = false;
         if let Some(base_replacement_history) = base_replacement_history {
@@ -512,6 +508,7 @@ impl Session {
         // chronologically so compaction resets and merge patches have their original meaning.
         world_state_replay.reverse();
         let mut world_state_baseline: Option<WorldStateSnapshot> = None;
+        let mut missing_world_state_baselines = 0usize;
         for item in world_state_replay {
             match item {
                 RolloutItem::Compacted(_) => world_state_baseline = None,
@@ -520,7 +517,7 @@ impl Session {
                 }
                 RolloutItem::WorldState(world_state) => {
                     let Some(baseline) = world_state_baseline.as_mut() else {
-                        tracing::warn!("ignored world-state patch without a full snapshot");
+                        missing_world_state_baselines += 1;
                         continue;
                     };
                     baseline.apply_merge_patch(&world_state.state);
@@ -537,6 +534,12 @@ impl Session {
                     unreachable!("only world-state replay items are collected")
                 }
             }
+        }
+        if missing_world_state_baselines > 0 {
+            tracing::warn!(
+                dropped_patches = missing_world_state_baselines,
+                "ignored world-state patches without a full snapshot"
+            );
         }
 
         let window = window.or(initial_window).unwrap_or(ReconstructedWindow {

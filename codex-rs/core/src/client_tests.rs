@@ -663,10 +663,10 @@ fn response_continuation_for_fork_drops_historical_reasoning_but_keeps_latest() 
     let latest_reasoning = reasoning_item("rs-latest", "latest analysis");
     let latest_message = output_message("msg-latest", "assistant output");
     let response_continuation = ResponseContinuation {
-        request: ResponsesApiRequest {
+        request: Arc::new(ResponsesApiRequest {
             model: "gpt-test".to_string(),
             instructions: "base instructions".to_string(),
-            input: vec![user_message.clone(), old_reasoning],
+            input: vec![user_message.clone(), old_reasoning.clone()],
             tools: Some(
                 Arc::<serde_json::value::RawValue>::from(
                     serde_json::value::RawValue::from_string("[]".to_string())
@@ -686,16 +686,30 @@ fn response_continuation_for_fork_drops_historical_reasoning_but_keeps_latest() 
             text: None,
             client_metadata: None,
             access_programs: None,
-        },
+        }),
         last_response: LastResponse {
             response_id: "parent-resp".to_string(),
             items_added: vec![latest_reasoning.clone(), latest_message.clone()],
         },
         endpoint: ResponsesEndpoint::Responses,
-    }
-    .for_fork();
+    };
+    let parent_continuation = response_continuation.clone();
+    assert!(Arc::ptr_eq(
+        &parent_continuation.request,
+        &response_continuation.request
+    ));
 
+    let response_continuation = response_continuation.for_fork();
+
+    assert_eq!(
+        parent_continuation.request.input,
+        vec![user_message.clone(), old_reasoning]
+    );
     assert_eq!(response_continuation.request.input, vec![user_message]);
+    assert!(!Arc::ptr_eq(
+        &parent_continuation.request,
+        &response_continuation.request
+    ));
     assert_eq!(
         response_continuation.last_response.items_added,
         vec![latest_reasoning, latest_message]
@@ -745,7 +759,7 @@ async fn inherited_response_continuation_obeys_endpoint_on_new_connection(
     )?;
     let parent_output = output_message("parent", "parent output");
     let continuation = ResponseContinuation {
-        request: parent_request,
+        request: parent_request.into(),
         last_response: LastResponse {
             response_id: "parent-response".to_string(),
             items_added: vec![parent_output.clone()],
@@ -854,7 +868,7 @@ fn model_reroute_reset_discards_provider_route_segment_state() {
         access_programs: None,
     };
     let continuation = ResponseContinuation {
-        request: request.clone(),
+        request: request.clone().into(),
         endpoint: ResponsesEndpoint::Responses,
         last_response: LastResponse {
             response_id: "test-response".to_string(),
@@ -868,7 +882,7 @@ fn model_reroute_reset_discards_provider_route_segment_state() {
         .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(continuation);
 
     let mut session = client.new_session();
-    session.websocket_session.last_request = Some(request);
+    session.websocket_session.last_request = Some(request.into());
     let (_last_response_tx, last_response_rx) = tokio::sync::oneshot::channel();
     session.websocket_session.last_response_rx = Some(last_response_rx);
     session.websocket_session.last_response_from_untraced_warmup = true;

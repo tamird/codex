@@ -1626,15 +1626,16 @@ impl ThreadManager {
     pub async fn fork_prepared_thread(
         &self,
         config: Config,
-        prepared: PreparedFork,
+        mut prepared: PreparedFork,
         thread_source: Option<ThreadSource>,
         parent_trace: Option<W3cTraceContext>,
         client_mcp_extensions: ClientMcpExtensions,
         reserved_thread_id: Option<ThreadId>,
     ) -> CodexResult<(NewThread, Arc<Vec<RolloutItem>>)> {
         let source_thread_id = prepared.source_thread_id;
-        let prepared_context =
-            InitialHistory::Forked(Arc::unwrap_or_clone(Arc::clone(&prepared.model_context)));
+        let prepared_context = InitialHistory::Forked(Arc::unwrap_or_clone(std::mem::take(
+            &mut prepared.model_context,
+        )));
         let multi_agent_version = self
             .state
             .effective_multi_agent_version_for_spawn(
@@ -1648,7 +1649,7 @@ impl ThreadManager {
         let interrupted_marker =
             InterruptedTurnHistoryMarker::from_config_and_version(&config, multi_agent_version);
         let prepared_response_history =
-            Arc::unwrap_or_clone(Arc::clone(&prepared.response_history));
+            Arc::unwrap_or_clone(std::mem::take(&mut prepared.response_history));
         let prepared_items = prepared_response_history.len();
         let snapshot_response_history = if prepared.interrupt_if_open {
             fork_history_from_snapshot(
@@ -1686,9 +1687,6 @@ impl ThreadManager {
         {
             history_items.extend_from_slice(synthesized_suffix);
         }
-        let mut response_history =
-            snapshot_response_history.get_rollout_items()[..prepared_items].to_vec();
-        response_history.extend_from_slice(synthesized_suffix);
         let InitialHistory::Forked(mut model_history_override) = prepared_context else {
             unreachable!("prepared model context is forked history");
         };
@@ -1722,6 +1720,9 @@ impl ThreadManager {
                 _ => None,
             })
             .collect::<Vec<_>>();
+        let InitialHistory::Forked(response_history) = snapshot_response_history else {
+            unreachable!("prepared response history is forked history");
+        };
         let shared_model_response_items = if synthesized_response_items.is_empty() {
             shared_model_response_items
         } else {

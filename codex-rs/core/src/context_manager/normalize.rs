@@ -352,20 +352,16 @@ pub(crate) fn strip_images_when_unsupported(
             ResponseItem::FunctionCallOutput { output, .. }
             | ResponseItem::CustomToolCallOutput { output, .. } => {
                 if let Some(content_items) = output.content_items_mut() {
-                    let mut normalized_content_items = Vec::with_capacity(content_items.len());
-                    for content_item in content_items.iter() {
-                        match content_item {
-                            FunctionCallOutputContentItem::InputImage { .. } => {
-                                normalized_content_items.push(
-                                    FunctionCallOutputContentItem::InputText {
-                                        text: UnsupportedMedia::IMAGE.render(),
-                                    },
-                                );
-                            }
-                            _ => normalized_content_items.push(content_item.clone()),
+                    for content_item in content_items.iter_mut() {
+                        if matches!(
+                            content_item,
+                            FunctionCallOutputContentItem::InputImage { .. }
+                        ) {
+                            *content_item = FunctionCallOutputContentItem::InputText {
+                                text: UnsupportedMedia::IMAGE.render(),
+                            };
                         }
                     }
-                    *content_items = normalized_content_items;
                 }
             }
             ResponseItem::ImageGenerationCall { result, .. } => {

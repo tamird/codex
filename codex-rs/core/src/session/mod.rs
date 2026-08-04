@@ -212,7 +212,7 @@ use crate::config::PermissionProfileState;
 use crate::config::StartedNetworkProxy;
 use crate::config::resolve_web_search_mode_for_turn;
 use crate::context_manager::ContextManager;
-use crate::thread_rollout_truncation::initial_history_has_prior_user_turns;
+use crate::thread_rollout_truncation::rollout_has_prior_user_turns;
 use codex_config::CONFIG_TOML_FILE;
 use codex_config::ConfigLayerSource;
 use codex_config::types::McpServerConfig;
@@ -1597,7 +1597,8 @@ impl Session {
                 ),
             )
         };
-        let has_prior_user_turns = initial_history_has_prior_user_turns(&conversation_history);
+        let has_prior_user_turns =
+            rollout_has_prior_user_turns(conversation_history.get_rollout_items());
         {
             let mut state = self.state.lock().await;
             state.set_next_turn_is_first(!has_prior_user_turns);
@@ -1619,11 +1620,10 @@ impl Session {
                         ForkedHistoryMaterialization::Recent,
                     )
                     .await?;
-                self.state.lock().await.set_next_turn_is_first(
-                    !initial_history_has_prior_user_turns(&InitialHistory::Forked(
-                        logical_rollout_items.clone(),
-                    )),
-                );
+                self.state
+                    .lock()
+                    .await
+                    .set_next_turn_is_first(!rollout_has_prior_user_turns(&logical_rollout_items));
                 if matches!(
                     logical_rollout_items
                         .iter()
@@ -1692,7 +1692,7 @@ impl Session {
                 Self::assign_missing_rollout_response_item_ids(&mut rollout_items);
                 let mut logical_rollout_items =
                     match fork_startup_items.model_history_override.take() {
-                        Some(model_history) => model_history,
+                        Some(model_history) => Cow::Owned(model_history),
                         None => {
                             self.materialize_forked_history(
                                 &rollout_items,
@@ -1718,17 +1718,21 @@ impl Session {
                         .rev()
                         .find(|item| crate::context_manager::is_user_turn_boundary(&item.item))
                 {
-                    logical_rollout_items.push(RolloutItem::ResponseItem(latest_user_item.clone()));
+                    // TurnContext reconstruction requires the real user-turn boundary even
+                    // though the complete response transcript remains in its shared Arc.
+                    logical_rollout_items
+                        .to_mut()
+                        .push(RolloutItem::ResponseItem(latest_user_item.clone()));
                 }
-                Self::assign_missing_rollout_response_item_ids(&mut logical_rollout_items);
+                if let Cow::Owned(items) = &mut logical_rollout_items {
+                    Self::assign_missing_rollout_response_item_ids(items);
+                }
                 let has_prior_user_turns = match &shared_model_response_items {
                     Some(items) => items
                         .iter()
                         .rev()
                         .any(|item| crate::context_manager::is_user_turn_boundary(&item.item)),
-                    None => initial_history_has_prior_user_turns(&InitialHistory::Forked(
-                        logical_rollout_items.clone(),
-                    )),
+                    None => rollout_has_prior_user_turns(&logical_rollout_items),
                 };
                 self.state
                     .lock()
@@ -1840,16 +1844,16 @@ impl Session {
         Ok(())
     }
 
-    async fn materialize_forked_history(
+    async fn materialize_forked_history<'a>(
         &self,
-        rollout_items: &[RolloutItem],
+        rollout_items: &'a [RolloutItem],
         materialization: ForkedHistoryMaterialization,
-    ) -> CodexResult<Vec<RolloutItem>> {
+    ) -> CodexResult<Cow<'a, [RolloutItem]>> {
         if !rollout_items
             .iter()
             .any(|item| matches!(item, RolloutItem::RolloutReference(_)))
         {
-            return Ok(rollout_items.to_vec());
+            return Ok(Cow::Borrowed(rollout_items));
         }
         let (codex_home, history_mode) = {
             let state = self.state.lock().await;
@@ -1878,28 +1882,28 @@ impl Session {
             )
         });
         match materialization {
-            ForkedHistoryMaterialization::Recent => Ok(materialize_recent_rollout_lines_from(
-                codex_home.as_path(),
-                lines,
-            )
-            .await?
-            .into_iter()
-            .map(|line| line.item)
-            .collect()),
-            ForkedHistoryMaterialization::ModelContext
-                if matches!(history_mode, ThreadHistoryMode::Legacy) && !bounded_legacy_cutoff =>
-            {
-                materialize_model_context_rollout_items_from(codex_home.as_path(), lines)
-                    .await
-                    .map_err(Into::into)
-            }
-            ForkedHistoryMaterialization::ModelContext => Ok(
+            ForkedHistoryMaterialization::Recent => Ok(Cow::Owned(
                 materialize_recent_rollout_lines_from(codex_home.as_path(), lines)
                     .await?
                     .into_iter()
                     .map(|line| line.item)
                     .collect(),
-            ),
+            )),
+            ForkedHistoryMaterialization::ModelContext
+                if matches!(history_mode, ThreadHistoryMode::Legacy) && !bounded_legacy_cutoff =>
+            {
+                materialize_model_context_rollout_items_from(codex_home.as_path(), lines)
+                    .await
+                    .map(Cow::Owned)
+                    .map_err(Into::into)
+            }
+            ForkedHistoryMaterialization::ModelContext => Ok(Cow::Owned(
+                materialize_recent_rollout_lines_from(codex_home.as_path(), lines)
+                    .await?
+                    .into_iter()
+                    .map(|line| line.item)
+                    .collect(),
+            )),
         }
     }
 
@@ -1932,6 +1936,36 @@ impl Session {
         shared_model_response_items: Option<Arc<Vec<ResponseItemEnvelope>>>,
         shared_model_state: Option<ForkModelState>,
     ) -> Option<PreviousTurnSettings> {
+        if let Some(source_model_state) = shared_model_state.as_ref() {
+            let previous_turn_settings = source_model_state.previous_turn_settings.clone();
+            let mut state = self.state.lock().await;
+            state.replace_shared_history_snapshot(&source_model_state.history);
+            state.restore_auto_compact_window(
+                source_model_state.window_number,
+                source_model_state.window_ids,
+            );
+            state.set_previous_turn_settings(source_model_state.previous_turn_settings.clone());
+            if let Some(rate_limits) = source_model_state.latest_rate_limits.clone() {
+                state.set_rate_limits(rate_limits);
+            }
+            if matches!(
+                turn_context.config.model_auto_compact_token_limit_scope,
+                AutoCompactTokenLimitScope::BodyAfterPrefix
+            ) {
+                let base_instructions = BaseInstructions {
+                    text: state.session_configuration.base_instructions.clone(),
+                    provenance: state.base_instructions_provenance.clone(),
+                };
+                if let Some(prefix_tokens) = state
+                    .history
+                    .estimate_token_count_with_base_instructions(&base_instructions)
+                {
+                    state.set_auto_compact_window_estimated_prefill(prefix_tokens);
+                }
+            }
+            return previous_turn_settings;
+        }
+
         let reconstruction = self
             .prepare_rollout_reconstruction(
                 turn_context,

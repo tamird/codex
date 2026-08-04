@@ -7,7 +7,6 @@ use crate::context_manager::is_user_turn_boundary;
 use crate::event_mapping;
 use codex_app_server_protocol::TurnStatus;
 use codex_app_server_protocol::build_turns_from_rollout_items;
-use codex_history::InitialHistory;
 use codex_history::RolloutItem;
 use codex_protocol::error::CodexErr;
 use codex_protocol::error::Result as CodexResult;
@@ -16,8 +15,8 @@ use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::InterAgentCommunication;
 
-pub(crate) fn initial_history_has_prior_user_turns(conversation_history: &InitialHistory) -> bool {
-    conversation_history.scan_rollout_items(rollout_item_is_user_turn_boundary)
+pub(crate) fn rollout_has_prior_user_turns(rollout_items: &[RolloutItem]) -> bool {
+    rollout_items.iter().any(rollout_item_is_user_turn_boundary)
 }
 
 fn rollout_item_is_user_turn_boundary(item: &RolloutItem) -> bool {
