@@ -131,13 +131,7 @@ impl ThreadWatchManager {
 
     #[cfg(test)]
     pub(crate) async fn running_turn_count(&self) -> usize {
-        self.state
-            .lock()
-            .await
-            .runtime_by_thread_id
-            .values()
-            .filter(|runtime| runtime.running)
-            .count()
+        self.state.lock().await.running_turn_count
     }
 
     pub(crate) fn subscribe_running_turn_count(&self) -> watch::Receiver<usize> {
@@ -227,11 +221,7 @@ impl ThreadWatchManager {
         let notification = {
             let mut state = self.state.lock().await;
             let notification = mutate(&mut state);
-            let running_turn_count = state
-                .runtime_by_thread_id
-                .values()
-                .filter(|runtime| runtime.running)
-                .count();
+            let running_turn_count = state.running_turn_count;
             self.running_turn_count_tx.send_if_modified(|current| {
                 if *current == running_turn_count {
                     false
@@ -311,6 +301,7 @@ pub(crate) fn resolve_thread_status(
 struct ThreadWatchState {
     runtime_by_thread_id: HashMap<String, RuntimeFacts>,
     status_watcher_by_thread_id: HashMap<String, watch::Sender<ThreadStatus>>,
+    running_turn_count: usize,
 }
 
 impl ThreadWatchState {
@@ -335,7 +326,9 @@ impl ThreadWatchState {
 
     fn remove_thread(&mut self, thread_id: &str) -> Option<ThreadStatusChangedNotification> {
         let previous_status = self.status_for(thread_id);
-        self.runtime_by_thread_id.remove(thread_id);
+        if let Some(runtime) = self.runtime_by_thread_id.remove(thread_id) {
+            self.running_turn_count -= usize::from(runtime.running);
+        }
         self.update_status_watcher(thread_id, &ThreadStatus::NotLoaded);
         if previous_status.is_some() && previous_status != Some(ThreadStatus::NotLoaded) {
             Some(ThreadStatusChangedNotification {
@@ -360,8 +353,14 @@ impl ThreadWatchState {
             .runtime_by_thread_id
             .entry(thread_id.to_string())
             .or_default();
+        let was_running = runtime.running;
         runtime.is_loaded = true;
         mutate(runtime);
+        match (was_running, runtime.running) {
+            (false, true) => self.running_turn_count += 1,
+            (true, false) => self.running_turn_count -= 1,
+            (false, false) | (true, true) => {}
+        }
         self.update_status_watcher_for_thread(thread_id);
         self.status_changed_notification(thread_id.to_string(), previous_status)
     }
@@ -684,22 +683,45 @@ mod tests {
     #[tokio::test]
     async fn has_running_turns_tracks_runtime_running_flag_only() {
         let manager = ThreadWatchManager::new();
+        let mut running_turn_count = manager.subscribe_running_turn_count();
         manager.upsert_thread(INTERACTIVE_THREAD_ID).await;
 
         assert_eq!(manager.running_turn_count().await, 0);
+        assert!(!running_turn_count.has_changed().unwrap());
 
         let _permission_guard = manager
             .note_permission_requested(INTERACTIVE_THREAD_ID)
             .await;
         assert_eq!(manager.running_turn_count().await, 0);
+        assert!(!running_turn_count.has_changed().unwrap());
 
         manager.note_turn_started(INTERACTIVE_THREAD_ID).await;
         assert_eq!(manager.running_turn_count().await, 1);
+        assert_eq!(*running_turn_count.borrow_and_update(), 1);
+
+        manager.note_turn_started(INTERACTIVE_THREAD_ID).await;
+        assert_eq!(manager.running_turn_count().await, 1);
+        assert!(!running_turn_count.has_changed().unwrap());
+
+        manager.note_turn_started(NON_INTERACTIVE_THREAD_ID).await;
+        assert_eq!(*running_turn_count.borrow_and_update(), 2);
+
+        manager
+            .note_thread_shutdown(NON_INTERACTIVE_THREAD_ID)
+            .await;
+        assert_eq!(*running_turn_count.borrow_and_update(), 1);
+
+        manager.remove_thread(INTERACTIVE_THREAD_ID).await;
+        assert_eq!(*running_turn_count.borrow_and_update(), 0);
+
+        manager.note_turn_started(INTERACTIVE_THREAD_ID).await;
+        assert_eq!(*running_turn_count.borrow_and_update(), 1);
 
         manager
             .note_turn_completed(INTERACTIVE_THREAD_ID, false)
             .await;
         assert_eq!(manager.running_turn_count().await, 0);
+        assert_eq!(*running_turn_count.borrow_and_update(), 0);
     }
 
     #[tokio::test]
