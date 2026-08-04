@@ -2,7 +2,14 @@
 
 use super::HistoryCell;
 use super::HistoryRenderMode;
+use crate::history_cell::StreamingAgentTailCell;
+use crate::history_cell::StreamingPlanTailCell;
+use crate::terminal_hyperlinks::HyperlinkLine;
+use crate::terminal_hyperlinks::HyperlinkParagraph;
+use ratatui::style::Style;
 use std::cell::Cell;
+use std::cell::Ref;
+use std::cell::RefCell;
 
 /// Identifies the render state that determines an active cell's viewport height.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -25,6 +32,23 @@ pub(super) struct ActiveCellLayoutCache {
     pub(super) rendered_height: Option<usize>,
 }
 
+#[derive(Debug, Eq, PartialEq)]
+struct ActiveCellRenderKey {
+    width: u16,
+    revision: u64,
+    animation_tick: Option<u64>,
+    render_mode: HistoryRenderMode,
+    syntax_theme_revision: u64,
+}
+
+#[derive(Default)]
+pub(super) struct ActiveCellRender {
+    key: Option<ActiveCellRenderKey>,
+    pub(super) desired_height: u16,
+    pub(super) paragraph_height: usize,
+    pub(super) lines: Vec<HyperlinkLine>,
+}
+
 #[derive(Default)]
 pub(super) struct TranscriptState {
     pub(super) active_cell: Option<Box<dyn HistoryCell>>,
@@ -32,6 +56,8 @@ pub(super) struct TranscriptState {
     pub(super) active_cell_revision: u64,
     /// One bounded entry shared by layout and paint across unchanged active-cell frames.
     pub(super) active_cell_layout: Cell<Option<ActiveCellLayoutCache>>,
+    /// Reuses one exact active-cell layout across consecutive unchanged viewport frames.
+    active_cell_render: RefCell<ActiveCellRender>,
     /// Markdown of the most recently completed agent response for whole-response copying.
     pub(super) last_agent_markdown: Option<String>,
     /// Original source of that response, before display sanitization, for exact block copying.
@@ -78,8 +104,46 @@ impl TranscriptState {
         let active_cell = self.active_cell.take();
         if active_cell.is_some() {
             self.active_cell_layout.set(None);
+            *self.active_cell_render.get_mut() = ActiveCellRender::default();
         }
         active_cell
+    }
+
+    pub(super) fn render_active_cell(
+        &self,
+        cell: &dyn HistoryCell,
+        width: u16,
+        render_mode: HistoryRenderMode,
+    ) -> Ref<'_, ActiveCellRender> {
+        let key = ActiveCellRenderKey {
+            width,
+            revision: self.active_cell_revision,
+            animation_tick: cell.transcript_animation_tick(),
+            render_mode,
+            syntax_theme_revision: crate::render::highlight::syntax_theme_revision(),
+        };
+        {
+            let mut cached = self.active_cell_render.borrow_mut();
+            if cached.key.as_ref() != Some(&key) {
+                let lines = cell.display_hyperlink_lines(width);
+                let paragraph_height =
+                    HyperlinkParagraph::new(&lines, Style::default()).line_count(width);
+                let desired_height = if cell.as_any().is::<StreamingAgentTailCell>()
+                    || cell.as_any().is::<StreamingPlanTailCell>()
+                {
+                    paragraph_height.try_into().unwrap_or(0)
+                } else {
+                    HistoryCell::desired_height(cell, width)
+                };
+                *cached = ActiveCellRender {
+                    key: Some(key),
+                    desired_height,
+                    paragraph_height,
+                    lines,
+                };
+            }
+        }
+        self.active_cell_render.borrow()
     }
 
     pub(super) fn record_agent_markdown(&mut self, markdown: String, source: String) {
@@ -108,7 +172,12 @@ impl TranscriptState {
 
 #[cfg(test)]
 mod tests {
+    use crate::chatwidget::tests::make_chatwidget_manual_with_sender;
+    use crate::render::renderable::Renderable;
     use pretty_assertions::assert_eq;
+    use ratatui::buffer::Buffer;
+    use ratatui::layout::Rect;
+    use ratatui::text::Line;
 
     use super::*;
 
@@ -122,5 +191,49 @@ mod tests {
         state.bump_active_cell_revision();
 
         assert_eq!(state.active_cell_revision, 0);
+    }
+
+    #[tokio::test]
+    async fn streaming_tails_reuse_rendered_lines_without_animation_ticks() {
+        let lines = vec![HyperlinkLine::new(Line::from("visible stream tail"))];
+        let cells: [Box<dyn HistoryCell>; 2] = [
+            Box::new(StreamingAgentTailCell::new(
+                lines.clone(),
+                /*is_first_line*/ true,
+            )),
+            Box::new(StreamingPlanTailCell::new(
+                lines, /*is_stream_continuation*/ false,
+            )),
+        ];
+        for cell in cells {
+            assert_eq!(cell.transcript_animation_tick(), None);
+            let (mut widget, _sender, _events, _operations) =
+                make_chatwidget_manual_with_sender().await;
+            widget.transcript.active_cell = Some(cell);
+            widget.transcript.bump_active_cell_revision();
+            let area = Rect::new(
+                /*x*/ 0, /*y*/ 0, /*width*/ 40, /*height*/ 10,
+            );
+            let mut first = Buffer::empty(area);
+            widget.as_renderable().render(area, &mut first);
+            let first_lines = {
+                let cached = widget.transcript.active_cell_render.borrow();
+                assert!(
+                    cached.key.is_some(),
+                    "the real streaming tail must use the cache"
+                );
+                assert!(!cached.lines.is_empty());
+                cached.lines.as_ptr()
+            };
+
+            let mut second = Buffer::empty(area);
+            widget.as_renderable().render(area, &mut second);
+            assert_eq!(first, second);
+            assert_eq!(
+                widget.transcript.active_cell_render.borrow().lines.as_ptr(),
+                first_lines,
+                "unchanged streaming tails must reuse their rendered lines",
+            );
+        }
     }
 }

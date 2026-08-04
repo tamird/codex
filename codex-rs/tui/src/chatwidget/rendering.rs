@@ -31,7 +31,7 @@ impl ChatWidget {
                 right: active_cell_right_reserve,
                 // Externally backed transcript cells can also change viewport height without an
                 // active-cell revision. Spinner cells remain safe because their indicator width
-                // is stable and their display lines are still rebuilt on every frame.
+                // is stable and cached display lines update when the animation tick changes.
                 persistent_layout: cell.has_stable_transcript_height().then_some(
                     PersistentActiveCellLayout {
                         cache: &self.transcript.active_cell_layout,
@@ -41,6 +41,14 @@ impl ChatWidget {
                         render_mode: self.history_render_mode(),
                     },
                 ),
+                // Stream tails are immutable between revisions and have no animation tick.
+                active_transcript: (cell.transcript_animation_tick().is_some()
+                    || cell.as_any().is::<history_cell::StreamingAgentTailCell>()
+                    || cell.as_any().is::<history_cell::StreamingPlanTailCell>())
+                .then_some(ActiveTranscriptRender {
+                    state: &self.transcript,
+                    render_mode: self.history_render_mode(),
+                }),
             })),
             None => RenderableItem::Owned(Box::new(())),
         };
@@ -51,6 +59,7 @@ impl ChatWidget {
                     top: 1,
                     right: active_cell_right_reserve,
                     persistent_layout: None,
+                    active_transcript: None,
                 }))
             }
             _ => RenderableItem::Owned(Box::new(())),
@@ -66,6 +75,7 @@ impl ChatWidget {
                     top: 1,
                     right: active_cell_right_reserve,
                     persistent_layout: None,
+                    active_transcript: None,
                 })),
             );
         }
@@ -77,6 +87,7 @@ impl ChatWidget {
                     top: 1,
                     right: active_cell_right_reserve,
                     persistent_layout: None,
+                    active_transcript: None,
                 })),
             );
         }
@@ -101,6 +112,7 @@ struct TranscriptAreaRenderable<'a> {
     top: u16,
     right: u16,
     persistent_layout: Option<PersistentActiveCellLayout<'a>>,
+    active_transcript: Option<ActiveTranscriptRender<'a>>,
 }
 
 struct PersistentActiveCellLayout<'a> {
@@ -110,25 +122,63 @@ struct PersistentActiveCellLayout<'a> {
     render_mode: HistoryRenderMode,
 }
 
+struct ActiveTranscriptRender<'a> {
+    state: &'a TranscriptState,
+    render_mode: HistoryRenderMode,
+}
+
 impl Renderable for TranscriptAreaRenderable<'_> {
     fn render(&self, area: Rect, buf: &mut Buffer) {
         let area = self.child_area(area);
-        let lines = self.child.display_hyperlink_lines(area.width);
-        let paragraph = HyperlinkParagraph::new(&lines, Style::default());
+        let rendered = self.active_transcript.as_ref().map(|active| {
+            active
+                .state
+                .render_active_cell(self.child, area.width, active.render_mode)
+        });
+        let viewport_height = usize::from(area.height);
+        let render_visible_tail = rendered.as_ref().is_some_and(|rendered| {
+            area.height > 0
+                && rendered.lines.len() > viewport_height
+                && rendered.paragraph_height.saturating_sub(viewport_height)
+                    <= usize::from(u16::MAX)
+        });
+        let uncached_lines;
+        let lines = match &rendered {
+            Some(rendered) => {
+                if render_visible_tail {
+                    &rendered.lines[rendered.lines.len() - viewport_height..]
+                } else {
+                    &rendered.lines
+                }
+            }
+            None => {
+                uncached_lines = self.child.display_hyperlink_lines(area.width);
+                &uncached_lines
+            }
+        };
+        let paragraph = HyperlinkParagraph::new(lines, Style::default());
         let y = if area.height == 0 {
             0
         } else {
-            let rendered_height = if let Some((cache, mut layout)) = self.layout(area.width) {
+            let rendered_height = if render_visible_tail {
+                paragraph.line_count(area.width)
+            } else if let Some((cache, mut layout)) = self.layout(area.width) {
                 if let Some(height) = layout.rendered_height {
                     height
                 } else {
-                    let height = paragraph.line_count(area.width);
+                    let height = match &rendered {
+                        Some(rendered) => rendered.paragraph_height,
+                        None => paragraph.line_count(area.width),
+                    };
                     layout.rendered_height = Some(height);
                     cache.set(Some(layout));
                     height
                 }
             } else {
-                paragraph.line_count(area.width)
+                match &rendered {
+                    Some(rendered) => rendered.paragraph_height,
+                    None => paragraph.line_count(area.width),
+                }
             };
             let overflow = rendered_height.saturating_sub(usize::from(area.height));
             u16::try_from(overflow).unwrap_or(u16::MAX)
@@ -143,13 +193,29 @@ impl Renderable for TranscriptAreaRenderable<'_> {
             if let Some(height) = layout.desired_height {
                 height
             } else {
-                let height = HistoryCell::desired_height(self.child, child_width);
+                let height = match &self.active_transcript {
+                    Some(active) => {
+                        active
+                            .state
+                            .render_active_cell(self.child, child_width, active.render_mode)
+                            .desired_height
+                    }
+                    None => HistoryCell::desired_height(self.child, child_width),
+                };
                 layout.desired_height = Some(height);
                 cache.set(Some(layout));
                 height
             }
         } else {
-            HistoryCell::desired_height(self.child, child_width)
+            match &self.active_transcript {
+                Some(active) => {
+                    active
+                        .state
+                        .render_active_cell(self.child, child_width, active.render_mode)
+                        .desired_height
+                }
+                None => HistoryCell::desired_height(self.child, child_width),
+            }
         };
         desired_height + self.top
     }

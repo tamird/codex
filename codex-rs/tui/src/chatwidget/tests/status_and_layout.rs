@@ -8,6 +8,10 @@ use codex_app_server_protocol::ThreadUsage;
 use pretty_assertions::assert_eq;
 use ratatui::backend::TestBackend;
 use serial_test::serial;
+use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering;
 
 fn enable_test_ambient_pet(chat: &mut ChatWidget) {
     chat.set_pet_image_support_for_tests(crate::pets::PetImageSupport::Supported(
@@ -4558,6 +4562,36 @@ async fn deltas_then_same_final_message_are_rendered_snapshot() {
 
 #[tokio::test]
 async fn unterminated_agent_delta_does_not_redraw_unchanged_stream_tail() {
+    #[derive(Debug)]
+    struct CountingActiveCell {
+        display_calls: Arc<AtomicUsize>,
+        height_calls: Arc<AtomicUsize>,
+        animation_tick: Arc<AtomicU64>,
+    }
+
+    impl HistoryCell for CountingActiveCell {
+        fn display_lines(&self, width: u16) -> Vec<Line<'static>> {
+            self.display_calls.fetch_add(1, Ordering::Relaxed);
+            let tick = self.animation_tick.load(Ordering::Relaxed);
+            vec![Line::from(format!(
+                "active width {width}, animation {tick}"
+            ))]
+        }
+
+        fn raw_lines(&self) -> Vec<Line<'static>> {
+            vec![Line::from("active raw line")]
+        }
+
+        fn desired_height(&self, _width: u16) -> u16 {
+            self.height_calls.fetch_add(1, Ordering::Relaxed);
+            2
+        }
+
+        fn transcript_animation_tick(&self) -> Option<u64> {
+            Some(self.animation_tick.load(Ordering::Relaxed))
+        }
+    }
+
     let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
     chat.handle_streaming_delta("| Step | Owner |\n".to_string());
     assert!(chat.active_cell_is_stream_tail());
@@ -4572,6 +4606,110 @@ async fn unterminated_agent_delta_does_not_redraw_unchanged_stream_tail() {
         draw_rx.try_recv(),
         Err(tokio::sync::mpsc::error::TryRecvError::Empty)
     ));
+
+    let display_calls = Arc::new(AtomicUsize::new(0));
+    let height_calls = Arc::new(AtomicUsize::new(0));
+    let animation_tick = Arc::new(AtomicU64::new(0));
+    chat.transcript.active_cell = Some(Box::new(CountingActiveCell {
+        display_calls: Arc::clone(&display_calls),
+        height_calls: Arc::clone(&height_calls),
+        animation_tick: Arc::clone(&animation_tick),
+    }));
+    chat.bump_active_cell_revision();
+
+    let draw = |chat: &ChatWidget, width| {
+        let area = Rect::new(0, 0, width, chat.desired_height(width));
+        let mut buffer = Buffer::empty(area);
+        chat.render(area, &mut buffer);
+        buffer
+    };
+    let first_frame = draw(&chat, 40);
+    assert_eq!(draw(&chat, 40), first_frame);
+    assert_eq!(
+        (
+            height_calls.load(Ordering::Relaxed),
+            display_calls.load(Ordering::Relaxed)
+        ),
+        (1, 1)
+    );
+
+    draw(&chat, 41);
+    assert_eq!(height_calls.load(Ordering::Relaxed), 2);
+
+    chat.bump_active_cell_revision();
+    let before_animation = draw(&chat, 41);
+    assert_eq!(height_calls.load(Ordering::Relaxed), 3);
+
+    animation_tick.store(1, Ordering::Relaxed);
+    assert_ne!(draw(&chat, 41), before_animation);
+    assert_eq!(height_calls.load(Ordering::Relaxed), 4);
+
+    chat.set_raw_output_mode(/*enabled*/ true);
+    draw(&chat, 41);
+    assert_eq!(
+        (
+            height_calls.load(Ordering::Relaxed),
+            display_calls.load(Ordering::Relaxed)
+        ),
+        (5, 5)
+    );
+
+    let mut linked_line = HyperlinkLine::default();
+    linked_line.push_span(
+        "final wrapped line at the bottom".into(),
+        Some("https://example.com"),
+    );
+    let tail_lines = vec![
+        HyperlinkLine::new(Line::from("first line")),
+        HyperlinkLine::new(Line::from("")),
+        HyperlinkLine::new(Line::from("a long line that wraps beyond the viewport")),
+        HyperlinkLine::new(Line::from(vec!["styled".cyan(), " text".into()])),
+        HyperlinkLine::new(Line::from("wide 界界 characters")),
+        HyperlinkLine::new(Line::from("")),
+        linked_line,
+    ];
+    chat.transcript.active_cell = Some(Box::new(history_cell::StreamingAgentTailCell::new(
+        tail_lines, /*is_first_line*/ true,
+    )));
+    chat.bump_active_cell_revision();
+
+    let width = 14;
+    let area = Rect::new(/*x*/ 0, /*y*/ 0, width, /*height*/ 10);
+    let mut actual = Buffer::empty(area);
+    chat.render(area, &mut actual);
+
+    let right_reserve = 0;
+    let bottom_height = chat
+        .bottom_pane
+        .as_renderable_with_composer_right_reserve(right_reserve)
+        .inset(Insets::tlbr(
+            /*top*/ 1, /*left*/ 0, /*bottom*/ 0, /*right*/ 0,
+        ))
+        .desired_height(width);
+    let active_area = Rect::new(
+        /*x*/ 0,
+        /*y*/ 1,
+        width,
+        area.height.saturating_sub(bottom_height).saturating_sub(1),
+    );
+    let full_lines = chat
+        .transcript
+        .active_cell
+        .as_ref()
+        .expect("streaming active cell")
+        .display_hyperlink_lines(width);
+    assert!(usize::from(active_area.height) < full_lines.len());
+    let paragraph =
+        crate::terminal_hyperlinks::HyperlinkParagraph::new(&full_lines, Style::default());
+    let overflow = paragraph
+        .line_count(width)
+        .saturating_sub(usize::from(active_area.height));
+    let mut expected = actual.clone();
+    Clear.render(active_area, &mut expected);
+    paragraph
+        .scroll(u16::try_from(overflow).unwrap_or(u16::MAX))
+        .render(active_area, &mut expected);
+    assert_eq!(actual, expected);
 }
 
 #[tokio::test]

@@ -86,6 +86,7 @@ fn active_transcript_preserves_clipped_markdown_hyperlinks() {
         top: 1,
         right: 2,
         persistent_layout: None,
+        active_transcript: None,
     };
     let area = Rect::new(
         /*x*/ 2, /*y*/ 1, /*width*/ 40, /*height*/ 3,
