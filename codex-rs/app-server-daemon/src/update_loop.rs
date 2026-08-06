@@ -58,6 +58,8 @@ const INSTALL_URL: &str = "https://chatgpt.com/codex/install.sh";
 
 #[cfg(unix)]
 pub(crate) async fn run(http_client_factory: HttpClientFactory) -> Result<()> {
+    let daemon = Daemon::from_environment()?;
+    daemon.ensure_standalone_updater().await?;
     let mut terminate =
         signal(SignalKind::terminate()).context("failed to install updater shutdown handler")?;
     let running_updater_identity = current_updater_identity().await?;
@@ -104,10 +106,11 @@ async fn update_once(
     running_updater_identity: &ExecutableIdentity,
     terminate: &mut Signal,
 ) -> Result<UpdateLoopControl> {
+    let daemon = Daemon::from_environment()?;
+    daemon.ensure_standalone_updater().await?;
     install_latest_standalone(http).await?;
 
-    let daemon = Daemon::from_environment()?;
-    let managed_codex_bin = resolved_managed_codex_bin(&daemon.managed_codex_bin).await?;
+    let managed_codex_bin = resolved_managed_codex_bin(daemon.executable.path()).await?;
     let managed_identity = executable_identity(&managed_codex_bin).await?;
     let (restart_mode, updater_refresh_mode) =
         update_modes_for_identities(running_updater_identity, &managed_identity);

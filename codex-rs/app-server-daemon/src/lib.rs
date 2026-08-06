@@ -1,5 +1,6 @@
 mod backend;
 mod client;
+mod executable;
 mod managed_install;
 mod remote_control_client;
 mod settings;
@@ -18,7 +19,9 @@ use codex_app_server_protocol::RemoteControlConnectionStatus;
 use codex_app_server_protocol::RemoteControlPairingStartResponse;
 use codex_app_server_transport::app_server_control_socket_path;
 use codex_utils_home_dir::find_codex_home;
-use managed_install::managed_codex_bin;
+pub use executable::DaemonConnectionGuard;
+use executable::Executable;
+pub use executable::lock_default_daemon_connection;
 #[cfg(unix)]
 use managed_install::managed_codex_version;
 use serde::Serialize;
@@ -223,6 +226,7 @@ pub async fn enable_remote_control_on_socket(
 pub async fn start_remote_control_pairing() -> Result<RemoteControlPairingStartResponse> {
     ensure_supported_platform()?;
     let daemon = Daemon::from_environment()?;
+    let _connection_guard = daemon.lock_connection().await?;
     remote_control_client::start_pairing(&daemon.socket_path).await
 }
 
@@ -256,23 +260,27 @@ struct Daemon {
     update_pid_file: PathBuf,
     operation_lock_file: PathBuf,
     settings_file: PathBuf,
-    managed_codex_bin: PathBuf,
+    executable: Executable,
 }
 
 impl Daemon {
     fn from_environment() -> Result<Self> {
         let codex_home = find_codex_home().context("failed to resolve CODEX_HOME")?;
-        let socket_path = app_server_control_socket_path(codex_home.as_path())?
-            .as_path()
-            .to_path_buf();
-        let state_dir = codex_home.as_path().join(STATE_DIR_NAME);
+        Self::for_codex_home(codex_home.as_path())
+    }
+
+    fn for_codex_home(codex_home: &Path) -> Result<Self> {
+        let executable = Executable::current(codex_home)?;
+        let socket_path = app_server_control_socket_path(codex_home)?;
+        let socket_path = socket_path.as_path().to_path_buf();
+        let state_dir = codex_home.join(STATE_DIR_NAME);
         Ok(Self {
             socket_path,
             pid_file: state_dir.join(PID_FILE_NAME),
             update_pid_file: state_dir.join(UPDATE_PID_FILE_NAME),
             operation_lock_file: state_dir.join(OPERATION_LOCK_FILE_NAME),
             settings_file: state_dir.join(SETTINGS_FILE_NAME),
-            managed_codex_bin: managed_codex_bin(codex_home.as_path()),
+            executable,
         })
     }
 
@@ -297,6 +305,7 @@ impl Daemon {
     async fn start(&self) -> Result<LifecycleOutput> {
         let settings = self.load_settings().await?;
         if let Ok(info) = client::probe(&self.socket_path).await {
+            self.ensure_socket_ownership(&settings).await?;
             return Ok(self
                 .output(
                     LifecycleStatus::AlreadyRunning,
@@ -307,6 +316,7 @@ impl Daemon {
                 .await);
         }
 
+        self.ensure_ownership(&settings).await?;
         if self.running_backend_instance(&settings).await?.is_some() {
             let info = self.wait_until_ready().await?;
             return Ok(self
@@ -319,7 +329,7 @@ impl Daemon {
                 .await);
         }
 
-        self.ensure_managed_codex_bin()?;
+        self.executable.ensure_available()?;
         let pid = self.start_managed_backend(&settings).await?;
         let info = self.wait_until_ready().await?;
         Ok(self
@@ -334,6 +344,7 @@ impl Daemon {
 
     async fn restart(&self) -> Result<LifecycleOutput> {
         let settings = self.load_settings().await?;
+        self.ensure_ownership(&settings).await?;
         if client::probe(&self.socket_path).await.is_ok()
             && self.running_backend(&settings).await?.is_none()
         {
@@ -342,7 +353,7 @@ impl Daemon {
             ));
         }
 
-        self.ensure_managed_codex_bin()?;
+        self.executable.ensure_available()?;
         if let Some(backend) = self.running_backend_instance(&settings).await? {
             backend.stop().await?;
         }
@@ -371,6 +382,7 @@ impl Daemon {
             return Ok(RestartIfRunningOutcome::Busy);
         }
         let settings = self.load_settings().await?;
+        self.ensure_ownership(&settings).await?;
         let outcome = if let Some(backend) = self.running_backend_instance(&settings).await? {
             let info = client::probe(&self.socket_path).await.ok();
             let managed_version = if info.is_some() {
@@ -482,7 +494,7 @@ impl Daemon {
             .unwrap_or_else(|| "unknown".to_string());
         context.push_str(&format!(
             "\n\nDaemon used app-server:\n  path: {}\n  version: {managed_codex_version}",
-            self.managed_codex_bin.display()
+            self.executable.path().display()
         ));
     }
 
@@ -494,7 +506,7 @@ impl Daemon {
     async fn ensure_remote_control_started(&self) -> Result<RemoteControlStartOutput> {
         let _operation_lock = self.acquire_operation_lock().await?;
         let settings = self.load_settings().await?;
-        if self.is_bootstrapped(&settings).await? {
+        if !self.executable.is_standalone() || self.is_bootstrapped(&settings).await? {
             let _ = self
                 .set_remote_control_locked(RemoteControlMode::Enabled)
                 .await?;
@@ -512,6 +524,7 @@ impl Daemon {
 
     async fn ensure_remote_control_ready(&self) -> Result<RemoteControlReadyOutput> {
         let daemon = self.ensure_remote_control_started().await?;
+        let _connection_guard = self.lock_connection().await?;
         let remote_control =
             remote_control_client::enable_remote_control(&self.socket_path).await?;
         Ok(RemoteControlReadyOutput {
@@ -530,6 +543,7 @@ impl Daemon {
         mode: RemoteControlMode,
     ) -> Result<RemoteControlOutput> {
         let previous_settings = self.load_settings().await?;
+        self.ensure_ownership(&previous_settings).await?;
         let mut settings = previous_settings.clone();
         let remote_control_enabled = mode.is_enabled();
         let backend = self.running_backend_instance(&previous_settings).await?;
@@ -568,7 +582,7 @@ impl Daemon {
         settings.save(&self.settings_file).await?;
 
         let app_server_version = if let Some(backend) = backend {
-            self.ensure_managed_codex_bin()?;
+            self.executable.ensure_available()?;
             backend.stop().await?;
             let _ = self.start_managed_backend(&settings).await?;
             Some(self.wait_until_ready().await?.app_server_version)
@@ -585,11 +599,12 @@ impl Daemon {
     }
 
     async fn bootstrap_locked(&self, options: BootstrapOptions) -> Result<BootstrapOutput> {
-        self.ensure_managed_codex_bin()?;
+        self.executable.ensure_available()?;
 
         let settings = DaemonSettings {
             remote_control_enabled: options.remote_control_enabled,
         };
+        self.ensure_ownership(&settings).await?;
         if client::probe(&self.socket_path).await.is_ok()
             && self.running_backend(&settings).await?.is_none()
         {
@@ -605,20 +620,22 @@ impl Daemon {
 
         let backend = backend::pid_backend(self.backend_paths(&settings));
         backend.start().await?;
-        let updater = backend::pid_update_loop_backend(self.backend_paths(&settings));
-        if updater.is_starting_or_running().await? {
-            updater.stop().await?;
+        if self.executable.is_standalone() {
+            let updater = backend::pid_update_loop_backend(self.backend_paths(&settings));
+            if updater.is_starting_or_running().await? {
+                updater.stop().await?;
+            }
+            updater.start().await?;
         }
-        updater.start().await?;
 
         let info = self.wait_until_ready().await?;
         let managed_codex_version = self.managed_codex_version_best_effort().await;
         Ok(BootstrapOutput {
             status: BootstrapStatus::Bootstrapped,
             backend: BackendKind::Pid,
-            auto_update_enabled: true,
+            auto_update_enabled: self.executable.is_standalone(),
             remote_control_enabled: settings.remote_control_enabled,
-            managed_codex_path: self.managed_codex_bin.clone(),
+            managed_codex_path: self.executable.path().to_path_buf(),
             managed_codex_version,
             socket_path: self.socket_path.clone(),
             cli_version: env!("CARGO_PKG_VERSION").to_string(),
@@ -645,7 +662,7 @@ impl Daemon {
     }
 
     async fn start_managed_backend(&self, settings: &DaemonSettings) -> Result<Option<u32>> {
-        self.start_managed_backend_with_bin(settings, &self.managed_codex_bin)
+        self.start_managed_backend_with_bin(settings, self.executable.path())
             .await
     }
 
@@ -664,24 +681,9 @@ impl Daemon {
         updater.is_starting_or_running().await
     }
 
-    fn ensure_managed_codex_bin(&self) -> Result<()> {
-        if self.managed_codex_bin.is_file() {
-            return Ok(());
-        }
-
-        let managed_codex_path = self.managed_codex_bin.display();
-        Err(anyhow!(
-            "managed standalone Codex install not found at {managed_codex_path}\n\n\
-             This command requires the standalone install managed by the Codex installer, because \
-             the daemon starts and updates app-server from that fixed path.\n\n\
-             Install it with:\n  curl -fsSL https://chatgpt.com/codex/install.sh | sh\n\n\
-             Then rerun the command you just tried."
-        ))
-    }
-
     #[cfg(unix)]
     async fn managed_codex_version_best_effort(&self) -> Option<String> {
-        managed_codex_version(&self.managed_codex_bin).await.ok()
+        managed_codex_version(self.executable.path()).await.ok()
     }
 
     #[cfg(not(unix))]
@@ -690,7 +692,7 @@ impl Daemon {
     }
 
     fn backend_paths(&self, settings: &DaemonSettings) -> BackendPaths {
-        self.backend_paths_with_bin(settings, &self.managed_codex_bin)
+        self.backend_paths_with_bin(settings, self.executable.path())
     }
 
     fn backend_paths_with_bin(
@@ -699,7 +701,12 @@ impl Daemon {
         managed_codex_bin: &Path,
     ) -> BackendPaths {
         BackendPaths {
-            codex_bin: managed_codex_bin.to_path_buf(),
+            executable: match &self.executable {
+                Executable::Standalone(_) => {
+                    Executable::Standalone(managed_codex_bin.to_path_buf())
+                }
+                Executable::External(_) => Executable::External(managed_codex_bin.to_path_buf()),
+            },
             pid_file: self.pid_file.clone(),
             update_pid_file: self.update_pid_file.clone(),
             remote_control_enabled: settings.remote_control_enabled,
@@ -760,7 +767,7 @@ impl Daemon {
             status,
             backend,
             pid,
-            managed_codex_path: self.managed_codex_bin.clone(),
+            managed_codex_path: self.executable.path().to_path_buf(),
             managed_codex_version,
             socket_path: self.socket_path.clone(),
             cli_version: Some(env!("CARGO_PKG_VERSION").to_string()),
@@ -1015,7 +1022,9 @@ mod tests {
             update_pid_file: temp_dir.path().join("app-server-updater.pid"),
             operation_lock_file: temp_dir.path().join("daemon.lock"),
             settings_file: temp_dir.path().join("settings.json"),
-            managed_codex_bin: temp_dir.path().join("missing-codex"),
+            executable: crate::executable::Executable::External(
+                temp_dir.path().join("missing-codex"),
+            ),
         };
         let stderr_log = daemon.pid_file.with_extension("stderr.log");
         tokio::fs::write(&stderr_log, "unexpected argument")
@@ -1029,7 +1038,7 @@ mod tests {
                  Daemon used app-server:\n  path: {}\n  version: unknown\n\n\
                  Managed app-server stderr ({}):\n  unexpected argument",
                 daemon.socket_path.display(),
-                daemon.managed_codex_bin.display(),
+                daemon.executable.path().display(),
                 stderr_log.display()
             )
         );

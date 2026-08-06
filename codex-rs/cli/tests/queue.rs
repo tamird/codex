@@ -190,7 +190,7 @@ async fn run_remote_queue_command(response: QueueResponse) -> Result<(Output, Va
 
 #[cfg(unix)]
 #[tokio::test]
-async fn queue_rejects_local_daemon_that_does_not_support_queueing() -> Result<()> {
+async fn queue_rejects_explicit_unix_server_that_does_not_support_queueing() -> Result<()> {
     let codex_home = tempfile::tempdir_in("/tmp")?;
     let socket_path = codex_app_server::app_server_control_socket_path(codex_home.path())?;
     std::fs::create_dir_all(
@@ -202,8 +202,6 @@ async fn queue_rejects_local_daemon_that_does_not_support_queueing() -> Result<(
     let listener = tokio::net::UnixListener::bind(socket_path.as_path())?;
     let server_home = codex_home.path().to_path_buf();
     let server = tokio::spawn(async move {
-        let (probe, _) = listener.accept().await?;
-        drop(probe);
         let (stream, _) = listener.accept().await?;
         respond_to_queue_request(
             stream,
@@ -215,7 +213,15 @@ async fn queue_rejects_local_daemon_that_does_not_support_queueing() -> Result<(
 
     let output = tokio::process::Command::new(codex_utils_cargo_bin::cargo_bin("codex")?)
         .env("CODEX_HOME", codex_home.path())
-        .args(["queue", "--thread", THREAD_ID, "--message", "do the thing"])
+        .args([
+            "queue",
+            "--remote",
+            &format!("unix://{}", socket_path.display()),
+            "--thread",
+            THREAD_ID,
+            "--message",
+            "do the thing",
+        ])
         .output()
         .await?;
     server.await??;
@@ -223,7 +229,7 @@ async fn queue_rejects_local_daemon_that_does_not_support_queueing() -> Result<(
     assert!(!output.status.success());
     assert!(
         String::from_utf8(output.stderr)?
-            .contains("local app-server daemon does not support thread/queue/add")
+            .contains("remote app server does not support thread/queue/add")
     );
     assert!(!codex_home.path().join("queue_1.sqlite").exists());
     Ok(())

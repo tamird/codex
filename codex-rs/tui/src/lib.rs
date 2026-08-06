@@ -504,9 +504,15 @@ async fn start_app_server(
         )
         .await
         .map(AppServerClient::InProcess),
-        AppServerTarget::LocalDaemon { endpoint } | AppServerTarget::Remote { endpoint } => {
+        AppServerTarget::LocalDaemon { endpoint } => {
+            let _connection_guard = codex_app_server_daemon::lock_default_daemon_connection(
+                config.codex_home.as_path(),
+            )
+            .await
+            .map_err(|error| color_eyre::eyre::eyre!(error))?;
             connect_remote_app_server(endpoint.clone()).await
         }
+        AppServerTarget::Remote { endpoint } => connect_remote_app_server(endpoint.clone()).await,
     }
 }
 
@@ -960,7 +966,7 @@ fn can_reuse_implicit_local_daemon(
     strict_config: bool,
     has_non_replayable_launch_overrides: bool,
 ) -> bool {
-    // A reused daemon cannot adopt this invocation's full launch config state.
+    // Executable ownership is checked at attachment; launch configuration must still match.
     cli_kv_overrides.is_empty()
         && loader_overrides_are_default(loader_overrides)
         && !strict_config
@@ -2681,6 +2687,80 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn local_daemon_connection_requires_matching_ownership() -> color_eyre::Result<()> {
+        let codex_home = TempDir::new()?;
+        let socket_path =
+            codex_app_server_client::app_server_control_socket_path(codex_home.path())?;
+        std::fs::create_dir_all(socket_path.as_path().parent().expect("socket parent"))?;
+        let _listener = tokio::net::UnixListener::bind(socket_path.as_path())?;
+
+        let state = codex_home.path().join("app-server-daemon");
+        std::fs::create_dir_all(&state)?;
+        let pid = std::process::id();
+        let start_time = std::process::Command::new("ps")
+            .args(["-p", &pid.to_string(), "-o", "lstart="])
+            .output()?;
+        assert!(start_time.status.success());
+        let start_time = String::from_utf8(start_time.stdout)?;
+        let executable = std::env::current_exe()?;
+        let mut record = serde_json::json!({
+            "pid": pid, "processStartTime": start_time.trim(),
+            "executable": {"kind": "external", "path": executable},
+        });
+        let contents = serde_json::to_vec(&record)?;
+        std::fs::write(state.join("app-server.pid"), contents)?;
+        let discovered = maybe_probe_default_daemon_socket(codex_home.path()).await;
+        assert_eq!(discovered, Some(socket_path.clone()));
+        let guard = codex_app_server_daemon::lock_default_daemon_connection(codex_home.path())
+            .await
+            .map_err(std::io::Error::other)?;
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(/*millis*/ 100),
+                codex_app_server_daemon::lock_default_daemon_connection(codex_home.path()),
+            )
+            .await
+            .is_err(),
+            "connection ownership must remain locked until initialization completes"
+        );
+        drop(guard);
+        let guard = codex_app_server_daemon::lock_default_daemon_connection(codex_home.path())
+            .await
+            .map_err(std::io::Error::other)?;
+        drop(guard);
+        record.as_object_mut().expect("record").insert(
+            "executable".into(),
+            serde_json::json!({
+                "kind": "external", "path": "/another/codex",
+            }),
+        );
+        let contents = serde_json::to_vec(&record)?;
+        std::fs::write(state.join("app-server.pid"), contents)?;
+        let config = build_config(&codex_home).await?;
+        let target = AppServerTarget::LocalDaemon {
+            endpoint: RemoteAppServerEndpoint::UnixSocket { socket_path },
+        };
+        let result = start_app_server_for_picker(
+            &config,
+            &target,
+            /*state_db*/ None,
+            Arc::new(EnvironmentManager::default_for_tests()),
+        )
+        .await;
+        let error = match result {
+            Err(error) => error,
+            Ok(_) => {
+                return Err(color_eyre::eyre::eyre!(
+                    "connected to replacement installation"
+                ));
+            }
+        };
+        assert!(error.to_string().contains("different Codex installation"));
+        Ok(())
+    }
+
     #[test]
     fn app_server_target_for_launch_uses_local_daemon_for_default_socket() -> color_eyre::Result<()>
     {
@@ -2818,7 +2898,6 @@ mod tests {
     fn can_reuse_implicit_local_daemon_requires_default_launch_config() -> color_eyre::Result<()> {
         let mut loader_overrides = LoaderOverrides::default();
         let cli_kv_overrides = vec![("web_search".to_string(), toml::Value::String("live".into()))];
-
         assert!(can_reuse_implicit_local_daemon(
             &[],
             &LoaderOverrides::default(),

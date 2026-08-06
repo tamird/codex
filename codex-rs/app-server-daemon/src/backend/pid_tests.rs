@@ -6,6 +6,8 @@ use tempfile::TempDir;
 
 use codex_app_server_transport::REMOTE_CONTROL_DISABLED_ENV_VAR;
 
+use crate::executable::Executable;
+
 use super::PidBackend;
 use super::PidCommandKind;
 use super::PidFileState;
@@ -17,6 +19,28 @@ use super::stderr_log_file_for_pid_file;
 use super::try_lock_file;
 
 #[tokio::test]
+async fn unrecordable_executable_is_rejected_before_reserving_a_pid() {
+    use std::os::unix::ffi::OsStringExt;
+
+    let temp_dir = TempDir::new().expect("temp dir");
+    let pid_file = temp_dir.path().join("app-server.pid");
+    let executable = temp_dir
+        .path()
+        .join(std::ffi::OsString::from_vec(b"codex\xff".to_vec()));
+    let backend = PidBackend::new(
+        Executable::External(executable),
+        pid_file.clone(),
+        /*remote_control_enabled*/ false,
+    );
+    let error = backend.start().await.expect_err("unrecordable executable");
+    assert!(error.to_string().contains("cannot be recorded as JSON"));
+    assert!(
+        !pid_file.exists(),
+        "must reject before reserving or spawning a process"
+    );
+}
+
+#[tokio::test]
 async fn locked_empty_pid_file_is_treated_as_active_reservation() {
     let temp_dir = TempDir::new().expect("temp dir");
     let pid_file = temp_dir.path().join("app-server.pid");
@@ -24,7 +48,7 @@ async fn locked_empty_pid_file_is_treated_as_active_reservation() {
         .await
         .expect("write pid file");
     let backend = PidBackend::new(
-        temp_dir.path().join("codex"),
+        Executable::External(temp_dir.path().join("codex")),
         pid_file.clone(),
         /*remote_control_enabled*/ false,
     );
@@ -52,7 +76,7 @@ async fn unlocked_empty_pid_file_is_treated_as_stale_reservation() {
         .await
         .expect("write pid file");
     let backend = PidBackend::new(
-        temp_dir.path().join("codex"),
+        Executable::External(temp_dir.path().join("codex")),
         pid_file.clone(),
         /*remote_control_enabled*/ false,
     );
@@ -72,7 +96,7 @@ async fn stop_waits_for_live_reservation_to_resolve() {
         .await
         .expect("write pid file");
     let backend = PidBackend::new(
-        temp_dir.path().join("codex"),
+        Executable::External(temp_dir.path().join("codex")),
         pid_file.clone(),
         /*remote_control_enabled*/ false,
     );
@@ -104,7 +128,7 @@ async fn start_retries_stale_empty_pid_file_under_its_own_lock() {
         .await
         .expect("write pid file");
     let backend = PidBackend::new(
-        temp_dir.path().join("missing-codex"),
+        Executable::External(temp_dir.path().join("missing-codex")),
         pid_file,
         /*remote_control_enabled*/ false,
     );
@@ -121,17 +145,19 @@ async fn stale_record_cleanup_preserves_replacement_record() {
     let temp_dir = TempDir::new().expect("temp dir");
     let pid_file = temp_dir.path().join("app-server.pid");
     let backend = PidBackend::new(
-        temp_dir.path().join("codex"),
+        Executable::External(temp_dir.path().join("codex")),
         pid_file.clone(),
         /*remote_control_enabled*/ false,
     );
     let stale = PidRecord {
         pid: 1,
         process_start_time: "old".to_string(),
+        executable: None,
     };
     let replacement = PidRecord {
         pid: 2,
         process_start_time: "new".to_string(),
+        executable: None,
     };
     tokio::fs::write(
         &pid_file,
@@ -164,6 +190,7 @@ async fn stop_reaps_untracked_app_server_child() {
     let record = PidRecord {
         pid,
         process_start_time: read_process_start_time(pid).await.expect("start time"),
+        executable: None,
     };
     tokio::fs::write(
         &pid_file,
@@ -172,7 +199,7 @@ async fn stop_reaps_untracked_app_server_child() {
     .await
     .expect("write pid file");
     let backend = PidBackend::new(
-        temp_dir.path().join("codex"),
+        Executable::External(temp_dir.path().join("codex")),
         pid_file.clone(),
         /*remote_control_enabled*/ false,
     );
@@ -191,7 +218,7 @@ async fn stop_reaps_untracked_app_server_child() {
 #[test]
 fn update_loop_uses_hidden_app_server_subcommand() {
     let backend = PidBackend {
-        codex_bin: "codex".into(),
+        executable: Executable::Standalone("codex".into()),
         pid_file: "updater.pid".into(),
         lock_file: "updater.pid.lock".into(),
         command_kind: PidCommandKind::UpdateLoop,
@@ -206,7 +233,7 @@ fn update_loop_uses_hidden_app_server_subcommand() {
 #[test]
 fn app_server_remote_control_uses_runtime_flag() {
     let backend = PidBackend::new(
-        "codex".into(),
+        Executable::External("codex".into()),
         "app-server.pid".into(),
         /*remote_control_enabled*/ true,
     );
@@ -220,7 +247,7 @@ fn app_server_remote_control_uses_runtime_flag() {
 #[test]
 fn app_server_disabled_remote_control_uses_compatible_args_and_runtime_env() {
     let backend = PidBackend::new(
-        "codex".into(),
+        Executable::External("codex".into()),
         "app-server.pid".into(),
         /*remote_control_enabled*/ false,
     );

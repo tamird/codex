@@ -5,6 +5,7 @@ use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::Duration;
 
+use crate::executable::Executable;
 use anyhow::Context;
 use anyhow::Result;
 use anyhow::bail;
@@ -28,7 +29,7 @@ const STDERR_LOG_TAIL_BYTES: u64 = 4096;
 #[derive(Debug)]
 #[cfg_attr(not(unix), allow(dead_code))]
 pub(crate) struct PidBackend {
-    codex_bin: PathBuf,
+    executable: Executable,
     pid_file: PathBuf,
     lock_file: PathBuf,
     command_kind: PidCommandKind,
@@ -39,6 +40,8 @@ pub(crate) struct PidBackend {
 struct PidRecord {
     pid: u32,
     process_start_time: String,
+    #[serde(default)]
+    executable: Option<Executable>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -67,6 +70,12 @@ enum PidFileState {
     Running(PidRecord),
 }
 
+pub(crate) enum ProcessOwnership {
+    NotRunning,
+    Unrecorded,
+    Recorded(Executable),
+}
+
 #[derive(Debug, Clone, Copy)]
 #[cfg_attr(not(unix), allow(dead_code))]
 enum PidCommandKind {
@@ -75,10 +84,14 @@ enum PidCommandKind {
 }
 
 impl PidBackend {
-    pub(crate) fn new(codex_bin: PathBuf, pid_file: PathBuf, remote_control_enabled: bool) -> Self {
+    pub(crate) fn new(
+        executable: Executable,
+        pid_file: PathBuf,
+        remote_control_enabled: bool,
+    ) -> Self {
         let lock_file = pid_file.with_extension("pid.lock");
         Self {
-            codex_bin,
+            executable,
             pid_file,
             lock_file,
             command_kind: PidCommandKind::AppServer {
@@ -87,10 +100,10 @@ impl PidBackend {
         }
     }
 
-    pub(crate) fn new_update_loop(codex_bin: PathBuf, pid_file: PathBuf) -> Self {
+    pub(crate) fn new_update_loop(executable: Executable, pid_file: PathBuf) -> Self {
         let lock_file = pid_file.with_extension("pid.lock");
         Self {
-            codex_bin,
+            executable,
             pid_file,
             lock_file,
             command_kind: PidCommandKind::UpdateLoop,
@@ -115,8 +128,46 @@ impl PidBackend {
         }
     }
 
+    /// Inspect ownership without cleaning up stale records or creating state.
+    pub(crate) async fn ownership(&self) -> Result<ProcessOwnership> {
+        let contents = match fs::read_to_string(&self.pid_file).await {
+            Ok(contents) => contents,
+            Err(err) => {
+                if err.kind() != std::io::ErrorKind::NotFound {
+                    return Err(err)
+                        .with_context(|| format!("failed to read {}", self.pid_file.display()));
+                }
+                String::new()
+            }
+        };
+        if contents.trim().is_empty() {
+            let reserved = reservation_lock_is_active(&self.lock_file).await?;
+            return Ok(if reserved {
+                ProcessOwnership::Unrecorded
+            } else {
+                ProcessOwnership::NotRunning
+            });
+        }
+        let record: PidRecord = serde_json::from_str(&contents)
+            .with_context(|| format!("invalid pid file contents in {}", self.pid_file.display()))?;
+        let active = self.record_is_active(&record).await?;
+        if !active {
+            return Ok(ProcessOwnership::NotRunning);
+        }
+        let PidRecord {
+            pid: _,
+            process_start_time: _,
+            executable,
+        } = record;
+        Ok(match executable {
+            Some(executable) => ProcessOwnership::Recorded(executable),
+            None => ProcessOwnership::Unrecorded,
+        })
+    }
+
     #[cfg(unix)]
     pub(crate) async fn start(&self) -> Result<Option<u32>> {
+        self.executable.ensure_recordable()?;
         if let Some(parent) = self.pid_file.parent() {
             fs::create_dir_all(parent)
                 .await
@@ -153,7 +204,7 @@ impl PidBackend {
                 }
             }
         };
-        let mut command = Command::new(&self.codex_bin);
+        let mut command = Command::new(self.executable.path());
         let stderr_log = match self.open_stderr_log().await {
             Ok(stderr_log) => stderr_log,
             Err(err) => {
@@ -189,7 +240,7 @@ impl PidBackend {
                 return Err(err).with_context(|| {
                     format!(
                         "failed to spawn detached app-server process using {}",
-                        self.codex_bin.display()
+                        self.executable.path().display()
                     )
                 });
             }
@@ -201,6 +252,7 @@ impl PidBackend {
             Ok(process_start_time) => PidRecord {
                 pid,
                 process_start_time,
+                executable: Some(self.executable.clone()),
             },
             Err(err) => {
                 let _ = self.terminate_process(pid);
@@ -622,13 +674,7 @@ fn try_lock_file(_file: &fs::File) -> Result<bool> {
 
 #[cfg(unix)]
 async fn reservation_lock_is_active(path: &Path) -> Result<bool> {
-    let file = match fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(path)
-        .await
-    {
+    let file = match fs::OpenOptions::new().write(true).open(path).await {
         Ok(file) => file,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
             return Ok(false);
