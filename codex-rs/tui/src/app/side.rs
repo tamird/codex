@@ -228,14 +228,16 @@ impl App {
             self.activate_standalone_side_ui();
             return;
         }
-        let clear_side_ui = |chat_widget: &mut crate::chatwidget::ChatWidget| {
-            chat_widget.set_side_conversation_context_label(/*label*/ None);
-            chat_widget.set_side_conversation_active(/*active*/ false);
+        let clear_side_ui = |chat_widget: &mut crate::chatwidget::ChatWidget, label| {
+            chat_widget.set_side_conversation_context_label(label);
+            if chat_widget.side_conversation_active() {
+                chat_widget.set_side_conversation_active(/*active*/ false);
+            }
             chat_widget.clear_thread_rename_block();
             chat_widget.set_interrupted_turn_notice_mode(InterruptedTurnNoticeMode::Default);
         };
         let Some(active_thread_id) = self.current_displayed_thread_id() else {
-            clear_side_ui(&mut self.chat_widget);
+            clear_side_ui(&mut self.chat_widget, /*label*/ None);
             return;
         };
         let Some((parent_thread_id, parent_status)) = self
@@ -243,29 +245,30 @@ impl App {
             .get(&active_thread_id)
             .map(|state| (state.parent_thread_id, state.parent_status))
         else {
-            clear_side_ui(&mut self.chat_widget);
-            if self
+            let label = if self
                 .side_threads
                 .values()
                 .any(|state| state.parent_thread_id == active_thread_id)
-                && let Some(binding) = self.keymap.primary_hint(
-                    crate::keymap::KeymapContext::Global,
-                    "toggle_side_conversation",
-                )
             {
-                self.chat_widget
-                    .set_side_conversation_context_label(Some(format!(
-                        "{} for side",
-                        binding.display_label()
-                    )));
-            }
+                self.keymap
+                    .primary_hint(
+                        crate::keymap::KeymapContext::Global,
+                        "toggle_side_conversation",
+                    )
+                    .map(|binding| format!("{} for side", binding.display_label()))
+            } else {
+                None
+            };
+            clear_side_ui(&mut self.chat_widget, label);
             return;
         };
 
         self.chat_widget
             .set_thread_rename_block_message(SIDE_RENAME_BLOCK_MESSAGE);
-        self.chat_widget
-            .set_side_conversation_active(/*active*/ true);
+        if !self.chat_widget.side_conversation_active() {
+            self.chat_widget
+                .set_side_conversation_active(/*active*/ true);
+        }
         self.chat_widget
             .set_interrupted_turn_notice_mode(InterruptedTurnNoticeMode::Suppress);
         let mut label_parts = Vec::new();

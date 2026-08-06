@@ -816,6 +816,41 @@ async fn enqueue_thread_event_does_not_block_when_channel_full() -> Result<()> {
         .expect("timed out waiting for second event")
         .expect("channel closed unexpectedly");
 
+    drop(rx);
+    app.thread_event_channels
+        .insert(thread_id, ThreadEventChannel::new(/*capacity*/ 65));
+    app.activate_thread_channel(thread_id).await;
+    for _ in 0..65 {
+        app.enqueue_thread_notification(
+            thread_id,
+            token_usage_notification(thread_id, "turn-1", Some(100)),
+        )
+        .await?;
+    }
+
+    let mut tui = crate::tui::test_support::make_test_tui()?;
+    app.drain_active_thread_events_until(
+        &mut tui,
+        Instant::now() + Duration::from_secs(/*secs*/ 60),
+    )
+    .await?;
+    assert_eq!(
+        app.active_thread_rx
+            .as_ref()
+            .map(tokio::sync::mpsc::Receiver::len),
+        Some(1),
+        "the event-count bound must yield before the distant frame deadline"
+    );
+
+    while app
+        .active_thread_rx
+        .as_ref()
+        .is_some_and(|receiver| !receiver.is_empty())
+    {
+        app.drain_active_thread_events(&mut tui).await?;
+    }
+    assert_eq!(app.chat_widget.token_usage().total_tokens, 10);
+
     Ok(())
 }
 
@@ -4268,15 +4303,20 @@ async fn inactive_thread_started_notification_initializes_replay_session() -> Re
     )
     .await?;
 
-    let store = app
-        .thread_event_channels
-        .get(&agent_thread_id)
-        .expect("agent thread channel")
-        .store
-        .lock()
-        .await;
-    let session = store.session.clone().expect("inferred session");
-    drop(store);
+    let (session, mut started) = {
+        let store = app
+            .thread_event_channels
+            .get(&agent_thread_id)
+            .expect("agent thread channel")
+            .store
+            .lock()
+            .await;
+        let session = store.session.clone().expect("inferred session");
+        let Some(ThreadBufferedEvent::Notification(started)) = store.buffer.front().cloned() else {
+            panic!("thread/started notification was not buffered");
+        };
+        (session, started)
+    };
 
     assert_eq!(session.thread_id, agent_thread_id);
     assert_eq!(session.thread_name, Some("agent thread".to_string()));
@@ -4294,6 +4334,34 @@ async fn inactive_thread_started_notification_initializes_replay_session() -> Re
         Some(&AgentPickerThreadEntry {
             agent_nickname: Some("Robie".to_string()),
             agent_role: Some("explorer".to_string()),
+            agent_path: None,
+            is_running: false,
+            is_closed: false,
+        })
+    );
+
+    let ServerNotification::ThreadStarted(notification) = started.as_mut() else {
+        unreachable!("notification was constructed as thread/started");
+    };
+    notification.thread.agent_nickname = Some("Updated".to_string());
+    notification.thread.agent_role = Some("worker".to_string());
+    notification.thread.model_provider = "different-provider".to_string();
+
+    app.enqueue_thread_notification(agent_thread_id, *started)
+        .await?;
+    let store = app
+        .thread_event_channels
+        .get(&agent_thread_id)
+        .expect("agent thread channel")
+        .store
+        .lock()
+        .await;
+    assert_eq!(store.session.as_ref(), Some(&session));
+    assert_eq!(
+        app.agent_navigation.get(&agent_thread_id),
+        Some(&AgentPickerThreadEntry {
+            agent_nickname: Some("Updated".to_string()),
+            agent_role: Some("worker".to_string()),
             agent_path: None,
             is_running: false,
             is_closed: false,

@@ -424,7 +424,7 @@ impl App {
                     Err(err) if Self::can_fallback_from_include_turns_error(&err) => {}
                     Err(err) => return Err(err),
                 }
-                let turns = thread.turns.clone();
+                let turns = std::mem::take(&mut thread.turns);
                 if turns.is_empty() {
                     // A `thread/read` fallback without turns would create a blank local replay
                     // channel with no live listener attached, which blocks later real re-attach.

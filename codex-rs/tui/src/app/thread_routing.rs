@@ -1468,7 +1468,7 @@ impl App {
         };
 
         let mut disconnected = false;
-        loop {
+        for _ in 0..64 {
             match rx.try_recv() {
                 Ok(event) => {
                     self.handle_thread_event_now_recovering_file_changes(event)
