@@ -27,6 +27,7 @@ use crate::facts::PluginState;
 use crate::facts::PluginStateChangedInput;
 use crate::facts::SkillInvocation;
 use crate::facts::SkillInvokedInput;
+use crate::facts::SubAgentThreadResumedInput;
 use crate::facts::SubAgentThreadStartedInput;
 use crate::facts::TrackEventsContext;
 use crate::facts::TurnCodexErrorFact;
@@ -61,12 +62,14 @@ use codex_login::CodexAuth;
 use codex_login::default_client::create_client;
 use codex_plugin::PluginId;
 use codex_plugin::PluginTelemetryMetadata;
+use codex_protocol::SessionId;
 use codex_protocol::ThreadId;
 use codex_protocol::items::CollabAgentToolCallItem;
 use codex_protocol::items::CollabAgentToolCallStatus;
 use codex_protocol::items::TurnItem;
 use codex_protocol::protocol::Event;
 use codex_protocol::protocol::EventMsg;
+use codex_protocol::protocol::SubAgentSource;
 use codex_protocol::request_permissions::RequestPermissionsResponse;
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -397,6 +400,25 @@ impl AnalyticsEventsClient {
                 turn_id,
                 completed_at_ms,
             },
+        ));
+    }
+
+    pub fn track_subagent_thread_resumed(
+        &self,
+        session_id: SessionId,
+        thread_id: ThreadId,
+        parent_thread_id: ThreadId,
+        product_client_id: String,
+        subagent_source: SubAgentSource,
+    ) {
+        self.record_fact(AnalyticsFact::Custom(
+            CustomAnalyticsFact::SubAgentThreadResumed(SubAgentThreadResumedInput {
+                session_id: session_id.to_string(),
+                thread_id: thread_id.to_string(),
+                parent_thread_id: parent_thread_id.to_string(),
+                product_client_id,
+                subagent_source,
+            }),
         ));
     }
 

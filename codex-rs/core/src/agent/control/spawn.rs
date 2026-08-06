@@ -491,6 +491,8 @@ impl AgentControl {
                 registered_agent.lifecycle.clear_cold_terminal_status();
                 self.state.clear_evicted_environments(thread_id);
                 residency_slot.commit(reloaded_thread.thread_id);
+                self.register_resumed_subagent_analytics(&reloaded_thread)
+                    .await;
                 state.notify_thread_created(reloaded_thread.thread_id);
                 Ok(())
             }
@@ -662,37 +664,42 @@ impl AgentControl {
             residency_slot.commit(new_thread.thread_id);
         }
 
-        if let Some(SessionSource::SubAgent(
-            subagent_source @ SubAgentSource::ThreadSpawn {
-                parent_thread_id, ..
-            },
-        )) = notification_source.as_ref()
-        {
-            let client_metadata = match state.get_thread(*parent_thread_id).await {
-                Ok(parent_thread) => parent_thread.session.app_server_client_metadata().await,
-                Err(error) => {
-                    tracing::warn!(
-                        error = %error,
-                        parent_thread_id = %parent_thread_id,
-                        "skipping subagent thread analytics: failed to load parent thread metadata"
-                    );
-                    crate::session::session::AppServerClientMetadata {
-                        client_name: None,
-                        client_version: None,
-                    }
-                }
-            };
+        if let Some(SessionSource::SubAgent(subagent_source)) = notification_source.as_ref() {
             let thread_config = new_thread.thread.config_snapshot().await;
-            let parent_thread_id = thread_config.parent_thread_id;
-            emit_subagent_session_started(
-                &new_thread.thread.session.services.analytics_events_client,
-                client_metadata,
-                new_thread.thread.session.session_id(),
-                new_thread.thread_id,
-                parent_thread_id,
-                thread_config,
-                subagent_source.clone(),
-            );
+            let source_parent_thread_id = match subagent_source {
+                SubAgentSource::ThreadSpawn {
+                    parent_thread_id, ..
+                } => Some(*parent_thread_id),
+                _ => options.parent_thread_id,
+            };
+
+            if let Some(parent_thread_id) =
+                thread_config.parent_thread_id.or(source_parent_thread_id)
+            {
+                let client_metadata = match state.get_thread(parent_thread_id).await {
+                    Ok(parent_thread) => parent_thread.session.app_server_client_metadata().await,
+                    Err(error) => {
+                        tracing::warn!(
+                            error = %error,
+                            parent_thread_id = %parent_thread_id,
+                            "skipping subagent thread analytics: failed to load parent thread metadata"
+                        );
+                        crate::session::session::AppServerClientMetadata {
+                            client_name: None,
+                            client_version: None,
+                        }
+                    }
+                };
+                emit_subagent_session_started(
+                    &new_thread.thread.session.services.analytics_events_client,
+                    client_metadata,
+                    new_thread.thread.session.session_id(),
+                    new_thread.thread_id,
+                    Some(parent_thread_id),
+                    thread_config,
+                    subagent_source.clone(),
+                );
+            }
         }
 
         // Notify a new thread has been created. This notification will be processed by clients

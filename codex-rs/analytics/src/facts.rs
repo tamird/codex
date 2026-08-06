@@ -407,6 +407,14 @@ pub struct SubAgentThreadStartedInput {
     pub created_at: u64,
 }
 
+pub(crate) struct SubAgentThreadResumedInput {
+    pub session_id: String,
+    pub thread_id: String,
+    pub parent_thread_id: String,
+    pub product_client_id: String,
+    pub subagent_source: SubAgentSource,
+}
+
 #[derive(Clone, Copy, Debug, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CompactionTrigger {
@@ -558,6 +566,7 @@ pub(crate) enum CustomAnalyticsFact {
     CodeModeToolCall(CodeModeToolCallFact),
     ControlToolCall(ControlToolCallFact),
     SubAgentThreadStarted(SubAgentThreadStartedInput),
+    SubAgentThreadResumed(SubAgentThreadResumedInput),
     Compaction(Box<CodexCompactionEvent>),
     Goal(Box<CodexGoalEvent>),
     GuardianReview(Box<GuardianReviewEventParams>),

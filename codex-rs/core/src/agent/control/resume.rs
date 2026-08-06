@@ -2,6 +2,7 @@ use super::ownership::ResumedThreadOwnership;
 use super::ownership::normalize_resumed_session_metadata;
 use super::residency::is_resident_session_source;
 use super::*;
+use crate::thread_manager::NewThread;
 use codex_thread_store::ThreadMetadataPatch;
 
 pub(super) async fn load_agent_model_context(
@@ -32,6 +33,27 @@ pub(super) async fn load_agent_model_context(
 }
 
 impl AgentControl {
+    pub(super) async fn register_resumed_subagent_analytics(&self, thread: &NewThread) {
+        let config = thread.thread.config_snapshot().await;
+        let (Some(parent_thread_id), SessionSource::SubAgent(subagent_source)) =
+            (config.parent_thread_id, config.session_source)
+        else {
+            return;
+        };
+        thread
+            .thread
+            .session
+            .services
+            .analytics_events_client
+            .track_subagent_thread_resumed(
+                thread.thread.session.session_id(),
+                thread.thread_id,
+                parent_thread_id,
+                config.originator,
+                subagent_source,
+            );
+    }
+
     pub(crate) async fn ensure_agent_loaded(
         &self,
         config: Config,
@@ -223,6 +245,8 @@ impl AgentControl {
                 if let Some(residency_slot) = residency_slot {
                     residency_slot.commit(reloaded_thread.thread_id);
                 }
+                self.register_resumed_subagent_analytics(&reloaded_thread)
+                    .await;
                 state.notify_thread_created(reloaded_thread.thread_id);
                 Ok(multi_agent_version)
             }
@@ -395,7 +419,7 @@ impl AgentControl {
 
         let resumed_thread = state
             .resume_thread_with_history_with_source(ResumeThreadWithHistoryOptions {
-                config: config.clone(),
+                config,
                 initial_history,
                 agent_control: self.clone(),
                 session_source: session_source.clone(),
@@ -435,6 +459,11 @@ impl AgentControl {
         let mut agent_metadata = agent_metadata;
         agent_metadata.agent_id = Some(resumed_thread.thread_id);
         reservation.commit(agent_metadata.clone());
+        if let Some(residency_slot) = residency_slot {
+            residency_slot.commit(resumed_thread.thread_id);
+        }
+        self.register_resumed_subagent_analytics(&resumed_thread)
+            .await;
         // Resumed threads are re-registered in-memory and need the same listener
         // attachment path as freshly spawned threads.
         state.notify_thread_created(resumed_thread.thread_id);
@@ -458,9 +487,6 @@ impl AgentControl {
             Some(&notification_source),
         )
         .await;
-        if let Some(residency_slot) = residency_slot {
-            residency_slot.commit(resumed_thread.thread_id);
-        }
 
         Ok((resumed_thread.thread_id, multi_agent_version))
     }

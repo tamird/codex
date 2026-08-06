@@ -614,6 +614,19 @@ impl AnalyticsReducer {
                 CustomAnalyticsFact::SubAgentThreadStarted(input) => {
                     self.ingest_subagent_thread_started(input, out);
                 }
+                CustomAnalyticsFact::SubAgentThreadResumed(input) => {
+                    let connection_id = self.thread_connection_id(&input.parent_thread_id);
+                    let thread = self.threads.entry(input.thread_id).or_default();
+                    thread.connection_id = connection_id;
+                    thread.originator = Some(input.product_client_id);
+                    thread.metadata = Some(ThreadMetadataState {
+                        session_id: input.session_id,
+                        thread_source: Some(ThreadSource::Subagent),
+                        initialization_mode: ThreadInitializationMode::Resumed,
+                        subagent_source: Some(subagent_source_name(&input.subagent_source)),
+                        parent_thread_id: Some(input.parent_thread_id),
+                    });
+                }
                 CustomAnalyticsFact::Compaction(input) => {
                     self.ingest_compaction(*input, out);
                 }
@@ -2362,16 +2375,16 @@ impl AnalyticsReducer {
     }
 
     /// Resolve the parent connection lazily when a subagent fact arrives first.
-    ///
-    /// Parents are spawned before their children, so ancestor links cannot cycle.
     fn thread_connection_id(&self, thread_id: &str) -> Option<u64> {
         let mut thread = self.threads.get(thread_id)?;
-        while thread.connection_id.is_none() {
-            let thread_metadata = thread.metadata.as_ref()?;
-            let parent_thread_id = thread_metadata.parent_thread_id.as_deref()?;
+        for _ in 0..self.threads.len() {
+            if let Some(connection_id) = thread.connection_id {
+                return Some(connection_id);
+            }
+            let parent_thread_id = thread.metadata.as_ref()?.parent_thread_id.as_deref()?;
             thread = self.threads.get(parent_thread_id)?;
         }
-        thread.connection_id
+        None
     }
 
     fn thread_connection_or_warn(

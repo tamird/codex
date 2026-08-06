@@ -87,6 +87,7 @@ use crate::facts::PluginUsedInput;
 use crate::facts::SkillInvocation;
 use crate::facts::SkillInvocationLocation;
 use crate::facts::SkillInvokedInput;
+use crate::facts::SubAgentThreadResumedInput;
 use crate::facts::SubAgentThreadStartedInput;
 use crate::facts::ThreadInitializationMode;
 use crate::facts::TrackEventsContext;
@@ -3715,27 +3716,27 @@ async fn subagent_tool_items_inherit_parent_connection_metadata() {
     let mut reducer = AnalyticsReducer::default();
     let mut events = Vec::new();
 
-    reducer
-        .ingest(
-            AnalyticsFact::Custom(CustomAnalyticsFact::SubAgentThreadStarted(
-                SubAgentThreadStartedInput {
-                    session_id: "session-thread-1".to_string(),
-                    thread_id: "thread-subagent".to_string(),
-                    parent_thread_id: Some("thread-1".to_string()),
-                    forked_from_thread_id: None,
-                    product_client_id: "codex-tui".to_string(),
-                    client_name: Some("codex-tui".to_string()),
-                    client_version: Some("1.0.0".to_string()),
-                    model: "gpt-5".to_string(),
-                    ephemeral: false,
-                    thread_source: Some(ThreadSource::Subagent),
-                    subagent_source: SubAgentSource::Review,
-                    created_at: 128,
-                },
-            )),
-            &mut events,
-        )
-        .await;
+    for (thread_id, parent_thread_id) in [
+        ("thread-subagent", "thread-resumed-parent"),
+        ("thread-resumed-parent", "thread-1"),
+        ("thread-subagent", "thread-resumed-parent"),
+    ] {
+        reducer
+            .ingest(
+                AnalyticsFact::Custom(CustomAnalyticsFact::SubAgentThreadResumed(
+                    SubAgentThreadResumedInput {
+                        session_id: "session-thread-1".to_string(),
+                        thread_id: thread_id.to_string(),
+                        parent_thread_id: parent_thread_id.to_string(),
+                        product_client_id: "codex-tui".to_string(),
+                        subagent_source: SubAgentSource::Review,
+                    },
+                )),
+                &mut events,
+            )
+            .await;
+    }
+    assert!(events.is_empty());
     ingest_review_prerequisites(&mut reducer, &mut events).await;
     for (thread_id, turn_id, root_turn_id) in [
         ("thread-1", "turn-parent", "parent-current-root"),
@@ -3838,13 +3839,67 @@ async fn subagent_tool_items_inherit_parent_connection_metadata() {
     assert_eq!(payload[0]["event_params"]["session_id"], "session-thread-1");
     assert_eq!(payload[0]["event_params"]["thread_source"], "subagent");
     assert_eq!(payload[0]["event_params"]["subagent_source"], "review");
-    assert_eq!(payload[0]["event_params"]["parent_thread_id"], "thread-1");
+    assert_eq!(
+        payload[0]["event_params"]["parent_thread_id"],
+        "thread-resumed-parent"
+    );
     assert_eq!(
         payload[0]["event_params"]["app_server_client"]["client_name"],
         "codex-tui"
     );
     assert_eq!(payload[1]["event_type"], "codex_dynamic_tool_call_event");
-    assert_eq!(payload[1]["event_params"]["parent_thread_id"], "thread-1");
+    assert_eq!(
+        payload[1]["event_params"]["parent_thread_id"],
+        "thread-resumed-parent"
+    );
+
+    events.clear();
+    reducer
+        .ingest(
+            AnalyticsFact::Custom(CustomAnalyticsFact::SubAgentThreadStarted(
+                SubAgentThreadStartedInput {
+                    session_id: "session-thread-1".to_string(),
+                    thread_id: "thread-guardian".to_string(),
+                    parent_thread_id: Some("thread-1".to_string()),
+                    forked_from_thread_id: None,
+                    product_client_id: "codex-tui".to_string(),
+                    client_name: Some("codex-tui".to_string()),
+                    client_version: Some("1.0.0".to_string()),
+                    model: "gpt-5".to_string(),
+                    ephemeral: false,
+                    thread_source: Some(ThreadSource::Subagent),
+                    subagent_source: SubAgentSource::Other("guardian".to_string()),
+                    created_at: 126,
+                },
+            )),
+            &mut events,
+        )
+        .await;
+    assert!(matches!(
+        events.as_slice(),
+        [TrackEventRequest::ThreadInitialized(_)]
+    ));
+
+    events.clear();
+    ingest_completed_command_execution_item(
+        &mut reducer,
+        &mut events,
+        "thread-guardian",
+        "item-guardian",
+    )
+    .await;
+
+    let payload = serde_json::to_value(&events).expect("serialize guardian tool event");
+    assert_eq!(payload.as_array().expect("events array").len(), 1);
+    assert_eq!(payload[0]["event_type"], "codex_command_execution_event");
+    assert_eq!(payload[0]["event_params"]["thread_id"], "thread-guardian");
+    assert_eq!(payload[0]["event_params"]["session_id"], "session-thread-1");
+    assert_eq!(payload[0]["event_params"]["subagent_source"], "guardian");
+    assert_eq!(payload[0]["event_params"]["parent_thread_id"], "thread-1");
+    assert_eq!(
+        payload[0]["event_params"]["app_server_client"]["client_name"],
+        "codex-tui"
+    );
 }
 
 #[test]
