@@ -1046,6 +1046,11 @@ async fn skills_list_uses_cached_result_after_session_default_writes_until_force
 
     for edits in [
         vec![ConfigEdit {
+            key_path: "approvals_reviewer".to_string(),
+            value: serde_json::json!("user"),
+            merge_strategy: MergeStrategy::Replace,
+        }],
+        vec![ConfigEdit {
             key_path: "plan_mode_reasoning_effort".to_string(),
             value: serde_json::json!("high"),
             merge_strategy: MergeStrategy::Replace,

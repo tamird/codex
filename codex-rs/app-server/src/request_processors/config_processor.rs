@@ -155,7 +155,8 @@ impl ConfigRequestProcessor {
             && params.edits.iter().all(|edit| {
                 matches!(
                     edit.key_path.as_str(),
-                    "model"
+                    "approvals_reviewer"
+                        | "model"
                         | "model_reasoning_effort"
                         | "plan_mode_reasoning_effort"
                         | "service_tier"
