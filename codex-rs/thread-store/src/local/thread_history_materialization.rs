@@ -55,9 +55,13 @@ async fn materialize_to_sqlite_inner(
     let mut start_offset = projection_state
         .as_ref()
         .map_or(0, |state| state.next_byte_offset);
+    let cached_first_ordinal = if projection_state.is_some() && start_offset != 0 {
+        Some(first_rollout_ordinal(rollout_path).await?)
+    } else {
+        None
+    };
     if let Some(state) = projection_state.as_ref()
-        && start_offset != 0
-        && first_rollout_ordinal(rollout_path).await? == Some(state.next_ordinal)
+        && cached_first_ordinal == Some(Some(state.next_ordinal))
     {
         // The stable rollout was replaced after its immutable prefix was projected. Recover the
         // physical cursor without changing the lineage ordinal or deleting the existing rows.
@@ -82,7 +86,10 @@ async fn materialize_to_sqlite_inner(
         .meta;
     let initial_ordinal = match session_meta.history_base {
         Some(base) => base.end_ordinal_exclusive,
-        None => first_rollout_ordinal(rollout_path).await?.unwrap_or(0),
+        None => match cached_first_ordinal {
+            Some(ordinal) => ordinal.unwrap_or(0),
+            None => first_rollout_ordinal(rollout_path).await?.unwrap_or(0),
+        },
     };
     if projection_state.is_none()
         && (session_meta.history_base.is_some()
