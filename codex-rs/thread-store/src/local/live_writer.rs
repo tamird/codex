@@ -766,6 +766,9 @@ pub(super) async fn shutdown_thread(
         recorder.shutdown().await.map_err(thread_store_io_error)?;
         if let Err(error) = project_segmented_legacy_rollout(store, thread_id, &recorder).await {
             warn!(
+                projection_mode = "legacy",
+                write_operation = "shutdown",
+                error_kind = projection_error_kind(&error),
                 "failed to project segmented legacy history during shutdown for {thread_id}: {error}"
             );
         }
@@ -778,7 +781,12 @@ pub(super) async fn shutdown_thread(
         )
         .await
         {
-            warn!("failed to project durable rollout during shutdown for {thread_id}: {err}");
+            warn!(
+                projection_mode = "paginated",
+                write_operation = "shutdown",
+                error_kind = projection_error_kind(&err),
+                "failed to project durable rollout during shutdown for {thread_id}: {err}"
+            );
         }
     }
     sync_materialized_rollout_path(store, thread_id, rollout_path.as_path()).await?;
@@ -884,6 +892,24 @@ fn thread_store_io_error(err: std::io::Error) -> ThreadStoreError {
     }
 }
 
+fn projection_error_kind(error: &ThreadStoreError) -> &'static str {
+    match error {
+        ThreadStoreError::ThreadNotFound { .. } => "not_found",
+        ThreadStoreError::InvalidRequest { .. } => "invalid_request",
+        ThreadStoreError::Conflict { .. } => "conflict",
+        ThreadStoreError::Unsupported { .. } => "unsupported",
+        ThreadStoreError::Internal { message } => {
+            if codex_state::sqlite_error_detail_is_lock(message) {
+                "sqlite_locked"
+            } else if codex_state::sqlite_error_detail_is_corruption(message) {
+                "sqlite_corrupt"
+            } else {
+                "internal"
+            }
+        }
+    }
+}
+
 /// The rollout writer has three distinct lifecycle moments:
 /// - `AppendItems` is normal turn/event persistence and adds new rollout records.
 /// - `Persist` makes the thread durable before any turn items exist; locally this can write the
@@ -966,16 +992,16 @@ async fn write_and_project_reserved(
     let (recorder, rollout_id, history_mode, persistence_mode) =
         live_writer_parts(store, thread_id).await?;
     let sync_rollout_path = matches!(&write_op, RolloutWriteOp::Persist | RolloutWriteOp::Flush);
-    let write_op = match write_op {
+    let (write_op, write_operation) = match write_op {
         RolloutWriteOp::AppendItems(mut items) => {
             items.retain(|item| is_persisted_rollout_item(item, history_mode));
             if items.is_empty() {
                 return Ok(());
             }
-            RolloutWriteOp::AppendItems(items)
+            (RolloutWriteOp::AppendItems(items), "append")
         }
-        RolloutWriteOp::Persist => RolloutWriteOp::Persist,
-        RolloutWriteOp::Flush => RolloutWriteOp::Flush,
+        RolloutWriteOp::Persist => (RolloutWriteOp::Persist, "persist"),
+        RolloutWriteOp::Flush => (RolloutWriteOp::Flush, "flush"),
     };
     let inherited_legacy_reference = matches!(history_mode, ThreadHistoryMode::Legacy)
         && matches!(&write_op, RolloutWriteOp::AppendItems(items) if items.iter().any(|item| {
@@ -1028,7 +1054,12 @@ async fn write_and_project_reserved(
     }
     if matches!(history_mode, ThreadHistoryMode::Legacy) {
         if let Err(error) = project_segmented_legacy_rollout(store, thread_id, &recorder).await {
-            warn!("failed to project segmented legacy history for {thread_id}: {error}");
+            warn!(
+                projection_mode = "legacy",
+                write_operation,
+                error_kind = projection_error_kind(&error),
+                "failed to project segmented legacy history for {thread_id}: {error}"
+            );
         }
     } else {
         let rollout_path = recorder.rollout_path();
@@ -1041,7 +1072,12 @@ async fn write_and_project_reserved(
         )
         .await
         {
-            warn!("failed to project durable rollout for {thread_id}: {err}");
+            warn!(
+                projection_mode = "paginated",
+                write_operation,
+                error_kind = projection_error_kind(&err),
+                "failed to project durable rollout for {thread_id}: {err}"
+            );
         }
     }
     if sync_rollout_path {
