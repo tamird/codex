@@ -270,6 +270,8 @@ pub(crate) enum AppEvent {
     /// Open the agent picker for switching active threads.
     OpenAgentPicker,
     /// Merge a completed root-scoped agent-picker refresh without blocking terminal input.
+    /// Refresh the model catalog from app-server and reopen the model picker.
+    RefreshModelCatalog,
     AgentPickerThreadsLoaded {
         primary_thread_id: ThreadId,
         request_id: Uuid,

@@ -1154,8 +1154,16 @@
     "CustomModelToml": {
       "additionalProperties": false,
       "properties": {
+        "candidates": {
+          "default": [],
+          "description": "Ordered concrete request configurations for a routed alias.",
+          "items": {
+            "$ref": "#/definitions/ModelRoutingCandidateToml"
+          },
+          "type": "array"
+        },
         "model": {
-          "description": "Provider-facing model slug used on API requests.",
+          "description": "Provider-facing model slug used on API requests for a direct alias.",
           "type": "string"
         },
         "model_auto_compact_token_limit": {
@@ -1174,7 +1182,6 @@
         }
       },
       "required": [
-        "model",
         "name"
       ],
       "type": "object"
@@ -2269,6 +2276,32 @@
           "description": "Which wire protocol this provider expects."
         }
       },
+      "type": "object"
+    },
+    "ModelRoutingCandidateToml": {
+      "additionalProperties": false,
+      "description": "One concrete request configuration in a routed custom model alias.",
+      "properties": {
+        "model": {
+          "description": "Provider-facing model slug used on API requests.",
+          "type": "string"
+        },
+        "reasoning_effort": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/ReasoningEffort"
+            }
+          ],
+          "description": "Optional reasoning effort required for this candidate."
+        },
+        "service_tier": {
+          "description": "Optional service tier required for this candidate.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "model"
+      ],
       "type": "object"
     },
     "MultiAgentV2ConfigToml": {

@@ -37,6 +37,12 @@ async fn loads_latest_checkpoint_with_required_turn_metadata() {
     let home = TempDir::new().expect("temp dir");
     let uuid = Uuid::from_u128(/*v*/ 1001);
     let thread_id = codex_protocol::ThreadId::from_string(&uuid.to_string()).expect("thread id");
+    let mut latest_turn_context = turn_context(home.path(), "turn-2");
+    let RolloutItem::TurnContext(latest_turn_context_item) = &mut latest_turn_context else {
+        unreachable!("turn_context should return a turn context item");
+    };
+    latest_turn_context_item.service_tier = Some("priority".to_string());
+    latest_turn_context_item.model_profile = Some("balanced".to_string());
     write_paginated_rollout(
         home.path(),
         "2025-01-03T13-00-00",
@@ -51,7 +57,7 @@ async fn loads_latest_checkpoint_with_required_turn_metadata() {
             turn_started("turn-2"),
             user_message("latest turn"),
             completed_user_message("turn-2", "latest turn"),
-            turn_context(home.path(), "turn-2"),
+            latest_turn_context,
             compacted("latest checkpoint", Some(Vec::new())),
             turn_complete("turn-2"),
         ],
@@ -77,7 +83,13 @@ async fn loads_latest_checkpoint_with_required_turn_metadata() {
         matches!(item, RolloutItem::Compacted(compacted) if compacted.message == "older checkpoint")
     }));
     assert!(context.items.iter().any(|item| {
-        matches!(item, RolloutItem::TurnContext(context) if context.turn_id.as_deref() == Some("turn-2"))
+        matches!(
+            item,
+            RolloutItem::TurnContext(context)
+                if context.turn_id.as_deref() == Some("turn-2")
+                    && context.service_tier.as_deref() == Some("priority")
+                    && context.model_profile.as_deref() == Some("balanced")
+        )
     }));
 }
 
@@ -640,6 +652,8 @@ fn turn_context(root: &Path, turn_id: &str) -> RolloutItem {
         realtime_active: None,
         cyber_access_program: None,
         effort: None,
+        service_tier: None,
+        model_profile: None,
         summary: ReasoningSummary::Auto,
     })
 }

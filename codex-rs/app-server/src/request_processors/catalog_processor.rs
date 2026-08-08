@@ -169,6 +169,15 @@ impl CatalogRequestProcessor {
         &self,
         params: ModelListParams,
     ) -> Result<Option<ClientResponsePayload>, JSONRPCErrorError> {
+        match self.load_latest_config(/*fallback_cwd*/ None).await {
+            Ok(config) => self
+                .thread_manager
+                .replace_custom_models(config.custom_models),
+            Err(err) => tracing::warn!(
+                error = %err.message,
+                "failed to refresh custom models before model/list; retaining the last valid snapshot"
+            ),
+        }
         Self::list_models(
             self.thread_manager.clone(),
             self.config.http_client_factory(),

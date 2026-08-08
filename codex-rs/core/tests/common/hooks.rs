@@ -27,6 +27,16 @@ pub fn trust_discovered_hooks(config: &mut Config) {
 pub fn trust_hooks(config: &mut Config, hooks: Vec<HookListEntry>) {
     config.config_layer_stack =
         trusted_config_layer_stack(&config.config_layer_stack, &config.codex_home, hooks);
+    // Frodex reloads the user layer before an idle turn. Trust must survive that reload.
+    let user = config
+        .config_layer_stack
+        .get_active_user_layer()
+        .expect("trusted user layer");
+    std::fs::write(
+        config.codex_home.join(CONFIG_TOML_FILE),
+        toml::to_string(&user.config).expect("serialize trusted user config"),
+    )
+    .expect("persist trusted hook fixture");
 }
 
 pub fn trusted_config_layer_stack(

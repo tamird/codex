@@ -1,5 +1,6 @@
 use crate::TransportError;
 use crate::error::ApiError;
+use crate::error::is_request_configuration_unavailable;
 use crate::rate_limits::parse_promo_message;
 use crate::rate_limits::parse_rate_limit_for_limit;
 use crate::rate_limits::parse_rate_limit_reached_type;
@@ -23,6 +24,7 @@ pub fn map_api_error(err: ApiError) -> CodexErr {
         ApiError::ContextWindowExceeded => CodexErr::ContextWindowExceeded,
         ApiError::QuotaExceeded => CodexErr::QuotaExceeded,
         ApiError::UsageNotIncluded => CodexErr::UsageNotIncluded,
+        ApiError::UsageLimitReached(error) => CodexErr::UsageLimitReached(error),
         ApiError::Retryable { message, delay } => {
             let error = CodexErr::Stream(message);
             match delay {
@@ -53,6 +55,7 @@ pub fn map_api_error(err: ApiError) -> CodexErr {
             })
         }
         ApiError::InvalidRequest { message } => CodexErr::InvalidRequest(message),
+        ApiError::ModelUnavailable { message } => CodexErr::ModelUnavailable(message),
         ApiError::CyberPolicy { message } => {
             CodexErr::new(CodexErrorDetails::CyberPolicy { message })
         }
@@ -85,52 +88,7 @@ pub fn map_api_error(err: ApiError) -> CodexErr {
                     return CodexErr::ServerOverloaded;
                 }
 
-                if (status == http::StatusCode::BAD_REQUEST
-                    || status == http::StatusCode::FORBIDDEN)
-                    && let Ok(parsed) = serde_json::from_str::<Value>(&body_text)
-                    && let Some(error) = parsed.get("error")
-                    && error.get("code").and_then(Value::as_str)
-                        == Some(MISALIGNMENT_POLICY_VIOLATION_ERROR_CODE)
-                {
-                    let message = error
-                        .get("message")
-                        .and_then(Value::as_str)
-                        .filter(|message| !message.trim().is_empty())
-                        .map(str::to_string)
-                        .unwrap_or_else(|| {
-                            MISALIGNMENT_POLICY_VIOLATION_FALLBACK_MESSAGE.to_string()
-                        });
-                    return CodexErr::new(CodexErrorDetails::MisalignmentPolicyViolation {
-                        message,
-                        misalignment: error.get("misalignment").cloned().and_then(|details| {
-                            serde_json::from_value::<MisalignmentErrorDetails>(details).ok()
-                        }),
-                    });
-                }
-
-                if status == http::StatusCode::BAD_REQUEST {
-                    if let Ok(parsed) = serde_json::from_str::<Value>(&body_text)
-                        && let Some(error) = parsed.get("error")
-                        && error.get("code").and_then(Value::as_str)
-                            == Some(CYBER_POLICY_ERROR_CODE)
-                    {
-                        let message = error
-                            .get("message")
-                            .and_then(Value::as_str)
-                            .filter(|message| !message.trim().is_empty())
-                            .map(str::to_string)
-                            .unwrap_or_else(|| CYBER_POLICY_FALLBACK_MESSAGE.to_string());
-                        CodexErr::new(CodexErrorDetails::CyberPolicy { message })
-                    } else if body_text
-                        .contains("The image data you provided does not represent a valid image")
-                    {
-                        CodexErr::InvalidImageRequest()
-                    } else {
-                        CodexErr::InvalidRequest(body_text)
-                    }
-                } else if status == http::StatusCode::INTERNAL_SERVER_ERROR {
-                    CodexErr::InternalServerError
-                } else if status == http::StatusCode::TOO_MANY_REQUESTS {
+                if status == http::StatusCode::TOO_MANY_REQUESTS {
                     if let Ok(err) = serde_json::from_str::<UsageErrorResponse>(&body_text) {
                         if err.error.error_type.as_deref() == Some("usage_limit_reached") {
                             let limit_id = extract_header(headers.as_ref(), ACTIVE_LIMIT_HEADER);
@@ -162,10 +120,65 @@ pub fn map_api_error(err: ApiError) -> CodexErr {
                         }
                     }
 
-                    CodexErr::RetryLimit(RetryLimitReachedError {
+                    return CodexErr::RetryLimit(RetryLimitReachedError {
                         status,
                         request_id: extract_request_tracking_id(headers.as_ref()),
-                    })
+                    });
+                }
+
+                if (status == http::StatusCode::BAD_REQUEST
+                    || status == http::StatusCode::FORBIDDEN)
+                    && let Ok(parsed) = serde_json::from_str::<Value>(&body_text)
+                    && let Some(error) = parsed.get("error")
+                    && error.get("code").and_then(Value::as_str)
+                        == Some(MISALIGNMENT_POLICY_VIOLATION_ERROR_CODE)
+                {
+                    let message = error
+                        .get("message")
+                        .and_then(Value::as_str)
+                        .filter(|message| !message.trim().is_empty())
+                        .map(str::to_string)
+                        .unwrap_or_else(|| {
+                            MISALIGNMENT_POLICY_VIOLATION_FALLBACK_MESSAGE.to_string()
+                        });
+                    return CodexErr::new(CodexErrorDetails::MisalignmentPolicyViolation {
+                        message,
+                        misalignment: error.get("misalignment").cloned().and_then(|details| {
+                            serde_json::from_value::<MisalignmentErrorDetails>(details).ok()
+                        }),
+                    });
+                }
+
+                if status == http::StatusCode::BAD_REQUEST
+                    && let Ok(parsed) = serde_json::from_str::<Value>(&body_text)
+                    && let Some(error) = parsed.get("error")
+                    && error.get("code").and_then(Value::as_str) == Some(CYBER_POLICY_ERROR_CODE)
+                {
+                    let message = error
+                        .get("message")
+                        .and_then(Value::as_str)
+                        .filter(|message| !message.trim().is_empty())
+                        .map(str::to_string)
+                        .unwrap_or_else(|| CYBER_POLICY_FALLBACK_MESSAGE.to_string());
+                    return CodexErr::new(CodexErrorDetails::CyberPolicy { message });
+                }
+
+                if let Some(message) =
+                    request_configuration_unavailable_message(&body_text, status.is_client_error())
+                {
+                    return CodexErr::ModelUnavailable(message);
+                }
+
+                if status == http::StatusCode::BAD_REQUEST {
+                    if body_text
+                        .contains("The image data you provided does not represent a valid image")
+                    {
+                        CodexErr::InvalidImageRequest()
+                    } else {
+                        CodexErr::InvalidRequest(body_text)
+                    }
+                } else if status == http::StatusCode::INTERNAL_SERVER_ERROR {
+                    CodexErr::InternalServerError
                 } else {
                     CodexErr::UnexpectedStatus(UnexpectedResponseError {
                         status,
@@ -208,6 +221,7 @@ const CYBER_POLICY_FALLBACK_MESSAGE: &str =
 const MISALIGNMENT_POLICY_VIOLATION_ERROR_CODE: &str = "misalignment_policy_violation";
 const MISALIGNMENT_POLICY_VIOLATION_FALLBACK_MESSAGE: &str =
     "This request was blocked due to a misalignment policy violation.";
+const MODEL_UNAVAILABLE_FALLBACK_MESSAGE: &str = "The selected model is unavailable.";
 const CLOUDFLARE_BLOCKED_MESSAGE: &str =
     "Access blocked by Cloudflare. This usually happens when connecting from a restricted region";
 
@@ -228,6 +242,28 @@ fn api_error_user_message(status: http::StatusCode, body: &str) -> Option<String
     } else {
         None
     }
+}
+
+fn request_configuration_unavailable_message(
+    body: &str,
+    allow_parameter_match: bool,
+) -> Option<String> {
+    let parsed = serde_json::from_str::<Value>(body).ok()?;
+    let error = parsed.get("error")?;
+    let code = error.get("code").and_then(Value::as_str);
+    let param = error.get("param").and_then(Value::as_str);
+    if !is_request_configuration_unavailable(code, allow_parameter_match.then_some(param).flatten())
+    {
+        return None;
+    }
+    Some(
+        error
+            .get("message")
+            .and_then(Value::as_str)
+            .filter(|message| !message.trim().is_empty())
+            .unwrap_or(MODEL_UNAVAILABLE_FALLBACK_MESSAGE)
+            .to_string(),
+    )
 }
 
 fn extract_request_id(headers: Option<&HeaderMap>) -> Option<String> {

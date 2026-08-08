@@ -16,6 +16,10 @@ use codex_login::CodexAuth;
 use codex_login::auth::AgentIdentityAuthPolicy;
 use codex_model_provider_info::ModelProviderInfo;
 use codex_model_provider_info::WireApi;
+use codex_models_manager::CustomModelConfig;
+use codex_models_manager::ModelRoutingCandidate;
+use codex_models_manager::ModelRoutingProfile;
+use codex_models_manager::model_info::model_info_from_slug;
 use codex_otel::MetricsClient;
 use codex_otel::MetricsConfig;
 use codex_otel::SessionTelemetry;
@@ -32,6 +36,7 @@ use codex_protocol::models::ContentItem;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::openai_models::ModelInfo;
 use codex_protocol::openai_models::ModelServiceTier;
+use codex_protocol::openai_models::ModelsResponse;
 use codex_protocol::openai_models::ReasoningEffort as ReasoningEffortConfig;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::SessionSource;
@@ -48,11 +53,14 @@ use core_test_support::responses::WebSocketConnectionConfig;
 use core_test_support::responses::WebSocketTestServer;
 use core_test_support::responses::ev_assistant_message;
 use core_test_support::responses::ev_completed;
+use core_test_support::responses::ev_function_call;
+use core_test_support::responses::ev_output_text_delta;
 use core_test_support::responses::ev_response_created;
 use core_test_support::responses::start_websocket_server;
 use core_test_support::responses::start_websocket_server_with_headers;
 use core_test_support::responses_metadata as test_responses_metadata;
 use core_test_support::skip_if_no_network;
+use core_test_support::test_codex::TestCodex;
 use core_test_support::test_codex::test_codex;
 use core_test_support::tracing::install_test_tracing;
 use core_test_support::wait_for_event;
@@ -60,6 +68,7 @@ use futures::StreamExt;
 use opentelemetry_sdk::metrics::InMemoryMetricExporter;
 use pretty_assertions::assert_eq;
 use serde_json::json;
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use tempfile::TempDir;
@@ -77,6 +86,52 @@ const TEST_INSTALLATION_ID: &str = "11111111-1111-4111-8111-111111111111";
 const TEST_WINDOW_ID: &str = "test-thread:0";
 const X_CODEX_WS_STREAM_REQUEST_START_MS_CLIENT_METADATA_KEY: &str =
     "x-codex-ws-stream-request-start-ms";
+const X_CODEX_TURN_STATE_HEADER: &str = "x-codex-turn-state";
+const ROUTED_WEBSOCKET_PROFILE: &str = "test-websocket-route";
+const ROUTED_WEBSOCKET_PRIMARY: &str = "test-websocket-primary";
+const ROUTED_WEBSOCKET_FALLBACK: &str = "test-websocket-fallback";
+
+async fn routed_websocket_test(server: &WebSocketTestServer) -> TestCodex {
+    let custom_models = HashMap::from([(
+        ROUTED_WEBSOCKET_PROFILE.to_string(),
+        CustomModelConfig {
+            model: ROUTED_WEBSOCKET_PRIMARY.to_string(),
+            routing_profile: Some(ModelRoutingProfile {
+                candidates: vec![
+                    ModelRoutingCandidate {
+                        model: ROUTED_WEBSOCKET_PRIMARY.to_string(),
+                        reasoning_effort: None,
+                        service_tier: None,
+                    },
+                    ModelRoutingCandidate {
+                        model: ROUTED_WEBSOCKET_FALLBACK.to_string(),
+                        reasoning_effort: None,
+                        service_tier: None,
+                    },
+                ],
+            }),
+            model_context_window: None,
+            model_auto_compact_token_limit: None,
+        },
+    )]);
+    let mut primary_model = model_info_from_slug(ROUTED_WEBSOCKET_PRIMARY);
+    primary_model.experimental_supported_tools = vec!["test_sync_tool".to_string()];
+    let mut fallback_model = model_info_from_slug(ROUTED_WEBSOCKET_FALLBACK);
+    fallback_model.experimental_supported_tools = vec!["test_sync_tool".to_string()];
+    let mut builder = test_codex().with_config(move |config| {
+        config.model = Some(ROUTED_WEBSOCKET_PROFILE.to_string());
+        config.custom_models = custom_models.clone();
+        config.model_catalog = Some(ModelsResponse {
+            models: vec![primary_model.clone(), fallback_model],
+        });
+        config.model_provider.request_max_retries = Some(0);
+        config.model_provider.stream_max_retries = Some(0);
+    });
+    builder
+        .build_with_websocket_server(server)
+        .await
+        .expect("build routed websocket Codex")
+}
 
 fn assert_request_trace_matches(body: &serde_json::Value, expected_trace: &W3cTraceContext) {
     let client_metadata = body["client_metadata"]
@@ -815,6 +870,234 @@ async fn responses_websocket_reuses_connection_after_session_drop() {
 
     assert_eq!(server.handshakes().len(), 1);
     assert_eq!(server.single_connection().len(), 2);
+
+    server.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn routed_profile_rebases_websocket_continuation_after_tool_call() {
+    skip_if_no_network!();
+
+    const CALL_ID: &str = "test-websocket-call";
+    const ITEM_ID: &str = "test-websocket-item";
+
+    let mut tool_call = ev_function_call(CALL_ID, "test_sync_tool", "{}");
+    tool_call["item"]["id"] = json!(ITEM_ID);
+    let server = start_websocket_server(vec![
+        vec![
+            vec![
+                ev_response_created("test-warmup-response"),
+                ev_completed("test-warmup-response"),
+            ],
+            vec![
+                json!({
+                    "type": "response.metadata",
+                    "headers": {(X_CODEX_TURN_STATE_HEADER): "test-primary-turn-state"},
+                }),
+                ev_response_created("test-primary-tool-response"),
+                tool_call,
+                ev_completed("test-primary-tool-response"),
+            ],
+            vec![json!({
+                "type": "response.failed",
+                "response": {
+                    "id": "test-primary-failed-response",
+                    "status": "failed",
+                    "error": {
+                        "code": "server_is_overloaded",
+                        "message": "temporary test diagnostic",
+                    },
+                },
+            })],
+        ],
+        vec![vec![
+            ev_response_created("test-fallback-response"),
+            ev_assistant_message("test-fallback-message", "routed completion"),
+            ev_completed("test-fallback-response"),
+        ]],
+    ])
+    .await;
+    let test = routed_websocket_test(&server).await;
+
+    test.submit_turn("run the routing test tool")
+        .await
+        .expect("routed websocket turn should complete");
+
+    let connections = server.connections();
+    assert_eq!(connections.len(), 2);
+    assert_eq!(connections[0].len(), 3);
+    assert_eq!(connections[1].len(), 1);
+
+    let warmup = connections[0][0].body_json();
+    let primary = connections[0][1].body_json();
+    let primary_continuation = connections[0][2].body_json();
+    let fallback = connections[1][0].body_json();
+
+    assert_eq!(warmup["generate"].as_bool(), Some(false));
+    assert_eq!(primary["model"].as_str(), Some(ROUTED_WEBSOCKET_PRIMARY));
+    assert_eq!(primary.get("previous_response_id"), None);
+    assert_eq!(
+        primary["client_metadata"].get(X_CODEX_TURN_STATE_HEADER),
+        None
+    );
+
+    assert_eq!(
+        primary_continuation["model"].as_str(),
+        Some(ROUTED_WEBSOCKET_PRIMARY)
+    );
+    assert_eq!(
+        primary_continuation["previous_response_id"].as_str(),
+        Some("test-primary-tool-response")
+    );
+    assert_eq!(
+        primary_continuation["client_metadata"][X_CODEX_TURN_STATE_HEADER].as_str(),
+        Some("test-primary-turn-state")
+    );
+    let primary_continuation_input = primary_continuation["input"]
+        .as_array()
+        .expect("primary continuation input");
+    assert!(primary_continuation_input.iter().any(|item| {
+        item.get("call_id").and_then(serde_json::Value::as_str) == Some(CALL_ID)
+            && item.get("type").and_then(serde_json::Value::as_str) == Some("function_call_output")
+    }));
+
+    assert_eq!(fallback["model"].as_str(), Some(ROUTED_WEBSOCKET_FALLBACK));
+    assert_eq!(fallback.get("previous_response_id"), None);
+    assert_eq!(
+        fallback["client_metadata"].get(X_CODEX_TURN_STATE_HEADER),
+        None
+    );
+    let fallback_input = fallback["input"].as_array().expect("fallback full input");
+    assert!(fallback_input.iter().any(|item| {
+        item.get("call_id").and_then(serde_json::Value::as_str) == Some(CALL_ID)
+            && item.get("type").and_then(serde_json::Value::as_str) == Some("function_call")
+    }));
+    assert!(fallback_input.iter().any(|item| {
+        item.get("call_id").and_then(serde_json::Value::as_str) == Some(CALL_ID)
+            && item.get("type").and_then(serde_json::Value::as_str) == Some("function_call_output")
+    }));
+
+    server.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn routed_profile_rebases_websocket_after_partial_commentary() {
+    skip_if_no_network!();
+
+    const ITEM_ID: &str = "test-websocket-commentary";
+    const FIRST_DELTA: &str = "checking the ";
+    const SECOND_DELTA: &str = "request";
+    const PREFIX: &str = "checking the request";
+
+    let server = start_websocket_server(vec![
+        vec![
+            vec![
+                ev_response_created("test-commentary-warmup"),
+                ev_completed("test-commentary-warmup"),
+            ],
+            vec![
+                json!({
+                    "type": "response.metadata",
+                    "headers": {(X_CODEX_TURN_STATE_HEADER): "test-commentary-turn-state"},
+                }),
+                ev_response_created("test-commentary-primary"),
+                json!({
+                    "type": "response.output_item.added",
+                    "item": {
+                        "type": "message",
+                        "role": "assistant",
+                        "id": ITEM_ID,
+                        "phase": "commentary",
+                        "content": [{"type": "output_text", "text": ""}],
+                    },
+                }),
+                ev_output_text_delta(FIRST_DELTA),
+                ev_output_text_delta(SECOND_DELTA),
+                json!({
+                    "type": "response.failed",
+                    "response": {
+                        "id": "test-commentary-primary-failed",
+                        "status": "failed",
+                        "error": {
+                            "code": "server_is_overloaded",
+                            "message": "temporary test diagnostic",
+                        },
+                    },
+                }),
+            ],
+        ],
+        vec![vec![
+            ev_response_created("test-commentary-fallback"),
+            ev_assistant_message("test-commentary-final", "routed completion"),
+            ev_completed("test-commentary-fallback"),
+        ]],
+    ])
+    .await;
+    let test = routed_websocket_test(&server).await;
+
+    test.codex
+        .submit(Op::UserInput {
+            items: vec![UserInput::Text {
+                text: "stream the routing test commentary".to_string(),
+                text_elements: Vec::new(),
+            }],
+            final_output_json_schema: None,
+            responsesapi_client_metadata: None,
+            additional_context: Default::default(),
+            thread_settings: Default::default(),
+        })
+        .await
+        .expect("submit routed websocket commentary turn");
+    let mut events = Vec::new();
+    loop {
+        let event = wait_for_event(&test.codex, |_| true).await;
+        let complete = matches!(event, EventMsg::TurnComplete(_));
+        events.push(event);
+        if complete {
+            break;
+        }
+    }
+
+    let connections = server.connections();
+    assert_eq!(connections.len(), 2);
+    assert_eq!(connections[0].len(), 2);
+    assert_eq!(connections[1].len(), 1);
+
+    let warmup = connections[0][0].body_json();
+    let primary = connections[0][1].body_json();
+    let fallback = connections[1][0].body_json();
+
+    assert_eq!(warmup["generate"].as_bool(), Some(false));
+    assert_eq!(primary["model"].as_str(), Some(ROUTED_WEBSOCKET_PRIMARY));
+    assert_eq!(fallback["model"].as_str(), Some(ROUTED_WEBSOCKET_FALLBACK));
+    assert_eq!(fallback.get("previous_response_id"), None);
+    assert_eq!(
+        fallback["client_metadata"].get(X_CODEX_TURN_STATE_HEADER),
+        None
+    );
+    let fallback_input = fallback["input"].as_array().expect("fallback full input");
+    let mut assistant_texts = Vec::new();
+    for item in fallback_input {
+        if item["type"] != "message" || item["role"] != "assistant" {
+            continue;
+        }
+        for content in item["content"].as_array().expect("assistant content") {
+            if content["type"] == "output_text" {
+                assistant_texts.push(content["text"].as_str().expect("assistant text"));
+            }
+        }
+    }
+    assert_eq!(assistant_texts, vec![PREFIX]);
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, EventMsg::ModelReroute(_)))
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, EventMsg::Error(_)))
+    );
 
     server.shutdown().await;
 }

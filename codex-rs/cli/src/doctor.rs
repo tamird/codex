@@ -2504,10 +2504,12 @@ fn websocket_error_detail(err: &ApiError) -> String {
         ApiError::ContextWindowExceeded
         | ApiError::QuotaExceeded
         | ApiError::UsageNotIncluded
+        | ApiError::UsageLimitReached(_)
         | ApiError::Retryable { .. }
         | ApiError::RateLimitExceeded { .. }
         | ApiError::RateLimit(_)
         | ApiError::InvalidRequest { .. }
+        | ApiError::ModelUnavailable { .. }
         | ApiError::CyberPolicy { .. }
         | ApiError::MisalignmentPolicyViolation { .. }
         | ApiError::ServerOverloaded => format!("handshake error: {err}"),

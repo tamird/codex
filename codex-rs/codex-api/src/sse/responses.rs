@@ -3,12 +3,15 @@ use crate::common::ResponseStream;
 use crate::common::SafetyBuffering;
 use crate::common::SafetyBufferingTreatment;
 use crate::error::ApiError;
+use crate::error::is_request_configuration_unavailable;
 use crate::rate_limits::parse_all_rate_limits;
 use crate::safety_buffering::treatment_from_headers;
 use crate::telemetry::SseTelemetry;
 use codex_client::ByteStream;
 use codex_client::StreamResponse;
 use codex_protocol::ResponseUsageMetadata;
+use codex_protocol::auth::PlanType;
+use codex_protocol::error::UsageLimitReachedError;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::MisalignmentErrorDetails;
 use codex_protocol::protocol::ModelVerification;
@@ -106,8 +109,9 @@ pub fn spawn_response_stream(
 struct Error {
     r#type: Option<String>,
     code: Option<String>,
+    param: Option<String>,
     message: Option<String>,
-    plan_type: Option<String>,
+    plan_type: Option<PlanType>,
     resets_at: Option<i64>,
     #[serde(default)]
     misalignment: Option<Value>,
@@ -367,7 +371,7 @@ pub fn process_responses_event(
                 return Ok(Some(ResponseEvent::OutputTextDelta(delta)));
             }
         }
-        "response.custom_tool_call_input.delta" => {
+        "response.custom_tool_call_input.delta" | "response.function_call_arguments.delta" => {
             if let (Some(delta), Some(item_id)) =
                 (event.delta, event.item_id.clone().or(event.call_id.clone()))
             {
@@ -422,6 +426,16 @@ pub fn process_responses_event(
                         response_error = ApiError::QuotaExceeded;
                     } else if is_usage_not_included(&error) {
                         response_error = ApiError::UsageNotIncluded;
+                    } else if error.r#type.as_deref() == Some("usage_limit_reached") {
+                        response_error = ApiError::UsageLimitReached(UsageLimitReachedError {
+                            plan_type: error.plan_type,
+                            resets_at: error
+                                .resets_at
+                                .and_then(|seconds| chrono::DateTime::from_timestamp(seconds, 0)),
+                            rate_limits: None,
+                            promo_message: None,
+                            rate_limit_reached_type: None,
+                        });
                     } else if is_cyber_policy_error(&error) {
                         let message = cyber_policy_message(error.message);
                         response_error = ApiError::CyberPolicy { message };
@@ -439,14 +453,18 @@ pub fn process_responses_event(
                                 serde_json::from_value::<MisalignmentErrorDetails>(details).ok()
                             }),
                         };
+                    } else if is_server_overloaded_error(&error) {
+                        response_error = ApiError::ServerOverloaded;
+                    } else if is_request_configuration_unavailable_error(&error) {
+                        response_error = ApiError::ModelUnavailable {
+                            message: model_unavailable_message(error.message),
+                        };
                     } else if matches!(error.code.as_deref(), Some("invalid_prompt" | "bio_policy"))
                     {
                         let message = error
                             .message
                             .unwrap_or_else(|| "Invalid request.".to_string());
                         response_error = ApiError::InvalidRequest { message };
-                    } else if is_server_overloaded_error(&error) {
-                        response_error = ApiError::ServerOverloaded;
                     } else {
                         let delay = try_parse_retry_after(&error);
                         let message = error.message.unwrap_or_default();
@@ -514,7 +532,6 @@ pub fn process_responses_event(
         | "response.content_part.added"
         | "response.content_part.done"
         | "response.custom_tool_call_input.done"
-        | "response.function_call_arguments.delta"
         | "response.function_call_arguments.done"
         | "response.in_progress"
         | "response.metadata"
@@ -712,6 +729,16 @@ fn is_cyber_policy_error(error: &Error) -> bool {
 fn is_server_overloaded_error(error: &Error) -> bool {
     error.code.as_deref() == Some("server_is_overloaded")
         || error.code.as_deref() == Some("slow_down")
+}
+
+fn is_request_configuration_unavailable_error(error: &Error) -> bool {
+    is_request_configuration_unavailable(error.code.as_deref(), error.param.as_deref())
+}
+
+fn model_unavailable_message(message: Option<String>) -> String {
+    message
+        .filter(|message| !message.trim().is_empty())
+        .unwrap_or_else(|| "The selected model is unavailable.".to_string())
 }
 
 fn cyber_policy_fallback_message() -> String {
@@ -1027,7 +1054,15 @@ mod tests {
                 delta,
             } if item_id == "ctc_1" && call_id == "call_1" && delta == "*** Begin"
         );
-        assert_matches!(&events[1], ResponseEvent::Completed { .. });
+        assert_matches!(
+            &events[1],
+            ResponseEvent::ToolCallInputDelta {
+                item_id,
+                call_id: None,
+                delta,
+            } if item_id == "fc_1" && delta == "{\"input\":\""
+        );
+        assert_matches!(&events[2], ResponseEvent::Completed { .. });
     }
 
     #[tokio::test]
@@ -1377,6 +1412,208 @@ mod tests {
                 other => panic!("unexpected event for {code}: {other:?}"),
             }
         }
+    }
+
+    #[tokio::test]
+    async fn structured_request_configuration_errors_are_unavailable_independent_of_message() {
+        for (code, message) in [
+            ("model_not_found", "unrelated first diagnostic"),
+            ("model_not_supported", "unrelated second diagnostic"),
+            ("unsupported_model", "unrelated third diagnostic"),
+            ("service_tier_not_supported", "unrelated fourth diagnostic"),
+            ("unsupported_service_tier", "unrelated fifth diagnostic"),
+            (
+                "reasoning_effort_not_supported",
+                "unrelated sixth diagnostic",
+            ),
+            (
+                "unsupported_reasoning_effort",
+                "unrelated seventh diagnostic",
+            ),
+        ] {
+            let raw_error = json!({
+                "type": "response.failed",
+                "sequence_number": 3,
+                "response": {
+                    "id": "resp_model_unavailable",
+                    "status": "failed",
+                    "error": { "code": code, "message": message },
+                },
+            })
+            .to_string();
+            let sse = format!("event: response.failed\ndata: {raw_error}\n\n");
+
+            let events = collect_events(&[sse.as_bytes()]).await;
+
+            assert_eq!(events.len(), 1);
+            match &events[0] {
+                Err(ApiError::ModelUnavailable { message: actual }) => {
+                    assert_eq!(actual, message);
+                }
+                other => panic!("unexpected event for {code}: {other:?}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn exact_request_configuration_params_are_model_unavailable() {
+        for param in ["service_tier", "reasoning.effort"] {
+            let raw_error = json!({
+                "type": "response.failed",
+                "sequence_number": 3,
+                "response": {
+                    "id": "resp_request_configuration_param",
+                    "status": "failed",
+                    "error": {
+                        "code": "invalid_value",
+                        "param": param,
+                        "message": "unrelated diagnostic",
+                    },
+                },
+            })
+            .to_string();
+            let sse = format!("event: response.failed\ndata: {raw_error}\n\n");
+
+            let events = collect_events(&[sse.as_bytes()]).await;
+
+            assert_eq!(events.len(), 1);
+            assert_matches!(
+                &events[0],
+                Err(ApiError::ModelUnavailable { message })
+                    if message == "unrelated diagnostic"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn model_unavailable_uses_fallback_for_empty_message() {
+        let raw_error = json!({
+            "type": "response.failed",
+            "sequence_number": 3,
+            "response": {
+                "id": "resp_model_unavailable_empty_message",
+                "status": "failed",
+                "error": { "code": "model_not_found", "message": " " },
+            },
+        })
+        .to_string();
+        let sse = format!("event: response.failed\ndata: {raw_error}\n\n");
+
+        let events = collect_events(&[sse.as_bytes()]).await;
+
+        assert_eq!(events.len(), 1);
+        assert_matches!(
+            &events[0],
+            Err(ApiError::ModelUnavailable { message })
+                if message == "The selected model is unavailable."
+        );
+    }
+
+    #[tokio::test]
+    async fn server_overloaded_takes_precedence_over_model_param() {
+        let raw_error = json!({
+            "type": "response.failed",
+            "sequence_number": 3,
+            "response": {
+                "id": "resp_server_overloaded",
+                "status": "failed",
+                "error": {
+                    "code": "server_is_overloaded",
+                    "param": "model",
+                    "message": "The requested model test-model does not support reasoning effort high or service tier priority.",
+                },
+            },
+        })
+        .to_string();
+        let sse = format!("event: response.failed\ndata: {raw_error}\n\n");
+
+        let events = collect_events(&[sse.as_bytes()]).await;
+
+        assert_eq!(events.len(), 1);
+        assert_matches!(&events[0], Err(ApiError::ServerOverloaded));
+    }
+
+    #[tokio::test]
+    async fn structured_usage_limit_is_semantic() {
+        let raw_error = json!({
+            "type": "response.failed",
+            "sequence_number": 3,
+            "response": {
+                "id": "resp_usage_limit",
+                "status": "failed",
+                "error": {
+                    "type": "usage_limit_reached",
+                    "resets_at": 4_102_444_800_i64,
+                    "message": "display text is not classification input",
+                },
+            },
+        })
+        .to_string();
+        let sse = format!("event: response.failed\ndata: {raw_error}\n\n");
+
+        let events = collect_events(&[sse.as_bytes()]).await;
+
+        assert_eq!(events.len(), 1);
+        assert_matches!(
+            &events[0],
+            Err(ApiError::UsageLimitReached(error))
+                if error.resets_at
+                    == chrono::DateTime::from_timestamp(4_102_444_800_i64, 0)
+        );
+    }
+
+    #[tokio::test]
+    async fn model_param_is_model_unavailable_without_a_known_code() {
+        let raw_error = json!({
+            "type": "response.failed",
+            "sequence_number": 3,
+            "response": {
+                "id": "resp_model_param",
+                "status": "failed",
+                "error": {
+                    "code": "future_model_error",
+                    "param": "model",
+                    "message": "candidate rejected",
+                },
+            },
+        })
+        .to_string();
+        let sse = format!("event: response.failed\ndata: {raw_error}\n\n");
+
+        let events = collect_events(&[sse.as_bytes()]).await;
+
+        assert_eq!(events.len(), 1);
+        assert_matches!(
+            &events[0],
+            Err(ApiError::ModelUnavailable { message }) if message == "candidate rejected"
+        );
+    }
+
+    #[tokio::test]
+    async fn model_prose_without_structured_fields_is_not_model_unavailable() {
+        let raw_error = json!({
+            "type": "response.failed",
+            "sequence_number": 3,
+            "response": {
+                "id": "resp_unstructured_model_prose",
+                "status": "failed",
+                "error": {
+                    "code": "invalid_request",
+                    "message": "The requested model test-model does not support reasoning effort high or service tier priority.",
+                },
+            },
+        })
+        .to_string();
+        let sse = format!("event: response.failed\ndata: {raw_error}\n\n");
+
+        let events = collect_events(&[sse.as_bytes()]).await;
+
+        assert_eq!(events.len(), 1);
+        assert_matches!(
+            &events[0],
+            Err(ApiError::Retryable { message, delay: None })
+                if message == "The requested model test-model does not support reasoning effort high or service tier priority."
+        );
     }
 
     #[tokio::test]
@@ -2006,6 +2243,7 @@ mod tests {
             r#type: None,
             message: Some("Rate limit reached for gpt-5.1 in organization org- on tokens per min (TPM): Limit 1, Used 1, Requested 19304. Please try again in 28ms. Visit https://platform.openai.com/account/rate-limits to learn more.".to_string()),
             code: Some("rate_limit_exceeded".to_string()),
+            param: None,
             plan_type: None,
             resets_at: None,
             misalignment: None,
@@ -2021,6 +2259,7 @@ mod tests {
             r#type: None,
             message: Some("Rate limit reached for gpt-5.1 in organization <ORG> on tokens per min (TPM): Limit 30000, Used 6899, Requested 24050. Please try again in 1.898s. Visit https://platform.openai.com/account/rate-limits to learn more.".to_string()),
             code: Some("rate_limit_exceeded".to_string()),
+            param: None,
             plan_type: None,
             resets_at: None,
             misalignment: None,
@@ -2035,6 +2274,7 @@ mod tests {
             r#type: None,
             message: Some("Rate limit exceeded. Try again in 35 seconds.".to_string()),
             code: Some("rate_limit_exceeded".to_string()),
+            param: None,
             plan_type: None,
             resets_at: None,
             misalignment: None,

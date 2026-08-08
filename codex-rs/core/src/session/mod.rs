@@ -224,6 +224,8 @@ mod mcp;
 mod mcp_prewarm;
 mod mcp_refresh;
 mod mcp_runtime;
+mod model_alias_refresh;
+mod model_routing;
 pub(crate) mod multi_agents;
 mod review;
 mod rollout_budget;
@@ -1889,11 +1891,24 @@ impl Session {
                 .then(|| self.build_effective_session_config(&state.session_configuration));
             let mut config = (*state.session_configuration.original_config_do_not_use).clone();
             config.active_project = next_config.active_project.clone();
+            let selected_model = state
+                .session_configuration
+                .step_settings
+                .collaboration_mode
+                .model()
+                .to_string();
+            let alias_update = model_alias_refresh::selected_alias_update(
+                &selected_model,
+                &config.custom_models,
+                &next_config.custom_models,
+                state.model_routing.last_success(),
+            );
             config.config_layer_stack = config
                 .config_layer_stack
                 .with_user_layer_from(&next_config.config_layer_stack);
             config.tool_suggest =
                 resolve_tool_suggest_config_from_layer_stack(&config.config_layer_stack);
+            config.custom_models = next_config.custom_models.clone();
             config.mcp_servers = next_config.mcp_servers.clone();
             config.mcp_optional_startup_grace = next_config.mcp_optional_startup_grace;
             config.mcp_oauth_credentials_store_mode = next_config.mcp_oauth_credentials_store_mode;
@@ -1904,6 +1919,57 @@ impl Session {
                 warn!("failed to refresh MCP auth storage config: {err}");
             }
             let config = Arc::new(config);
+            match alias_update {
+                model_alias_refresh::SelectedAliasUpdate::Unchanged => {}
+                model_alias_refresh::SelectedAliasUpdate::Renamed { alias } => {
+                    info!(
+                        previous_alias = selected_model,
+                        new_alias = alias,
+                        "updated the selected custom-model alias after a config rename"
+                    );
+                    state.model_routing.rename_profile(&selected_model, &alias);
+                    let selected = Arc::make_mut(&mut state.session_configuration.step_settings);
+                    selected.collaboration_mode = selected.collaboration_mode.with_updates(
+                        Some(alias),
+                        /*effort*/ None,
+                        /*developer_instructions*/ None,
+                    );
+                }
+                model_alias_refresh::SelectedAliasUpdate::DetachedProfile { candidate } => {
+                    warn!(
+                        removed_alias = selected_model,
+                        concrete_model = candidate.model,
+                        "detached the thread from a removed custom-model alias"
+                    );
+                    let selected = Arc::make_mut(&mut state.session_configuration.step_settings);
+                    selected.collaboration_mode = selected.collaboration_mode.with_updates(
+                        Some(candidate.model),
+                        Some(candidate.reasoning_effort),
+                        /*developer_instructions*/ None,
+                    );
+                    selected.service_tier = candidate.service_tier;
+                    state.model_routing = Default::default();
+                }
+                model_alias_refresh::SelectedAliasUpdate::DetachedAlias { model } => {
+                    warn!(
+                        removed_alias = selected_model,
+                        concrete_model = model,
+                        "detached the thread from a removed custom-model alias"
+                    );
+                    let selected = Arc::make_mut(&mut state.session_configuration.step_settings);
+                    selected.collaboration_mode = selected.collaboration_mode.with_updates(
+                        Some(model),
+                        /*effort*/ None,
+                        /*developer_instructions*/ None,
+                    );
+                    state.model_routing = Default::default();
+                }
+            }
+            state
+                .session_configuration
+                .model_info_overrides
+                .custom_models
+                .clone_from(&config.custom_models);
             state.session_configuration.original_config_do_not_use = Arc::clone(&config);
             self.mark_mcp_runtime_dirty();
             let new_config = notify_config_contributors
@@ -2032,6 +2098,19 @@ impl Session {
         let next_config = {
             let state = self.state.lock().await;
             let mut config = (*state.session_configuration.original_config_do_not_use).clone();
+            let previous_layer_models =
+                match crate::config::resolve_custom_models_from_config_layer_stack(
+                    &config.config_layer_stack,
+                ) {
+                    Ok(custom_models) => custom_models,
+                    Err(err) => {
+                        warn!(
+                            "failed to resolve existing custom models while reloading user config: {err}"
+                        );
+                        return;
+                    }
+                };
+            let previous_materialized_models = config.custom_models.clone();
             for (config_toml_path, user_config) in reloaded_user_configs {
                 let config_layer_stack = match config
                     .config_layer_stack
@@ -2045,8 +2124,32 @@ impl Session {
                 };
                 config.config_layer_stack = config_layer_stack;
             }
+            if config.config_layer_stack
+                == state
+                    .session_configuration
+                    .original_config_do_not_use
+                    .config_layer_stack
+            {
+                return;
+            }
             config.tool_suggest =
                 resolve_tool_suggest_config_from_layer_stack(&config.config_layer_stack);
+            let mut next_layer_models =
+                match crate::config::resolve_custom_models_from_config_layer_stack(
+                    &config.config_layer_stack,
+                ) {
+                    Ok(custom_models) => custom_models,
+                    Err(err) => {
+                        warn!("failed to resolve custom models while reloading user config: {err}");
+                        return;
+                    }
+                };
+            model_alias_refresh::preserve_materialized_custom_model_overrides(
+                &previous_layer_models,
+                &previous_materialized_models,
+                &mut next_layer_models,
+            );
+            config.custom_models = next_layer_models;
             config
         };
         self.services.skills_service.clear_cache();
@@ -3588,6 +3691,7 @@ impl Session {
             selected_capability_roots,
             executor_capability_discovery,
             mcp,
+            required_mcp_servers: required_servers.to_vec(),
             tool_router,
             loaded_agents_md,
         }))

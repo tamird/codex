@@ -25,6 +25,7 @@ use codex_config::SandboxModeRequirement;
 use codex_config::Sourced;
 use codex_config::ThreadConfigLoader;
 use codex_config::config_toml::ConfigToml;
+use codex_config::config_toml::CustomModelToml;
 use codex_config::config_toml::DEFAULT_PROJECT_DOC_MAX_BYTES;
 use codex_config::config_toml::ProjectConfig;
 use codex_config::config_toml::RealtimeAudioConfig;
@@ -95,6 +96,8 @@ use codex_model_provider_info::OLLAMA_CHAT_PROVIDER_REMOVED_ERROR;
 use codex_model_provider_info::built_in_model_providers;
 use codex_model_provider_info::merge_configured_model_providers;
 use codex_models_manager::CustomModelConfig;
+use codex_models_manager::ModelRoutingCandidate;
+use codex_models_manager::ModelRoutingProfile;
 use codex_models_manager::ModelsManagerConfig;
 use codex_protocol::config_types::AltScreenMode;
 use codex_protocol::config_types::AutoCompactTokenLimitScope;
@@ -3118,6 +3121,166 @@ fn validate_multi_agent_v2_tool_namespace(namespace: Option<&str>) -> std::io::R
     Ok(())
 }
 
+pub(crate) fn resolve_custom_models(
+    custom_models: Vec<CustomModelToml>,
+) -> std::io::Result<HashMap<String, CustomModelConfig>> {
+    let mut aliases = HashSet::new();
+    for custom_model in &custom_models {
+        if custom_model.name.trim().is_empty() {
+            return Err(std::io::Error::new(
+                ErrorKind::InvalidInput,
+                "custom model alias must not be empty",
+            ));
+        }
+        if !aliases.insert(custom_model.name.clone()) {
+            return Err(std::io::Error::new(
+                ErrorKind::InvalidInput,
+                format!("duplicate custom model alias: {}", custom_model.name),
+            ));
+        }
+    }
+
+    let mut resolved = HashMap::new();
+    let mut alias_dependencies = HashMap::new();
+    for custom_model in custom_models {
+        let alias = custom_model.name;
+        let mut dependencies = Vec::new();
+        let (model, routing_profile) = match (custom_model.model, custom_model.candidates) {
+            (Some(model), candidates) if candidates.is_empty() => {
+                validate_custom_model_target(&alias, &model)?;
+                if model != alias && aliases.contains(&model) {
+                    dependencies.push(model.clone());
+                }
+                (model, None)
+            }
+            (None, candidates) if !candidates.is_empty() => {
+                let mut seen = HashSet::new();
+                let mut resolved_candidates = Vec::with_capacity(candidates.len());
+                for candidate in candidates {
+                    validate_custom_model_target(&alias, &candidate.model)?;
+                    if candidate.model != alias && aliases.contains(&candidate.model) {
+                        return Err(std::io::Error::new(
+                            ErrorKind::InvalidInput,
+                            format!(
+                                "custom model alias {alias} has a routed candidate that references custom model alias {}",
+                                candidate.model
+                            ),
+                        ));
+                    }
+                    if candidate
+                        .service_tier
+                        .as_ref()
+                        .is_some_and(|service_tier| service_tier.trim().is_empty())
+                    {
+                        return Err(std::io::Error::new(
+                            ErrorKind::InvalidInput,
+                            format!(
+                                "custom model alias {alias} has a candidate with an empty service tier"
+                            ),
+                        ));
+                    }
+                    let candidate = ModelRoutingCandidate {
+                        model: candidate.model,
+                        reasoning_effort: candidate.reasoning_effort,
+                        service_tier: candidate.service_tier,
+                    };
+                    if !seen.insert(candidate.clone()) {
+                        return Err(std::io::Error::new(
+                            ErrorKind::InvalidInput,
+                            format!("custom model alias {alias} has a duplicate candidate"),
+                        ));
+                    }
+                    resolved_candidates.push(candidate);
+                }
+                let model = resolved_candidates[0].model.clone();
+                (
+                    model,
+                    Some(ModelRoutingProfile {
+                        candidates: resolved_candidates,
+                    }),
+                )
+            }
+            _ => {
+                return Err(std::io::Error::new(
+                    ErrorKind::InvalidInput,
+                    format!(
+                        "custom model alias {alias} must specify exactly one of model or nonempty candidates"
+                    ),
+                ));
+            }
+        };
+
+        alias_dependencies.insert(alias.clone(), dependencies);
+        resolved.insert(
+            alias,
+            CustomModelConfig {
+                model,
+                routing_profile,
+                model_context_window: custom_model.model_context_window,
+                model_auto_compact_token_limit: custom_model.model_auto_compact_token_limit,
+            },
+        );
+    }
+    validate_custom_model_alias_cycles(&alias_dependencies)?;
+    Ok(resolved)
+}
+
+pub(crate) fn resolve_custom_models_from_config_layer_stack(
+    config_layer_stack: &ConfigLayerStack,
+) -> std::io::Result<HashMap<String, CustomModelConfig>> {
+    let config_toml: ConfigToml = config_layer_stack
+        .effective_config()
+        .try_into()
+        .map_err(|error| std::io::Error::new(ErrorKind::InvalidData, error))?;
+    resolve_custom_models(config_toml.custom_models)
+}
+
+fn validate_custom_model_target(alias: &str, model: &str) -> std::io::Result<()> {
+    if model.trim().is_empty() {
+        return Err(std::io::Error::new(
+            ErrorKind::InvalidInput,
+            format!("custom model alias {alias} has an empty model"),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_custom_model_alias_cycles(
+    dependencies: &HashMap<String, Vec<String>>,
+) -> std::io::Result<()> {
+    fn visit(
+        alias: &str,
+        dependencies: &HashMap<String, Vec<String>>,
+        visiting: &mut HashSet<String>,
+        visited: &mut HashSet<String>,
+    ) -> std::io::Result<()> {
+        if visited.contains(alias) {
+            return Ok(());
+        }
+        if !visiting.insert(alias.to_string()) {
+            return Err(std::io::Error::new(
+                ErrorKind::InvalidInput,
+                format!("custom model alias {alias} is recursively defined"),
+            ));
+        }
+        if let Some(alias_dependencies) = dependencies.get(alias) {
+            for dependency in alias_dependencies {
+                visit(dependency, dependencies, visiting, visited)?;
+            }
+        }
+        visiting.remove(alias);
+        visited.insert(alias.to_string());
+        Ok(())
+    }
+
+    let mut visiting = HashSet::new();
+    let mut visited = HashSet::new();
+    for alias in dependencies.keys() {
+        visit(alias, dependencies, &mut visiting, &mut visited)?;
+    }
+    Ok(())
+}
+
 impl Config {
     #[cfg(test)]
     async fn load_from_base_config_with_overrides(
@@ -3715,24 +3878,7 @@ impl Config {
             merge_configured_model_providers(built_in_model_providers(openai_base_url), cfg.model_providers)
                 .map_err(|message| std::io::Error::new(std::io::ErrorKind::InvalidData, message))?;
 
-        let mut custom_models = HashMap::new();
-        for custom in cfg.custom_models {
-            let alias = custom.name;
-            if custom_models.contains_key(&alias) {
-                return Err(std::io::Error::new(
-                    ErrorKind::InvalidInput,
-                    format!("duplicate custom model alias: {alias}"),
-                ));
-            }
-            custom_models.insert(
-                alias,
-                CustomModelConfig {
-                    model: custom.model,
-                    model_context_window: custom.model_context_window,
-                    model_auto_compact_token_limit: custom.model_auto_compact_token_limit,
-                },
-            );
-        }
+        let custom_models = resolve_custom_models(cfg.custom_models)?;
 
         let model_provider_id = model_provider
             .or(cfg.model_provider)

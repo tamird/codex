@@ -11,6 +11,30 @@ fn map_api_error_maps_server_overloaded() {
 }
 
 #[test]
+fn map_api_error_maps_semantic_model_unavailable() {
+    let err = map_api_error(ApiError::ModelUnavailable {
+        message: "candidate rejected".to_string(),
+    });
+    assert!(matches!(
+        err.details(),
+        CodexErrorDetails::ModelUnavailable(message) if message == "candidate rejected"
+    ));
+}
+
+#[test]
+fn map_api_error_keeps_generic_invalid_request_generic() {
+    let message = "The requested model test-model is unavailable.".to_string();
+    let err = map_api_error(ApiError::InvalidRequest {
+        message: message.clone(),
+    });
+
+    assert!(matches!(
+        err.details(),
+        CodexErrorDetails::InvalidRequest(actual) if actual == &message
+    ));
+}
+
+#[test]
 fn map_api_error_preserves_retry_delay() {
     let retry_delay = std::time::Duration::from_secs(17);
     for (error, expected_code, expected_message) in [
@@ -55,7 +79,9 @@ fn map_api_error_preserves_retry_delay() {
 fn map_api_error_maps_server_overloaded_from_503_body() {
     let body = serde_json::json!({
         "error": {
-            "code": "server_is_overloaded"
+            "code": "server_is_overloaded",
+            "param": "model",
+            "message": "The requested model test-model is unavailable."
         }
     })
     .to_string();
@@ -67,6 +93,31 @@ fn map_api_error_maps_server_overloaded_from_503_body() {
     }));
 
     assert!(matches!(err.details(), CodexErrorDetails::ServerOverloaded));
+}
+
+#[test]
+fn map_api_error_preserves_usage_limit_with_model_fields() {
+    let body = serde_json::json!({
+        "error": {
+            "type": "usage_limit_reached",
+            "plan_type": "pro",
+            "param": "model",
+            "code": "model_not_found",
+            "message": "The requested model test-model is unavailable."
+        }
+    })
+    .to_string();
+    let err = map_api_error(ApiError::Transport(TransportError::Http {
+        status: http::StatusCode::TOO_MANY_REQUESTS,
+        url: Some("http://example.com/v1/responses".to_string()),
+        headers: None,
+        body: Some(body),
+    }));
+
+    assert!(matches!(
+        err.details(),
+        CodexErrorDetails::UsageLimitReached(_)
+    ));
 }
 
 #[test]
@@ -122,6 +173,194 @@ fn map_api_error_maps_cyber_policy_from_400_body() {
         message,
         "This request has been flagged for potentially high-risk cyber activity."
     );
+}
+
+#[test]
+fn map_api_error_maps_request_configuration_from_structured_codes_without_reading_message() {
+    for (code, message) in [
+        ("model_not_found", "unrelated first diagnostic"),
+        ("model_not_supported", "unrelated second diagnostic"),
+        ("unsupported_model", "unrelated third diagnostic"),
+        ("service_tier_not_supported", "unrelated fourth diagnostic"),
+        ("unsupported_service_tier", "unrelated fifth diagnostic"),
+        (
+            "reasoning_effort_not_supported",
+            "unrelated sixth diagnostic",
+        ),
+        (
+            "unsupported_reasoning_effort",
+            "unrelated seventh diagnostic",
+        ),
+    ] {
+        let body = serde_json::json!({
+            "error": {
+                "message": message,
+                "type": "invalid_request_error",
+                "param": null,
+                "code": code,
+            }
+        })
+        .to_string();
+        let err = map_api_error(ApiError::Transport(TransportError::Http {
+            status: http::StatusCode::BAD_REQUEST,
+            url: Some("http://example.com/v1/responses".to_string()),
+            headers: None,
+            body: Some(body),
+        }));
+
+        assert!(matches!(
+            err.details(),
+            CodexErrorDetails::ModelUnavailable(actual) if actual == message
+        ));
+    }
+}
+
+#[test]
+fn map_api_error_maps_exact_request_configuration_params() {
+    for param in ["service_tier", "reasoning.effort"] {
+        let body = serde_json::json!({
+            "error": {
+                "message": "unrelated diagnostic",
+                "type": "invalid_request_error",
+                "param": param,
+                "code": "invalid_value",
+            }
+        })
+        .to_string();
+        let err = map_api_error(ApiError::Transport(TransportError::Http {
+            status: http::StatusCode::BAD_REQUEST,
+            url: Some("http://example.com/v1/responses".to_string()),
+            headers: None,
+            body: Some(body),
+        }));
+
+        assert!(matches!(
+            err.details(),
+            CodexErrorDetails::ModelUnavailable(message)
+                if message == "unrelated diagnostic"
+        ));
+    }
+}
+
+#[test]
+fn map_api_error_maps_model_not_found_from_404_body() {
+    let body = serde_json::json!({
+        "error": {
+            "message": "unrelated diagnostic",
+            "type": "invalid_request_error",
+            "param": null,
+            "code": "model_not_found",
+        }
+    })
+    .to_string();
+    let err = map_api_error(ApiError::Transport(TransportError::Http {
+        status: http::StatusCode::NOT_FOUND,
+        url: Some("http://example.com/v1/responses".to_string()),
+        headers: None,
+        body: Some(body),
+    }));
+
+    assert!(matches!(
+        err.details(),
+        CodexErrorDetails::ModelUnavailable(message) if message == "unrelated diagnostic"
+    ));
+}
+
+#[test]
+fn map_api_error_maps_model_param_without_a_known_code() {
+    let body = serde_json::json!({
+        "error": {
+            "message": "account cannot use this candidate",
+            "type": "invalid_request_error",
+            "param": "model",
+            "code": "future_model_error",
+        }
+    })
+    .to_string();
+    let err = map_api_error(ApiError::Transport(TransportError::Http {
+        status: http::StatusCode::BAD_REQUEST,
+        url: Some("http://example.com/v1/responses".to_string()),
+        headers: None,
+        body: Some(body),
+    }));
+
+    assert!(matches!(
+        err.details(),
+        CodexErrorDetails::ModelUnavailable(message)
+            if message == "account cannot use this candidate"
+    ));
+}
+
+#[test]
+fn map_api_error_does_not_use_parameter_only_classification_for_server_errors() {
+    let body = serde_json::json!({
+        "error": {
+            "message": "internal failure",
+            "param": "model",
+            "code": "internal_error",
+        }
+    })
+    .to_string();
+    let err = map_api_error(ApiError::Transport(TransportError::Http {
+        status: http::StatusCode::INTERNAL_SERVER_ERROR,
+        url: Some("http://example.com/v1/responses".to_string()),
+        headers: None,
+        body: Some(body),
+    }));
+
+    assert!(matches!(
+        err.details(),
+        CodexErrorDetails::InternalServerError
+    ));
+}
+
+#[test]
+fn map_api_error_does_not_classify_model_prose_without_structured_fields() {
+    let body = serde_json::json!({
+        "error": {
+            "message": "The requested model test-model does not support reasoning effort high or service tier priority.",
+            "type": "invalid_request_error",
+            "param": null,
+            "code": "invalid_request",
+        }
+    })
+    .to_string();
+    let err = map_api_error(ApiError::Transport(TransportError::Http {
+        status: http::StatusCode::BAD_REQUEST,
+        url: Some("http://example.com/v1/responses".to_string()),
+        headers: None,
+        body: Some(body.clone()),
+    }));
+
+    assert!(matches!(
+        err.details(),
+        CodexErrorDetails::InvalidRequest(message) if message == &body
+    ));
+}
+
+#[test]
+fn map_api_error_uses_safe_model_unavailable_fallback_message() {
+    let body = serde_json::json!({
+        "error": {
+            "message": " ",
+            "type": "invalid_request_error",
+            "param": "model",
+            "code": null,
+        }
+    })
+    .to_string();
+    let err = map_api_error(ApiError::Transport(TransportError::Http {
+        status: http::StatusCode::BAD_REQUEST,
+        url: Some("http://example.com/v1/responses".to_string()),
+        headers: None,
+        body: Some(body),
+    }));
+
+    assert!(matches!(
+        err.details(),
+        CodexErrorDetails::ModelUnavailable(message)
+            if message == MODEL_UNAVAILABLE_FALLBACK_MESSAGE
+    ));
 }
 
 #[test]

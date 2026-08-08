@@ -3826,6 +3826,7 @@ dependencies = [
 name = "codex-models-manager"
 version = "0.151.0-alpha.10"
 dependencies = [
+ "arc-swap",
  "chrono",
  "codex-collaboration-mode-templates",
  "codex-http-client",
@@ -5145,6 +5146,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tokio-tungstenite",
+ "toml 0.9.11+spec-1.1.0",
  "tracing",
  "tracing-opentelemetry",
  "tracing-subscriber",

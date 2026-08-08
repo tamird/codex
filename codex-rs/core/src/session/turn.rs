@@ -2,25 +2,31 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 use std::marker::PhantomData;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 
 use crate::client::ModelClientSession;
 use crate::client_common::Prompt;
 use crate::client_common::ResponseEvent;
+use crate::compact::CompactionReporting;
 use crate::compact::InitialContextInjection;
 use crate::compact::run_inline_auto_compact_task;
 use crate::compact_remote::run_inline_remote_auto_compact_task;
 use crate::compact_remote_v2::run_inline_remote_auto_compact_task as run_inline_remote_auto_compact_task_v2;
 use crate::connectors;
 use crate::context::ContextualUserFragment;
+use crate::context::InterruptedResponseRecord;
+use crate::context::world_state::WorldState;
 use crate::environment_selection::TurnEnvironmentSnapshot;
 use crate::feedback_tags;
+use crate::hook_runtime::PostCompactHookOutcome;
 use crate::hook_runtime::drain_async_hook_results;
 use crate::hook_runtime::inspect_pending_input;
 use crate::hook_runtime::record_additional_contexts;
 use crate::hook_runtime::record_pending_input;
 use crate::hook_runtime::run_legacy_after_agent_hook;
 use crate::hook_runtime::run_pending_session_start_hooks;
+use crate::hook_runtime::run_post_compact_hooks;
 use crate::hook_runtime::run_turn_stop_hooks;
 use crate::mcp_skill_dependencies::maybe_prompt_and_install_mcp_dependencies;
 use crate::mentions::build_connector_slug_counts;
@@ -35,9 +41,11 @@ use crate::responses_retry::ResponsesStreamRetryState;
 use crate::responses_retry::handle_retryable_response_stream_error;
 use crate::session::PreviousTurnSettings;
 use crate::session::TurnInput;
+use crate::session::model_routing::classify_model_routing_failure;
 use crate::session::session::Session;
 use crate::session::step_context::StepContext;
 use crate::session::turn_context::TurnContext;
+use crate::session_startup_prewarm::SessionStartupPrewarmResolution;
 use crate::skills::emit_explicit_skill_invocations;
 use crate::stream_events_utils::HandleOutputCtx;
 use crate::stream_events_utils::InFlightFuture;
@@ -64,6 +72,7 @@ use crate::util::error_or_panic;
 use codex_analytics::AppInvocation;
 use codex_analytics::CompactionPhase;
 use codex_analytics::CompactionReason;
+use codex_analytics::CompactionTrigger;
 use codex_analytics::InvocationType;
 use codex_analytics::TurnResolvedConfigFact;
 use codex_analytics::build_track_events_context;
@@ -90,7 +99,10 @@ use codex_protocol::items::TurnItem;
 use codex_protocol::items::build_hook_prompt_message;
 use codex_protocol::models::BaseInstructions;
 use codex_protocol::models::ContentItem;
+use codex_protocol::models::FunctionCallOutputPayload;
 use codex_protocol::models::MessagePhase;
+use codex_protocol::models::ReasoningItemContent;
+use codex_protocol::models::ReasoningItemReasoningSummary;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::AgentMessageContentDeltaEvent;
 use codex_protocol::protocol::AgentReasoningSectionBreakEvent;
@@ -138,6 +150,15 @@ use tracing::warn;
 
 const POST_SAMPLING_TOKEN_ESTIMATE_TARGET: &str = "codex_core::post_sampling_token_estimate";
 
+/// Provider startup state for a regular turn.
+///
+/// A cooling routing candidate defers provider session creation, startup prewarm consumption, and
+/// pre-sampling compaction until the accepted input has crossed the rollout durability barrier.
+pub(crate) enum RunTurnProviderStartup {
+    Ready(Option<Box<ModelClientSession>>),
+    DeferredForRoutingCooldown,
+}
+
 /// Takes initial turn input and runs a loop where, at each sampling request,
 /// the model replies with either:
 ///
@@ -154,27 +175,40 @@ const POST_SAMPLING_TOKEN_ESTIMATE_TARGET: &str = "codex_core::post_sampling_tok
 ///
 pub(crate) async fn run_turn(
     sess: Arc<Session>,
-    turn_context: Arc<TurnContext>,
+    mut turn_context: Arc<TurnContext>,
     input: Vec<TurnInput>,
-    prewarmed_client_session: Option<ModelClientSession>,
+    provider_startup: RunTurnProviderStartup,
     cancellation_token: CancellationToken,
 ) -> CodexResult<Option<String>> {
     // Record results from hooks that finished after the previous turn before this turn's user prompt.
     drain_async_hook_results(&sess, &turn_context, /*before_user_prompt*/ true).await;
 
-    let mut client_session =
-        prewarmed_client_session.unwrap_or_else(|| sess.services.model_client.new_session());
+    let deferred_provider_startup = matches!(
+        provider_startup,
+        RunTurnProviderStartup::DeferredForRoutingCooldown
+    );
+    let mut client_session = match provider_startup {
+        RunTurnProviderStartup::Ready(prewarmed_client_session) => Some(
+            prewarmed_client_session
+                .map(|client_session| *client_session)
+                .unwrap_or_else(|| sess.services.model_client.new_session()),
+        ),
+        RunTurnProviderStartup::DeferredForRoutingCooldown => None,
+    };
+    let mut attempted_routing_candidates = HashSet::new();
+    if let Some(candidate) = turn_context.model_routing_candidate.clone() {
+        attempted_routing_candidates.insert(candidate);
+    }
+    let mut initial_routing_change_pending = turn_context.model_profile.is_some();
+    let mut interrupted_response_recorded = false;
     // TODO(ccunningham): Pre-turn compaction runs before context updates and the
     // new user message are recorded. Estimate pending incoming items (context
     // diffs/full reinjection + user input) and trigger compaction preemptively
     // when they would push the thread over the compaction threshold.
-    if let Err(err) = run_pre_sampling_compact(
-        &sess,
-        &turn_context,
-        &mut client_session,
-        &cancellation_token,
-    )
-    .await
+    if let Some(client_session) = client_session.as_mut()
+        && let Err(err) =
+            run_pre_sampling_compact(&sess, &turn_context, client_session, &cancellation_token)
+                .await
     {
         if matches!(err.details(), CodexErrorDetails::TurnAborted) {
             run_hooks_and_record_inputs(&sess, &turn_context, &input, PersistContext::Standard)
@@ -206,7 +240,7 @@ pub(crate) async fn run_turn(
         };
 
     // run_turn owns the step used to seed context and make the first sampling request.
-    let first_step_context = match sess
+    let mut first_step_context = match sess
         .capture_step_context_with_required_mcp_servers(
             Arc::clone(&turn_context),
             &cancellation_token,
@@ -269,6 +303,67 @@ pub(crate) async fn run_turn(
         return Ok(None);
     }
 
+    if deferred_provider_startup {
+        sess.flush_rollout().await?;
+        if !sess
+            .wait_for_model_routing_retry(turn_context.model_routing_retry_at, &cancellation_token)
+            .await
+        {
+            return Err(CodexErr::TurnAborted);
+        }
+        let prewarmed_client_session = match sess
+            .consume_startup_prewarm_for_regular_turn(&cancellation_token)
+            .await
+        {
+            SessionStartupPrewarmResolution::Cancelled => {
+                return Err(CodexErr::TurnAborted);
+            }
+            SessionStartupPrewarmResolution::Unavailable { .. } => None,
+            SessionStartupPrewarmResolution::Ready(prewarmed_client_session) => {
+                Some(*prewarmed_client_session)
+            }
+        };
+        let active_client_session = client_session.insert(
+            prewarmed_client_session.unwrap_or_else(|| sess.services.model_client.new_session()),
+        );
+        if let Err(err) = run_pre_sampling_compact(
+            &sess,
+            &turn_context,
+            active_client_session,
+            &cancellation_token,
+        )
+        .await
+        {
+            if matches!(err.details(), CodexErrorDetails::TurnAborted) {
+                return Err(err);
+            }
+            if matches!(err.details(), CodexErrorDetails::ToolCollision(_)) {
+                return Err(err);
+            }
+            let error = err.to_codex_protocol_error();
+            sess.emit_turn_error_lifecycle(turn_context.as_ref(), error.clone())
+                .await;
+            error!("Failed to run pre-sampling compact");
+            return Ok(None);
+        }
+        first_step_context = sess
+            .capture_step_context_with_required_mcp_servers(
+                Arc::clone(&turn_context),
+                &cancellation_token,
+                &required_servers,
+            )
+            .await?;
+        world_state = sess
+            .record_context_updates_and_set_reference_context_item(first_step_context.as_ref())
+            .await?;
+    }
+
+    let Some(mut client_session) = client_session else {
+        return Err(CodexErr::Fatal(
+            "provider startup did not complete before the first sampling request".to_string(),
+        ));
+    };
+
     sess.merge_connector_selection(explicitly_enabled_connectors.clone())
         .await;
     sess.set_previous_turn_settings(Some(PreviousTurnSettings {
@@ -300,7 +395,7 @@ pub(crate) async fn run_turn(
     // 2. After auto-compact, when model/tool continuation needs to resume before any steer.
 
     let mut next_step_context = Some(first_step_context);
-    loop {
+    'turn: loop {
         // Note that pending_input would be something like a message the user
         // submitted through the UI while the model was running. Though the UI
         // may support this, the model might not.
@@ -333,21 +428,31 @@ pub(crate) async fn run_turn(
         .await;
 
         // Capture once so context, advertised tools, and tool calls share one request view.
-        let step_context = match next_step_context.take() {
-            Some(step_context) => step_context,
-            None if pending_input.is_empty() => {
+        // Pending steering is authoritative for the next request. A context captured before the
+        // steering arrived cannot contain MCP servers mentioned by that steering.
+        let prepared_step_context = next_step_context.take();
+        let step_context = match (prepared_step_context, pending_input.is_empty()) {
+            (Some(step_context), true) => step_context,
+            (None, true) => {
                 sess.capture_step_context(Arc::clone(&turn_context), &cancellation_token)
                     .await?
             }
-            None => {
+            (prepared_step_context, false) => {
                 let pending_user_input = turn_user_input(&pending_input);
-                let (required_servers, _) = required_mcp_servers_for_input(
+                let (mut required_servers, _) = required_mcp_servers_for_input(
                     &sess,
                     turn_context.as_ref(),
                     &pending_user_input,
                 )
                 .or_cancel(&cancellation_token)
                 .await?;
+                if let Some(prepared_step_context) = prepared_step_context {
+                    for server in &prepared_step_context.required_mcp_servers {
+                        if !required_servers.contains(server) {
+                            required_servers.push(server.clone());
+                        }
+                    }
+                }
                 sess.capture_step_context_with_required_mcp_servers(
                     Arc::clone(&turn_context),
                     &cancellation_token,
@@ -356,7 +461,7 @@ pub(crate) async fn run_turn(
                 .await?
             }
         };
-        let sampling_request_result: CodexResult<_> = async {
+        let sampling_request_result = async {
             super::time_reminder::maybe_record_current_time_reminder(
                 sess.as_ref(),
                 turn_context.as_ref(),
@@ -389,12 +494,28 @@ pub(crate) async fn run_turn(
                 &responses_metadata,
                 sampling_request_input,
                 cancellation_token.child_token(),
+                &mut interrupted_response_recorded,
             )
             .await
         }
         .await;
         match sampling_request_result {
             Ok((sampling_request_output, sampling_request_input)) => {
+                if turn_context.model_profile.is_some() {
+                    if initial_routing_change_pending
+                        && attempted_routing_candidates.len() == 1
+                        && let (Some(previous), Some(reason)) = (
+                            turn_context.model_routing_previous_candidate.as_ref(),
+                            turn_context.model_routing_selection_reason,
+                        )
+                    {
+                        sess.notify_model_routing_candidate_change(previous, &turn_context, reason)
+                            .await;
+                    }
+                    sess.record_model_routing_success(turn_context.as_ref())
+                        .await;
+                    initial_routing_change_pending = false;
+                }
                 let SamplingRequestResult {
                     needs_follow_up: model_needs_follow_up,
                     last_agent_message: sampling_request_last_agent_message,
@@ -481,6 +602,7 @@ pub(crate) async fn run_turn(
                         },
                         CompactionReason::ContextLimit,
                         CompactionPhase::MidTurn,
+                        CompactionReporting::Immediate,
                     )
                     .await
                     {
@@ -562,15 +684,16 @@ pub(crate) async fn run_turn(
                 }
                 continue;
             }
-            Err(err) if matches!(err.details(), CodexErrorDetails::TurnAborted) => {
-                return Err(err);
+            Err(failure) if matches!(failure.error.details(), CodexErrorDetails::TurnAborted) => {
+                return Err(failure.error);
             }
-            Err(codex_error)
+            Err(failure)
                 if matches!(
-                    codex_error.details(),
+                    failure.error.details(),
                     CodexErrorDetails::InvalidImageRequest()
                 ) =>
             {
+                let codex_error = failure.error;
                 sess.track_turn_codex_error(turn_context.as_ref(), &codex_error);
                 let error = CodexErrorInfo::BadRequest;
                 sess.emit_turn_error_lifecycle(turn_context.as_ref(), error.clone())
@@ -584,7 +707,204 @@ pub(crate) async fn run_turn(
                 sess.send_event(&turn_context, event).await;
                 break;
             }
-            Err(e) => {
+            Err(failure) => {
+                let routing_failure = classify_model_routing_failure(failure.error.details());
+                if let Some(routing_failure) = routing_failure.as_ref() {
+                    sess.record_model_routing_failure(turn_context.as_ref(), routing_failure)
+                        .await;
+                }
+                if failure.reroute_safe
+                    && let Some(routing_failure) = routing_failure
+                    && let Some(profile_name) = turn_context.model_profile.clone()
+                {
+                    let mut last_compaction_error = None;
+                    while let Some(selection) = sess
+                        .select_model_routing_context(
+                            turn_context.as_ref(),
+                            &profile_name,
+                            &attempted_routing_candidates,
+                        )
+                        .await
+                    {
+                        if !sess
+                            .wait_for_model_routing_retry(selection.retry_at, &cancellation_token)
+                            .await
+                        {
+                            return Err(CodexErr::TurnAborted);
+                        }
+                        let mut routed = selection.context;
+                        routed.model_routing_previous_candidate = None;
+                        routed.model_routing_selection_reason = None;
+                        let routed = Arc::new(routed);
+                        if let Some(candidate) = routed.model_routing_candidate.clone() {
+                            attempted_routing_candidates.insert(candidate);
+                        }
+                        sess.services
+                            .thread_extension_data
+                            .insert(routed.model_info().as_ref().clone());
+                        let routed_step_context = match sess
+                            .capture_step_context_with_required_mcp_servers(
+                                Arc::clone(&routed),
+                                &cancellation_token,
+                                &step_context.required_mcp_servers,
+                            )
+                            .await
+                        {
+                            Ok(routed_step_context) => routed_step_context,
+                            Err(err) => {
+                                sess.services
+                                    .thread_extension_data
+                                    .insert(turn_context.model_info().as_ref().clone());
+                                return Err(err);
+                            }
+                        };
+                        client_session.reset_for_model_reroute();
+                        let compacted = match maybe_run_model_reroute_inline_compact(
+                            &sess,
+                            &turn_context,
+                            &routed_step_context,
+                            &world_state,
+                            &mut client_session,
+                        )
+                        .await
+                        {
+                            Ok(compacted) => compacted,
+                            Err(err)
+                                if matches!(
+                                    err.details(),
+                                    CodexErrorDetails::Interrupted | CodexErrorDetails::TurnAborted
+                                ) =>
+                            {
+                                sess.services
+                                    .thread_extension_data
+                                    .insert(turn_context.model_info().as_ref().clone());
+                                return Err(err);
+                            }
+                            Err(err) => {
+                                if let Some(compaction_failure) =
+                                    classify_model_routing_failure(err.details())
+                                {
+                                    sess.record_model_routing_failure(
+                                        routed.as_ref(),
+                                        &compaction_failure,
+                                    )
+                                    .await;
+                                    sess.services
+                                        .thread_extension_data
+                                        .insert(turn_context.model_info().as_ref().clone());
+                                    client_session.reset_for_model_reroute();
+                                    last_compaction_error = Some(err);
+                                    continue;
+                                }
+                                sess.services
+                                    .thread_extension_data
+                                    .insert(turn_context.model_info().as_ref().clone());
+                                info!("Turn error during model reroute compaction: {err:#}");
+                                let error = err.to_codex_protocol_error();
+                                sess.emit_turn_error_lifecycle(
+                                    turn_context.as_ref(),
+                                    error.clone(),
+                                )
+                                .await;
+                                sess.track_turn_codex_error(routed.as_ref(), &err);
+                                let event =
+                                    EventMsg::Error(err.to_error_event(/*message_prefix*/ None));
+                                sess.send_event(&turn_context, event).await;
+                                return Ok(None);
+                            }
+                        };
+                        if compacted {
+                            // Compaction is its own provider request. Sampling starts a clean route
+                            // segment and rebuilds from the compacted local history.
+                            client_session.reset_for_model_reroute();
+                            sess.notify_model_routing_change(
+                                turn_context.as_ref(),
+                                &routed,
+                                routing_failure.reason,
+                            )
+                            .await;
+                            sess.set_previous_turn_settings(Some(PreviousTurnSettings {
+                                model: routed.model_info().slug.clone(),
+                                comp_hash: routed.model_info().comp_hash.clone(),
+                                realtime_active: Some(routed.realtime_active),
+                            }))
+                            .await;
+                            turn_context = Arc::clone(&routed);
+                            if let PostCompactHookOutcome::Stopped = run_post_compact_hooks(
+                                &sess,
+                                &turn_context,
+                                CompactionTrigger::Auto,
+                            )
+                            .await
+                            {
+                                return Err(CodexErr::TurnAborted);
+                            }
+                        }
+                        let routed_step_context = if compacted {
+                            sess.capture_step_context_with_required_mcp_servers(
+                                Arc::clone(&routed),
+                                &cancellation_token,
+                                &step_context.required_mcp_servers,
+                            )
+                            .await?
+                        } else {
+                            routed_step_context
+                        };
+                        world_state = match sess
+                            .record_context_updates_and_set_reference_context_item(
+                                routed_step_context.as_ref(),
+                            )
+                            .await
+                        {
+                            Ok(world_state) => world_state,
+                            Err(err) if !compacted => {
+                                sess.services
+                                    .thread_extension_data
+                                    .insert(turn_context.model_info().as_ref().clone());
+                                return Err(err);
+                            }
+                            Err(err) => return Err(err),
+                        };
+                        if !compacted {
+                            sess.notify_model_routing_change(
+                                turn_context.as_ref(),
+                                &routed,
+                                routing_failure.reason,
+                            )
+                            .await;
+                            sess.set_previous_turn_settings(Some(PreviousTurnSettings {
+                                model: routed.model_info().slug.clone(),
+                                comp_hash: routed.model_info().comp_hash.clone(),
+                                realtime_active: Some(routed.realtime_active),
+                            }))
+                            .await;
+                            turn_context = routed;
+                        }
+                        if failure.interrupted_response && !interrupted_response_recorded {
+                            record_interrupted_response(sess.as_ref(), turn_context.as_ref()).await;
+                            interrupted_response_recorded = true;
+                        }
+                        next_step_context = Some(routed_step_context);
+                        // The failed request no longer owns the mailbox boundary. Steering that
+                        // arrived during X belongs in Y's next sampling request in the same user turn.
+                        can_drain_pending_input = true;
+                        continue 'turn;
+                    }
+                    if let Some(err) = last_compaction_error {
+                        sess.services
+                            .thread_extension_data
+                            .insert(turn_context.model_info().as_ref().clone());
+                        info!("Turn error during model reroute compaction: {err:#}");
+                        let error = err.to_codex_protocol_error();
+                        sess.emit_turn_error_lifecycle(turn_context.as_ref(), error.clone())
+                            .await;
+                        sess.track_turn_codex_error(turn_context.as_ref(), &err);
+                        let event = EventMsg::Error(err.to_error_event(/*message_prefix*/ None));
+                        sess.send_event(&turn_context, event).await;
+                        return Ok(None);
+                    }
+                }
+                let e = failure.error;
                 info!("Turn error: {e:#}");
                 let error = e.to_codex_protocol_error();
                 sess.emit_turn_error_lifecycle(turn_context.as_ref(), error.clone())
@@ -599,6 +919,22 @@ pub(crate) async fn run_turn(
     }
 
     Ok(last_agent_message)
+}
+
+struct SamplingRequestFailure {
+    error: CodexErr,
+    reroute_safe: bool,
+    interrupted_response: bool,
+}
+
+impl From<CodexErr> for SamplingRequestFailure {
+    fn from(error: CodexErr) -> Self {
+        Self {
+            error,
+            reroute_safe: false,
+            interrupted_response: false,
+        }
+    }
 }
 
 #[instrument(level = "trace", skip_all)]
@@ -1054,6 +1390,7 @@ async fn run_pre_sampling_compact(
             InitialContextInjection::DoNotInject,
             CompactionReason::ContextLimit,
             CompactionPhase::PreTurn,
+            CompactionReporting::Immediate,
         )
         .await?;
     }
@@ -1136,6 +1473,7 @@ async fn maybe_run_previous_model_inline_compact(
             InitialContextInjection::DoNotInject,
             CompactionReason::CompHashChanged,
             CompactionPhase::PreTurn,
+            CompactionReporting::Immediate,
         )
         .await?;
         return Ok(());
@@ -1184,10 +1522,78 @@ async fn maybe_run_previous_model_inline_compact(
             InitialContextInjection::DoNotInject,
             CompactionReason::ModelDownshift,
             CompactionPhase::PreTurn,
+            CompactionReporting::Immediate,
         )
         .await?;
     }
     Ok(())
+}
+
+/// Compacts a routing checkpoint directly with the replacement request configuration.
+///
+/// The failed configuration is not retried for compaction. The replacement configuration starts
+/// a new provider route segment and compacts the locally reconstructed history before it becomes
+/// the task's previous-turn configuration.
+async fn maybe_run_model_reroute_inline_compact(
+    sess: &Arc<Session>,
+    previous_turn_context: &Arc<TurnContext>,
+    routed_step_context: &Arc<StepContext>,
+    world_state: &Arc<WorldState>,
+    client_session: &mut ModelClientSession,
+) -> CodexResult<bool> {
+    let routed_turn_context = &routed_step_context.turn;
+    let reason = if comp_hash_changed(
+        previous_turn_context.model_info().comp_hash.as_deref(),
+        routed_turn_context.model_info().comp_hash.as_deref(),
+    ) {
+        Some(CompactionReason::CompHashChanged)
+    } else {
+        let active_context_tokens = sess.get_total_token_usage().await;
+        let routed_limit_reached = match routed_turn_context
+            .config
+            .model_auto_compact_token_limit_scope
+        {
+            AutoCompactTokenLimitScope::Total => {
+                let auto_compact_limit = routed_turn_context
+                    .model_info()
+                    .auto_compact_token_limit()
+                    .unwrap_or(i64::MAX);
+                let context_window = routed_turn_context
+                    .model_context_window()
+                    .unwrap_or(i64::MAX);
+                active_context_tokens > auto_compact_limit
+                    || active_context_tokens >= context_window
+            }
+            AutoCompactTokenLimitScope::BodyAfterPrefix => routed_turn_context
+                .model_context_window()
+                .is_some_and(|context_window| active_context_tokens >= context_window),
+        };
+        let is_model_downshift = previous_turn_context.model_info().slug
+            != routed_turn_context.model_info().slug
+            && previous_turn_context
+                .model_context_window()
+                .zip(routed_turn_context.model_context_window())
+                .is_some_and(|(previous, routed)| previous > routed);
+        (routed_limit_reached && is_model_downshift).then_some(CompactionReason::ModelDownshift)
+    };
+    let Some(reason) = reason else {
+        return Ok(false);
+    };
+    run_auto_compact(
+        sess,
+        Arc::clone(routed_step_context),
+        /*fallback_step_context*/ None,
+        client_session,
+        InitialContextInjection::BeforeLastUserMessage {
+            world_state: Arc::clone(world_state),
+            step_context: Arc::clone(routed_step_context),
+        },
+        reason,
+        CompactionPhase::MidTurn,
+        CompactionReporting::CandidateEvaluation,
+    )
+    .await?;
+    Ok(true)
 }
 
 #[instrument(
@@ -1195,6 +1601,7 @@ async fn maybe_run_previous_model_inline_compact(
     skip_all,
     fields(reason = ?reason, phase = ?phase)
 )]
+#[allow(clippy::too_many_arguments)]
 async fn run_auto_compact(
     sess: &Arc<Session>,
     step_context: Arc<StepContext>,
@@ -1203,6 +1610,7 @@ async fn run_auto_compact(
     initial_context_injection: InitialContextInjection,
     reason: CompactionReason,
     phase: CompactionPhase,
+    reporting: CompactionReporting,
 ) -> CodexResult<()> {
     let turn_context = &step_context.turn;
     let _profile_guard = turn_context.turn_timing_state.begin_compaction();
@@ -1213,6 +1621,7 @@ async fn run_auto_compact(
             Arc::clone(sess),
             step_context,
             initial_context_injection,
+            reporting,
         )
         .await?;
         return Ok(());
@@ -1238,6 +1647,7 @@ async fn run_auto_compact(
                 initial_context_injection,
                 reason,
                 phase,
+                reporting,
             )
             .await?;
         }
@@ -1255,6 +1665,7 @@ async fn run_auto_compact(
                 initial_context_injection,
                 reason,
                 phase,
+                reporting,
             )
             .await?;
         }
@@ -1267,9 +1678,11 @@ async fn run_auto_compact(
             run_inline_auto_compact_task(
                 Arc::clone(sess),
                 Arc::clone(turn_context),
+                client_session,
                 initial_context_injection,
                 reason,
                 phase,
+                reporting,
             )
             .await?;
         }
@@ -1367,7 +1780,8 @@ async fn run_sampling_request(
     responses_metadata: &CodexResponsesMetadata,
     input: Vec<ResponseItem>,
     cancellation_token: CancellationToken,
-) -> CodexResult<(SamplingRequestResult, Vec<ResponseItem>)> {
+    interrupted_response_recorded: &mut bool,
+) -> Result<(SamplingRequestResult, Vec<ResponseItem>), SamplingRequestFailure> {
     let turn_context = Arc::clone(&step_context.turn);
     let base_instructions = sess.get_base_instructions().await;
 
@@ -1387,6 +1801,10 @@ async fn run_sampling_request(
     let mut original_input = None;
     let mut executed_tool_calls_by_output = HashMap::new();
     loop {
+        // A routing profile must not hide unsafe partial output behind a later model change.
+        // Ordinary same-model retries rebuild the request from committed local history.
+        let reroute_safe = Arc::new(AtomicBool::new(true));
+        let interrupted_response = Arc::new(AtomicBool::new(false));
         let prompt_input = if let Some(input) = initial_input.take() {
             input
         } else {
@@ -1416,6 +1834,8 @@ async fn run_sampling_request(
             Arc::clone(&turn_diff_tracker),
             &prompt,
             cancellation_token.child_token(),
+            Arc::clone(&reroute_safe),
+            Arc::clone(&interrupted_response),
         )
         .await
         {
@@ -1425,25 +1845,49 @@ async fn run_sampling_request(
             Err(err) => match err.details() {
                 CodexErrorDetails::ContextWindowExceeded => {
                     sess.set_total_tokens_full(&turn_context).await;
-                    return Err(err);
+                    return Err(SamplingRequestFailure {
+                        error: err,
+                        reroute_safe: reroute_safe.load(Ordering::Relaxed),
+                        interrupted_response: interrupted_response.load(Ordering::Relaxed),
+                    });
                 }
                 CodexErrorDetails::UsageLimitReached(e) => {
                     let rate_limits = e.rate_limits.clone();
                     if let Some(rate_limits) = rate_limits {
                         sess.update_rate_limits(&turn_context, *rate_limits).await;
                     }
-                    return Err(err);
+                    return Err(SamplingRequestFailure {
+                        error: err,
+                        reroute_safe: reroute_safe.load(Ordering::Relaxed),
+                        interrupted_response: interrupted_response.load(Ordering::Relaxed),
+                    });
+                }
+                _ if turn_context.model_profile.is_some()
+                    && classify_model_routing_failure(err.details()).is_some() =>
+                {
+                    return Err(SamplingRequestFailure {
+                        error: err,
+                        reroute_safe: reroute_safe.load(Ordering::Relaxed),
+                        interrupted_response: interrupted_response.load(Ordering::Relaxed),
+                    });
                 }
                 _ => err,
             },
         };
+        let attempt_reroute_safe = reroute_safe.load(Ordering::Relaxed);
 
         if original_input.is_none() {
             original_input = Some(prompt.input);
         }
 
-        if !err.is_retryable() {
-            return Err(err);
+        let routing_profile_blocks_retry =
+            turn_context.model_profile.is_some() && !attempt_reroute_safe;
+        if routing_profile_blocks_retry || !err.is_retryable() {
+            return Err(SamplingRequestFailure {
+                error: err,
+                reroute_safe: attempt_reroute_safe,
+                interrupted_response: interrupted_response.load(Ordering::Relaxed),
+            });
         }
 
         handle_retryable_response_stream_error(
@@ -1455,7 +1899,16 @@ async fn run_sampling_request(
             &turn_context,
             ResponsesStreamRequest::Sampling,
         )
-        .await?;
+        .await
+        .map_err(|error| SamplingRequestFailure {
+            error,
+            reroute_safe: attempt_reroute_safe,
+            interrupted_response: interrupted_response.load(Ordering::Relaxed),
+        })?;
+        if interrupted_response.swap(false, Ordering::Relaxed) && !*interrupted_response_recorded {
+            record_interrupted_response(sess.as_ref(), turn_context.as_ref()).await;
+            *interrupted_response_recorded = true;
+        }
         turn_context.turn_timing_state.record_sampling_retry();
     }
 }
@@ -2151,6 +2604,141 @@ async fn handle_assistant_item_done_in_plan_mode(
     false
 }
 
+/// Finalizes assistant text from an interrupted provider route segment.
+///
+/// The text is part of the conversation history and client-visible turn item lifecycle, but it is
+/// not the final answer for the user turn. In particular, it must not defer queued steering to the
+/// next user turn.
+async fn finalize_interrupted_assistant_item(
+    sess: &Session,
+    turn_context: &TurnContext,
+    turn_store: &codex_extension_api::ExtensionData,
+    item: &ResponseItem,
+    previously_streamed_item: Option<&TurnItem>,
+    plan_mode_state: Option<&mut PlanModeStreamState>,
+) -> bool {
+    let plan_mode = plan_mode_state.is_some();
+    let Some(mut finalized_turn_item) = finalize_non_tool_response_item(
+        sess,
+        TurnItemContributorPolicy::Run(turn_store),
+        item,
+        plan_mode,
+    )
+    .await
+    else {
+        return false;
+    };
+    finalized_turn_item
+        .facts
+        .defers_mailbox_delivery_to_next_turn = false;
+
+    if let Some(plan_mode_state) = plan_mode_state {
+        emit_turn_item_in_plan_mode(
+            sess,
+            turn_context,
+            finalized_turn_item.turn_item,
+            previously_streamed_item,
+            plan_mode_state,
+        )
+        .await;
+    } else {
+        if previously_streamed_item.is_none() {
+            sess.emit_turn_item_started(turn_context, &finalized_turn_item.turn_item)
+                .await;
+        }
+        sess.emit_turn_item_completed(turn_context, finalized_turn_item.turn_item)
+            .await;
+    }
+    record_completed_response_item_with_finalized_facts(
+        sess,
+        turn_context,
+        item,
+        Some(&finalized_turn_item.facts),
+    )
+    .await;
+    true
+}
+
+async fn record_interrupted_response(sess: &Session, turn_context: &TurnContext) {
+    let interrupted_response: ResponseItem =
+        ContextualUserFragment::into(InterruptedResponseRecord);
+    sess.record_conversation_items(turn_context, &[interrupted_response])
+        .await;
+}
+
+/// Closes a client lifecycle without adding an incomplete provider-managed item to model history.
+///
+/// Reasoning may lack encrypted completion state, and hosted tools do not share one valid synthetic
+/// output type. The bounded interrupted-response record describes the failure for the replacement
+/// route segment instead.
+async fn finalize_interrupted_client_item(
+    sess: &Session,
+    turn_context: &TurnContext,
+    turn_store: &codex_extension_api::ExtensionData,
+    item: &ResponseItem,
+    previously_streamed_item: Option<&TurnItem>,
+    plan_mode: bool,
+) -> bool {
+    let finalized_turn_item = finalize_non_tool_response_item(
+        sess,
+        TurnItemContributorPolicy::Run(turn_store),
+        item,
+        plan_mode,
+    )
+    .await;
+    let Some(finalized_turn_item) = finalized_turn_item else {
+        return previously_streamed_item.is_none();
+    };
+    if previously_streamed_item.is_none() {
+        sess.emit_turn_item_started(turn_context, &finalized_turn_item.turn_item)
+            .await;
+    }
+    sess.emit_turn_item_completed(turn_context, finalized_turn_item.turn_item)
+        .await;
+    true
+}
+
+const MAX_INTERRUPTED_TOOL_INPUT_BYTES: usize = 8 * 1024;
+const INTERRUPTED_TOOL_CALL_OUTPUT: &str =
+    "Tool call was not executed because the model request ended before the call completed.";
+
+/// Records an incomplete harness-owned call as a non-executed exchange.
+///
+/// The call is never passed to `ToolRouter`. Pairing it with a fixed output preserves the model's
+/// attempted action without implying that truncated arguments were valid or that a side effect
+/// occurred.
+async fn record_interrupted_tool_call(
+    sess: &Session,
+    turn_context: &TurnContext,
+    item: ResponseItem,
+) {
+    let output = match &item {
+        ResponseItem::FunctionCall {
+            call_id,
+            name,
+            namespace,
+            ..
+        } => ResponseItem::FunctionCallOutput {
+            id: None,
+            call_id: Some(call_id.clone()),
+            name: Some(name.clone()),
+            namespace: namespace.clone(),
+            output: FunctionCallOutputPayload::from_text(INTERRUPTED_TOOL_CALL_OUTPUT.to_string()),
+            internal_chat_message_metadata_passthrough: None,
+        },
+        ResponseItem::CustomToolCall { call_id, name, .. } => ResponseItem::CustomToolCallOutput {
+            id: None,
+            call_id: call_id.clone(),
+            name: Some(name.clone()),
+            output: FunctionCallOutputPayload::from_text(INTERRUPTED_TOOL_CALL_OUTPUT.to_string()),
+            internal_chat_message_metadata_passthrough: None,
+        },
+        _ => return,
+    };
+    sess.record_conversation_items(turn_context, &[item, output])
+        .await;
+}
+
 #[instrument(level = "trace", skip_all)]
 async fn drain_in_flight(
     in_flight: &mut FuturesOrdered<InFlightFuture<'static>>,
@@ -2171,6 +2759,7 @@ async fn drain_in_flight(
             }
             Err(err) => {
                 error_or_panic(format!("in-flight tool future failed during drain: {err}"));
+                return Err(err);
             }
         }
     }
@@ -2192,6 +2781,110 @@ fn assign_missing_streamed_response_item_id(
     Session::assign_missing_response_item_id(item);
 }
 
+/// Extends the active assistant message with text already sent to the client.
+///
+/// If the provider fails before `OutputItemDone`, this accumulated item is finalized into local
+/// history before a model reroute. The replacement route segment can then continue after the exact
+/// assistant prefix instead of replaying it.
+fn append_partial_assistant_text(active_item: &mut Option<ResponseItem>, delta: &str) {
+    let Some(ResponseItem::Message { role, content, .. }) = active_item.as_mut() else {
+        return;
+    };
+    if role != "assistant" || delta.is_empty() {
+        return;
+    }
+    if let Some(ContentItem::OutputText { text }) = content.last_mut() {
+        text.push_str(delta);
+    } else {
+        content.push(ContentItem::OutputText {
+            text: delta.to_string(),
+        });
+    }
+}
+
+/// Accumulates only the bounded input needed to explain an interrupted, undispatched tool call.
+fn append_partial_tool_call_input(active_item: &mut Option<ResponseItem>, delta: &str) {
+    let input = match active_item.as_mut() {
+        Some(ResponseItem::FunctionCall { arguments, .. }) => arguments,
+        Some(ResponseItem::CustomToolCall { input, .. }) => input,
+        _ => return,
+    };
+    truncate_to_char_boundary(input, MAX_INTERRUPTED_TOOL_INPUT_BYTES);
+    if input.len() >= MAX_INTERRUPTED_TOOL_INPUT_BYTES || delta.is_empty() {
+        return;
+    }
+    let remaining = MAX_INTERRUPTED_TOOL_INPUT_BYTES - input.len();
+    let mut end = remaining.min(delta.len());
+    while !delta.is_char_boundary(end) {
+        end -= 1;
+    }
+    input.push_str(&delta[..end]);
+}
+
+fn bound_partial_tool_call_input(item: &mut ResponseItem) {
+    let input = match item {
+        ResponseItem::FunctionCall { arguments, .. } => arguments,
+        ResponseItem::CustomToolCall { input, .. } => input,
+        _ => return,
+    };
+    truncate_to_char_boundary(input, MAX_INTERRUPTED_TOOL_INPUT_BYTES);
+}
+
+fn truncate_to_char_boundary(value: &mut String, max_bytes: usize) {
+    if value.len() <= max_bytes {
+        return;
+    }
+    let mut end = max_bytes;
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    value.truncate(end);
+}
+
+fn append_partial_reasoning_summary(
+    active_item: &mut Option<ResponseItem>,
+    summary_index: i64,
+    delta: &str,
+) {
+    let Ok(summary_index) = usize::try_from(summary_index) else {
+        return;
+    };
+    let Some(ResponseItem::Reasoning { summary, .. }) = active_item.as_mut() else {
+        return;
+    };
+    while summary.len() <= summary_index {
+        summary.push(ReasoningItemReasoningSummary::SummaryText {
+            text: String::new(),
+        });
+    }
+    let ReasoningItemReasoningSummary::SummaryText { text } = &mut summary[summary_index];
+    text.push_str(delta);
+}
+
+fn append_partial_reasoning_content(
+    active_item: &mut Option<ResponseItem>,
+    content_index: i64,
+    delta: &str,
+) {
+    let Ok(content_index) = usize::try_from(content_index) else {
+        return;
+    };
+    let Some(ResponseItem::Reasoning { content, .. }) = active_item.as_mut() else {
+        return;
+    };
+    let content = content.get_or_insert_default();
+    while content.len() <= content_index {
+        content.push(ReasoningItemContent::ReasoningText {
+            text: String::new(),
+        });
+    }
+    match &mut content[content_index] {
+        ReasoningItemContent::ReasoningText { text } | ReasoningItemContent::Text { text } => {
+            text.push_str(delta);
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 #[instrument(level = "trace",
     skip_all,
@@ -2210,6 +2903,8 @@ async fn try_run_sampling_request(
     turn_diff_tracker: SharedTurnDiffTracker,
     prompt: &Prompt,
     cancellation_token: CancellationToken,
+    reroute_safe: Arc<AtomicBool>,
+    interrupted_response: Arc<AtomicBool>,
 ) -> CodexResult<SamplingRequestResult> {
     let turn_context = Arc::clone(&step_context.turn);
     feedback_tags!(
@@ -2249,6 +2944,7 @@ async fn try_run_sampling_request(
     let mut needs_follow_up = false;
     let mut last_agent_message: Option<String> = None;
     let mut active_item: Option<TurnItem> = None;
+    let mut active_response_item: Option<ResponseItem> = None;
     let mut active_tool_argument_diff_consumer: Option<(
         String,
         Box<dyn ToolArgumentDiffConsumer>,
@@ -2273,6 +2969,7 @@ async fn try_run_sampling_request(
     let defer_streamed_turn_items_for_contributors =
         !sess.services.extensions.turn_item_contributors().is_empty();
     let mut active_item_is_streaming_to_client = false;
+    let mut completed_response_item_before_failure = false;
     let receiving_span = trace_span!("receiving_stream");
     let outcome: CodexResult<SamplingRequestResult> = loop {
         let handle_responses = trace_span!(
@@ -2320,7 +3017,10 @@ async fn try_run_sampling_request(
         match event {
             ResponseEvent::Created => {}
             ResponseEvent::OutputItemDone(mut item) => {
+                completed_response_item_before_failure = true;
                 assign_missing_streamed_response_item_id(&mut item, active_item.as_ref());
+                active_response_item = None;
+                reroute_safe.store(true, Ordering::Relaxed);
                 if analytics_tool_call_ids.len() < MAX_ANALYTICS_TOOL_CALL_IDS_PER_RESPONSE {
                     let call_id = match &item {
                         ResponseItem::FunctionCall { call_id, .. }
@@ -2432,6 +3132,9 @@ async fn try_run_sampling_request(
             }
             ResponseEvent::OutputItemAdded(mut item) => {
                 assign_missing_streamed_response_item_id(&mut item, /*active_item*/ None);
+                bound_partial_tool_call_input(&mut item);
+                active_response_item = Some(item.clone());
+                reroute_safe.store(false, Ordering::Relaxed);
                 if let ResponseItem::CustomToolCall {
                     call_id,
                     name,
@@ -2612,6 +3315,8 @@ async fn try_run_sampling_request(
                 });
             }
             ResponseEvent::OutputTextDelta(delta) => {
+                reroute_safe.store(false, Ordering::Relaxed);
+                append_partial_assistant_text(&mut active_response_item, &delta);
                 // In review child threads, suppress assistant text deltas; the
                 // UI will show a selection popup from the final ReviewOutput.
                 if let Some(active) = active_item.as_ref() {
@@ -2648,6 +3353,8 @@ async fn try_run_sampling_request(
                 call_id,
                 delta,
             } => {
+                reroute_safe.store(false, Ordering::Relaxed);
+                append_partial_tool_call_input(&mut active_response_item, &delta);
                 let Some((active_call_id, consumer)) = active_tool_argument_diff_consumer.as_mut()
                 else {
                     continue;
@@ -2665,9 +3372,11 @@ async fn try_run_sampling_request(
                 delta,
                 summary_index,
             } => {
+                reroute_safe.store(false, Ordering::Relaxed);
                 if uses_sequential_cutoff_reasoning_summaries {
                     continue;
                 }
+                append_partial_reasoning_summary(&mut active_response_item, summary_index, &delta);
                 if let Some(active) = active_item.as_ref() {
                     if !active_item_is_streaming_to_client {
                         continue;
@@ -2686,6 +3395,7 @@ async fn try_run_sampling_request(
                 }
             }
             ResponseEvent::ReasoningSummaryPartAdded { summary_index } => {
+                reroute_safe.store(false, Ordering::Relaxed);
                 if uses_sequential_cutoff_reasoning_summaries {
                     continue;
                 }
@@ -2708,9 +3418,11 @@ async fn try_run_sampling_request(
                 text,
                 summary_index,
             } => {
+                reroute_safe.store(false, Ordering::Relaxed);
                 if !uses_sequential_cutoff_reasoning_summaries {
                     continue;
                 }
+                append_partial_reasoning_summary(&mut active_response_item, summary_index, &text);
                 let Some(active) = active_item.as_ref() else {
                     continue;
                 };
@@ -2741,6 +3453,8 @@ async fn try_run_sampling_request(
                 delta,
                 content_index,
             } => {
+                reroute_safe.store(false, Ordering::Relaxed);
+                append_partial_reasoning_content(&mut active_response_item, content_index, &delta);
                 if let Some(active) = active_item.as_ref() {
                     if !active_item_is_streaming_to_client {
                         continue;
@@ -2762,6 +3476,113 @@ async fn try_run_sampling_request(
     };
     drop(sampling_timing_guard);
 
+    let can_recover_failed_stream = outcome.as_ref().err().is_some_and(|err| {
+        err.is_retryable() || classify_model_routing_failure(err.details()).is_some()
+    });
+    if turn_context.model_profile.is_some() && can_recover_failed_stream {
+        if completed_response_item_before_failure {
+            interrupted_response.store(true, Ordering::Relaxed);
+        }
+        let checkpoint_ready = match active_response_item.take() {
+            None => reroute_safe.load(Ordering::Relaxed),
+            Some(item) if matches!(&item, ResponseItem::Message { role, .. } if role == "assistant") =>
+            {
+                if let Some(active) = active_item.as_ref()
+                    && active_item_is_streaming_to_client
+                {
+                    flush_assistant_text_segments_for_item(
+                        &sess,
+                        &turn_context,
+                        plan_mode_state.as_mut(),
+                        &mut assistant_message_stream_parsers,
+                        &active.id(),
+                    )
+                    .await;
+                }
+                let previously_active_item = active_item.take();
+                let previously_streamed_item = if active_item_is_streaming_to_client {
+                    previously_active_item
+                } else {
+                    None
+                };
+                let finalized = finalize_interrupted_assistant_item(
+                    sess.as_ref(),
+                    turn_context.as_ref(),
+                    turn_store.as_ref(),
+                    &item,
+                    previously_streamed_item.as_ref(),
+                    plan_mode_state.as_mut(),
+                )
+                .await;
+                if !finalized {
+                    error!("failed to finalize interrupted assistant message");
+                } else {
+                    interrupted_response.store(true, Ordering::Relaxed);
+                }
+                finalized
+            }
+            Some(item @ ResponseItem::Reasoning { .. }) => {
+                let previously_active_item = active_item.take();
+                let previously_streamed_item = if active_item_is_streaming_to_client {
+                    previously_active_item
+                } else {
+                    None
+                };
+                let finalized = finalize_interrupted_client_item(
+                    sess.as_ref(),
+                    turn_context.as_ref(),
+                    turn_store.as_ref(),
+                    &item,
+                    previously_streamed_item.as_ref(),
+                    plan_mode,
+                )
+                .await;
+                if !finalized {
+                    error!("failed to finalize interrupted reasoning item");
+                } else {
+                    interrupted_response.store(true, Ordering::Relaxed);
+                }
+                finalized
+            }
+            Some(item @ ResponseItem::FunctionCall { .. }) => {
+                drop(active_tool_argument_diff_consumer.take());
+                drop(active_item.take());
+                record_interrupted_tool_call(sess.as_ref(), turn_context.as_ref(), item).await;
+                interrupted_response.store(true, Ordering::Relaxed);
+                true
+            }
+            Some(item @ ResponseItem::CustomToolCall { .. }) => {
+                drop(active_tool_argument_diff_consumer.take());
+                drop(active_item.take());
+                record_interrupted_tool_call(sess.as_ref(), turn_context.as_ref(), item).await;
+                interrupted_response.store(true, Ordering::Relaxed);
+                true
+            }
+            Some(item) => {
+                let previously_active_item = active_item.take();
+                let previously_streamed_item = if active_item_is_streaming_to_client {
+                    previously_active_item
+                } else {
+                    None
+                };
+                let finalized = finalize_interrupted_client_item(
+                    sess.as_ref(),
+                    turn_context.as_ref(),
+                    turn_store.as_ref(),
+                    &item,
+                    previously_streamed_item.as_ref(),
+                    plan_mode,
+                )
+                .await;
+                if finalized {
+                    interrupted_response.store(true, Ordering::Relaxed);
+                }
+                finalized
+            }
+        };
+        reroute_safe.store(checkpoint_ready, Ordering::Relaxed);
+    }
+
     flush_assistant_text_segments_all(
         &sess,
         &turn_context,
@@ -2775,7 +3596,10 @@ async fn try_run_sampling_request(
     } else {
         Some(turn_context.turn_timing_state.begin_tool_blocking())
     };
-    drain_in_flight(&mut in_flight, sess.clone(), turn_context.clone()).await?;
+    if let Err(err) = drain_in_flight(&mut in_flight, sess.clone(), turn_context.clone()).await {
+        reroute_safe.store(false, Ordering::Relaxed);
+        return Err(err);
+    }
     drop(tool_blocking_timing_guard);
 
     if should_emit_token_count {

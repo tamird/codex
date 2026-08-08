@@ -2556,6 +2556,35 @@ async fn queued_menu_slash_keeps_agent_turn_complete_notification() {
 }
 
 #[tokio::test]
+async fn slash_model_requests_catalog_refresh() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(Some("gpt-5.2")).await;
+    chat.thread_id = Some(ThreadId::new());
+
+    chat.dispatch_command(SlashCommand::Model);
+
+    assert!(render_bottom_popup(&chat, /*width*/ 80).contains("Select Model"));
+    assert!(
+        std::iter::from_fn(|| rx.try_recv().ok())
+            .any(|event| matches!(event, AppEvent::RefreshModelCatalog))
+    );
+}
+
+#[tokio::test]
+async fn refreshed_model_catalog_does_not_open_picker_before_session_start() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(Some("gpt-5.2")).await;
+
+    chat.dispatch_command(SlashCommand::Model);
+    chat.open_model_popup();
+
+    assert!(!render_bottom_popup(&chat, /*width*/ 80).contains("Select Model"));
+    let history = drain_insert_history(&mut rx);
+    assert!(history.iter().any(|cell| {
+        lines_to_single_string(cell)
+            .contains("Model selection is disabled until startup completes.")
+    }));
+}
+
+#[tokio::test]
 async fn slash_exit_requests_exit() {
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
 

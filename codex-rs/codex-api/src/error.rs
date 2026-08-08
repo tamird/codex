@@ -1,5 +1,6 @@
 use crate::rate_limits::RateLimitError;
 use codex_client::TransportError;
+use codex_protocol::error::UsageLimitReachedError;
 use codex_protocol::protocol::MisalignmentErrorDetails;
 use http::StatusCode;
 use std::time::Duration;
@@ -19,6 +20,8 @@ pub enum ApiError {
     QuotaExceeded,
     #[error("usage not included")]
     UsageNotIncluded,
+    #[error("usage limit reached: {0}")]
+    UsageLimitReached(UsageLimitReachedError),
     #[error("retryable error: {message}")]
     Retryable {
         message: String,
@@ -33,6 +36,9 @@ pub enum ApiError {
     RateLimit(String),
     #[error("invalid request: {message}")]
     InvalidRequest { message: String },
+    /// The selected model, reasoning effort, or service tier is unavailable.
+    #[error("model unavailable: {message}")]
+    ModelUnavailable { message: String },
     #[error("cyber policy: {message}")]
     CyberPolicy { message: String },
     #[error("misalignment policy violation: {message}")]
@@ -42,6 +48,25 @@ pub enum ApiError {
     },
     #[error("server overloaded")]
     ServerOverloaded,
+}
+
+pub(crate) fn is_request_configuration_unavailable(
+    code: Option<&str>,
+    param: Option<&str>,
+) -> bool {
+    matches!(param, Some("model" | "service_tier" | "reasoning.effort"))
+        || matches!(
+            code,
+            Some(
+                "model_not_found"
+                    | "model_not_supported"
+                    | "unsupported_model"
+                    | "service_tier_not_supported"
+                    | "unsupported_service_tier"
+                    | "reasoning_effort_not_supported"
+                    | "unsupported_reasoning_effort"
+            )
+        )
 }
 
 impl From<RateLimitError> for ApiError {

@@ -945,12 +945,12 @@ async fn deferred_tool_world_state_tracks_initial_unchanged_and_removed_namespac
 
     let mut refresh_config = test.config.clone();
     let user_config_path = refresh_config.codex_home.join("config.toml");
-    let user_config = toml::from_str(
-        r#"
+    let user_config_toml = r#"
 [apps.calendar]
 enabled = false
-"#,
-    )?;
+"#;
+    tokio::fs::write(&user_config_path, user_config_toml).await?;
+    let user_config = toml::from_str(user_config_toml)?;
     refresh_config.config_layer_stack = refresh_config
         .config_layer_stack
         .with_user_config(&user_config_path, user_config)?;

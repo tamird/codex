@@ -950,12 +950,27 @@ pub fn validate_model_providers(
 pub struct CustomModelToml {
     /// User-facing alias shown in the model picker.
     pub name: String,
-    /// Provider-facing model slug used on API requests.
-    pub model: String,
+    /// Provider-facing model slug used on API requests for a direct alias.
+    pub model: Option<String>,
+    /// Ordered concrete request configurations for a routed alias.
+    #[serde(default)]
+    pub candidates: Vec<ModelRoutingCandidateToml>,
     /// Optional context window override applied when this alias is selected.
     pub model_context_window: Option<i64>,
     /// Optional auto-compaction token limit override applied when this alias is selected.
     pub model_auto_compact_token_limit: Option<i64>,
+}
+
+/// One concrete request configuration in a routed custom model alias.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Hash, JsonSchema)]
+#[schemars(deny_unknown_fields)]
+pub struct ModelRoutingCandidateToml {
+    /// Provider-facing model slug used on API requests.
+    pub model: String,
+    /// Optional reasoning effort required for this candidate.
+    pub reasoning_effort: Option<ReasoningEffort>,
+    /// Optional service tier required for this candidate.
+    pub service_tier: Option<String>,
 }
 
 fn deserialize_model_providers<'de, D>(

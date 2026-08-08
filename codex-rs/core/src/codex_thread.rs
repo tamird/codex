@@ -258,6 +258,18 @@ impl CodexThread {
         self.io.submit(op).await
     }
 
+    /// Returns a model-history snapshot only while the source thread is idle.
+    pub async fn model_history_snapshot(&self) -> Option<Arc<Vec<ResponseItem>>> {
+        if self.session.active_turn.lock().await.is_some() {
+            return None;
+        }
+        let history = Arc::new(self.session.clone_history().await.into_raw_items());
+        if self.session.active_turn.lock().await.is_some() {
+            return None;
+        }
+        Some(history)
+    }
+
     /// Returns the session telemetry handle for thread-scoped production instrumentation.
     pub fn session_telemetry(&self) -> SessionTelemetry {
         self.session.services.session_telemetry.clone()

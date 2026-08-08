@@ -536,7 +536,7 @@ impl AppServerSession {
         // requirements together so an uncached model fetch can overlap both config requests.
         let model_request_id = self.next_request_id();
         let requirements_request_id = self.next_request_id();
-        let (models, requirements) = tokio::try_join!(
+        let (available_models, requirements) = tokio::try_join!(
             async {
                 self.client
                     .request_typed::<ModelListResponse>(ClientRequest::ModelList {
@@ -548,6 +548,13 @@ impl AppServerSession {
                         },
                     })
                     .await
+                    .map(|response| {
+                        response
+                            .data
+                            .into_iter()
+                            .map(model_preset_from_api_model)
+                            .collect::<Vec<_>>()
+                    })
                     .map_err(|err| {
                         bootstrap_request_error("model/list failed during TUI bootstrap", err)
                     })
@@ -573,11 +580,6 @@ impl AppServerSession {
             .requirements
             .and_then(|requirements| requirements.models)
             .and_then(|models| models.new_thread);
-        let available_models = models
-            .data
-            .into_iter()
-            .map(model_preset_from_api_model)
-            .collect::<Vec<_>>();
         let default_model = config
             .model
             .clone()
@@ -646,6 +648,32 @@ impl AppServerSession {
             has_chatgpt_account,
             available_models,
         })
+    }
+
+    /// Fetches the current picker catalog without restarting the TUI session.
+    pub(crate) async fn refresh_available_models(&mut self) -> Result<Vec<ModelPreset>> {
+        let request_id = self.next_request_id();
+        let response = self
+            .client
+            .request_typed::<ModelListResponse>(ClientRequest::ModelList {
+                request_id,
+                params: ModelListParams {
+                    cursor: None,
+                    limit: None,
+                    include_hidden: Some(true),
+                },
+            })
+            .await
+            .map_err(|err| {
+                bootstrap_request_error("model/list failed while refreshing TUI", err)
+            })?;
+        let available_models = response
+            .data
+            .into_iter()
+            .map(model_preset_from_api_model)
+            .collect::<Vec<_>>();
+        self.available_models.clone_from(&available_models);
+        Ok(available_models)
     }
 
     pub(crate) fn managed_new_thread_defaults(&self) -> Option<&NewThreadModelDefaults> {
@@ -2353,6 +2381,65 @@ mod tests {
                 FeedbackAudience::OpenAiEmployee,
                 true,
             )
+        );
+        app_server.shutdown().await?;
+        Ok(())
+    }
+
+    fn write_custom_alias_config(codex_home: &std::path::Path, alias: &str) {
+        std::fs::write(
+            codex_home.join("config.toml"),
+            format!(
+                r#"
+[[custom_models]]
+name = "{alias}"
+model = "gpt-5.1-codex"
+"#
+            ),
+        )
+        .expect("write custom model alias config");
+    }
+
+    fn custom_aliases(models: &[ModelPreset]) -> Vec<String> {
+        models
+            .iter()
+            .map(|model| model.model.clone())
+            .filter(|model| model.starts_with("test-route-"))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn model_catalog_refreshes_aliases_without_restarting_tui_session() -> Result<()> {
+        const FIRST_ALIAS: &str = "test-route-first";
+        const RENAMED_ALIAS: &str = "test-route-renamed";
+
+        let codex_home = tempfile::tempdir().expect("tempdir");
+        write_custom_alias_config(codex_home.path(), FIRST_ALIAS);
+        let config = build_config(&codex_home).await;
+        let mut app_server = crate::start_embedded_app_server_for_picker(&config).await?;
+        let catalog = crate::model_catalog::ModelCatalog::new(Vec::new());
+
+        let models = app_server.refresh_available_models().await?;
+        catalog.replace_models(models);
+        assert_eq!(
+            custom_aliases(&catalog.try_list_models().expect("catalog read")),
+            vec![FIRST_ALIAS]
+        );
+
+        write_custom_alias_config(codex_home.path(), RENAMED_ALIAS);
+        let models = app_server.refresh_available_models().await?;
+        catalog.replace_models(models);
+        assert_eq!(
+            custom_aliases(&catalog.try_list_models().expect("catalog read")),
+            vec![RENAMED_ALIAS]
+        );
+
+        std::fs::write(codex_home.path().join("config.toml"), "")?;
+        let models = app_server.refresh_available_models().await?;
+        catalog.replace_models(models);
+        assert_eq!(
+            custom_aliases(&catalog.try_list_models().expect("catalog read")),
+            Vec::<String>::new()
         );
 
         app_server.shutdown().await?;

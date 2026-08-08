@@ -916,6 +916,7 @@ async fn custom_model_alias_uses_backing_model_in_responses_request() -> Result<
         "frontier-local".to_string(),
         CustomModelConfig {
             model: "gpt-real-preview".to_string(),
+            routing_profile: None,
             model_context_window: Some(123_456),
             model_auto_compact_token_limit: Some(100_000),
         },

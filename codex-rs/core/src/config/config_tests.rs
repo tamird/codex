@@ -22,6 +22,7 @@ use codex_config::config_toml::AutoReviewToml;
 use codex_config::config_toml::ConfigToml;
 use codex_config::config_toml::CustomModelToml;
 use codex_config::config_toml::ExperimentalRequestUserInput;
+use codex_config::config_toml::ModelRoutingCandidateToml;
 use codex_config::config_toml::ProjectConfig;
 use codex_config::config_toml::RealtimeConfig;
 use codex_config::config_toml::RealtimeToml;
@@ -9471,7 +9472,7 @@ async fn custom_models_load_from_config_toml() -> std::io::Result<()> {
     let cfg = ConfigToml {
         custom_models: vec![CustomModelToml {
             name: "frontier-local".to_string(),
-            model: "gpt-5.4".to_string(),
+            model: Some("gpt-5.4".to_string()),
             model_context_window: Some(123_456),
             ..Default::default()
         }],
@@ -9495,18 +9496,46 @@ async fn custom_models_load_from_config_toml() -> std::io::Result<()> {
 }
 
 #[tokio::test]
+async fn custom_models_allow_alias_that_matches_backend_model() -> std::io::Result<()> {
+    let codex_home = TempDir::new()?;
+    let cfg = ConfigToml {
+        custom_models: vec![CustomModelToml {
+            name: "gpt-5.4-pro".to_string(),
+            model: Some("gpt-5.4-pro".to_string()),
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+
+    let config = Config::load_from_base_config_with_overrides(
+        cfg,
+        ConfigOverrides::default(),
+        codex_home.abs(),
+    )
+    .await?;
+
+    let custom = config
+        .custom_models
+        .get("gpt-5.4-pro")
+        .expect("custom model with matching backend slug should load");
+    assert_eq!(custom.model, "gpt-5.4-pro");
+    assert!(custom.routing_profile.is_none());
+    Ok(())
+}
+
+#[tokio::test]
 async fn custom_models_reject_duplicate_aliases() -> std::io::Result<()> {
     let codex_home = TempDir::new()?;
     let cfg = ConfigToml {
         custom_models: vec![
             CustomModelToml {
                 name: "alias".to_string(),
-                model: "gpt-5.4".to_string(),
+                model: Some("gpt-5.4".to_string()),
                 ..Default::default()
             },
             CustomModelToml {
                 name: "alias".to_string(),
-                model: "gpt-5.3".to_string(),
+                model: Some("gpt-5.3".to_string()),
                 ..Default::default()
             },
         ],
@@ -9525,6 +9554,292 @@ async fn custom_models_reject_duplicate_aliases() -> std::io::Result<()> {
     assert!(
         err.to_string()
             .contains("duplicate custom model alias: alias")
+    );
+    Ok(())
+}
+
+#[test]
+fn routed_custom_models_preserve_candidates_and_context_overrides() -> std::io::Result<()> {
+    let candidates = vec![
+        ModelRoutingCandidateToml {
+            model: "model-primary".to_string(),
+            reasoning_effort: Some(ReasoningEffort::High),
+            service_tier: Some("tier-priority".to_string()),
+        },
+        ModelRoutingCandidateToml {
+            model: "model-fallback".to_string(),
+            reasoning_effort: None,
+            service_tier: None,
+        },
+    ];
+
+    let custom_models = resolve_custom_models(vec![CustomModelToml {
+        name: "profile-local".to_string(),
+        model: None,
+        candidates,
+        model_context_window: Some(123_456),
+        model_auto_compact_token_limit: Some(100_000),
+    }])?;
+
+    assert_eq!(
+        custom_models.get("profile-local"),
+        Some(&CustomModelConfig {
+            model: "model-primary".to_string(),
+            routing_profile: Some(ModelRoutingProfile {
+                candidates: vec![
+                    ModelRoutingCandidate {
+                        model: "model-primary".to_string(),
+                        reasoning_effort: Some(ReasoningEffort::High),
+                        service_tier: Some("tier-priority".to_string()),
+                    },
+                    ModelRoutingCandidate {
+                        model: "model-fallback".to_string(),
+                        reasoning_effort: None,
+                        service_tier: None,
+                    },
+                ],
+            }),
+            model_context_window: Some(123_456),
+            model_auto_compact_token_limit: Some(100_000),
+        })
+    );
+    Ok(())
+}
+
+#[test]
+fn custom_models_can_be_rebuilt_from_the_effective_config_layer_stack() -> std::io::Result<()> {
+    let config_layer_stack = ConfigLayerStack::new(
+        vec![ConfigLayerEntry::new(
+            ConfigLayerSource::SessionFlags,
+            toml::from_str(
+                r#"
+                [[custom_models]]
+                name = "profile-local"
+                model_context_window = 123456
+
+                [[custom_models.candidates]]
+                model = "model-primary"
+                reasoning_effort = "high"
+                service_tier = "tier-priority"
+                "#,
+            )
+            .expect("valid config layer"),
+        )],
+        codex_config::ConfigRequirements::default(),
+        codex_config::ConfigRequirementsToml::default(),
+    )?;
+
+    let custom_models = resolve_custom_models_from_config_layer_stack(&config_layer_stack)?;
+
+    assert_eq!(
+        custom_models
+            .get("profile-local")
+            .and_then(CustomModelConfig::routing_candidates),
+        Some(
+            [ModelRoutingCandidate {
+                model: "model-primary".to_string(),
+                reasoning_effort: Some(ReasoningEffort::High),
+                service_tier: Some("tier-priority".to_string()),
+            }]
+            .as_slice()
+        )
+    );
+    Ok(())
+}
+
+#[test]
+fn custom_models_require_exactly_one_target_form() {
+    for custom_model in [
+        CustomModelToml {
+            name: "profile-empty".to_string(),
+            ..Default::default()
+        },
+        CustomModelToml {
+            name: "profile-both".to_string(),
+            model: Some("model-direct".to_string()),
+            candidates: vec![ModelRoutingCandidateToml {
+                model: "model-candidate".to_string(),
+                reasoning_effort: None,
+                service_tier: None,
+            }],
+            ..Default::default()
+        },
+    ] {
+        let error = resolve_custom_models(vec![custom_model])
+            .expect_err("invalid target form should be rejected");
+        assert_eq!(error.kind(), ErrorKind::InvalidInput);
+        assert!(error.to_string().contains("must specify exactly one"));
+    }
+}
+
+#[test]
+fn custom_models_reject_empty_names_models_and_service_tiers() {
+    let cases = [
+        CustomModelToml {
+            name: "  ".to_string(),
+            model: Some("model-direct".to_string()),
+            ..Default::default()
+        },
+        CustomModelToml {
+            name: "profile-empty-model".to_string(),
+            model: Some("  ".to_string()),
+            ..Default::default()
+        },
+        CustomModelToml {
+            name: "profile-empty-candidate".to_string(),
+            candidates: vec![ModelRoutingCandidateToml {
+                model: "  ".to_string(),
+                reasoning_effort: None,
+                service_tier: None,
+            }],
+            ..Default::default()
+        },
+        CustomModelToml {
+            name: "profile-empty-tier".to_string(),
+            candidates: vec![ModelRoutingCandidateToml {
+                model: "model-primary".to_string(),
+                reasoning_effort: None,
+                service_tier: Some("  ".to_string()),
+            }],
+            ..Default::default()
+        },
+    ];
+
+    for custom_model in cases {
+        let error = resolve_custom_models(vec![custom_model])
+            .expect_err("empty custom model values should be rejected");
+        assert_eq!(error.kind(), ErrorKind::InvalidInput);
+    }
+}
+
+#[test]
+fn routed_custom_models_reject_duplicate_exact_candidates() {
+    let candidate = ModelRoutingCandidateToml {
+        model: "model-primary".to_string(),
+        reasoning_effort: Some(ReasoningEffort::High),
+        service_tier: Some("tier-priority".to_string()),
+    };
+    let error = resolve_custom_models(vec![CustomModelToml {
+        name: "profile-local".to_string(),
+        candidates: vec![candidate.clone(), candidate],
+        ..Default::default()
+    }])
+    .expect_err("duplicate candidates should be rejected");
+
+    assert_eq!(error.kind(), ErrorKind::InvalidInput);
+    assert!(error.to_string().contains("duplicate candidate"));
+}
+
+#[test]
+fn routed_custom_models_reject_alias_candidates() {
+    let error = resolve_custom_models(vec![
+        CustomModelToml {
+            name: "profile-first".to_string(),
+            model: Some("model-concrete".to_string()),
+            ..Default::default()
+        },
+        CustomModelToml {
+            name: "profile-second".to_string(),
+            candidates: vec![ModelRoutingCandidateToml {
+                model: "profile-first".to_string(),
+                reasoning_effort: None,
+                service_tier: None,
+            }],
+            ..Default::default()
+        },
+    ])
+    .expect_err("routed candidates must be concrete models");
+
+    assert_eq!(error.kind(), ErrorKind::InvalidInput);
+    assert!(
+        error
+            .to_string()
+            .contains("routed candidate that references custom model alias")
+    );
+}
+
+#[test]
+fn routed_custom_models_allow_candidate_that_matches_own_alias() -> std::io::Result<()> {
+    let custom_models = resolve_custom_models(vec![CustomModelToml {
+        name: "gpt-5.4-pro".to_string(),
+        candidates: vec![
+            ModelRoutingCandidateToml {
+                model: "gpt-5.4-pro".to_string(),
+                reasoning_effort: None,
+                service_tier: None,
+            },
+            ModelRoutingCandidateToml {
+                model: "gpt-5.4-pro-fallback".to_string(),
+                reasoning_effort: None,
+                service_tier: None,
+            },
+        ],
+        ..Default::default()
+    }])?;
+
+    assert_eq!(
+        custom_models
+            .get("gpt-5.4-pro")
+            .and_then(CustomModelConfig::routing_candidates),
+        Some(
+            [
+                ModelRoutingCandidate {
+                    model: "gpt-5.4-pro".to_string(),
+                    reasoning_effort: None,
+                    service_tier: None,
+                },
+                ModelRoutingCandidate {
+                    model: "gpt-5.4-pro-fallback".to_string(),
+                    reasoning_effort: None,
+                    service_tier: None,
+                },
+            ]
+            .as_slice()
+        )
+    );
+    Ok(())
+}
+
+#[test]
+fn custom_models_reject_recursive_legacy_aliases() {
+    let error = resolve_custom_models(vec![
+        CustomModelToml {
+            name: "alias-first".to_string(),
+            model: Some("alias-second".to_string()),
+            ..Default::default()
+        },
+        CustomModelToml {
+            name: "alias-second".to_string(),
+            model: Some("alias-first".to_string()),
+            ..Default::default()
+        },
+    ])
+    .expect_err("recursive legacy aliases should be rejected");
+
+    assert_eq!(error.kind(), ErrorKind::InvalidInput);
+    assert!(error.to_string().contains("recursively defined"));
+}
+
+#[test]
+fn custom_models_preserve_acyclic_legacy_alias_references() -> std::io::Result<()> {
+    let custom_models = resolve_custom_models(vec![
+        CustomModelToml {
+            name: "alias-outer".to_string(),
+            model: Some("alias-inner".to_string()),
+            ..Default::default()
+        },
+        CustomModelToml {
+            name: "alias-inner".to_string(),
+            model: Some("model-concrete".to_string()),
+            ..Default::default()
+        },
+    ])?;
+
+    assert_eq!(
+        custom_models
+            .get("alias-outer")
+            .map(|custom_model| custom_model.model.as_str()),
+        Some("alias-inner")
     );
     Ok(())
 }

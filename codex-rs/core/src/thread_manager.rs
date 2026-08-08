@@ -807,6 +807,16 @@ impl ThreadManager {
         self.state.models_manager.clone()
     }
 
+    /// Publishes the latest validated custom-model aliases used by model discovery.
+    pub fn replace_custom_models(
+        &self,
+        custom_models: HashMap<String, codex_models_manager::CustomModelConfig>,
+    ) {
+        self.state
+            .models_manager
+            .replace_custom_models(custom_models);
+    }
+
     pub async fn list_models(
         &self,
         refresh_strategy: RefreshStrategy,

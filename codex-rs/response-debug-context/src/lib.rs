@@ -79,10 +79,12 @@ pub fn telemetry_api_error_message(error: &ApiError) -> String {
         ApiError::ContextWindowExceeded => "context window exceeded".to_string(),
         ApiError::QuotaExceeded => "quota exceeded".to_string(),
         ApiError::UsageNotIncluded => "usage not included".to_string(),
+        ApiError::UsageLimitReached(_) => "usage limit reached".to_string(),
         ApiError::Retryable { .. } => "retryable error".to_string(),
         ApiError::RateLimitExceeded { .. } => "rate limit exceeded".to_string(),
         ApiError::RateLimit(_) => "rate limit".to_string(),
         ApiError::InvalidRequest { .. } => "invalid request".to_string(),
+        ApiError::ModelUnavailable { .. } => "model unavailable".to_string(),
         ApiError::CyberPolicy { .. } => "cyber policy".to_string(),
         ApiError::MisalignmentPolicyViolation { .. } => "misalignment policy violation".to_string(),
         ApiError::ServerOverloaded => "server overloaded".to_string(),
@@ -172,5 +174,11 @@ mod tests {
             "invalid header value"
         );
         assert_eq!(telemetry_api_error_message(&stream), "socket closed");
+        assert_eq!(
+            telemetry_api_error_message(&ApiError::ModelUnavailable {
+                message: "provider diagnostic".to_string(),
+            }),
+            "model unavailable"
+        );
     }
 }

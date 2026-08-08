@@ -59,6 +59,32 @@ use tracing::error;
 
 pub use codex_prompts::SUMMARIZATION_PROMPT;
 pub use codex_prompts::SUMMARY_PREFIX;
+
+/// Controls when compaction lifecycle and error events become client-visible.
+///
+/// Model routing evaluates replacement request configurations before committing them. A typed
+/// availability failure during that evaluation must not create an orphan compaction item or
+/// terminate the user turn. All ordinary compaction paths report lifecycle and failures
+/// immediately.
+#[derive(Clone, Copy)]
+pub(crate) enum CompactionReporting {
+    Immediate,
+    CandidateEvaluation,
+}
+
+impl CompactionReporting {
+    pub(crate) fn emits_error(self) -> bool {
+        matches!(self, Self::Immediate)
+    }
+
+    pub(crate) fn defers_lifecycle(self) -> bool {
+        matches!(self, Self::CandidateEvaluation)
+    }
+
+    pub(crate) fn defers_post_compact_hooks(self) -> bool {
+        matches!(self, Self::CandidateEvaluation)
+    }
+}
 const COMPACT_USER_MESSAGE_MAX_TOKENS: usize = 20_000;
 pub(crate) const UNIFIED_EXEC_PROCESS_WARNING_PREFIX: &str =
     "Warning: The maximum number of unified exec process";
@@ -118,9 +144,11 @@ pub(crate) async fn build_compaction_initial_context(
 pub(crate) async fn run_inline_auto_compact_task(
     sess: Arc<Session>,
     turn_context: Arc<TurnContext>,
+    client_session: &mut ModelClientSession,
     initial_context_injection: InitialContextInjection,
     reason: CompactionReason,
     phase: CompactionPhase,
+    reporting: CompactionReporting,
 ) -> CodexResult<()> {
     let prompt = turn_context
         .config
@@ -137,11 +165,13 @@ pub(crate) async fn run_inline_auto_compact_task(
     run_compact_task_inner(
         sess,
         turn_context,
+        client_session,
         input,
         initial_context_injection,
         CompactionTrigger::Auto,
         reason,
         phase,
+        reporting,
     )
     .await?;
     Ok(())
@@ -160,27 +190,33 @@ pub(crate) async fn run_compact_task(
         collaboration_mode_kind: turn_context.mode(),
     });
     sess.send_event(&turn_context, start_event).await;
+    let mut client_session = sess.services.model_client.new_session();
     run_compact_task_inner(
         sess.clone(),
         turn_context,
+        &mut client_session,
         input,
         InitialContextInjection::DoNotInject,
         CompactionTrigger::Manual,
         CompactionReason::UserRequested,
         CompactionPhase::StandaloneTurn,
+        CompactionReporting::Immediate,
     )
     .await?;
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_compact_task_inner(
     sess: Arc<Session>,
     turn_context: Arc<TurnContext>,
+    client_session: &mut ModelClientSession,
     input: Vec<UserInput>,
     initial_context_injection: InitialContextInjection,
     trigger: CompactionTrigger,
     reason: CompactionReason,
     phase: CompactionPhase,
+    reporting: CompactionReporting,
 ) -> CodexResult<()> {
     let compaction_metadata =
         CompactionTurnMetadata::new(trigger, reason, CompactionImplementation::Responses, phase);
@@ -212,14 +248,16 @@ async fn run_compact_task_inner(
     let result = run_compact_task_inner_impl(
         Arc::clone(&sess),
         Arc::clone(&turn_context),
+        client_session,
         input,
         initial_context_injection,
         compaction_metadata,
+        reporting,
     )
     .await;
     let status = compaction_status_from_result(&result);
     let codex_error = result.as_ref().err();
-    if result.is_ok() {
+    if result.is_ok() && !reporting.defers_post_compact_hooks() {
         let post_compact_outcome = run_post_compact_hooks(&sess, &turn_context, trigger).await;
         if let PostCompactHookOutcome::Stopped = post_compact_outcome {
             attempt
@@ -247,13 +285,17 @@ async fn run_compact_task_inner(
 async fn run_compact_task_inner_impl(
     sess: Arc<Session>,
     turn_context: Arc<TurnContext>,
+    client_session: &mut ModelClientSession,
     input: Vec<UserInput>,
     initial_context_injection: InitialContextInjection,
     compaction_metadata: CompactionTurnMetadata,
+    reporting: CompactionReporting,
 ) -> CodexResult<String> {
     let compaction_item = TurnItem::ContextCompaction(ContextCompactionItem::new());
-    sess.emit_turn_item_started(&turn_context, &compaction_item)
-        .await;
+    if !reporting.defers_lifecycle() {
+        sess.emit_turn_item_started(&turn_context, &compaction_item)
+            .await;
+    }
     let initial_input_for_turn: ResponseInputItem = ResponseInputItem::from(input);
 
     let mut history = sess.clone_history().await;
@@ -264,10 +306,7 @@ async fn run_compact_task_inner_impl(
 
     let max_retries = turn_context.provider.info().stream_max_retries();
     let mut retries = 0;
-    let mut client_session = sess.services.model_client.new_session();
-    // Reuse one client session so turn-scoped state (sticky routing, websocket incremental
-    // request tracking)
-    // survives retries within this compact turn.
+    // Reuse the caller's route session so a failed candidate cannot cache its WebSocket.
     let responses_metadata = sess
         .responses_metadata(
             turn_context.as_ref(),
@@ -289,14 +328,16 @@ async fn run_compact_task_inner_impl(
         let attempt_result = drain_to_completed(
             &sess,
             turn_context.as_ref(),
-            &mut client_session,
+            client_session,
             &responses_metadata,
             &prompt,
         )
         .await;
 
         match attempt_result {
-            Ok(()) => {
+            Ok(completed_items) => {
+                sess.record_conversation_items(&turn_context, &completed_items)
+                    .await;
                 break;
             }
             Err(err)
@@ -308,9 +349,11 @@ async fn run_compact_task_inner_impl(
                 return Err(err);
             }
             Err(e) if matches!(e.details(), CodexErrorDetails::SessionBudgetExceeded) => {
-                sess.track_turn_codex_error(turn_context.as_ref(), &e);
-                let event = EventMsg::Error(e.to_error_event(/*message_prefix*/ None));
-                sess.send_event(&turn_context, event).await;
+                if reporting.emits_error() {
+                    sess.track_turn_codex_error(turn_context.as_ref(), &e);
+                    let event = EventMsg::Error(e.to_error_event(/*message_prefix*/ None));
+                    sess.send_event(&turn_context, event).await;
+                }
                 return Err(e);
             }
             Err(e) if matches!(e.details(), CodexErrorDetails::ContextWindowExceeded) => {
@@ -324,12 +367,17 @@ async fn run_compact_task_inner_impl(
                     continue;
                 }
                 sess.set_total_tokens_full(turn_context.as_ref()).await;
-                sess.track_turn_codex_error(turn_context.as_ref(), &e);
-                let event = EventMsg::Error(e.to_error_event(/*message_prefix*/ None));
-                sess.send_event(&turn_context, event).await;
+                if reporting.emits_error() {
+                    sess.track_turn_codex_error(turn_context.as_ref(), &e);
+                    let event = EventMsg::Error(e.to_error_event(/*message_prefix*/ None));
+                    sess.send_event(&turn_context, event).await;
+                }
                 return Err(e);
             }
             Err(e) => {
+                if !reporting.emits_error() {
+                    return Err(e);
+                }
                 if retries < max_retries {
                     retries += 1;
                     let delay = backoff(retries);
@@ -391,6 +439,10 @@ async fn run_compact_task_inner_impl(
     .await;
     sess.recompute_token_usage(&turn_context).await;
 
+    if reporting.defers_lifecycle() {
+        sess.emit_turn_item_started(&turn_context, &compaction_item)
+            .await;
+    }
     sess.emit_turn_item_completed(&turn_context, compaction_item)
         .await;
     let warning = EventMsg::Warning(WarningEvent {
@@ -776,7 +828,7 @@ async fn drain_to_completed(
     client_session: &mut ModelClientSession,
     responses_metadata: &CodexResponsesMetadata,
     prompt: &Prompt,
-) -> CodexResult<()> {
+) -> CodexResult<Vec<ResponseItem>> {
     let mut stream = client_session
         .stream(
             prompt,
@@ -791,6 +843,7 @@ async fn drain_to_completed(
             &InferenceTraceContext::disabled(),
         )
         .await?;
+    let mut completed_items = Vec::new();
     loop {
         let maybe_event = stream.next().await;
         let Some(event) = maybe_event else {
@@ -799,10 +852,7 @@ async fn drain_to_completed(
             ));
         };
         match event {
-            Ok(ResponseEvent::OutputItemDone(item)) => {
-                sess.record_conversation_items(turn_context, std::slice::from_ref(&item))
-                    .await;
-            }
+            Ok(ResponseEvent::OutputItemDone(item)) => completed_items.push(item),
             Ok(ResponseEvent::ServerReasoningIncluded(included)) => {
                 sess.set_server_reasoning_included(included).await;
             }
@@ -826,7 +876,7 @@ async fn drain_to_completed(
                 .await;
                 sess.update_token_usage_info(turn_context, token_usage.as_ref())
                     .await?;
-                return Ok(());
+                return Ok(completed_items);
             }
             Ok(_) => continue,
             Err(e) => return Err(e),

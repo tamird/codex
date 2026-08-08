@@ -64,6 +64,10 @@ fn retryability_preserves_error_details_distinctions() {
             CodexErrorDetails::ToolCollision("functions.update_plan".to_string()).into(),
             false,
         ),
+        (
+            CodexErr::ModelUnavailable("selected model is unavailable".to_string()),
+            false,
+        ),
         (CodexErr::InternalServerError, true),
     ];
 
@@ -175,6 +179,12 @@ fn server_overloaded_maps_to_protocol() {
         err.to_codex_protocol_error(),
         CodexErrorInfo::ServerOverloaded
     );
+}
+
+#[test]
+fn model_unavailable_maps_to_bad_request_protocol_error() {
+    let err = CodexErr::ModelUnavailable("selected model is unavailable".to_string());
+    assert_eq!(err.to_codex_protocol_error(), CodexErrorInfo::BadRequest);
 }
 
 #[test]

@@ -407,6 +407,1360 @@ async fn thread_turns_list_can_page_backward_and_forward() -> Result<()> {
 }
 
 #[tokio::test]
+async fn thread_turns_list_pages_complete_turns_across_rollout_segments() -> Result<()> {
+    let server = create_mock_responses_server_repeating_assistant("Done").await;
+    let codex_home = TempDir::new()?;
+    MockResponsesConfig::new(&server.uri()).write(codex_home.path())?;
+    let thread_id = codex_protocol::ThreadId::new();
+    let sqlite = codex_state::SqliteConfig::new_for_testing(codex_home.path().abs());
+    let store = LocalThreadStore::new(
+        LocalThreadStoreConfig {
+            codex_home: codex_home.path().to_path_buf(),
+            sqlite,
+            default_model_provider_id: "mock_provider".to_string(),
+        },
+        /*state_db*/ None,
+    );
+    store
+        .create_thread(CreateThreadParams {
+            session_id: thread_id.into(),
+            thread_id,
+            extra_config: None,
+            forked_from_id: None,
+            parent_thread_id: None,
+            source: ProtocolSessionSource::Cli,
+            thread_source: None,
+            originator: "test_originator".to_string(),
+            base_instructions: BaseInstructions::default(),
+            dynamic_tools: Vec::new(),
+            selected_capability_roots: Vec::new(),
+            multi_agent_version: None,
+            history_mode: codex_protocol::protocol::ThreadHistoryMode::Legacy,
+            history_base: None,
+            subagent_history_start_ordinal: None,
+            persistence_mode: Default::default(),
+            initial_rollout_ordinal: 0,
+            initial_window_id: Uuid::now_v7().to_string(),
+            metadata: ThreadPersistenceMetadata {
+                cwd: Some(codex_home.path().to_path_buf()),
+                model_provider: "mock_provider".to_string(),
+                memory_mode: ThreadMemoryMode::Enabled,
+            },
+        })
+        .await?;
+    store.persist_thread(thread_id).await?;
+    store
+        .append_items(AppendThreadItemsParams {
+            thread_id,
+            items: vec![RolloutItem::EventMsg(EventMsg::AgentMessage(
+                AgentMessageEvent {
+                    message: "must not be read".to_string(),
+                    phase: None,
+                    delivery: None,
+                    memory_citation: None,
+                },
+            ))],
+        })
+        .await?;
+    let malformed_segment = store
+        .freeze_thread_segment(thread_id, FreezeRolloutSegmentParams::rotate(Vec::new()))
+        .await?
+        .reference
+        .rollout_path;
+    for _ in 0..2 {
+        store
+            .freeze_thread_segment(thread_id, FreezeRolloutSegmentParams::rotate(Vec::new()))
+            .await?;
+    }
+    store
+        .append_items(AppendThreadItemsParams {
+            thread_id,
+            items: vec![
+                paginated_turn_started("previous-turn"),
+                RolloutItem::EventMsg(EventMsg::UserMessage(UserMessageEvent {
+                    message: "previous user".to_string(),
+                    ..Default::default()
+                })),
+                RolloutItem::EventMsg(EventMsg::AgentMessage(AgentMessageEvent {
+                    message: "previous answer".to_string(),
+                    phase: None,
+                    delivery: None,
+                    memory_citation: None,
+                })),
+                paginated_turn_completed("previous-turn"),
+                paginated_turn_started("latest-turn"),
+                RolloutItem::EventMsg(EventMsg::UserMessage(UserMessageEvent {
+                    message: "latest user".to_string(),
+                    ..Default::default()
+                })),
+            ],
+        })
+        .await?;
+    for _ in 0..6 {
+        store
+            .freeze_thread_segment(thread_id, FreezeRolloutSegmentParams::rotate(Vec::new()))
+            .await?;
+    }
+    store
+        .append_items(AppendThreadItemsParams {
+            thread_id,
+            items: vec![
+                RolloutItem::EventMsg(EventMsg::AgentMessage(AgentMessageEvent {
+                    message: "latest answer".to_string(),
+                    phase: None,
+                    delivery: None,
+                    memory_citation: None,
+                })),
+                paginated_turn_completed("latest-turn"),
+            ],
+        })
+        .await?;
+    store.shutdown_thread(thread_id).await?;
+    writeln!(
+        OpenOptions::new().append(true).open(malformed_segment)?,
+        "{{malformed rollout line"
+    )?;
+
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .without_auto_env()
+        .build()
+        .await?;
+    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+
+    let ThreadTurnsListResponse {
+        data,
+        next_cursor,
+        backwards_cursor,
+    } = read_turns_page(
+        &mut mcp,
+        thread_id,
+        /*cursor*/ None,
+        Some(1),
+        SortDirection::Desc,
+        Some(TurnItemsView::Summary),
+    )
+    .await?;
+    assert_eq!(
+        data.iter().map(|turn| turn.id.as_str()).collect::<Vec<_>>(),
+        vec!["latest-turn"]
+    );
+    assert_eq!(turn_user_texts(&data), vec!["latest user"]);
+    assert_eq!(turn_agent_texts(&data), vec!["latest answer"]);
+    let next_cursor = next_cursor.expect("older referenced history should have a cursor");
+    let backwards_cursor =
+        backwards_cursor.expect("the latest referenced turn should have a backwards cursor");
+
+    let ThreadTurnsListResponse { data, .. } = read_turns_page(
+        &mut mcp,
+        thread_id,
+        Some(backwards_cursor),
+        Some(1),
+        SortDirection::Asc,
+        Some(TurnItemsView::Summary),
+    )
+    .await?;
+    assert_eq!(
+        data.iter().map(|turn| turn.id.as_str()).collect::<Vec<_>>(),
+        vec!["latest-turn"]
+    );
+
+    let ThreadTurnsListResponse { data, .. } = read_turns_page(
+        &mut mcp,
+        thread_id,
+        Some(next_cursor),
+        Some(1),
+        SortDirection::Desc,
+        Some(TurnItemsView::Summary),
+    )
+    .await?;
+    assert_eq!(
+        data.iter().map(|turn| turn.id.as_str()).collect::<Vec<_>>(),
+        vec!["previous-turn"]
+    );
+    assert_eq!(turn_user_texts(&data), vec!["previous user"]);
+    assert_eq!(turn_agent_texts(&data), vec!["previous answer"]);
+
+    let fork_id = mcp
+        .send_thread_fork_request(ThreadForkParams {
+            thread_id: thread_id.to_string(),
+            exclude_turns: true,
+            ..Default::default()
+        })
+        .await?;
+    let fork_response: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(fork_id)),
+    )
+    .await??;
+    let ThreadForkResponse { thread: fork, .. } = to_response::<ThreadForkResponse>(fork_response)?;
+    assert!(fork.turns.is_empty());
+    let fork_path = fork.path.as_ref().expect("fork should have a rollout path");
+    let fork_physical_items = RolloutRecorder::load_rollout_items(fork_path.as_path())
+        .await?
+        .0;
+    assert!(matches!(
+        fork_physical_items.as_slice(),
+        [
+            RolloutItem::SessionMeta(_),
+            RolloutItem::RolloutReference(_),
+            RolloutItem::EventMsg(EventMsg::ThreadSettingsApplied(_))
+        ]
+    ));
+    assert!(
+        !std::fs::read_to_string(fork_path.as_path())?.contains("latest user"),
+        "forked rollout must not copy inherited source messages"
+    );
+    let fork_thread_id = codex_protocol::ThreadId::from_string(&fork.id)?;
+    let ThreadTurnsListResponse {
+        data, next_cursor, ..
+    } = read_turns_page(
+        &mut mcp,
+        fork_thread_id,
+        /*cursor*/ None,
+        Some(1),
+        SortDirection::Desc,
+        Some(TurnItemsView::Summary),
+    )
+    .await?;
+    assert_eq!(
+        data.iter().map(|turn| turn.id.as_str()).collect::<Vec<_>>(),
+        vec!["latest-turn"]
+    );
+    assert_eq!(turn_user_texts(&data), vec!["latest user"]);
+    assert_eq!(turn_agent_texts(&data), vec!["latest answer"]);
+    assert!(next_cursor.is_some());
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn rotated_legacy_fork_turns_list_preserves_inherited_parent_turns() -> Result<()> {
+    let server = create_mock_responses_server_repeating_assistant("Done").await;
+    let codex_home = TempDir::new()?;
+    MockResponsesConfig::new(&server.uri()).write(codex_home.path())?;
+    let sqlite = codex_state::SqliteConfig::new_for_testing(codex_home.path().abs());
+    let state_db =
+        codex_state::StateRuntime::init(sqlite.clone(), "mock_provider".to_string()).await?;
+    let store = LocalThreadStore::new(
+        LocalThreadStoreConfig {
+            codex_home: codex_home.path().to_path_buf(),
+            sqlite,
+            default_model_provider_id: "mock_provider".to_string(),
+        },
+        Some(state_db),
+    );
+    let create_params = |thread_id: codex_protocol::ThreadId,
+                         forked_from_id: Option<codex_protocol::ThreadId>| {
+        CreateThreadParams {
+            session_id: thread_id.into(),
+            thread_id,
+            extra_config: None,
+            forked_from_id,
+            parent_thread_id: None,
+            source: ProtocolSessionSource::Cli,
+            thread_source: None,
+            originator: "test_originator".to_string(),
+            base_instructions: BaseInstructions::default(),
+            dynamic_tools: Vec::new(),
+            selected_capability_roots: Vec::new(),
+            multi_agent_version: None,
+            history_mode: codex_protocol::protocol::ThreadHistoryMode::Legacy,
+            history_base: None,
+            subagent_history_start_ordinal: None,
+            persistence_mode: Default::default(),
+            initial_rollout_ordinal: 0,
+            initial_window_id: Uuid::now_v7().to_string(),
+            metadata: ThreadPersistenceMetadata {
+                cwd: Some(codex_home.path().to_path_buf()),
+                model_provider: "mock_provider".to_string(),
+                memory_mode: ThreadMemoryMode::Enabled,
+            },
+        }
+    };
+
+    let parent_id = codex_protocol::ThreadId::new();
+    store.create_thread(create_params(parent_id, None)).await?;
+    store.persist_thread(parent_id).await?;
+    store
+        .append_items(AppendThreadItemsParams {
+            thread_id: parent_id,
+            items: vec![
+                paginated_turn_started("inherited-parent-turn"),
+                RolloutItem::EventMsg(EventMsg::UserMessage(UserMessageEvent {
+                    message: "inherited parent user".to_string(),
+                    ..Default::default()
+                })),
+                RolloutItem::EventMsg(EventMsg::AgentMessage(AgentMessageEvent {
+                    message: "inherited parent answer".to_string(),
+                    phase: None,
+                    delivery: None,
+                    memory_citation: None,
+                })),
+                paginated_turn_completed("inherited-parent-turn"),
+            ],
+        })
+        .await?;
+    let inherited_parent = store
+        .freeze_thread_segment(parent_id, FreezeRolloutSegmentParams::snapshot())
+        .await?
+        .reference;
+
+    let mut child_ids = Vec::new();
+    for forked_from_id in [Some(parent_id), None] {
+        let child_id = codex_protocol::ThreadId::new();
+        store
+            .create_thread(create_params(child_id, forked_from_id))
+            .await?;
+        store.persist_thread(child_id).await?;
+        store
+            .append_items(AppendThreadItemsParams {
+                thread_id: child_id,
+                items: vec![RolloutItem::RolloutReference(inherited_parent.clone())],
+            })
+            .await?;
+        store
+            .freeze_thread_segment(child_id, FreezeRolloutSegmentParams::rotate(Vec::new()))
+            .await?;
+        store.shutdown_thread(child_id).await?;
+        child_ids.push(child_id);
+    }
+    store.shutdown_thread(parent_id).await?;
+
+    let mut app_server = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .without_auto_env()
+        .build_initialized()
+        .await?;
+    for child_id in child_ids {
+        let ThreadTurnsListResponse { data, .. } = read_turns_page(
+            &mut app_server,
+            child_id,
+            /*cursor*/ None,
+            Some(1),
+            SortDirection::Desc,
+            Some(TurnItemsView::Full),
+        )
+        .await?;
+
+        assert_eq!(
+            data.iter().map(|turn| turn.id.as_str()).collect::<Vec<_>>(),
+            vec!["inherited-parent-turn"],
+            "an empty child-local projection must not hide an inherited parent turn after rotation"
+        );
+        assert_eq!(turn_user_texts(&data), vec!["inherited parent user"]);
+        assert_eq!(turn_agent_texts(&data), vec!["inherited parent answer"]);
+    }
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn running_legacy_resume_initial_page_reads_enough_referenced_segments() -> Result<()> {
+    let server = create_mock_responses_server_repeating_assistant("Done").await;
+    let codex_home = TempDir::new()?;
+    MockResponsesConfig::new(&server.uri()).write(codex_home.path())?;
+    let thread_id = codex_protocol::ThreadId::new();
+    let sqlite = codex_state::SqliteConfig::new_for_testing(codex_home.path().abs());
+    let store = LocalThreadStore::new(
+        LocalThreadStoreConfig {
+            codex_home: codex_home.path().to_path_buf(),
+            sqlite,
+            default_model_provider_id: "mock_provider".to_string(),
+        },
+        /*state_db*/ None,
+    );
+    store
+        .create_thread(CreateThreadParams {
+            session_id: thread_id.into(),
+            thread_id,
+            extra_config: None,
+            forked_from_id: None,
+            parent_thread_id: None,
+            source: ProtocolSessionSource::Cli,
+            thread_source: None,
+            originator: "test_originator".to_string(),
+            base_instructions: BaseInstructions::default(),
+            dynamic_tools: Vec::new(),
+            selected_capability_roots: Vec::new(),
+            multi_agent_version: None,
+            history_mode: codex_protocol::protocol::ThreadHistoryMode::Legacy,
+            history_base: None,
+            subagent_history_start_ordinal: None,
+            persistence_mode: Default::default(),
+            initial_rollout_ordinal: 0,
+            initial_window_id: Uuid::now_v7().to_string(),
+            metadata: ThreadPersistenceMetadata {
+                cwd: Some(codex_home.path().to_path_buf()),
+                model_provider: "mock_provider".to_string(),
+                memory_mode: ThreadMemoryMode::Enabled,
+            },
+        })
+        .await?;
+    store.persist_thread(thread_id).await?;
+    store
+        .append_items(AppendThreadItemsParams {
+            thread_id,
+            items: vec![RolloutItem::EventMsg(EventMsg::AgentMessage(
+                AgentMessageEvent {
+                    message: "must not be read".to_string(),
+                    phase: None,
+                    delivery: None,
+                    memory_citation: None,
+                },
+            ))],
+        })
+        .await?;
+    let malformed_segment = store
+        .freeze_thread_segment(thread_id, FreezeRolloutSegmentParams::rotate(Vec::new()))
+        .await?
+        .reference
+        .rollout_path;
+
+    for index in 0..8 {
+        let turn_id = format!("turn-{index}");
+        store
+            .append_items(AppendThreadItemsParams {
+                thread_id,
+                items: vec![
+                    paginated_turn_started(&turn_id),
+                    RolloutItem::EventMsg(EventMsg::UserMessage(UserMessageEvent {
+                        message: format!("user {index}"),
+                        ..Default::default()
+                    })),
+                    RolloutItem::EventMsg(EventMsg::AgentMessage(AgentMessageEvent {
+                        message: format!("answer {index}"),
+                        phase: None,
+                        delivery: None,
+                        memory_citation: None,
+                    })),
+                    paginated_turn_completed(&turn_id),
+                ],
+            })
+            .await?;
+        if index < 7 {
+            store
+                .freeze_thread_segment(thread_id, FreezeRolloutSegmentParams::rotate(Vec::new()))
+                .await?;
+        }
+    }
+    store.shutdown_thread(thread_id).await?;
+    writeln!(
+        OpenOptions::new().append(true).open(malformed_segment)?,
+        "{{malformed rollout line"
+    )?;
+
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .without_auto_env()
+        .build_initialized()
+        .await?;
+    let initial_resume = mcp
+        .send_thread_resume_request(ThreadResumeParams {
+            thread_id: thread_id.to_string(),
+            exclude_turns: true,
+            ..Default::default()
+        })
+        .await?;
+    let _: ThreadResumeResponse =
+        timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(initial_resume)).await??;
+
+    let expected_page = read_turns_page(
+        &mut mcp,
+        thread_id,
+        /*cursor*/ None,
+        Some(5),
+        SortDirection::Desc,
+        Some(TurnItemsView::Full),
+    )
+    .await?;
+    assert_eq!(
+        expected_page
+            .data
+            .iter()
+            .map(|turn| turn.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["turn-7", "turn-6", "turn-5", "turn-4", "turn-3"]
+    );
+    assert!(expected_page.next_cursor.is_some());
+
+    let resume_id = mcp
+        .send_thread_resume_request(ThreadResumeParams {
+            thread_id: thread_id.to_string(),
+            exclude_turns: true,
+            initial_turns_page: Some(ThreadResumeInitialTurnsPageParams {
+                limit: Some(5),
+                sort_direction: Some(SortDirection::Desc),
+                items_view: Some(TurnItemsView::Full),
+            }),
+            ..Default::default()
+        })
+        .await?;
+    let ThreadResumeResponse {
+        thread,
+        initial_turns_page,
+        ..
+    } = timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(resume_id)).await??;
+
+    assert!(thread.turns.is_empty());
+    assert_eq!(
+        initial_turns_page,
+        Some(codex_app_server_protocol::TurnsPage::from(expected_page))
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn thread_turns_list_loads_258_same_thread_rollout_segments() -> Result<()> {
+    assert_thread_turns_list_same_thread_segment_limit(
+        codex_rollout::MAX_ROLLOUT_REFERENCE_DEPTH + 2,
+        None,
+    )
+    .await
+}
+
+#[tokio::test]
+async fn thread_turns_list_loads_512_same_thread_rollout_segments() -> Result<()> {
+    assert_thread_turns_list_same_thread_segment_limit(512, None).await
+}
+
+#[tokio::test]
+async fn thread_turns_list_loads_513_same_thread_rollout_segments() -> Result<()> {
+    assert_thread_turns_list_same_thread_segment_limit(513, None).await
+}
+
+#[tokio::test]
+async fn thread_turns_list_loads_1025_same_thread_rollout_segments() -> Result<()> {
+    assert_thread_turns_list_same_thread_segment_limit(1025, None).await
+}
+
+#[tokio::test]
+async fn thread_turns_list_loads_4097_same_thread_rollout_segments() -> Result<()> {
+    assert_thread_turns_list_same_thread_segment_limit(4097, None).await
+}
+
+#[tokio::test]
+#[ignore = "manual five-figure same-thread segment scaling validation"]
+async fn thread_turns_list_loads_10001_same_thread_rollout_segments() -> Result<()> {
+    assert_thread_turns_list_same_thread_segment_limit(10001, None).await
+}
+
+async fn assert_thread_turns_list_same_thread_segment_limit(
+    segment_count: usize,
+    expected_error: Option<&str>,
+) -> Result<()> {
+    let read_timeout = if segment_count >= 4_096 {
+        DEFAULT_READ_TIMEOUT.saturating_mul(12)
+    } else {
+        DEFAULT_READ_TIMEOUT
+    };
+    let server = create_mock_responses_server_repeating_assistant("Done").await;
+    let codex_home = TempDir::new()?;
+    MockResponsesConfig::new(&server.uri()).write(codex_home.path())?;
+    let thread_id = codex_protocol::ThreadId::new();
+    let segment_ids = (0..segment_count)
+        .map(|_| SegmentId::new())
+        .collect::<Vec<_>>();
+    let active_path = rollout_path(
+        codex_home.path(),
+        "2026-08-03T00-00-00",
+        thread_id.to_string().as_str(),
+    );
+    let paths = segment_ids
+        .iter()
+        .enumerate()
+        .map(|(index, segment_id)| {
+            if index + 1 == segment_count {
+                active_path.clone()
+            } else {
+                codex_home
+                    .path()
+                    .join(codex_rollout::ROTATED_ROLLOUT_SEGMENTS_SUBDIR)
+                    .join(thread_id.to_string())
+                    .join(segment_id.to_string())
+                    .join("segment.jsonl")
+            }
+        })
+        .collect::<Vec<_>>();
+
+    for index in 0..segment_count {
+        let mut items = vec![RolloutItem::SessionMeta(SessionMetaLine {
+            meta: SessionMeta {
+                session_id: thread_id.into(),
+                id: thread_id,
+                segment_id: Some(segment_ids[index]),
+                timestamp: "2026-08-03T00:00:00Z".to_string(),
+                cwd: codex_home.path().to_path_buf(),
+                originator: "same-thread-reference-test".to_string(),
+                cli_version: "0.147.0-alpha.4".to_string(),
+                source: ProtocolSessionSource::Cli,
+                model_provider: Some("mock_provider".to_string()),
+                history_mode: codex_protocol::protocol::ThreadHistoryMode::Legacy,
+                ..SessionMeta::default()
+            },
+            git: None,
+        })];
+        if let Some(previous_index) = index.checked_sub(1) {
+            items.push(RolloutItem::RolloutReference(RolloutReferenceItem {
+                rollout_path: paths[previous_index].clone(),
+                thread_id: Some(thread_id),
+                rollout_timestamp: None,
+                segment_id: Some(segment_ids[previous_index]),
+                max_depth: codex_protocol::protocol::DEFAULT_ROLLOUT_REFERENCE_DEPTH,
+                nth_user_message: None,
+                compacted_replacement_history_filter_texts: None,
+            }));
+        } else {
+            items.extend([
+                paginated_turn_started("oldest-turn"),
+                RolloutItem::EventMsg(EventMsg::UserMessage(UserMessageEvent {
+                    message: "oldest user".to_string(),
+                    ..Default::default()
+                })),
+                RolloutItem::EventMsg(EventMsg::AgentMessage(AgentMessageEvent {
+                    message: "oldest answer".to_string(),
+                    phase: None,
+                    delivery: None,
+                    memory_citation: None,
+                })),
+                paginated_turn_completed("oldest-turn"),
+            ]);
+        }
+
+        let base_ordinal = u64::try_from(index)? * 8;
+        let records = items
+            .into_iter()
+            .enumerate()
+            .map(|(item_index, item)| {
+                serde_json::to_string(&RolloutLine {
+                    timestamp: "2026-08-03T00:00:00Z".to_string(),
+                    ordinal: Some(base_ordinal + u64::try_from(item_index).expect("item ordinal")),
+                    item,
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        if let Some(parent) = paths[index].parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(paths[index].as_path(), format!("{}\n", records.join("\n")))?;
+    }
+
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .without_auto_env()
+        .build_initialized()
+        .await?;
+    let request_id = mcp
+        .send_thread_turns_list_request(ThreadTurnsListParams {
+            thread_id: thread_id.to_string(),
+            cursor: None,
+            limit: Some(1),
+            sort_direction: Some(SortDirection::Desc),
+            items_view: Some(TurnItemsView::Summary),
+        })
+        .await?;
+    if let Some(expected_error) = expected_error {
+        let error: JSONRPCError = timeout(
+            read_timeout,
+            mcp.read_stream_until_error_message(RequestId::Integer(request_id)),
+        )
+        .await??;
+        assert!(
+            error.error.message.contains(expected_error),
+            "unexpected error: {}",
+            error.error.message
+        );
+        return Ok(());
+    }
+
+    let ThreadTurnsListResponse { data, .. } =
+        timeout(read_timeout, mcp.read_response(request_id)).await??;
+    assert_eq!(
+        data.iter().map(|turn| turn.id.as_str()).collect::<Vec<_>>(),
+        vec!["oldest-turn"]
+    );
+    assert_eq!(turn_user_texts(&data), vec!["oldest user"]);
+    assert_eq!(turn_agent_texts(&data), vec!["oldest answer"]);
+    Ok(())
+}
+
+#[tokio::test]
+async fn segmented_legacy_index_preserves_full_items_cursors_and_restart() -> Result<()> {
+    let server = create_mock_responses_server_repeating_assistant("Done").await;
+    let codex_home = TempDir::new()?;
+    MockResponsesConfig::new(&server.uri()).write(codex_home.path())?;
+    let thread_id = codex_protocol::ThreadId::new();
+    let sqlite = codex_state::SqliteConfig::new_for_testing(codex_home.path().abs());
+    let state_db =
+        codex_state::StateRuntime::init(sqlite.clone(), "mock_provider".to_string()).await?;
+    let store = LocalThreadStore::new(
+        LocalThreadStoreConfig {
+            codex_home: codex_home.path().to_path_buf(),
+            sqlite,
+            default_model_provider_id: "mock_provider".to_string(),
+        },
+        Some(state_db),
+    );
+    store
+        .create_thread(CreateThreadParams {
+            session_id: thread_id.into(),
+            thread_id,
+            extra_config: None,
+            forked_from_id: Some(codex_protocol::ThreadId::new()),
+            parent_thread_id: None,
+            source: ProtocolSessionSource::Cli,
+            thread_source: None,
+            originator: "test_originator".to_string(),
+            base_instructions: BaseInstructions::default(),
+            dynamic_tools: Vec::new(),
+            selected_capability_roots: Vec::new(),
+            multi_agent_version: None,
+            history_mode: codex_protocol::protocol::ThreadHistoryMode::Legacy,
+            history_base: None,
+            subagent_history_start_ordinal: None,
+            persistence_mode: Default::default(),
+            initial_rollout_ordinal: 0,
+            initial_window_id: Uuid::now_v7().to_string(),
+            metadata: ThreadPersistenceMetadata {
+                cwd: Some(codex_home.path().to_path_buf()),
+                model_provider: "mock_provider".to_string(),
+                memory_mode: ThreadMemoryMode::Enabled,
+            },
+        })
+        .await?;
+    store.persist_thread(thread_id).await?;
+
+    let mut oldest_segment_path = None;
+    let active_path = store.live_rollout_path(thread_id).await?;
+    for (index, text) in ["first", "second", "third", "fourth"].iter().enumerate() {
+        let turn_id = format!("{text}-turn");
+        let mut items = Vec::new();
+        if *text != "second" {
+            items.push(paginated_turn_started(&turn_id));
+        }
+        if *text == "third" {
+            items.push(RolloutItem::Compacted(CompactedItem {
+                message: "indexed Legacy resume checkpoint".to_string(),
+                replacement_history: Some(Vec::new()),
+                mcp_resource_origins: None,
+                window_number: Some(1),
+                first_window_id: None,
+                previous_window_id: None,
+                window_id: None,
+            }));
+            items.push(RolloutItem::TurnContext(TurnContextItem {
+                turn_id: Some(turn_id.clone()),
+                cwd: codex_home.path().abs(),
+                workspace_roots: None,
+                current_date: None,
+                timezone: None,
+                approval_policy: AskForApproval::Never,
+                approvals_reviewer: None,
+                sandbox_policy: SandboxPolicy::new_read_only_policy(),
+                permission_profile: None,
+                active_permission_profile: None,
+                network: None,
+                file_system_sandbox_policy: None,
+                model: "mock-model".to_string(),
+                comp_hash: None,
+                cyber_access_program: None,
+                personality: None,
+                collaboration_mode: None,
+                multi_agent_version: None,
+                multi_agent_mode: None,
+                realtime_active: None,
+                effort: None,
+                service_tier: None,
+                model_profile: None,
+                summary: ReasoningSummary::Auto,
+            }));
+        }
+        items.extend([
+            RolloutItem::EventMsg(EventMsg::UserMessage(UserMessageEvent {
+                message: (*text).to_string(),
+                ..Default::default()
+            })),
+            RolloutItem::EventMsg(EventMsg::AgentMessage(AgentMessageEvent {
+                message: format!("{text} answer"),
+                phase: None,
+                delivery: None,
+                memory_citation: None,
+            })),
+        ]);
+        if *text == "fourth" {
+            items.push(RolloutItem::InterAgentCommunication(
+                InterAgentCommunication::new(
+                    AgentPath::try_from("/root/worker").expect("valid worker agent path"),
+                    AgentPath::root(),
+                    Vec::new(),
+                    "worker completed".to_string(),
+                    /*trigger_turn*/ false,
+                ),
+            ));
+        }
+        if *text != "second" {
+            items.push(paginated_turn_completed(&turn_id));
+        }
+        store
+            .append_items(AppendThreadItemsParams { thread_id, items })
+            .await?;
+        if index < 2 {
+            let frozen = store
+                .freeze_thread_segment(thread_id, FreezeRolloutSegmentParams::rotate(Vec::new()))
+                .await?;
+            if index == 0 {
+                oldest_segment_path = Some(frozen.reference.rollout_path);
+            }
+        }
+    }
+    store.shutdown_thread(thread_id).await?;
+    let excluded_historical_event = RolloutLine {
+        timestamp: "2026-08-03T00:00:00Z".to_string(),
+        ordinal: None,
+        item: RolloutItem::EventMsg(EventMsg::CollabAgentSpawnEnd(CollabAgentSpawnEndEvent {
+            call_id: "historically-excluded-spawn".to_string(),
+            completed_at_ms: 0,
+            sender_thread_id: thread_id,
+            new_thread_id: Some(codex_protocol::ThreadId::new()),
+            new_agent_nickname: None,
+            new_agent_role: None,
+            prompt: "historical transient event".to_string(),
+            model: "mock-model".to_string(),
+            reasoning_effort: ReasoningEffort::Medium,
+            status: CoreAgentStatus::Completed(None),
+        })),
+    };
+    writeln!(
+        OpenOptions::new().append(true).open(&active_path)?,
+        "{}",
+        serde_json::to_string(&excluded_historical_event)?
+    )?;
+    store.discard_segmented_legacy_projection(thread_id).await?;
+    let indexed_page_params = || StoreListTurnsParams {
+        thread_id,
+        include_archived: true,
+        cursor: None,
+        page_size: 2,
+        sort_direction: StoreSortDirection::Desc,
+        items_view: StoredTurnItemsView::Summary,
+    };
+    assert!(
+        store
+            .list_existing_segmented_legacy_turns(indexed_page_params())
+            .await?
+            .is_none()
+    );
+
+    let mut app_server = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .without_auto_env()
+        .build_initialized()
+        .await?;
+    let initial_resume_id = app_server
+        .send_thread_resume_request(ThreadResumeParams {
+            thread_id: thread_id.to_string(),
+            exclude_turns: true,
+            initial_turns_page: Some(ThreadResumeInitialTurnsPageParams {
+                limit: Some(1),
+                sort_direction: Some(SortDirection::Desc),
+                items_view: Some(TurnItemsView::Full),
+            }),
+            ..Default::default()
+        })
+        .await?;
+    let ThreadResumeResponse {
+        thread,
+        initial_turns_page,
+        ..
+    } = timeout(
+        DEFAULT_READ_TIMEOUT,
+        app_server.read_response(initial_resume_id),
+    )
+    .await??;
+    assert!(thread.turns.is_empty());
+    let bounded_page = initial_turns_page.expect("Legacy resume returns the requested latest page");
+    assert_eq!(turn_user_texts(&bounded_page.data), vec!["fourth"]);
+    assert!(
+        store
+            .list_existing_segmented_legacy_turns(indexed_page_params())
+            .await?
+            .is_none(),
+        "the latest Legacy page must not synchronously backfill complete history"
+    );
+
+    let second_page = read_turns_page(
+        &mut app_server,
+        thread_id,
+        bounded_page.next_cursor.clone(),
+        Some(1),
+        SortDirection::Desc,
+        Some(TurnItemsView::Full),
+    )
+    .await?;
+    assert_eq!(turn_user_texts(&second_page.data), vec!["third"]);
+    assert!(
+        store
+            .list_existing_segmented_legacy_turns(indexed_page_params())
+            .await?
+            .is_some(),
+        "an explicit older Legacy page backfills the complete history index"
+    );
+    let third_page = read_turns_page(
+        &mut app_server,
+        thread_id,
+        second_page.next_cursor,
+        Some(1),
+        SortDirection::Desc,
+        Some(TurnItemsView::Full),
+    )
+    .await?;
+    assert_eq!(turn_user_texts(&third_page.data), vec!["second"]);
+    assert!(third_page.data[0].id.starts_with("rollout-"));
+    let bounded_page_again = read_turns_page(
+        &mut app_server,
+        thread_id,
+        /*cursor*/ None,
+        Some(1),
+        SortDirection::Desc,
+        Some(TurnItemsView::Full),
+    )
+    .await?;
+    assert_eq!(
+        serde_json::to_value(bounded_page_again.data)?,
+        serde_json::to_value(&bounded_page.data)?,
+        "indexing older Legacy turns must not rewrite an already displayed latest turn"
+    );
+    let canonical_read_id = app_server
+        .send_thread_read_request(ThreadReadParams {
+            thread_id: thread_id.to_string(),
+            include_turns: true,
+        })
+        .await?;
+    let ThreadReadResponse { thread } = timeout(
+        DEFAULT_READ_TIMEOUT,
+        app_server.read_response(canonical_read_id),
+    )
+    .await??;
+    let canonical_latest_turn = thread
+        .turns
+        .last()
+        .expect("full Legacy replay includes the newest turn")
+        .clone();
+    let canonical_implicit_turn = thread
+        .turns
+        .iter()
+        .find(|turn| turn_user_texts(std::slice::from_ref(*turn)) == vec!["second"])
+        .expect("full Legacy replay includes the historical implicit turn")
+        .clone();
+    assert!(canonical_implicit_turn.id.starts_with("rollout-"));
+
+    drop(app_server);
+    let mut app_server = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .without_auto_env()
+        .build_initialized()
+        .await?;
+    let indexed_resume_id = app_server
+        .send_thread_resume_request(ThreadResumeParams {
+            thread_id: thread_id.to_string(),
+            exclude_turns: true,
+            initial_turns_page: Some(ThreadResumeInitialTurnsPageParams {
+                limit: Some(2),
+                sort_direction: Some(SortDirection::Desc),
+                items_view: Some(TurnItemsView::Full),
+            }),
+            ..Default::default()
+        })
+        .await?;
+    let ThreadResumeResponse {
+        thread,
+        initial_turns_page,
+        ..
+    } = timeout(
+        DEFAULT_READ_TIMEOUT,
+        app_server.read_response(indexed_resume_id),
+    )
+    .await??;
+    assert!(thread.turns.is_empty());
+    let latest_page =
+        initial_turns_page.expect("projected Legacy resume returns the complete indexed page");
+    assert_eq!(turn_user_texts(&latest_page.data), vec!["fourth", "third"]);
+    let hot_resume_id = app_server
+        .send_thread_resume_request(ThreadResumeParams {
+            thread_id: thread_id.to_string(),
+            exclude_turns: true,
+            initial_turns_page: Some(ThreadResumeInitialTurnsPageParams {
+                limit: Some(2),
+                sort_direction: Some(SortDirection::Desc),
+                items_view: Some(TurnItemsView::Full),
+            }),
+            ..Default::default()
+        })
+        .await?;
+    let ThreadResumeResponse {
+        initial_turns_page, ..
+    } = timeout(
+        DEFAULT_READ_TIMEOUT,
+        app_server.read_response(hot_resume_id),
+    )
+    .await??;
+    let hot_resume_page =
+        initial_turns_page.expect("running Legacy resume preserves its indexed history");
+    assert_eq!(
+        serde_json::to_value(&hot_resume_page.data)?,
+        serde_json::to_value(&latest_page.data)?,
+        "a hot indexed Legacy resume must preserve cold-resume item identifiers"
+    );
+    let hot_list_page = read_turns_page(
+        &mut app_server,
+        thread_id,
+        /*cursor*/ None,
+        Some(2),
+        SortDirection::Desc,
+        Some(TurnItemsView::Full),
+    )
+    .await?;
+    assert_eq!(
+        serde_json::to_value(&hot_list_page.data)?,
+        serde_json::to_value(&latest_page.data)?,
+        "a running indexed Legacy thread must not revert to bounded synthetic item identifiers"
+    );
+    assert_eq!(
+        latest_page.data[0].id, canonical_latest_turn.id,
+        "indexed Legacy history must preserve the canonical full-replay implicit turn ID"
+    );
+    assert_eq!(
+        serde_json::to_value(&latest_page.data[0].items)?,
+        serde_json::to_value(&canonical_latest_turn.items)?,
+        "indexed Legacy history must preserve every canonical implicit-turn item"
+    );
+    assert_eq!(
+        turn_agent_texts(&latest_page.data),
+        vec!["fourth answer", "third answer"]
+    );
+    let item_ids = latest_page
+        .data
+        .iter()
+        .flat_map(|turn| turn.items.iter().map(ThreadItem::id))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        item_ids,
+        vec!["item-7", "item-8", "item-9", "item-5", "item-6"]
+    );
+    assert!(matches!(
+        &latest_page.data[0].items[2],
+        ThreadItem::InterAgentCommunication { communication, .. }
+            if communication.content == "worker completed"
+    ));
+
+    let older_page = read_turns_page(
+        &mut app_server,
+        thread_id,
+        latest_page.next_cursor.clone(),
+        Some(2),
+        SortDirection::Desc,
+        Some(TurnItemsView::Full),
+    )
+    .await?;
+    assert_eq!(turn_user_texts(&older_page.data), vec!["second", "first"]);
+    assert_eq!(
+        older_page.data[0].id, canonical_implicit_turn.id,
+        "indexed Legacy history must preserve canonical implicit historical turn IDs"
+    );
+    let indexed_item_ids = latest_page
+        .data
+        .iter()
+        .chain(older_page.data.iter())
+        .flat_map(|turn| turn.items.iter().map(ThreadItem::id))
+        .collect::<Vec<_>>();
+    let unique_indexed_item_ids = indexed_item_ids
+        .iter()
+        .copied()
+        .collect::<std::collections::HashSet<_>>();
+    assert_eq!(
+        unique_indexed_item_ids.len(),
+        indexed_item_ids.len(),
+        "indexed Legacy pages must not reuse synthetic item identifiers"
+    );
+
+    std::fs::remove_file(oldest_segment_path.expect("the first immutable segment exists"))?;
+    drop(app_server);
+    let mut app_server = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .without_auto_env()
+        .build_initialized()
+        .await?;
+    let restarted_page = read_turns_page(
+        &mut app_server,
+        thread_id,
+        /*cursor*/ None,
+        Some(2),
+        SortDirection::Desc,
+        Some(TurnItemsView::Full),
+    )
+    .await?;
+    assert_eq!(
+        serde_json::to_value(restarted_page.data)?,
+        serde_json::to_value(latest_page.data)?
+    );
+
+    let read_id = app_server
+        .send_thread_read_request(ThreadReadParams {
+            thread_id: thread_id.to_string(),
+            include_turns: false,
+        })
+        .await?;
+    let ThreadReadResponse { thread } =
+        timeout(DEFAULT_READ_TIMEOUT, app_server.read_response(read_id)).await??;
+    assert_eq!(thread.history_mode, ThreadHistoryMode::Legacy);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn thread_turns_list_reuses_legacy_reference_depths_without_changing_history() -> Result<()> {
+    let server = create_mock_responses_server_repeating_assistant("Done").await;
+    let codex_home = TempDir::new()?;
+    MockResponsesConfig::new(&server.uri()).write(codex_home.path())?;
+    let thread_id = codex_protocol::ThreadId::new();
+    let sqlite = codex_state::SqliteConfig::new_for_testing(codex_home.path().abs());
+    let store = LocalThreadStore::new(
+        LocalThreadStoreConfig {
+            codex_home: codex_home.path().to_path_buf(),
+            sqlite,
+            default_model_provider_id: "mock_provider".to_string(),
+        },
+        /*state_db*/ None,
+    );
+    store
+        .create_thread(CreateThreadParams {
+            session_id: thread_id.into(),
+            thread_id,
+            extra_config: None,
+            forked_from_id: None,
+            parent_thread_id: None,
+            source: ProtocolSessionSource::Cli,
+            thread_source: None,
+            originator: "test_originator".to_string(),
+            base_instructions: BaseInstructions::default(),
+            dynamic_tools: Vec::new(),
+            selected_capability_roots: Vec::new(),
+            multi_agent_version: None,
+            history_mode: codex_protocol::protocol::ThreadHistoryMode::Legacy,
+            history_base: None,
+            subagent_history_start_ordinal: None,
+            persistence_mode: Default::default(),
+            initial_rollout_ordinal: 0,
+            initial_window_id: Uuid::now_v7().to_string(),
+            metadata: ThreadPersistenceMetadata {
+                cwd: Some(codex_home.path().to_path_buf()),
+                model_provider: "mock_provider".to_string(),
+                memory_mode: ThreadMemoryMode::Enabled,
+            },
+        })
+        .await?;
+    store.persist_thread(thread_id).await?;
+
+    const TURN_COUNT: usize = 12;
+    let mut recent_immutable_segment = None;
+    for index in 0..TURN_COUNT {
+        let turn_id = format!("turn-{index:02}");
+        store
+            .append_items(AppendThreadItemsParams {
+                thread_id,
+                items: vec![
+                    paginated_turn_started(turn_id.as_str()),
+                    RolloutItem::EventMsg(EventMsg::UserMessage(UserMessageEvent {
+                        message: format!("user-{index}"),
+                        ..Default::default()
+                    })),
+                    RolloutItem::EventMsg(EventMsg::AgentMessage(AgentMessageEvent {
+                        message: "x".repeat(1024),
+                        phase: None,
+                        delivery: None,
+                        memory_citation: None,
+                    })),
+                    paginated_turn_completed(turn_id.as_str()),
+                ],
+            })
+            .await?;
+        if index + 1 != TURN_COUNT {
+            recent_immutable_segment = Some(
+                store
+                    .freeze_thread_segment(
+                        thread_id,
+                        FreezeRolloutSegmentParams::rotate(Vec::new()),
+                    )
+                    .await?
+                    .reference
+                    .rollout_path,
+            );
+        }
+    }
+    let active_rollout_path = store
+        .read_thread(StoreReadThreadParams {
+            thread_id,
+            include_archived: false,
+            include_history: false,
+        })
+        .await?
+        .rollout_path
+        .expect("Legacy thread has an active rollout");
+    store.shutdown_thread(thread_id).await?;
+
+    let mut app_server = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .without_auto_env()
+        .build_initialized()
+        .await?;
+
+    let first_page = read_turns_page(
+        &mut app_server,
+        thread_id,
+        None,
+        Some(1),
+        SortDirection::Desc,
+        Some(TurnItemsView::Full),
+    )
+    .await?;
+    let repeated_first_page = read_turns_page(
+        &mut app_server,
+        thread_id,
+        None,
+        Some(1),
+        SortDirection::Desc,
+        Some(TurnItemsView::Full),
+    )
+    .await?;
+    assert_eq!(first_page.data, repeated_first_page.data);
+    assert_eq!(first_page.next_cursor, repeated_first_page.next_cursor);
+    assert_eq!(
+        first_page.backwards_cursor,
+        repeated_first_page.backwards_cursor
+    );
+
+    let mut cursor = None;
+    let mut turn_ids = Vec::new();
+    let mut item_ids = Vec::new();
+    while turn_ids.len() < TURN_COUNT {
+        let page = read_turns_page(
+            &mut app_server,
+            thread_id,
+            cursor,
+            Some(1),
+            SortDirection::Desc,
+            Some(TurnItemsView::Full),
+        )
+        .await?;
+        assert_eq!(page.data.len(), 1);
+        turn_ids.push(page.data[0].id.clone());
+        item_ids.push(
+            page.data[0]
+                .items
+                .iter()
+                .map(|item| item.id().to_string())
+                .collect::<Vec<_>>(),
+        );
+        cursor = page.next_cursor;
+    }
+    assert!(cursor.is_none());
+    assert_eq!(
+        turn_ids,
+        (0..TURN_COUNT)
+            .rev()
+            .map(|index| format!("turn-{index:02}"))
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        item_ids,
+        vec![
+            vec!["item-5", "item-6"],
+            vec!["item-3", "item-4"],
+            vec!["item-1", "item-2"],
+            vec!["item-3", "item-4"],
+            vec!["item-1", "item-2"],
+            vec!["item-7", "item-8"],
+            vec!["item-5", "item-6"],
+            vec!["item-3", "item-4"],
+            vec!["item-1", "item-2"],
+            vec!["item-5", "item-6"],
+            vec!["item-3", "item-4"],
+            vec!["item-1", "item-2"],
+        ]
+    );
+
+    let late_item = RolloutLine {
+        timestamp: "2026-08-03T00:00:00.000Z".to_string(),
+        ordinal: None,
+        item: paginated_completed_item(
+            thread_id,
+            "turn-00",
+            CoreTurnItem::Plan(PlanItem {
+                id: "late-older-plan".to_string(),
+                text: "older turn updated from a newer segment".to_string(),
+            }),
+        ),
+    };
+    writeln!(
+        OpenOptions::new().append(true).open(active_rollout_path)?,
+        "{}",
+        serde_json::to_string(&late_item)?
+    )?;
+
+    let mut cursor = None;
+    let mut cached_continuation = None;
+    loop {
+        let page = read_turns_page(
+            &mut app_server,
+            thread_id,
+            cursor,
+            Some(1),
+            SortDirection::Desc,
+            Some(TurnItemsView::Full),
+        )
+        .await?;
+        if cached_continuation.is_none() {
+            cached_continuation = page.next_cursor.clone();
+        }
+        if page.data[0].id == "turn-00" {
+            assert!(page.data[0].items.iter().any(|item| matches!(
+                item,
+                ThreadItem::Plan { id, text }
+                    if id == "late-older-plan"
+                        && text == "older turn updated from a newer segment"
+            )));
+            break;
+        }
+        cursor = page.next_cursor;
+        assert!(cursor.is_some(), "the oldest turn must remain reachable");
+    }
+
+    writeln!(
+        OpenOptions::new()
+            .append(true)
+            .open(recent_immutable_segment.expect("thread has immutable segments"))?,
+        "{{malformed immutable rollout line"
+    )?;
+    let read_id = app_server
+        .send_thread_turns_list_request(ThreadTurnsListParams {
+            thread_id: thread_id.to_string(),
+            cursor: cached_continuation,
+            limit: Some(1),
+            sort_direction: Some(SortDirection::Desc),
+            items_view: Some(TurnItemsView::Full),
+        })
+        .await?;
+    let read_error: JSONRPCError = timeout(
+        DEFAULT_READ_TIMEOUT,
+        app_server.read_stream_until_error_message(RequestId::Integer(read_id)),
+    )
+    .await??;
+    assert_eq!(read_error.error.code, -32603);
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn thread_turns_list_supports_requested_items_view() -> Result<()> {
     let server = create_mock_responses_server_repeating_assistant("Done").await;
     let codex_home = TempDir::new()?;

@@ -416,8 +416,10 @@ impl LunaSampler {
                 ApiError::Transport(TransportError::Build(_))
                 | ApiError::ContextWindowExceeded
                 | ApiError::QuotaExceeded
+                | ApiError::UsageLimitReached(_)
                 | ApiError::UsageNotIncluded
                 | ApiError::RateLimit(_)
+                | ApiError::ModelUnavailable { .. }
                 | ApiError::InvalidRequest { .. }
                 | ApiError::MisalignmentPolicyViolation { .. }
                 | ApiError::CyberPolicy { .. },

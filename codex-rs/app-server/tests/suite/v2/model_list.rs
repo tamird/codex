@@ -129,6 +129,33 @@ async fn list_models_returns_all_models_with_large_limit() -> Result<()> {
 }
 
 #[tokio::test]
+async fn list_models_reloads_custom_aliases_without_restarting() -> Result<()> {
+    const FIRST_ALIAS: &str = "test-route-first";
+    const RENAMED_ALIAS: &str = "test-route-renamed";
+
+    let codex_home = TempDir::new()?;
+    write_models_cache(codex_home.path())?;
+    write_custom_alias_config(codex_home.path(), FIRST_ALIAS)?;
+    let mut app = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .without_auto_env()
+        .build_initialized()
+        .await?;
+
+    assert_eq!(listed_aliases(&mut app).await?, vec![FIRST_ALIAS]);
+
+    write_custom_alias_config(codex_home.path(), RENAMED_ALIAS)?;
+    assert_eq!(listed_aliases(&mut app).await?, vec![RENAMED_ALIAS]);
+
+    std::fs::write(codex_home.path().join("config.toml"), "[[custom_models]\n")?;
+    assert_eq!(listed_aliases(&mut app).await?, vec![RENAMED_ALIAS]);
+
+    std::fs::write(codex_home.path().join("config.toml"), "")?;
+    assert_eq!(listed_aliases(&mut app).await?, Vec::<String>::new());
+    Ok(())
+}
+
+#[tokio::test]
 async fn list_models_includes_hidden_models() -> Result<()> {
     let codex_home = TempDir::new()?;
     write_models_cache(codex_home.path())?;
@@ -357,4 +384,37 @@ async fn list_models_rejects_invalid_cursor() -> Result<()> {
     assert_eq!(error.error.code, INVALID_REQUEST_ERROR_CODE);
     assert_eq!(error.error.message, "invalid cursor: invalid");
     Ok(())
+}
+
+fn write_custom_alias_config(codex_home: &std::path::Path, alias: &str) -> Result<()> {
+    std::fs::write(
+        codex_home.join("config.toml"),
+        format!(
+            r#"
+[[custom_models]]
+name = "{alias}"
+model = "gpt-5.1-codex"
+"#
+        ),
+    )?;
+    Ok(())
+}
+
+async fn listed_aliases(app: &mut TestAppServer) -> Result<Vec<String>> {
+    let response: ModelListResponse = app
+        .request(|request_id| ClientRequest::ModelList {
+            request_id,
+            params: ModelListParams {
+                limit: Some(100),
+                cursor: None,
+                include_hidden: Some(true),
+            },
+        })
+        .await?;
+    Ok(response
+        .data
+        .into_iter()
+        .map(|model| model.model)
+        .filter(|model| model.starts_with("test-route-"))
+        .collect())
 }

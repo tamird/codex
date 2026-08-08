@@ -6,6 +6,7 @@ use codex_model_provider_info::ModelProviderInfo;
 use codex_model_provider_info::WireApi;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::user_input::UserInput;
+use core_test_support::PathBufExt;
 use core_test_support::responses;
 use core_test_support::skip_if_no_network;
 use core_test_support::streaming_sse::StreamingSseChunk;
@@ -14,6 +15,8 @@ use core_test_support::test_codex::TestCodex;
 use core_test_support::test_codex::test_codex;
 use core_test_support::wait_for_event;
 use pretty_assertions::assert_eq;
+use serde_json::Value;
+use serde_json::json;
 use std::net::TcpListener;
 use wiremock::MockServer;
 
@@ -95,6 +98,126 @@ async fn retries_on_early_close() {
         2,
         "expected retry after incomplete SSE stream"
     );
+
+    server.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn retries_same_model_after_early_close_with_incomplete_custom_tool_call() {
+    skip_if_no_network!();
+
+    let workspace = tempfile::tempdir().expect("create workspace");
+    let workspace_path = workspace.path().to_path_buf();
+    let incomplete_sse = responses::sse(vec![
+        responses::ev_response_created("resp-incomplete"),
+        json!({
+            "type": "response.output_item.added",
+            "item": {
+                "type": "custom_tool_call",
+                "id": "incomplete-tool-item",
+                "call_id": "incomplete-tool-call",
+                "name": "apply_patch",
+                "input": ""
+            }
+        }),
+        json!({
+            "type": "response.custom_tool_call_input.delta",
+            "item_id": "incomplete-tool-item",
+            "call_id": "incomplete-tool-call",
+            "delta": "*** Begin Patch\n*** Add File: should-not-exist.txt\n+created\n*** End Patch"
+        }),
+    ]);
+    let completed_sse = responses::sse(vec![
+        responses::ev_response_created("resp-ok"),
+        responses::ev_assistant_message("msg-ok", "done"),
+        responses::ev_completed("resp-ok"),
+    ]);
+
+    let (server, _) = start_streaming_sse_server(vec![
+        vec![StreamingSseChunk {
+            gate: None,
+            body: incomplete_sse,
+        }],
+        vec![StreamingSseChunk {
+            gate: None,
+            body: completed_sse,
+        }],
+    ])
+    .await;
+
+    let model_provider = ModelProviderInfo {
+        name: "openai".into(),
+        base_url: Some(format!("{}/v1", server.uri())),
+        env_key: Some("PATH".into()),
+        env_key_instructions: None,
+        experimental_bearer_token: None,
+        auth: None,
+        aws: None,
+        wire_api: WireApi::Responses,
+        query_params: None,
+        http_headers: None,
+        env_http_headers: None,
+        request_max_retries: Some(0),
+        stream_max_retries: Some(1),
+        stream_idle_timeout_ms: Some(2000),
+        websocket_connect_timeout_ms: None,
+        requires_openai_auth: false,
+        supports_websockets: false,
+        supports_standalone_web_search: false,
+    };
+
+    let TestCodex { codex, .. } = test_codex()
+        .with_config(move |config| {
+            config.model_provider = model_provider;
+            config.cwd = workspace_path.abs();
+        })
+        .build_with_streaming_server(&server)
+        .await
+        .unwrap();
+
+    codex
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: "hello".into(),
+            text_elements: Vec::new(),
+        }]))
+        .await
+        .unwrap();
+
+    let mut events = Vec::new();
+    loop {
+        let event = wait_for_event(&codex, |_| true).await;
+        let terminal = matches!(event, EventMsg::TurnComplete(_) | EventMsg::Error(_));
+        events.push(event);
+        if terminal {
+            break;
+        }
+    }
+    assert!(matches!(events.last(), Some(EventMsg::TurnComplete(_))));
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, EventMsg::DynamicToolCallRequest(_)))
+    );
+    assert!(!workspace.path().join("should-not-exist.txt").exists());
+
+    let requests = server.requests().await;
+    assert_eq!(requests.len(), 2, "expected one same-model retry");
+    let initial_request: Value = serde_json::from_slice(&requests[0]).expect("request JSON");
+    let retry_request: Value = serde_json::from_slice(&requests[1]).expect("request JSON");
+    assert_eq!(retry_request["model"], initial_request["model"]);
+    let retry_input = retry_request["input"]
+        .as_array()
+        .expect("request input array");
+    assert!(
+        retry_input.iter().all(|item| {
+            !matches!(
+                item["type"].as_str(),
+                Some("custom_tool_call" | "custom_tool_call_output")
+            )
+        }),
+        "incomplete custom tool call must not enter committed history"
+    );
+    assert!(!String::from_utf8_lossy(&requests[1]).contains("<interrupted_response>"));
 
     server.shutdown().await;
 }

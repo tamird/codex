@@ -3194,6 +3194,14 @@ pub struct TurnContextItem {
     pub cyber_access_program: Option<CyberAccessProgram>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub effort: Option<ReasoningEffortConfig>,
+    /// Concrete service tier used for this turn, if one was requested.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub service_tier: Option<String>,
+    /// Stable custom-model routing profile selected for this turn.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub model_profile: Option<String>,
     // Compatibility-only field written with a default value so older Codex
     // versions can deserialize turn-context rollout items. It is no longer
     // read by context reconstruction and should be removed in a future schema
@@ -5985,10 +5993,12 @@ mod tests {
             realtime_active: None,
             cyber_access_program: None,
             effort: None,
+            service_tier: Some("priority".to_string()),
+            model_profile: Some("balanced".to_string()),
             summary: ReasoningSummaryConfig::Auto,
         };
 
-        let value = serde_json::to_value(item)?;
+        let value = serde_json::to_value(&item)?;
         assert_eq!(
             value["network"],
             json!({
@@ -6009,7 +6019,10 @@ mod tests {
                 }]
             })
         );
+        assert_eq!(value["service_tier"], json!("priority"));
+        assert_eq!(value["model_profile"], json!("balanced"));
         assert_eq!(value["summary"], json!("auto"));
+        assert_eq!(serde_json::from_value::<TurnContextItem>(value)?, item);
         Ok(())
     }
 

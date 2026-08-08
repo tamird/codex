@@ -4,6 +4,7 @@ use std::sync::OnceLock;
 use crate::compact::CompactedHistoryMetadata;
 use crate::compact::CompactionAnalyticsAttempt;
 use crate::compact::CompactionAnalyticsDetails;
+use crate::compact::CompactionReporting;
 use crate::compact::InitialContextInjection;
 use crate::compact::build_compaction_initial_context;
 use crate::compact::compaction_status_from_result;
@@ -51,6 +52,7 @@ use request::run_remote_compact_attempt;
 const CONTEXT_WINDOW_TRUNCATED_OUTPUT_MESSAGE: &str =
     "Output exceeded the available model context and was truncated";
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_inline_remote_auto_compact_task(
     sess: Arc<Session>,
     step_context: Arc<StepContext>,
@@ -59,6 +61,7 @@ pub(crate) async fn run_inline_remote_auto_compact_task(
     initial_context_injection: InitialContextInjection,
     reason: CompactionReason,
     phase: CompactionPhase,
+    reporting: CompactionReporting,
 ) -> CodexResult<()> {
     let compaction_metadata = CompactionTurnMetadata::new(
         CompactionTrigger::Auto,
@@ -73,6 +76,7 @@ pub(crate) async fn run_inline_remote_auto_compact_task(
         Some(turn_state),
         initial_context_injection,
         compaction_metadata,
+        reporting,
     )
     .await?;
     Ok(())
@@ -108,6 +112,7 @@ pub(crate) async fn run_remote_compact_task(
         /*turn_state*/ None,
         InitialContextInjection::DoNotInject,
         compaction_metadata,
+        CompactionReporting::Immediate,
     )
     .await?;
     Ok(())
@@ -120,6 +125,7 @@ async fn run_remote_compact_task_inner(
     turn_state: Option<Arc<OnceLock<String>>>,
     initial_context_injection: InitialContextInjection,
     compaction_metadata: CompactionTurnMetadata,
+    reporting: CompactionReporting,
 ) -> CodexResult<()> {
     let turn_context = &step_context.turn;
     let trigger = compaction_metadata.trigger();
@@ -163,11 +169,12 @@ async fn run_remote_compact_task_inner(
         initial_context_injection,
         compaction_metadata,
         &mut analytics_details,
+        reporting,
     )
     .await;
     let status = compaction_status_from_result(&result);
     let codex_error = result.as_ref().err();
-    if result.is_ok() {
+    if result.is_ok() && !reporting.defers_post_compact_hooks() {
         let post_compact_outcome = run_post_compact_hooks(sess, turn_context, trigger).await;
         if let PostCompactHookOutcome::Stopped = post_compact_outcome {
             attempt
@@ -180,16 +187,19 @@ async fn run_remote_compact_task_inner(
         .track(sess.as_ref(), status, codex_error, analytics_details)
         .await;
     if let Err(err) = result {
-        sess.track_turn_codex_error(turn_context, &err);
-        let event = EventMsg::Error(
-            err.to_error_event(Some("Error running remote compact task".to_string())),
-        );
-        sess.send_event(turn_context, event).await;
+        if reporting.emits_error() {
+            sess.track_turn_codex_error(turn_context, &err);
+            let event = EventMsg::Error(
+                err.to_error_event(Some("Error running remote compact task".to_string())),
+            );
+            sess.send_event(turn_context, event).await;
+        }
         return Err(err);
     }
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_remote_compact_task_inner_impl(
     sess: &Arc<Session>,
     step_context: &Arc<StepContext>,
@@ -198,6 +208,7 @@ async fn run_remote_compact_task_inner_impl(
     initial_context_injection: InitialContextInjection,
     compaction_metadata: CompactionTurnMetadata,
     analytics_details: &mut CompactionAnalyticsDetails,
+    reporting: CompactionReporting,
 ) -> CodexResult<()> {
     let turn_context = &step_context.turn;
     let context_compaction_item = ContextCompactionItem::new();
@@ -211,8 +222,10 @@ async fn run_remote_compact_task_inner_impl(
         turn_context.provider.info().name.as_str(),
     );
     let compaction_item = TurnItem::ContextCompaction(context_compaction_item);
-    sess.emit_turn_item_started(turn_context, &compaction_item)
-        .await;
+    if !reporting.defers_lifecycle() {
+        sess.emit_turn_item_started(turn_context, &compaction_item)
+            .await;
+    }
     let attempt = run_remote_compact_attempt(
         sess,
         step_context,
@@ -306,6 +319,10 @@ async fn run_remote_compact_task_inner_impl(
     .await;
     sess.recompute_token_usage(compaction_turn_context).await;
 
+    if reporting.defers_lifecycle() {
+        sess.emit_turn_item_started(compaction_turn_context, &compaction_item)
+            .await;
+    }
     sess.emit_turn_item_completed(compaction_turn_context, compaction_item)
         .await;
     Ok(())

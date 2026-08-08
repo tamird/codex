@@ -70,6 +70,11 @@ default_tools_approval_mode = "{approval_mode}"
 "#
     ))
     .expect("apps config should parse");
+    std::fs::write(
+        &user_config_path,
+        toml::to_string(&user_config).expect("serialize apps config"),
+    )
+    .expect("persist apps config for per-turn reload");
     config.config_layer_stack = config
         .config_layer_stack
         .with_user_config(&user_config_path, user_config)
@@ -96,6 +101,11 @@ default_tools_approval_mode = "{approval_mode}"
 "#
     ))
     .expect("apps config should parse");
+    std::fs::write(
+        &user_config_path,
+        toml::to_string(&user_config).expect("serialize apps config"),
+    )
+    .expect("persist apps config for per-turn reload");
     config.config_layer_stack = config
         .config_layer_stack
         .with_user_config(&user_config_path, user_config)

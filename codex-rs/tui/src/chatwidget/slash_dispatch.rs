@@ -296,6 +296,7 @@ impl ChatWidget {
             }
             SlashCommand::Model => {
                 self.open_model_popup();
+                self.app_event_tx.send(AppEvent::RefreshModelCatalog);
                 self.defer_input_until_settings_applied();
             }
             SlashCommand::Personality => {

@@ -10,7 +10,9 @@
 //!
 //! A [`ModelClientSession`] is created per turn and is used to stream one or more Responses API
 //! requests during that turn. It caches a Responses WebSocket connection (opened lazily) and stores
-//! per-turn state such as the `x-codex-turn-state` token used for sticky routing.
+//! provider route-segment state such as the `x-codex-turn-state` token used for sticky routing. A
+//! route segment is the consecutive requests that use one model request configuration; changing
+//! that configuration resets the provider state without starting a new Codex turn.
 //!
 //! WebSocket prewarm is a v2-only `response.create` with `generate=false`; it waits for completion
 //! so the next request can reuse the same connection and `previous_response_id`.
@@ -304,29 +306,31 @@ pub struct ModelClient {
 /// A turn-scoped streaming session created from a [`ModelClient`].
 ///
 /// The session establishes a Responses WebSocket connection lazily and reuses it across multiple
-/// requests within the turn. It also caches per-turn state:
+/// requests within one provider route segment. It also caches route-segment state:
 ///
 /// - The last full request, so subsequent calls can reuse incremental websocket request payloads
 ///   only when the current request is an incremental extension of the previous one.
 /// - The `x-codex-turn-state` sticky-routing token, which must be replayed for all requests within
-///   the same turn.
+///   the same provider route segment.
 ///
 /// Create a fresh `ModelClientSession` for each Codex turn. Reusing it across turns would replay
-/// the previous turn's sticky-routing token into the next turn, which violates the client/server
-/// contract and can cause routing bugs.
+/// the previous turn's provider state into the next turn, which violates the client/server
+/// contract and can cause routing bugs. Within a turn, reset the session before changing the model
+/// request configuration so provider state does not cross route segments.
 pub struct ModelClientSession {
     client: ModelClient,
     websocket_session: WebsocketSession,
-    /// Turn state for sticky routing.
+    /// Provider route-segment state for sticky routing.
     ///
-    /// This is an `OnceLock` that stores the turn state value received from the server
-    /// on turn start via the `x-codex-turn-state` response header. Once set, this value
+    /// This is a `OnceLock` that stores the turn state value received from the server
+    /// at route-segment start via the `x-codex-turn-state` response header. Once set, this value
     /// should be sent back to the server in the `x-codex-turn-state` request header for
-    /// all subsequent requests within the same turn to maintain sticky routing.
+    /// all subsequent requests within the same route segment to maintain sticky routing.
     ///
-    /// This is a contract between the client and server: we receive it at turn start,
-    /// keep sending it unchanged between turn requests (e.g., for retries, incremental
-    /// appends, or continuation requests), and must not send it between different turns.
+    /// This is a contract between the client and server: we receive it at route-segment start,
+    /// keep sending it unchanged between requests in that route segment (e.g., for retries,
+    /// incremental appends, or continuation requests), and must not send it after the model request
+    /// configuration changes or the Codex turn ends.
     turn_state: Arc<OnceLock<String>>,
 }
 
@@ -1387,6 +1391,23 @@ impl ModelClientSession {
         self.websocket_session.last_response_from_untraced_warmup = false;
         self.websocket_session
             .set_connection_reused(/*connection_reused*/ false);
+    }
+
+    /// Starts a provider route segment after the model request configuration changes.
+    ///
+    /// `previous_response_id`, the WebSocket connection, and `x-codex-turn-state` may all carry
+    /// affinity to the previous request configuration. Discard them in place so the next request
+    /// sends complete local history and the discarded state is never stored in the client's shared
+    /// WebSocket cache. Fork continuation state is cleared for the same reason.
+    pub(crate) fn reset_for_model_reroute(&mut self) {
+        self.reset_websocket_session();
+        self.turn_state = Arc::new(OnceLock::new());
+        *self
+            .client
+            .state
+            .latest_response_continuation
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
     }
 
     #[allow(clippy::too_many_arguments)]

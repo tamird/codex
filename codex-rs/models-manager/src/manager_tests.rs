@@ -22,9 +22,11 @@ use serde_json::json;
 use std::collections::VecDeque;
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::Barrier;
 use std::sync::Mutex;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
+use std::thread;
 use tempfile::tempdir;
 
 #[path = "model_info_overrides_tests.rs"]
@@ -779,6 +781,7 @@ async fn custom_model_alias_uses_backing_model_metadata_and_request_model() {
         "frontier-local".to_string(),
         CustomModelConfig {
             model: "gpt-real-preview".to_string(),
+            routing_profile: None,
             model_context_window: Some(123_456),
             model_auto_compact_token_limit: Some(100_000),
         },
@@ -815,6 +818,120 @@ async fn custom_model_alias_uses_backing_model_metadata_and_request_model() {
             .iter()
             .any(|preset| preset.model == "frontier-local")
     );
+}
+
+#[tokio::test]
+async fn replacing_custom_models_updates_picker_and_fallback_lookup() {
+    let remote = remote_model("gpt-real", "Real", /*priority*/ 0);
+    let manager = StaticModelsManager::new(
+        /*auth_manager*/ None,
+        ModelsResponse {
+            models: vec![remote],
+        },
+    );
+    let replacement = HashMap::from([(
+        "profile-added".to_string(),
+        CustomModelConfig {
+            model: "gpt-preview".to_string(),
+            routing_profile: None,
+            model_context_window: Some(64_000),
+            model_auto_compact_token_limit: None,
+        },
+    )]);
+
+    manager.replace_custom_models(replacement);
+
+    let listed = manager
+        .list_models(RefreshStrategy::Offline, DEFAULT_HTTP_CLIENT_FACTORY)
+        .await;
+    assert!(listed.iter().any(|preset| preset.model == "profile-added"));
+    let try_listed = manager
+        .try_list_models()
+        .expect("model catalog is unlocked");
+    assert!(
+        try_listed
+            .iter()
+            .any(|preset| preset.model == "profile-added")
+    );
+    let model_info = manager
+        .get_model_info("profile-added", &ModelsManagerConfig::default())
+        .await;
+    assert_eq!(model_info.request_model.as_deref(), Some("gpt-preview"));
+    assert_eq!(model_info.context_window, Some(64_000));
+
+    manager.replace_custom_models(HashMap::new());
+
+    let listed = manager
+        .list_models(RefreshStrategy::Offline, DEFAULT_HTTP_CLIENT_FACTORY)
+        .await;
+    assert!(!listed.iter().any(|preset| preset.model == "profile-added"));
+    let try_listed = manager
+        .try_list_models()
+        .expect("model catalog is unlocked");
+    assert!(
+        !try_listed
+            .iter()
+            .any(|preset| preset.model == "profile-added")
+    );
+}
+
+#[test]
+fn try_list_models_reads_complete_snapshots_during_custom_model_replacement() {
+    let remote = remote_model("gpt-real", "Real", /*priority*/ 0);
+    let profile = |model: &str| CustomModelConfig {
+        model: model.to_string(),
+        routing_profile: None,
+        model_context_window: None,
+        model_auto_compact_token_limit: None,
+    };
+    let manager = Arc::new(StaticModelsManager::new_with_custom_models(
+        /*auth_manager*/ None,
+        ModelsResponse {
+            models: vec![remote],
+        },
+        HashMap::from([("profile-a".to_string(), profile("gpt-a"))]),
+    ));
+    let start = Arc::new(Barrier::new(3));
+
+    let writer = {
+        let manager = Arc::clone(&manager);
+        let start = Arc::clone(&start);
+        thread::spawn(move || {
+            start.wait();
+            for index in 0..2_000 {
+                let (alias, model) = if index % 2 == 0 {
+                    ("profile-a", "gpt-a")
+                } else {
+                    ("profile-b", "gpt-b")
+                };
+                manager.replace_custom_models(HashMap::from([(alias.to_string(), profile(model))]));
+            }
+        })
+    };
+    let reader = {
+        let manager = Arc::clone(&manager);
+        let start = Arc::clone(&start);
+        thread::spawn(move || {
+            start.wait();
+            for _ in 0..2_000 {
+                let aliases = manager
+                    .try_list_models()
+                    .expect("lock-free model snapshot")
+                    .into_iter()
+                    .filter(|preset| preset.model.starts_with("profile-"))
+                    .map(|preset| preset.model)
+                    .collect::<Vec<_>>();
+                assert!(
+                    aliases == ["profile-a"] || aliases == ["profile-b"],
+                    "unexpected custom-model snapshot: {aliases:?}"
+                );
+            }
+        })
+    };
+
+    start.wait();
+    writer.join().expect("writer thread");
+    reader.join().expect("reader thread");
 }
 
 #[tokio::test]
