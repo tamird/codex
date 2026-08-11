@@ -138,6 +138,7 @@ pub use recorder::RolloutRecorderParams;
 pub use recorder::append_rollout_item_to_path;
 pub use reference::BoundedRolloutLines;
 pub use reference::BoundedRolloutMaterializer;
+pub use reference::FRODEX_RECENT_ROLLOUT_SEGMENTS;
 pub use reference::MAX_ROLLOUT_REFERENCE_DEPTH;
 pub use reference::compose_compacted_replacement_history_filter_texts;
 pub use reference::materialize_bounded_rollout_lines;

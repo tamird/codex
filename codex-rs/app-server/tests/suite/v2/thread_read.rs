@@ -1042,7 +1042,7 @@ async fn rotated_legacy_fork_turns_list_preserves_inherited_parent_turns() -> Re
 }
 
 #[tokio::test]
-async fn running_legacy_resume_initial_page_reads_enough_referenced_segments() -> Result<()> {
+async fn frodex_running_legacy_resume_returns_newest_five_segments_only() -> Result<()> {
     let server = create_mock_responses_server_repeating_assistant("Done").await;
     let codex_home = TempDir::new()?;
     MockResponsesConfig::new(&server.uri()).write(codex_home.path())?;
@@ -1171,7 +1171,9 @@ async fn running_legacy_resume_initial_page_reads_enough_referenced_segments() -
             .collect::<Vec<_>>(),
         vec!["turn-7", "turn-6", "turn-5", "turn-4", "turn-3"]
     );
-    assert!(expected_page.next_cursor.is_some());
+    // LOAD BEARING: do not advertise a cursor into rollout segments older than the five segments
+    // normal Frodex reads make available. Following that cursor restored the unbounded scan.
+    assert_eq!(expected_page.next_cursor, None);
 
     let resume_id = mcp
         .send_thread_resume_request(ThreadResumeParams {
@@ -1200,7 +1202,7 @@ async fn running_legacy_resume_initial_page_reads_enough_referenced_segments() -
 }
 
 #[tokio::test]
-async fn thread_turns_list_loads_258_same_thread_rollout_segments() -> Result<()> {
+async fn frodex_thread_turns_list_stays_bounded_with_258_segments() -> Result<()> {
     assert_thread_turns_list_same_thread_segment_limit(
         codex_rollout::MAX_ROLLOUT_REFERENCE_DEPTH + 2,
         None,
@@ -1209,28 +1211,28 @@ async fn thread_turns_list_loads_258_same_thread_rollout_segments() -> Result<()
 }
 
 #[tokio::test]
-async fn thread_turns_list_loads_512_same_thread_rollout_segments() -> Result<()> {
+async fn frodex_thread_turns_list_stays_bounded_with_512_segments() -> Result<()> {
     assert_thread_turns_list_same_thread_segment_limit(512, None).await
 }
 
 #[tokio::test]
-async fn thread_turns_list_loads_513_same_thread_rollout_segments() -> Result<()> {
+async fn frodex_thread_turns_list_stays_bounded_with_513_segments() -> Result<()> {
     assert_thread_turns_list_same_thread_segment_limit(513, None).await
 }
 
 #[tokio::test]
-async fn thread_turns_list_loads_1025_same_thread_rollout_segments() -> Result<()> {
+async fn frodex_thread_turns_list_stays_bounded_with_1025_segments() -> Result<()> {
     assert_thread_turns_list_same_thread_segment_limit(1025, None).await
 }
 
 #[tokio::test]
-async fn thread_turns_list_loads_4097_same_thread_rollout_segments() -> Result<()> {
+async fn frodex_thread_turns_list_stays_bounded_with_4097_segments() -> Result<()> {
     assert_thread_turns_list_same_thread_segment_limit(4097, None).await
 }
 
 #[tokio::test]
 #[ignore = "manual five-figure same-thread segment scaling validation"]
-async fn thread_turns_list_loads_10001_same_thread_rollout_segments() -> Result<()> {
+async fn frodex_thread_turns_list_stays_bounded_with_10001_segments() -> Result<()> {
     assert_thread_turns_list_same_thread_segment_limit(10001, None).await
 }
 
@@ -1300,22 +1302,22 @@ async fn assert_thread_turns_list_same_thread_segment_limit(
                 nth_user_message: None,
                 compacted_replacement_history_filter_texts: None,
             }));
-        } else {
-            items.extend([
-                paginated_turn_started("oldest-turn"),
-                RolloutItem::EventMsg(EventMsg::UserMessage(UserMessageEvent {
-                    message: "oldest user".to_string(),
-                    ..Default::default()
-                })),
-                RolloutItem::EventMsg(EventMsg::AgentMessage(AgentMessageEvent {
-                    message: "oldest answer".to_string(),
-                    phase: None,
-                    delivery: None,
-                    memory_citation: None,
-                })),
-                paginated_turn_completed("oldest-turn"),
-            ]);
         }
+        let turn_id = format!("turn-{index}");
+        items.extend([
+            paginated_turn_started(turn_id.as_str()),
+            RolloutItem::EventMsg(EventMsg::UserMessage(UserMessageEvent {
+                message: format!("user {index}"),
+                ..Default::default()
+            })),
+            RolloutItem::EventMsg(EventMsg::AgentMessage(AgentMessageEvent {
+                message: format!("answer {index}"),
+                phase: None,
+                delivery: None,
+                memory_citation: None,
+            })),
+            paginated_turn_completed(turn_id.as_str()),
+        ]);
 
         let base_ordinal = u64::try_from(index)? * 8;
         let records = items
@@ -1365,12 +1367,186 @@ async fn assert_thread_turns_list_same_thread_segment_limit(
 
     let ThreadTurnsListResponse { data, .. } =
         timeout(read_timeout, mcp.read_response(request_id)).await??;
+    let newest_index = segment_count - 1;
     assert_eq!(
         data.iter().map(|turn| turn.id.as_str()).collect::<Vec<_>>(),
-        vec!["oldest-turn"]
+        vec![format!("turn-{newest_index}")]
     );
-    assert_eq!(turn_user_texts(&data), vec!["oldest user"]);
-    assert_eq!(turn_agent_texts(&data), vec!["oldest answer"]);
+    assert_eq!(turn_user_texts(&data), vec![format!("user {newest_index}")]);
+    assert_eq!(
+        turn_agent_texts(&data),
+        vec![format!("answer {newest_index}")]
+    );
+    Ok(())
+}
+
+// LOAD BEARING: normal Frodex history APIs MUST NOT open the sixth-newest rollout segment.
+// Removing this bound made Desktop "Continue in new chat" take tens of seconds on long threads.
+#[tokio::test]
+async fn frodex_history_apis_ignore_deleted_sixth_segment() -> Result<()> {
+    let server = create_mock_responses_server_repeating_assistant("Done").await;
+    let codex_home = TempDir::new()?;
+    MockResponsesConfig::new(&server.uri()).write(codex_home.path())?;
+    let thread_id = codex_protocol::ThreadId::new();
+    let segment_ids = (0..codex_rollout::FRODEX_RECENT_ROLLOUT_SEGMENTS + 1)
+        .map(|_| SegmentId::new())
+        .collect::<Vec<_>>();
+    let active_path = rollout_path(
+        codex_home.path(),
+        "2026-08-11T00-00-00",
+        thread_id.to_string().as_str(),
+    );
+    let paths = segment_ids
+        .iter()
+        .enumerate()
+        .map(|(index, segment_id)| {
+            if index + 1 == segment_ids.len() {
+                active_path.clone()
+            } else {
+                codex_home
+                    .path()
+                    .join(codex_rollout::ROTATED_ROLLOUT_SEGMENTS_SUBDIR)
+                    .join(thread_id.to_string())
+                    .join(segment_id.to_string())
+                    .join("segment.jsonl")
+            }
+        })
+        .collect::<Vec<_>>();
+
+    for index in 0..paths.len() {
+        let mut items = vec![RolloutItem::SessionMeta(SessionMetaLine {
+            meta: SessionMeta {
+                session_id: thread_id.into(),
+                id: thread_id,
+                segment_id: Some(segment_ids[index]),
+                timestamp: "2026-08-11T00:00:00Z".to_string(),
+                cwd: codex_home.path().to_path_buf(),
+                originator: "frodex-five-segment-test".to_string(),
+                cli_version: "test".to_string(),
+                source: ProtocolSessionSource::Cli,
+                model_provider: Some("mock_provider".to_string()),
+                history_mode: codex_protocol::protocol::ThreadHistoryMode::Legacy,
+                ..SessionMeta::default()
+            },
+            git: None,
+        })];
+        if let Some(previous_index) = index.checked_sub(1) {
+            items.push(RolloutItem::RolloutReference(RolloutReferenceItem {
+                rollout_path: paths[previous_index].clone(),
+                thread_id: Some(thread_id),
+                rollout_id: Some(thread_id),
+                rollout_timestamp: None,
+                segment_id: Some(segment_ids[previous_index]),
+                max_depth: codex_protocol::protocol::DEFAULT_ROLLOUT_REFERENCE_DEPTH,
+                nth_user_message: None,
+                compacted_replacement_history_filter_texts: None,
+            }));
+        }
+        let turn_id = format!("turn-{index}");
+        items.extend([
+            paginated_turn_started(turn_id.as_str()),
+            RolloutItem::EventMsg(EventMsg::UserMessage(UserMessageEvent {
+                message: format!("user {index}"),
+                ..Default::default()
+            })),
+            RolloutItem::EventMsg(EventMsg::AgentMessage(AgentMessageEvent {
+                message: format!("answer {index}"),
+                phase: None,
+                delivery: None,
+                memory_citation: None,
+            })),
+            paginated_turn_completed(turn_id.as_str()),
+        ]);
+        let records = items
+            .into_iter()
+            .map(|item| {
+                serde_json::to_string(&RolloutLine {
+                    timestamp: "2026-08-11T00:00:00Z".to_string(),
+                    ordinal: None,
+                    item,
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        if let Some(parent) = paths[index].parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(paths[index].as_path(), format!("{}\n", records.join("\n")))?;
+    }
+    std::fs::remove_file(paths[0].as_path())?;
+
+    let expected_user_texts = (1..=5)
+        .map(|index| format!("user {index}"))
+        .collect::<Vec<_>>();
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .without_auto_env()
+        .build_initialized()
+        .await?;
+
+    let read_id = mcp
+        .send_thread_read_request(ThreadReadParams {
+            thread_id: thread_id.to_string(),
+            include_turns: true,
+        })
+        .await?;
+    let ThreadReadResponse { thread } =
+        timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(read_id)).await??;
+    assert_eq!(turn_user_texts(&thread.turns), expected_user_texts);
+
+    let turns_id = mcp
+        .send_thread_turns_list_request(ThreadTurnsListParams {
+            thread_id: thread_id.to_string(),
+            cursor: None,
+            limit: Some(100),
+            sort_direction: Some(SortDirection::Desc),
+            items_view: Some(TurnItemsView::Full),
+        })
+        .await?;
+    let ThreadTurnsListResponse {
+        data, next_cursor, ..
+    } = timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(turns_id)).await??;
+    assert_eq!(
+        turn_user_texts(&data),
+        expected_user_texts
+            .iter()
+            .rev()
+            .cloned()
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(next_cursor, None);
+
+    let resume_id = mcp
+        .send_thread_resume_request(ThreadResumeParams {
+            thread_id: thread_id.to_string(),
+            ..Default::default()
+        })
+        .await?;
+    let ThreadResumeResponse { thread, .. } =
+        timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(resume_id)).await??;
+    assert_eq!(turn_user_texts(&thread.turns), expected_user_texts);
+
+    let fork_id = mcp
+        .send_thread_fork_request(ThreadForkParams {
+            thread_id: thread_id.to_string(),
+            ..Default::default()
+        })
+        .await?;
+    let ThreadForkResponse { thread, .. } =
+        timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(fork_id)).await??;
+    assert_eq!(turn_user_texts(&thread.turns), expected_user_texts);
+
+    let side_id = mcp
+        .send_thread_fork_request(ThreadForkParams {
+            thread_id: thread_id.to_string(),
+            ephemeral: true,
+            exclude_turns: true,
+            ..Default::default()
+        })
+        .await?;
+    let ThreadForkResponse { thread, .. } =
+        timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(side_id)).await??;
+    assert!(thread.ephemeral);
+    assert!(thread.turns.is_empty());
     Ok(())
 }
 

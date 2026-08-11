@@ -36,6 +36,14 @@ use crate::recorder::RolloutRecorder;
 /// Bounds cross-thread and nth-user-message fork nesting during rollout expansion.
 pub const MAX_ROLLOUT_REFERENCE_DEPTH: usize = 256;
 
+/// Number of physical same-thread rollout segments available to normal Frodex reads.
+///
+/// Normal reads stop before opening an older sixth segment. Explicit complete materialization and
+/// model-context recovery retain their separate semantics.
+pub const FRODEX_RECENT_ROLLOUT_SEGMENTS: usize = 5;
+
+const FRODEX_RECENT_ROLLOUT_REFERENCES: usize = FRODEX_RECENT_ROLLOUT_SEGMENTS - 1;
+
 /// Composes inherited and local compaction filters in their application order.
 ///
 /// An outer reference constrains every segment below it. A nested reference adds its own
@@ -115,7 +123,7 @@ impl MaterializationPolicy {
         }
         match self {
             Self::Complete => None,
-            Self::RecentSegments => Some(reference.max_depth.min(DEFAULT_ROLLOUT_REFERENCE_DEPTH)),
+            Self::RecentSegments => Some(FRODEX_RECENT_ROLLOUT_REFERENCES),
             Self::OrdinaryReferenceLimit(limit) => Some(limit),
         }
     }
