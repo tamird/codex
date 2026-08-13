@@ -6,13 +6,17 @@ use sqlx::migrate::Migration;
 use sqlx::migrate::Migrator;
 use std::borrow::Cow;
 
+use super::FRODEX_GOAL_SUPERVISOR_MIGRATION_CHECKSUM;
+use super::FRODEX_GOAL_SUPERVISOR_MIGRATION_DESCRIPTION;
 use super::STATE_MIGRATOR;
 use super::THREAD_HISTORY_MIGRATOR;
+use super::repair_frodex_goal_supervisor_state_migration;
 use super::repair_legacy_recency_migration_version;
 use crate::PINNED_THREAD_SECTION_ID;
 use crate::PINNED_THREAD_SECTION_NAME;
 
 const CUSTOM_THREAD_SECTION_ID: &str = "01984de2-8f74-7c91-a3b2-5c5e937cf317";
+const FRODEX_GOAL_SUPERVISOR_MIGRATION_SQL: &str = "CREATE TABLE thread_goal_supervisor_state (\n    thread_id TEXT PRIMARY KEY NOT NULL REFERENCES threads(id) ON DELETE CASCADE,\n    goal_id TEXT NOT NULL,\n    snoozed_until_ms INTEGER,\n    updated_at_ms INTEGER NOT NULL\n);\n";
 
 fn migrator_through(version: i64) -> Migrator {
     Migrator {
@@ -29,6 +33,406 @@ fn migrator_through(version: i64) -> Migrator {
         table_name: STATE_MIGRATOR.table_name.clone(),
         create_schemas: STATE_MIGRATOR.create_schemas.clone(),
         no_tx: STATE_MIGRATOR.no_tx,
+    }
+}
+
+fn migrator_with_frodex_goal_supervisor_collision(version: i64, sql: &'static str) -> Migrator {
+    let mut migrations = STATE_MIGRATOR
+        .migrations
+        .iter()
+        .filter(|migration| migration.version < version)
+        .cloned()
+        .collect::<Vec<_>>();
+    let migration_type = STATE_MIGRATOR
+        .migrations
+        .first()
+        .expect("state migrations should not be empty")
+        .migration_type;
+    migrations.push(Migration::new(
+        version,
+        Cow::Borrowed(FRODEX_GOAL_SUPERVISOR_MIGRATION_DESCRIPTION),
+        migration_type,
+        sqlx::SqlStr::from_static(sql),
+        /*no_tx*/ false,
+    ));
+    Migrator::with_migrations(migrations)
+}
+
+async fn new_migration_test_pool() -> (std::path::PathBuf, crate::SqliteConfig, sqlx::SqlitePool) {
+    let sqlite_home = crate::runtime::test_support::unique_temp_dir();
+    tokio::fs::create_dir_all(&sqlite_home)
+        .await
+        .expect("sqlite home should be created");
+    let sqlite = crate::SqliteConfig::new_for_testing(sqlite_home.as_path().abs());
+    let pool = sqlite
+        .open_read_write_pool(&sqlite.state_db_path())
+        .await
+        .expect("sqlite database should open");
+    (sqlite_home, sqlite, pool)
+}
+
+#[tokio::test]
+async fn repairs_exact_frodex_goal_supervisor_migration_33_and_34() {
+    for version in [33_i64, 34_i64] {
+        let (sqlite_home, _sqlite, pool) = new_migration_test_pool().await;
+        let legacy_migrator = migrator_with_frodex_goal_supervisor_collision(
+            version,
+            FRODEX_GOAL_SUPERVISOR_MIGRATION_SQL,
+        );
+        let legacy = legacy_migrator
+            .migrations
+            .last()
+            .expect("legacy migration should exist");
+        assert_eq!(
+            legacy.checksum.as_ref(),
+            FRODEX_GOAL_SUPERVISOR_MIGRATION_CHECKSUM
+        );
+        legacy_migrator
+            .run(&pool)
+            .await
+            .expect("released Frodex migration should apply");
+
+        repair_frodex_goal_supervisor_state_migration(&pool)
+            .await
+            .expect("released Frodex collision should repair");
+        STATE_MIGRATOR
+            .run(&pool)
+            .await
+            .expect("official migrations should apply after repair");
+
+        let applied = sqlx::query_as::<_, (i64, String, Vec<u8>)>(
+            "SELECT version, description, checksum FROM _sqlx_migrations WHERE version IN (33, 34) ORDER BY version",
+        )
+        .fetch_all(&pool)
+        .await
+        .expect("official migration rows should load");
+        let expected = STATE_MIGRATOR
+            .migrations
+            .iter()
+            .filter(|migration| matches!(migration.version, 33 | 34))
+            .map(|migration| {
+                (
+                    migration.version,
+                    migration.description.to_string(),
+                    migration.checksum.to_vec(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(applied, expected);
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM sqlite_schema WHERE type = 'table' AND name = 'thread_goal_supervisor_state'",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            1,
+            "the source table remains until goals transfer"
+        );
+
+        pool.close().await;
+        std::fs::remove_dir_all(sqlite_home).expect("sqlite home should be removed");
+    }
+}
+
+#[tokio::test]
+async fn frodex_goal_supervisor_migration_repair_rejects_unknown_checksum_without_mutation() {
+    let (sqlite_home, _sqlite, pool) = new_migration_test_pool().await;
+    let legacy_migrator = migrator_with_frodex_goal_supervisor_collision(
+        33,
+        "CREATE TABLE thread_goal_supervisor_state (\n    thread_id TEXT PRIMARY KEY NOT NULL REFERENCES threads(id) ON DELETE CASCADE,\n    goal_id TEXT NOT NULL,\n    snoozed_until_ms INTEGER,\n    updated_at_ms INTEGER NOT NULL\n); \n",
+    );
+    legacy_migrator
+        .run(&pool)
+        .await
+        .expect("unknown legacy migration should apply");
+    let before = sqlx::query_as::<_, (String, bool, Vec<u8>)>(
+        "SELECT description, success, checksum FROM _sqlx_migrations WHERE version = 33",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+
+    let error = repair_frodex_goal_supervisor_state_migration(&pool)
+        .await
+        .expect_err("unknown checksum must fail closed");
+    assert!(
+        error
+            .to_string()
+            .contains("does not match the released Frodex migration")
+    );
+    let after = sqlx::query_as::<_, (String, bool, Vec<u8>)>(
+        "SELECT description, success, checksum FROM _sqlx_migrations WHERE version = 33",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(after, before);
+
+    pool.close().await;
+    std::fs::remove_dir_all(sqlite_home).expect("sqlite home should be removed");
+}
+
+#[tokio::test]
+async fn frodex_goal_supervisor_migration_repair_rejects_missing_or_incompatible_schema() {
+    for mutation in [
+        "DROP TABLE thread_goal_supervisor_state",
+        "ALTER TABLE thread_goal_supervisor_state ADD COLUMN extra TEXT",
+    ] {
+        let (sqlite_home, _sqlite, pool) = new_migration_test_pool().await;
+        migrator_with_frodex_goal_supervisor_collision(33, FRODEX_GOAL_SUPERVISOR_MIGRATION_SQL)
+            .run(&pool)
+            .await
+            .expect("released Frodex migration should apply");
+        sqlx::query(mutation).execute(&pool).await.unwrap();
+
+        repair_frodex_goal_supervisor_state_migration(&pool)
+            .await
+            .expect_err("incompatible schema must fail closed");
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM _sqlx_migrations WHERE version = 33 AND description = ?",
+            )
+            .bind(FRODEX_GOAL_SUPERVISOR_MIGRATION_DESCRIPTION)
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            1
+        );
+
+        pool.close().await;
+        std::fs::remove_dir_all(sqlite_home).expect("sqlite home should be removed");
+    }
+}
+
+#[tokio::test]
+async fn frodex_goal_supervisor_migration_repair_rejects_wrong_key_and_auxiliary_objects() {
+    let incompatible_schemas = [
+        r#"
+CREATE TABLE thread_goal_supervisor_state (
+    thread_id TEXT NOT NULL REFERENCES threads(id) ON DELETE CASCADE,
+    goal_id TEXT PRIMARY KEY NOT NULL,
+    snoozed_until_ms INTEGER,
+    updated_at_ms INTEGER NOT NULL
+)
+        "#,
+        r#"
+CREATE TABLE thread_goal_supervisor_state (
+    thread_id TEXT PRIMARY KEY NOT NULL REFERENCES threads(id) ON DELETE SET NULL,
+    goal_id TEXT NOT NULL,
+    snoozed_until_ms INTEGER,
+    updated_at_ms INTEGER NOT NULL
+)
+        "#,
+    ];
+    for schema in incompatible_schemas {
+        let (sqlite_home, _sqlite, pool) = new_migration_test_pool().await;
+        migrator_with_frodex_goal_supervisor_collision(33, FRODEX_GOAL_SUPERVISOR_MIGRATION_SQL)
+            .run(&pool)
+            .await
+            .unwrap();
+        sqlx::query("DROP TABLE thread_goal_supervisor_state")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(sqlx::AssertSqlSafe(schema.to_string()))
+            .execute(&pool)
+            .await
+            .unwrap();
+        repair_frodex_goal_supervisor_state_migration(&pool)
+            .await
+            .expect_err("wrong keys must fail closed");
+        pool.close().await;
+        std::fs::remove_dir_all(sqlite_home).unwrap();
+    }
+
+    let (sqlite_home, _sqlite, pool) = new_migration_test_pool().await;
+    migrator_with_frodex_goal_supervisor_collision(33, FRODEX_GOAL_SUPERVISOR_MIGRATION_SQL)
+        .run(&pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "CREATE TRIGGER incompatible_supervisor_trigger AFTER INSERT ON thread_goal_supervisor_state BEGIN SELECT 1; END",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    repair_frodex_goal_supervisor_state_migration(&pool)
+        .await
+        .expect_err("auxiliary triggers must fail closed");
+    pool.close().await;
+    std::fs::remove_dir_all(sqlite_home).unwrap();
+}
+
+#[tokio::test]
+async fn frodex_goal_supervisor_migration_repair_rejects_unreleased_table_constraints() {
+    let incompatible_schemas = [
+        r#"
+CREATE TABLE thread_goal_supervisor_state (
+    thread_id TEXT PRIMARY KEY NOT NULL REFERENCES threads(id) ON DELETE CASCADE,
+    goal_id TEXT UNIQUE NOT NULL,
+    snoozed_until_ms INTEGER,
+    updated_at_ms INTEGER NOT NULL
+)
+        "#,
+        r#"
+CREATE TABLE thread_goal_supervisor_state (
+    thread_id TEXT PRIMARY KEY NOT NULL REFERENCES threads(id) ON DELETE CASCADE,
+    goal_id TEXT NOT NULL CHECK(length(goal_id) > 0),
+    snoozed_until_ms INTEGER,
+    updated_at_ms INTEGER NOT NULL
+)
+        "#,
+        r#"
+CREATE TABLE thread_goal_supervisor_state (
+    thread_id TEXT PRIMARY KEY NOT NULL REFERENCES threads(id) ON DELETE CASCADE,
+    goal_id TEXT COLLATE NOCASE NOT NULL,
+    snoozed_until_ms INTEGER,
+    updated_at_ms INTEGER NOT NULL
+)
+        "#,
+        r#"
+CREATE TABLE thread_goal_supervisor_state (
+    thread_id TEXT PRIMARY KEY NOT NULL REFERENCES threads(id) ON DELETE CASCADE,
+    goal_id TEXT NOT NULL,
+    snoozed_until_ms INTEGER,
+    updated_at_ms INTEGER NOT NULL
+)
+STRICT
+        "#,
+    ];
+    for schema in incompatible_schemas {
+        let (sqlite_home, _sqlite, pool) = new_migration_test_pool().await;
+        migrator_with_frodex_goal_supervisor_collision(33, FRODEX_GOAL_SUPERVISOR_MIGRATION_SQL)
+            .run(&pool)
+            .await
+            .expect("released Frodex migration should apply");
+        sqlx::query("DROP TABLE thread_goal_supervisor_state")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(sqlx::AssertSqlSafe(schema.to_string()))
+            .execute(&pool)
+            .await
+            .expect("incompatible table should be valid SQLite");
+
+        repair_frodex_goal_supervisor_state_migration(&pool)
+            .await
+            .expect_err("unreleased constraints must fail closed");
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM _sqlx_migrations WHERE version = 33 AND description = ?",
+            )
+            .bind(FRODEX_GOAL_SUPERVISOR_MIGRATION_DESCRIPTION)
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            1
+        );
+        pool.close().await;
+        std::fs::remove_dir_all(sqlite_home).unwrap();
+    }
+}
+
+#[tokio::test]
+async fn frodex_goal_supervisor_migration_repair_rejects_multiple_candidates() {
+    let (sqlite_home, _sqlite, pool) = new_migration_test_pool().await;
+    migrator_with_frodex_goal_supervisor_collision(33, FRODEX_GOAL_SUPERVISOR_MIGRATION_SQL)
+        .run(&pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO _sqlx_migrations (version, description, success, checksum, execution_time) VALUES (34, ?, 1, ?, 0)",
+    )
+    .bind(FRODEX_GOAL_SUPERVISOR_MIGRATION_DESCRIPTION)
+    .bind(FRODEX_GOAL_SUPERVISOR_MIGRATION_CHECKSUM.as_slice())
+    .execute(&pool)
+    .await
+    .unwrap();
+    repair_frodex_goal_supervisor_state_migration(&pool)
+        .await
+        .expect_err("multiple candidates must fail closed");
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM _sqlx_migrations WHERE description = ?",
+        )
+        .bind(FRODEX_GOAL_SUPERVISOR_MIGRATION_DESCRIPTION)
+        .fetch_one(&pool)
+        .await
+        .unwrap(),
+        2
+    );
+    pool.close().await;
+    std::fs::remove_dir_all(sqlite_home).unwrap();
+}
+
+#[tokio::test]
+async fn frodex_goal_supervisor_migration_repair_rejects_unsuccessful_ledger_row() {
+    let (sqlite_home, _sqlite, pool) = new_migration_test_pool().await;
+    migrator_with_frodex_goal_supervisor_collision(33, FRODEX_GOAL_SUPERVISOR_MIGRATION_SQL)
+        .run(&pool)
+        .await
+        .expect("released Frodex migration should apply");
+    sqlx::query("UPDATE _sqlx_migrations SET success = 0 WHERE version = 33")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    repair_frodex_goal_supervisor_state_migration(&pool)
+        .await
+        .expect_err("unsuccessful ledger row must fail closed");
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT success FROM _sqlx_migrations WHERE version = 33")
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+        0
+    );
+
+    pool.close().await;
+    std::fs::remove_dir_all(sqlite_home).expect("sqlite home should be removed");
+}
+
+#[tokio::test]
+async fn frodex_goal_supervisor_migration_repair_authenticates_complete_predecessor_ledger() {
+    for mutation in [
+        "UPDATE _sqlx_migrations SET checksum = X'00' WHERE version = 32",
+        "UPDATE _sqlx_migrations SET success = 0 WHERE version = 32",
+        "DELETE FROM _sqlx_migrations WHERE version = 32",
+    ] {
+        let (sqlite_home, _sqlite, pool) = new_migration_test_pool().await;
+        migrator_with_frodex_goal_supervisor_collision(33, FRODEX_GOAL_SUPERVISOR_MIGRATION_SQL)
+            .run(&pool)
+            .await
+            .expect("released Frodex migration should apply");
+        sqlx::query(mutation).execute(&pool).await.unwrap();
+
+        repair_frodex_goal_supervisor_state_migration(&pool)
+            .await
+            .expect_err("an unauthenticated predecessor ledger must fail closed");
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM _sqlx_migrations WHERE version = 33 AND description = ?",
+            )
+            .bind(FRODEX_GOAL_SUPERVISOR_MIGRATION_DESCRIPTION)
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            1,
+            "the collision row must remain unchanged"
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM sqlite_schema WHERE type = 'table' AND name = 'thread_goal_supervisor_state'",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            1,
+            "the source table must remain unchanged"
+        );
+        pool.close().await;
+        std::fs::remove_dir_all(sqlite_home).expect("sqlite home should be removed");
     }
 }
 

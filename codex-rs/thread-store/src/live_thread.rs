@@ -3,7 +3,10 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
+use std::time::Duration;
+use std::time::Instant;
 
+use chrono::Utc;
 use codex_protocol::ThreadId;
 use codex_protocol::protocol::ThreadHistoryMode;
 use codex_protocol::protocol::ThreadMemoryMode;
@@ -32,8 +35,11 @@ use crate::ThreadPersistenceMode;
 use crate::ThreadStore;
 use crate::ThreadStoreError;
 use crate::ThreadStoreResult;
+use crate::TouchRootThreadRecencyParams;
 use crate::UpdateThreadMetadataParams;
 use crate::thread_metadata_sync::ThreadMetadataSync;
+
+const BACKGROUND_ROOT_RECENCY_INTERVAL: Duration = Duration::from_secs(60 * 60);
 
 /// Handle for an active thread's persistence lifecycle.
 ///
@@ -49,6 +55,7 @@ pub struct LiveThread {
     persistence_mode: Arc<Mutex<ThreadPersistenceMode>>,
     /// Rejects later persistence after a checkpoint may have committed ambiguously.
     persistence_restart_required: Arc<AtomicBool>,
+    root_recency_touch_state: Arc<Mutex<RootRecencyTouchState>>,
     persistence_telemetry: RolloutPersistenceTelemetry,
 }
 
@@ -76,6 +83,27 @@ impl Drop for CheckpointPersistenceRestartGuard {
         if self.armed {
             self.restart_required.store(true, Ordering::Release);
         }
+    }
+}
+
+/// Tracks descendant activity that still needs to advance the top-level root's recency.
+///
+/// A store call acknowledges only the generation it observed. Cancellation, errors, and appends
+/// that arrive while the store call is in flight therefore remain pending for a later flush.
+#[derive(Debug, Default)]
+struct RootRecencyTouchState {
+    latest_generation: u128,
+    acknowledged_generation: u128,
+    next_attempt: Option<Instant>,
+}
+
+impl RootRecencyTouchState {
+    fn record_activity(&mut self) {
+        self.latest_generation = self.latest_generation.saturating_add(1);
+    }
+
+    fn has_pending_activity(&self) -> bool {
+        self.latest_generation != self.acknowledged_generation
     }
 }
 
@@ -145,6 +173,7 @@ impl LiveThread {
             metadata_sync: Arc::new(Mutex::new(metadata_sync)),
             persistence_mode: Arc::new(Mutex::new(persistence_mode)),
             persistence_restart_required: Arc::new(AtomicBool::new(false)),
+            root_recency_touch_state: Arc::new(Mutex::new(RootRecencyTouchState::default())),
             persistence_telemetry: RolloutPersistenceTelemetry::new(thread_id),
         })
     }
@@ -242,6 +271,7 @@ impl LiveThread {
             metadata_sync: Arc::new(Mutex::new(metadata_sync)),
             persistence_mode: Arc::new(Mutex::new(ThreadPersistenceMode::Durable)),
             persistence_restart_required: Arc::new(AtomicBool::new(false)),
+            root_recency_touch_state: Arc::new(Mutex::new(RootRecencyTouchState::default())),
             persistence_telemetry: RolloutPersistenceTelemetry::new(thread_id),
         })
     }
@@ -262,6 +292,7 @@ impl LiveThread {
         if items.is_empty() {
             return Ok(());
         }
+        self.root_recency_touch_state.lock().await.record_activity();
         let update = self
             .metadata_sync
             .lock()
@@ -283,7 +314,48 @@ impl LiveThread {
                 .await
                 .mark_pending_update_applied(&update);
         }
+        self.flush_pending_root_recency_touch().await;
         Ok(())
+    }
+
+    async fn flush_pending_root_recency_touch(&self) {
+        let now = Instant::now();
+        let attempted_generation = {
+            let state = self.root_recency_touch_state.lock().await;
+            if !state.has_pending_activity()
+                || state
+                    .next_attempt
+                    .is_some_and(|next_attempt| now < next_attempt)
+            {
+                return;
+            }
+            state.latest_generation
+        };
+
+        match self
+            .thread_store
+            .touch_root_thread_recency(TouchRootThreadRecencyParams {
+                descendant_thread_id: self.thread_id,
+                activity_at: Utc::now(),
+                minimum_interval: BACKGROUND_ROOT_RECENCY_INTERVAL,
+            })
+            .await
+        {
+            Ok(retry_after) => {
+                let retry_after = retry_after.unwrap_or(BACKGROUND_ROOT_RECENCY_INTERVAL);
+                let mut state = self.root_recency_touch_state.lock().await;
+                if attempted_generation > state.acknowledged_generation {
+                    state.acknowledged_generation = attempted_generation;
+                    state.next_attempt = now.checked_add(retry_after);
+                }
+            }
+            Err(err) => {
+                warn!(
+                    "failed to advance root recency for {}: {err}",
+                    self.thread_id
+                );
+            }
+        }
     }
 
     async fn persist_appended_items(
@@ -330,7 +402,9 @@ impl LiveThread {
             .await?;
         *persistence_mode = ThreadPersistenceMode::Durable;
         drop(persistence_mode);
-        self.flush_pending_metadata_update().await
+        self.flush_pending_metadata_update().await?;
+        self.flush_pending_root_recency_touch().await;
+        Ok(())
     }
 
     #[expect(
@@ -346,7 +420,9 @@ impl LiveThread {
         }
         drop(persistence_mode);
         self.flush_pending_metadata_update_for_existing_history()
-            .await
+            .await?;
+        self.flush_pending_root_recency_touch().await;
+        Ok(())
     }
 
     /// Returns whether this thread should remain memory-only until explicitly persisted.
@@ -389,6 +465,7 @@ impl LiveThread {
         let frozen = freeze_result.map(Some)?;
         drop(persistence_mode);
         self.flush_pending_metadata_update().await?;
+        self.flush_pending_root_recency_touch().await;
         Ok(frozen)
     }
 
@@ -521,6 +598,9 @@ impl LiveThread {
         } else {
             Ok(())
         };
+        if matches!(*persistence_mode, ThreadPersistenceMode::Durable) {
+            self.flush_pending_root_recency_touch().await;
+        }
         let shutdown_result = self.thread_store.shutdown_thread(self.thread_id).await;
         match (metadata_result, shutdown_result) {
             (Err(metadata_error), Err(shutdown_error)) => Err(ThreadStoreError::Internal {
@@ -690,5 +770,150 @@ impl LiveThread {
             .await
             .mark_pending_update_applied(&update);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::InMemoryThreadStore;
+    use crate::ThreadPersistenceMetadata;
+    use codex_protocol::models::BaseInstructions;
+    use codex_protocol::models::ContentItem;
+    use codex_protocol::models::ResponseItem;
+    use codex_protocol::protocol::SessionSource;
+
+    #[tokio::test]
+    async fn retains_debounced_and_failed_root_recency_touches() {
+        let store = Arc::new(InMemoryThreadStore::default());
+        store
+            .queue_root_recency_touch_results([Ok(Some(Duration::from_secs(60 * 60)))])
+            .await;
+        let (blocked_touch_started, blocked_touch_release) = store
+            .queue_blocked_root_recency_touch(Ok(Some(Duration::from_secs(60 * 60))))
+            .await;
+        store
+            .queue_root_recency_touch_results([
+                Err(ThreadStoreError::Internal {
+                    message: "injected root recency failure".to_string(),
+                }),
+                Ok(Some(Duration::from_secs(60 * 60))),
+            ])
+            .await;
+        let thread_id = ThreadId::new();
+        let live_thread = LiveThread::create(store.clone(), create_thread_params(thread_id))
+            .await
+            .expect("live thread should be created");
+        let activity = RolloutItem::ResponseItem(
+            ResponseItem::Message {
+                id: None,
+                role: "user".to_string(),
+                content: vec![ContentItem::InputText {
+                    text: "descendant activity".to_string(),
+                }],
+                phase: None,
+                internal_chat_message_metadata_passthrough: None,
+            }
+            .into(),
+        );
+
+        live_thread
+            .append_items(std::slice::from_ref(&activity))
+            .await
+            .expect("first activity should persist and touch root recency");
+        live_thread
+            .append_items(std::slice::from_ref(&activity))
+            .await
+            .expect("second activity should remain pending during debounce");
+        assert_eq!(store.calls().await.touch_root_thread_recency, 1);
+        assert!(
+            live_thread
+                .root_recency_touch_state
+                .lock()
+                .await
+                .has_pending_activity()
+        );
+
+        live_thread
+            .root_recency_touch_state
+            .lock()
+            .await
+            .next_attempt = Some(Instant::now());
+        let cancelled_flush = tokio::spawn({
+            let live_thread = live_thread.clone();
+            async move { live_thread.flush().await }
+        });
+        blocked_touch_started.notified().await;
+        cancelled_flush.abort();
+        assert!(
+            cancelled_flush
+                .await
+                .expect_err("flush should be cancelled")
+                .is_cancelled()
+        );
+        drop(blocked_touch_release);
+        assert_eq!(store.calls().await.touch_root_thread_recency, 2);
+        assert!(
+            live_thread
+                .root_recency_touch_state
+                .lock()
+                .await
+                .has_pending_activity()
+        );
+
+        live_thread
+            .flush()
+            .await
+            .expect("failed root recency touch should remain best effort");
+        assert_eq!(store.calls().await.touch_root_thread_recency, 3);
+        assert!(
+            live_thread
+                .root_recency_touch_state
+                .lock()
+                .await
+                .has_pending_activity()
+        );
+
+        live_thread
+            .shutdown()
+            .await
+            .expect("shutdown should retry the failed root recency touch");
+        assert_eq!(store.calls().await.touch_root_thread_recency, 4);
+        assert!(
+            !live_thread
+                .root_recency_touch_state
+                .lock()
+                .await
+                .has_pending_activity()
+        );
+    }
+
+    fn create_thread_params(thread_id: ThreadId) -> CreateThreadParams {
+        CreateThreadParams {
+            session_id: thread_id.into(),
+            thread_id,
+            extra_config: None,
+            forked_from_id: None,
+            forked_from_ordinal_exclusive: None,
+            parent_thread_id: None,
+            source: SessionSource::Exec,
+            thread_source: None,
+            originator: "test_originator".to_string(),
+            base_instructions: BaseInstructions::default(),
+            dynamic_tools: Vec::new(),
+            selected_capability_roots: Vec::new(),
+            multi_agent_version: None,
+            history_mode: ThreadHistoryMode::Legacy,
+            history_base: None,
+            subagent_history_start_ordinal: None,
+            persistence_mode: ThreadPersistenceMode::Durable,
+            initial_rollout_ordinal: 0,
+            initial_window_id: uuid::Uuid::now_v7().to_string(),
+            metadata: ThreadPersistenceMetadata {
+                cwd: None,
+                model_provider: "test-provider".to_string(),
+                memory_mode: ThreadMemoryMode::Enabled,
+            },
+        }
     }
 }

@@ -34,6 +34,7 @@ use codex_context_fragments::AnnotatedContent;
 use codex_context_fragments::set_annotated_content;
 use codex_history::CodexHarnessMetadata;
 use codex_history::ResponseItemEnvelope;
+use codex_protocol::AgentPath;
 use codex_protocol::error::CodexErr;
 use codex_protocol::error::CodexErrorDetails;
 use codex_protocol::error::Result as CodexResult;
@@ -86,6 +87,7 @@ impl CompactionReporting {
     }
 }
 const COMPACT_USER_MESSAGE_MAX_TOKENS: usize = 20_000;
+pub(crate) const MAX_RECENT_SUBAGENT_MESSAGES: usize = 16;
 pub(crate) const UNIFIED_EXEC_PROCESS_WARNING_PREFIX: &str =
     "Warning: The maximum number of unified exec process";
 
@@ -399,6 +401,7 @@ async fn run_compact_task_inner_impl(
         }
     }
 
+    let agent_path = turn_context.session_source.get_agent_path();
     let history_snapshot = sess.clone_history().await;
     let history_items = history_snapshot.annotated_items();
     let summary_suffix =
@@ -411,6 +414,9 @@ async fn run_compact_task_inner_impl(
         // This replacement history skips `record_conversation_items`; only the appended summary
         // belongs to this compaction turn.
         summary_item.set_turn_id_if_missing(&turn_context.sub_id);
+    }
+    if let Some(agent_path) = agent_path.as_ref() {
+        retain_subagent_assignment_and_recent_messages(history_items, &mut new_history, agent_path);
     }
     let (window_number, window_ids) = sess.advance_auto_compact_window().await;
 
@@ -590,6 +596,71 @@ pub(crate) fn collect_user_messages(items: &[ResponseItem]) -> Vec<CompactedUser
 
 pub(crate) fn is_compaction_filtered_user_message(message: &str) -> bool {
     message.starts_with(UNIFIED_EXEC_PROCESS_WARNING_PREFIX)
+}
+
+/// Keeps the original subagent assignment and a bounded suffix of later messages.
+///
+/// Remote compaction can omit every `AgentMessage`, while local compaction otherwise retains only
+/// user messages. A forked subagent must not resume work with an ancestor's user request as its
+/// newest instruction after its parent-assigned task disappears.
+pub(crate) fn retain_subagent_assignment_and_recent_messages(
+    previous_history: &[ResponseItemEnvelope],
+    compacted_history: &mut Vec<ResponseItemEnvelope>,
+    agent_path: &AgentPath,
+) {
+    let is_message_for_subagent = |item: &&ResponseItemEnvelope| {
+        matches!(
+            &item.item,
+            ResponseItem::AgentMessage { recipient, .. } if recipient == agent_path.as_str()
+        )
+    };
+
+    let Some(initial_assignment) = previous_history
+        .iter()
+        .find(is_message_for_subagent)
+        .cloned()
+    else {
+        return;
+    };
+
+    let mut retained_messages = previous_history
+        .iter()
+        .rev()
+        .filter(is_message_for_subagent)
+        .take(MAX_RECENT_SUBAGENT_MESSAGES)
+        .cloned()
+        .collect::<Vec<_>>();
+    retained_messages.reverse();
+    if retained_messages
+        .first()
+        .is_none_or(|message| message != &initial_assignment)
+    {
+        retained_messages.insert(0, initial_assignment);
+    }
+
+    compacted_history.retain(|item| {
+        !matches!(
+            &item.item,
+            ResponseItem::AgentMessage { recipient, .. } if recipient == agent_path.as_str()
+        )
+    });
+
+    let insertion_index = compacted_history
+        .last()
+        .filter(|item| {
+            matches!(
+                &item.item,
+                ResponseItem::Compaction { .. } | ResponseItem::ContextCompaction { .. }
+            ) || matches!(
+                &item.item,
+                ResponseItem::Message { role, content, .. }
+                    if role == "user"
+                        && content_items_to_text(content)
+                            .is_some_and(|message| is_summary_message(&message))
+            )
+        })
+        .map_or(compacted_history.len(), |_| compacted_history.len() - 1);
+    compacted_history.splice(insertion_index..insertion_index, retained_messages);
 }
 
 pub(crate) fn is_compaction_filtered_history_item(item: &ResponseItem) -> bool {

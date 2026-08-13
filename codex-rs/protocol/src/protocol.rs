@@ -4028,7 +4028,15 @@ pub enum ThreadGoalStatus {
     Complete,
 }
 
-pub const MAX_THREAD_GOAL_OBJECTIVE_CHARS: usize = 4_000;
+/// Maximum persisted goal-objective length.
+///
+/// Objectives are reinjected into model context for continuation and supervisor turns, so accepted
+/// values must also satisfy the model-visible representation guard in
+/// [`validate_thread_goal_objective`].
+pub const MAX_THREAD_GOAL_OBJECTIVE_CHARS: usize = 16_000;
+// Leave room below the model-item ceiling for goal prompt templates and response wrappers. This is
+// a pathological-input guard, not a second user-facing goal limit.
+const MAX_THREAD_GOAL_OBJECTIVE_REPRESENTATION_TOKENS: usize = 6_000;
 
 pub fn validate_thread_goal_objective(value: &str) -> Result<(), String> {
     if value.is_empty() {
@@ -4038,6 +4046,27 @@ pub fn validate_thread_goal_objective(value: &str) -> Result<(), String> {
         return Err(format!(
             "goal objective must be at most {MAX_THREAD_GOAL_OBJECTIVE_CHARS} characters"
         ));
+    }
+    let json = serde_json::to_string(value)
+        .map_err(|err| format!("failed to serialize goal objective: {err}"))?;
+    let xml_escaped_bytes = value.bytes().fold(0_usize, |total, byte| {
+        total.saturating_add(match byte {
+            b'&' => 5,
+            b'<' | b'>' => 4,
+            _ => 1,
+        })
+    });
+    if codex_utils_string::approx_token_count(value)
+        > MAX_THREAD_GOAL_OBJECTIVE_REPRESENTATION_TOKENS
+        || codex_utils_string::approx_tokens_from_byte_count(xml_escaped_bytes) as usize
+            > MAX_THREAD_GOAL_OBJECTIVE_REPRESENTATION_TOKENS
+        || codex_utils_string::approx_token_count(&json)
+            > MAX_THREAD_GOAL_OBJECTIVE_REPRESENTATION_TOKENS
+    {
+        return Err(
+            "goal objective is too large to include safely in model context; use ordinary text or move bulky data into a referenced file"
+                .to_string(),
+        );
     }
     Ok(())
 }
@@ -4475,6 +4504,35 @@ mod tests {
         assert_eq!(serde_json::to_value(&decision)?, value);
         assert_eq!(serde_json::from_value::<ReviewDecision>(value)?, decision);
         Ok(())
+    }
+
+    #[test]
+    fn thread_goal_objective_enforces_length_and_model_context_limits() {
+        let tail = "FULL_OBJECTIVE_TAIL_9F3A";
+        let objective = format!(
+            "{}{}",
+            "x".repeat(MAX_THREAD_GOAL_OBJECTIVE_CHARS - tail.chars().count()),
+            tail
+        );
+        assert_eq!(validate_thread_goal_objective(&objective), Ok(()));
+        assert_eq!(
+            validate_thread_goal_objective(&"x".repeat(MAX_THREAD_GOAL_OBJECTIVE_CHARS + 1)),
+            Err(format!(
+                "goal objective must be at most {MAX_THREAD_GOAL_OBJECTIVE_CHARS} characters"
+            ))
+        );
+        let representation_error = Err(
+            "goal objective is too large to include safely in model context; use ordinary text or move bulky data into a referenced file"
+                .to_string(),
+        );
+        assert_eq!(
+            validate_thread_goal_objective(&"🚀".repeat(MAX_THREAD_GOAL_OBJECTIVE_CHARS)),
+            representation_error
+        );
+        assert_eq!(
+            validate_thread_goal_objective(&"&".repeat(MAX_THREAD_GOAL_OBJECTIVE_CHARS)),
+            representation_error
+        );
     }
 
     #[test]

@@ -21,11 +21,13 @@ use crate::model::epoch_millis_to_datetime;
 use crate::paths::file_modified_time_utc;
 use crate::telemetry::DbKind;
 use crate::telemetry::DbTelemetry;
+use anyhow::Context;
 use chrono::DateTime;
 use chrono::Utc;
 use codex_history::RolloutItem;
 use codex_protocol::ThreadId;
 use serde_json::Value;
+use sqlx::Connection;
 use sqlx::QueryBuilder;
 use sqlx::Row;
 use sqlx::Sqlite;
@@ -59,10 +61,13 @@ pub use external_agent_config_imports::ExternalAgentConfigImportDetailsRecord;
 pub use external_agent_config_imports::ExternalAgentConfigImportFailureRecord;
 pub use external_agent_config_imports::ExternalAgentConfigImportHistoryRecord;
 pub use external_agent_config_imports::ExternalAgentConfigImportSuccessRecord;
+pub use goals::ActiveGoalSupervisorSchedule;
+pub use goals::ActiveGoalSupervisorSchedulesPage;
 pub use goals::GoalAccountingMode;
 pub use goals::GoalAccountingOutcome;
 pub use goals::GoalStore;
 pub use goals::GoalUpdate;
+pub use goals::ListActiveGoalSupervisorSchedulesParams;
 pub use memories::MemoryStore;
 pub use queued_items::SqliteQueueStore;
 pub use recovery::RuntimeDbBackup;
@@ -196,6 +201,25 @@ impl StateRuntime {
                 return Err(err);
             }
         };
+        let thread_goals = GoalStore::new(Arc::clone(&goals_pool));
+        let thread_goals_init_result = async {
+            thread_goals
+                .ensure_thread_goal_supervisor_state_table()
+                .await?;
+            migrate_frodex_goal_supervisor_state_from_state_db(pool.as_ref(), &thread_goals).await
+        }
+        .await;
+        if let Err(err) = thread_goals_init_result {
+            close_sqlite_pools(&[
+                pool.as_ref(),
+                logs_pool.as_ref(),
+                goals_pool.as_ref(),
+                memories_pool.as_ref(),
+                queue_pool.as_ref(),
+            ])
+            .await;
+            return Err(err);
+        }
         let started = Instant::now();
         let backfill_state_result = ensure_backfill_state_row_in_pool(pool.as_ref()).await;
         crate::telemetry::record_init_result(
@@ -249,7 +273,7 @@ impl StateRuntime {
         let thread_updated_at_millis = thread_updated_at_millis.unwrap_or(0);
         let thread_recency_at_millis = thread_recency_at_millis.unwrap_or(0);
         let runtime = Arc::new(Self {
-            thread_goals: GoalStore::new(Arc::clone(&goals_pool)),
+            thread_goals,
             memories: MemoryStore::new(Arc::clone(&memories_pool), Arc::clone(&pool)),
             thread_queue: SqliteQueueStore::new(queue_pool),
             pool,
@@ -315,6 +339,53 @@ async fn close_sqlite_pools(pools: &[&SqlitePool]) {
     for pool in pools {
         pool.close().await;
     }
+}
+
+async fn migrate_frodex_goal_supervisor_state_from_state_db(
+    state_pool: &SqlitePool,
+    thread_goals: &GoalStore,
+) -> anyhow::Result<()> {
+    let supervisor_table_exists: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM sqlite_schema WHERE type = 'table' AND name = 'thread_goal_supervisor_state'",
+    )
+    .fetch_one(state_pool)
+    .await?;
+    if supervisor_table_exists == 0 {
+        return Ok(());
+    }
+
+    let mut state_connection = state_pool.acquire().await?;
+    let mut state_transaction = state_connection.begin_with("BEGIN IMMEDIATE").await?;
+    let supervisor_table_exists: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM sqlite_schema WHERE type = 'table' AND name = 'thread_goal_supervisor_state'",
+    )
+    .fetch_one(&mut *state_transaction)
+    .await?;
+    if supervisor_table_exists == 0 {
+        state_transaction.commit().await?;
+        return Ok(());
+    }
+    crate::migrations::validate_frodex_goal_supervisor_state_table_on(&mut state_transaction)
+        .await?;
+
+    let supervisor_rows = sqlx::query_as::<_, (String, String, Option<i64>, i64)>(
+        r#"
+SELECT thread_id, goal_id, snoozed_until_ms, updated_at_ms
+FROM thread_goal_supervisor_state
+ORDER BY thread_id
+        "#,
+    )
+    .fetch_all(&mut *state_transaction)
+    .await?;
+    thread_goals
+        .upsert_frodex_goal_supervisor_state_rows(supervisor_rows)
+        .await?;
+    sqlx::query("DROP TABLE thread_goal_supervisor_state")
+        .execute(&mut *state_transaction)
+        .await
+        .context("dropping transferred Frodex goal supervisor state table")?;
+    state_transaction.commit().await?;
+    Ok(())
 }
 
 /// Open and migrate the rebuildable paginated thread-history database.
@@ -428,12 +499,16 @@ mod tests {
     use super::test_support::unique_temp_dir;
     use crate::DB_INIT_METRIC;
     use crate::DbTelemetry;
+    use crate::migrations::GOALS_MIGRATOR;
     use crate::migrations::STATE_MIGRATOR;
     use codex_protocol::ThreadId;
     use codex_utils_absolute_path::test_support::PathExt;
     use pretty_assertions::assert_eq;
     use sqlx::SqlitePool;
     use sqlx::migrate::MigrateError;
+    use sqlx::migrate::Migration;
+    use sqlx::migrate::Migrator;
+    use std::borrow::Cow;
     use std::collections::BTreeMap;
     use std::collections::BTreeSet;
     use std::path::Path;
@@ -500,6 +575,461 @@ mod tests {
             .open_read_write_pool(path)
             .await
             .expect("open sqlite pool")
+    }
+
+    const LEGACY_SUPERVISOR_TABLE_SQL: &str = r#"
+CREATE TABLE thread_goal_supervisor_state (
+    thread_id TEXT PRIMARY KEY NOT NULL REFERENCES threads(id) ON DELETE CASCADE,
+    goal_id TEXT NOT NULL,
+    snoozed_until_ms INTEGER,
+    updated_at_ms INTEGER NOT NULL
+)
+    "#;
+    const LEGACY_SUPERVISOR_MIGRATION_SQL: &str = "CREATE TABLE thread_goal_supervisor_state (\n    thread_id TEXT PRIMARY KEY NOT NULL REFERENCES threads(id) ON DELETE CASCADE,\n    goal_id TEXT NOT NULL,\n    snoozed_until_ms INTEGER,\n    updated_at_ms INTEGER NOT NULL\n);\n";
+
+    async fn insert_test_thread(pool: &SqlitePool, thread_id: &str) {
+        sqlx::query(
+            r#"
+INSERT INTO threads (
+    id, rollout_path, created_at, updated_at, source, model_provider, cwd, title,
+    sandbox_policy, approval_mode
+) VALUES (?, ?, 1, 1, 'cli', 'openai', '/tmp', '', 'read-only', 'on-request')
+            "#,
+        )
+        .bind(thread_id)
+        .bind(format!("/tmp/{thread_id}.jsonl"))
+        .execute(pool)
+        .await
+        .expect("test thread should insert");
+    }
+
+    async fn seed_official_state_with_legacy_supervisor_rows(
+        sqlite: &crate::SqliteConfig,
+        rows: &[(&str, &str, Option<i64>, i64)],
+    ) {
+        let pool = sqlite
+            .open_read_write_pool(&sqlite.state_db_path())
+            .await
+            .expect("state database should open");
+        STATE_MIGRATOR
+            .run(&pool)
+            .await
+            .expect("official state migrations should apply");
+        sqlx::query(LEGACY_SUPERVISOR_TABLE_SQL)
+            .execute(&pool)
+            .await
+            .expect("legacy supervisor table should be created");
+        for (thread_id, goal_id, snoozed_until_ms, updated_at_ms) in rows {
+            insert_test_thread(&pool, thread_id).await;
+            sqlx::query(
+                "INSERT INTO thread_goal_supervisor_state (thread_id, goal_id, snoozed_until_ms, updated_at_ms) VALUES (?, ?, ?, ?)",
+            )
+            .bind(thread_id)
+            .bind(goal_id)
+            .bind(snoozed_until_ms)
+            .bind(updated_at_ms)
+            .execute(&pool)
+            .await
+            .expect("legacy supervisor row should insert");
+        }
+        pool.close().await;
+    }
+
+    #[tokio::test]
+    async fn startup_repairs_and_transfers_exact_released_frodex_migration_33_and_34() {
+        for version in [33_i64, 34_i64] {
+            let sqlite_home = unique_temp_dir();
+            tokio::fs::create_dir_all(&sqlite_home).await.unwrap();
+            let sqlite = crate::SqliteConfig::new_for_testing(sqlite_home.as_path().abs());
+            let pool = sqlite
+                .open_read_write_pool(&sqlite.state_db_path())
+                .await
+                .unwrap();
+            let mut migrations = STATE_MIGRATOR
+                .migrations
+                .iter()
+                .filter(|migration| migration.version < version)
+                .cloned()
+                .collect::<Vec<_>>();
+            migrations.push(Migration::new(
+                version,
+                Cow::Borrowed("thread goal supervisor state"),
+                STATE_MIGRATOR.migrations[0].migration_type,
+                sqlx::SqlStr::from_static(LEGACY_SUPERVISOR_MIGRATION_SQL),
+                /*no_tx*/ false,
+            ));
+            Migrator::with_migrations(migrations)
+                .run(&pool)
+                .await
+                .expect("released Frodex migration should apply");
+            let thread_id = format!("00000000-0000-0000-0000-0000000003{version}");
+            insert_test_thread(&pool, thread_id.as_str()).await;
+            sqlx::query(
+                "INSERT INTO thread_goal_supervisor_state (thread_id, goal_id, snoozed_until_ms, updated_at_ms) VALUES (?, ?, ?, ?)",
+            )
+            .bind(thread_id.as_str())
+            .bind(format!("goal-{version}"))
+            .bind(version * 1_000)
+            .bind(version)
+            .execute(&pool)
+            .await
+            .unwrap();
+            pool.close().await;
+
+            let runtime = StateRuntime::init(sqlite.clone(), "test-provider".to_string())
+                .await
+                .expect("runtime startup should repair and transfer");
+            let thread_id = codex_protocol::ThreadId::from_string(thread_id.as_str()).unwrap();
+            assert_eq!(
+                runtime
+                    .thread_goals()
+                    .get_thread_goal_supervisor_snoozed_until_ms(
+                        thread_id,
+                        format!("goal-{version}").as_str(),
+                    )
+                    .await
+                    .unwrap(),
+                Some(version * 1_000)
+            );
+            runtime.close().await;
+            let state_pool = sqlite
+                .open_read_write_pool(&sqlite.state_db_path())
+                .await
+                .unwrap();
+            assert_eq!(
+                sqlx::query_scalar::<_, i64>(
+                    "SELECT COUNT(*) FROM sqlite_schema WHERE type = 'table' AND name = 'thread_goal_supervisor_state'",
+                )
+                .fetch_one(&state_pool)
+                .await
+                .unwrap(),
+                0
+            );
+            state_pool.close().await;
+            let _ = tokio::fs::remove_dir_all(sqlite_home).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn transfers_interrupted_frodex_supervisor_state_and_repeated_start_is_a_noop() {
+        let sqlite_home = unique_temp_dir();
+        tokio::fs::create_dir_all(&sqlite_home).await.unwrap();
+        let sqlite = crate::SqliteConfig::new_for_testing(sqlite_home.as_path().abs());
+        let thread_id = "00000000-0000-0000-0000-000000000331";
+        seed_official_state_with_legacy_supervisor_rows(
+            &sqlite,
+            &[(thread_id, "goal-331", Some(331_000), 331)],
+        )
+        .await;
+
+        for _ in 0..2 {
+            let runtime = StateRuntime::init(sqlite.clone(), "test-provider".to_string())
+                .await
+                .expect("state runtime should initialize");
+            let thread_id = codex_protocol::ThreadId::from_string(thread_id).unwrap();
+            assert_eq!(
+                runtime
+                    .thread_goals()
+                    .get_thread_goal_supervisor_snoozed_until_ms(thread_id, "goal-331")
+                    .await
+                    .unwrap(),
+                Some(331_000)
+            );
+            runtime.close().await;
+        }
+
+        let state_pool = sqlite
+            .open_read_write_pool(&sqlite.state_db_path())
+            .await
+            .unwrap();
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM sqlite_schema WHERE type = 'table' AND name = 'thread_goal_supervisor_state'",
+            )
+            .fetch_one(&state_pool)
+            .await
+            .unwrap(),
+            0
+        );
+        state_pool.close().await;
+        let _ = tokio::fs::remove_dir_all(sqlite_home).await;
+    }
+
+    #[tokio::test]
+    async fn startup_rejects_an_incompatible_goal_supervisor_destination_without_legacy_source() {
+        let sqlite_home = unique_temp_dir();
+        tokio::fs::create_dir_all(&sqlite_home).await.unwrap();
+        let sqlite = crate::SqliteConfig::new_for_testing(sqlite_home.as_path().abs());
+        let initialized = StateRuntime::init(sqlite.clone(), "test-provider".to_string())
+            .await
+            .expect("runtime databases should initialize");
+        initialized.close().await;
+        let goals_pool = sqlite
+            .open_read_write_pool(&sqlite.goals_db_path())
+            .await
+            .unwrap();
+        sqlx::query("DROP TABLE thread_goal_supervisor_state")
+            .execute(&goals_pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            r#"
+CREATE TABLE thread_goal_supervisor_state (
+    thread_id TEXT PRIMARY KEY NOT NULL,
+    goal_id TEXT UNIQUE NOT NULL,
+    snoozed_until_ms INTEGER,
+    updated_at_ms INTEGER NOT NULL
+)
+            "#,
+        )
+        .execute(&goals_pool)
+        .await
+        .unwrap();
+        goals_pool.close().await;
+
+        assert!(
+            StateRuntime::init(sqlite, "test-provider".to_string())
+                .await
+                .is_err(),
+            "startup must reject an incompatible goals destination"
+        );
+        let _ = tokio::fs::remove_dir_all(sqlite_home).await;
+    }
+
+    #[tokio::test]
+    async fn failed_goals_transfer_keeps_complete_source_for_retry() {
+        let sqlite_home = unique_temp_dir();
+        tokio::fs::create_dir_all(&sqlite_home).await.unwrap();
+        let sqlite = crate::SqliteConfig::new_for_testing(sqlite_home.as_path().abs());
+        let first_thread = "00000000-0000-0000-0000-000000000341";
+        let second_thread = "00000000-0000-0000-0000-000000000342";
+        seed_official_state_with_legacy_supervisor_rows(
+            &sqlite,
+            &[
+                (first_thread, "goal-341", Some(341_000), 341),
+                (second_thread, "goal-342", Some(342_000), 342),
+            ],
+        )
+        .await;
+
+        let goals_pool = sqlite
+            .open_read_write_pool(&sqlite.goals_db_path())
+            .await
+            .unwrap();
+        GOALS_MIGRATOR.run(&goals_pool).await.unwrap();
+        sqlx::query(
+            r#"
+CREATE TABLE thread_goal_supervisor_state (
+    thread_id TEXT PRIMARY KEY NOT NULL,
+    goal_id TEXT NOT NULL,
+    snoozed_until_ms INTEGER,
+    updated_at_ms INTEGER NOT NULL
+)
+            "#,
+        )
+        .execute(&goals_pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "CREATE TRIGGER reject_second_supervisor_row BEFORE INSERT ON thread_goal_supervisor_state WHEN NEW.thread_id = '00000000-0000-0000-0000-000000000342' BEGIN SELECT RAISE(ABORT, 'injected transfer failure'); END",
+        )
+        .execute(&goals_pool)
+        .await
+        .unwrap();
+        goals_pool.close().await;
+
+        assert!(
+            StateRuntime::init(sqlite.clone(), "test-provider".to_string())
+                .await
+                .is_err(),
+            "injected target failure should fail initialization"
+        );
+        let state_pool = sqlite
+            .open_read_write_pool(&sqlite.state_db_path())
+            .await
+            .unwrap();
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM thread_goal_supervisor_state")
+                .fetch_one(&state_pool)
+                .await
+                .unwrap(),
+            2
+        );
+        state_pool.close().await;
+        let goals_pool = sqlite
+            .open_read_write_pool(&sqlite.goals_db_path())
+            .await
+            .unwrap();
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM thread_goal_supervisor_state")
+                .fetch_one(&goals_pool)
+                .await
+                .unwrap(),
+            0,
+            "the target batch should roll back atomically"
+        );
+        sqlx::query("DROP TRIGGER reject_second_supervisor_row")
+            .execute(&goals_pool)
+            .await
+            .unwrap();
+        goals_pool.close().await;
+
+        let runtime = StateRuntime::init(sqlite.clone(), "test-provider".to_string())
+            .await
+            .expect("retry should transfer the complete source");
+        runtime.close().await;
+        let goals_pool = sqlite
+            .open_read_write_pool(&sqlite.goals_db_path())
+            .await
+            .unwrap();
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM thread_goal_supervisor_state")
+                .fetch_one(&goals_pool)
+                .await
+                .unwrap(),
+            2
+        );
+        goals_pool.close().await;
+        let _ = tokio::fs::remove_dir_all(sqlite_home).await;
+    }
+
+    #[tokio::test]
+    async fn repeated_frodex_supervisor_transfer_preserves_newer_target_state() {
+        let sqlite_home = unique_temp_dir();
+        tokio::fs::create_dir_all(&sqlite_home).await.unwrap();
+        let sqlite = crate::SqliteConfig::new_for_testing(sqlite_home.as_path().abs());
+        let thread_id = "00000000-0000-0000-0000-000000000351";
+        seed_official_state_with_legacy_supervisor_rows(
+            &sqlite,
+            &[(thread_id, "legacy-goal", Some(351_000), 351)],
+        )
+        .await;
+        let goals_pool = sqlite
+            .open_read_write_pool(&sqlite.goals_db_path())
+            .await
+            .unwrap();
+        GOALS_MIGRATOR.run(&goals_pool).await.unwrap();
+        sqlx::query(
+            r#"
+CREATE TABLE thread_goal_supervisor_state (
+    thread_id TEXT PRIMARY KEY NOT NULL,
+    goal_id TEXT NOT NULL,
+    snoozed_until_ms INTEGER,
+    updated_at_ms INTEGER NOT NULL
+)
+            "#,
+        )
+        .execute(&goals_pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO thread_goal_supervisor_state (thread_id, goal_id, snoozed_until_ms, updated_at_ms) VALUES (?, 'newer-goal', 999000, 999)",
+        )
+        .bind(thread_id)
+        .execute(&goals_pool)
+        .await
+        .unwrap();
+        goals_pool.close().await;
+
+        let runtime = StateRuntime::init(sqlite.clone(), "test-provider".to_string())
+            .await
+            .expect("transfer should converge");
+        runtime.close().await;
+        let goals_pool = sqlite
+            .open_read_write_pool(&sqlite.goals_db_path())
+            .await
+            .unwrap();
+        let row = sqlx::query_as::<_, (String, Option<i64>, i64)>(
+            "SELECT goal_id, snoozed_until_ms, updated_at_ms FROM thread_goal_supervisor_state WHERE thread_id = ?",
+        )
+        .bind(thread_id)
+        .fetch_one(&goals_pool)
+        .await
+        .unwrap();
+        assert_eq!(row, ("newer-goal".to_string(), Some(999_000), 999));
+        goals_pool.close().await;
+        let _ = tokio::fs::remove_dir_all(sqlite_home).await;
+    }
+
+    #[tokio::test]
+    async fn concurrent_frodex_supervisor_transfers_converge() {
+        let sqlite_home = unique_temp_dir();
+        tokio::fs::create_dir_all(&sqlite_home).await.unwrap();
+        let sqlite = crate::SqliteConfig::new_for_testing(sqlite_home.as_path().abs());
+        let initialized = StateRuntime::init(sqlite.clone(), "test-provider".to_string())
+            .await
+            .expect("runtime databases should initialize before the concurrent transfer");
+        initialized.close().await;
+        tokio::fs::remove_file(sqlite.state_db_path())
+            .await
+            .expect("official state database should be replaced by the released collision");
+        let thread_id = "00000000-0000-0000-0000-000000000361";
+        let state_pool = sqlite
+            .open_read_write_pool(&sqlite.state_db_path())
+            .await
+            .unwrap();
+        let mut migrations = STATE_MIGRATOR
+            .migrations
+            .iter()
+            .filter(|migration| migration.version < 33)
+            .cloned()
+            .collect::<Vec<_>>();
+        migrations.push(Migration::new(
+            33,
+            Cow::Borrowed("thread goal supervisor state"),
+            STATE_MIGRATOR.migrations[0].migration_type,
+            sqlx::SqlStr::from_static(LEGACY_SUPERVISOR_MIGRATION_SQL),
+            /*no_tx*/ false,
+        ));
+        Migrator::with_migrations(migrations)
+            .run(&state_pool)
+            .await
+            .expect("released Frodex migration should apply");
+        insert_test_thread(&state_pool, thread_id).await;
+        sqlx::query(
+            "INSERT INTO thread_goal_supervisor_state (thread_id, goal_id, snoozed_until_ms, updated_at_ms) VALUES (?, 'goal-361', 361000, 361)",
+        )
+        .bind(thread_id)
+        .execute(&state_pool)
+        .await
+        .unwrap();
+        state_pool.close().await;
+
+        let first = StateRuntime::init(sqlite.clone(), "test-provider".to_string());
+        let second = StateRuntime::init(sqlite.clone(), "test-provider".to_string());
+        let (first, second) = tokio::join!(first, second);
+        let first = first.expect("first runtime should initialize");
+        let second = second.expect("second runtime should initialize");
+        first.close().await;
+        second.close().await;
+
+        let goals_pool = sqlite
+            .open_read_write_pool(&sqlite.goals_db_path())
+            .await
+            .unwrap();
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM thread_goal_supervisor_state")
+                .fetch_one(&goals_pool)
+                .await
+                .unwrap(),
+            1
+        );
+        goals_pool.close().await;
+        let state_pool = sqlite
+            .open_read_write_pool(&sqlite.state_db_path())
+            .await
+            .unwrap();
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM sqlite_schema WHERE type = 'table' AND name = 'thread_goal_supervisor_state'",
+            )
+            .fetch_one(&state_pool)
+            .await
+            .unwrap(),
+            0
+        );
+        state_pool.close().await;
+        let _ = tokio::fs::remove_dir_all(sqlite_home).await;
     }
 
     #[tokio::test]

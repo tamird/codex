@@ -1,5 +1,6 @@
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use chrono::DateTime;
 use chrono::Utc;
@@ -1040,6 +1041,17 @@ pub struct UpdateThreadMetadataParams {
     pub patch: ThreadMetadataPatch,
     /// Whether archived threads are eligible.
     pub include_archived: bool,
+}
+
+/// Parameters for advancing a visible root thread after descendant activity.
+#[derive(Clone, Copy, Debug)]
+pub struct TouchRootThreadRecencyParams {
+    /// Spawned descendant whose activity should make its root visible.
+    pub descendant_thread_id: ThreadId,
+    /// Timestamp of the observed descendant activity.
+    pub activity_at: DateTime<Utc>,
+    /// Minimum time between persisted root recency advances.
+    pub minimum_interval: Duration,
 }
 
 /// Parameters for moving a thread to, within, or out of a server-ordered section.

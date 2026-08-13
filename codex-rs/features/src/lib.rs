@@ -309,6 +309,8 @@ pub enum Feature {
     GuardianExt,
     /// Enable persisted thread goals and automatic goal continuation.
     Goals,
+    /// Use an internal supervisor helper for active goal continuation.
+    GoalSupervisor,
     /// Add current context-window metadata to model-visible context.
     TokenBudget,
     /// Track and report a shared token budget across a session's agent threads.
@@ -1535,6 +1537,16 @@ pub const FEATURES: &[FeatureSpec] = &[
         key: "goals",
         stage: Stage::Stable,
         default_enabled: true,
+    },
+    FeatureSpec {
+        id: Feature::GoalSupervisor,
+        key: "goal_supervisor",
+        stage: Stage::Experimental {
+            name: "Goal supervisor",
+            menu_description: "Use an internal supervisor helper for active goal continuation.",
+            announcement: "",
+        },
+        default_enabled: false,
     },
     FeatureSpec {
         id: Feature::TokenBudget,

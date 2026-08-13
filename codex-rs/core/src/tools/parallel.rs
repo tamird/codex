@@ -29,6 +29,12 @@ use codex_history::ResponseItemEnvelope;
 use codex_protocol::error::CodexErr;
 use codex_protocol::models::ResponseInputItem;
 
+#[derive(Debug, PartialEq)]
+pub(crate) enum ToolCallResponse {
+    Response(Box<ResponseItemEnvelope>),
+    TerminalNoResponse,
+}
+
 struct ToolCallTimingGuard {
     started_at: Instant,
     execution_started_at: Arc<OnceLock<Instant>>,
@@ -75,17 +81,17 @@ impl ToolCallRuntime {
         self,
         call: ToolCall,
         cancellation_token: CancellationToken,
-    ) -> impl std::future::Future<Output = Result<ResponseItemEnvelope, CodexErr>> {
+    ) -> impl std::future::Future<Output = Result<ToolCallResponse, CodexErr>> {
         let error_call = call.clone();
         let source = call.direct_source();
         let future = self.handle_tool_call_with_source(call, source, cancellation_token);
         async move {
             match future.await {
-                Ok(response) => Ok(response.into_response()),
+                Ok(response) => Ok(Self::response_for_tool_result(response)),
                 Err(FunctionCallError::Fatal(message)) => Err(CodexErr::Fatal(message)),
-                Err(other) => Ok(ResponseItemEnvelope::new(
-                    Self::failure_response(error_call, other).into(),
-                )),
+                Err(other) => Ok(ToolCallResponse::Response(Box::new(
+                    ResponseItemEnvelope::new(Self::failure_response(error_call, other).into()),
+                ))),
             }
         }
         .in_current_span()
@@ -212,6 +218,14 @@ impl ToolCallRuntime {
 }
 
 impl ToolCallRuntime {
+    fn response_for_tool_result(response: AnyToolResult) -> ToolCallResponse {
+        if response.result.terminal_no_response() {
+            ToolCallResponse::TerminalNoResponse
+        } else {
+            ToolCallResponse::Response(Box::new(response.into_response()))
+        }
+    }
+
     fn tool_task_join_error(err: JoinError) -> FunctionCallError {
         FunctionCallError::Fatal(format!("tool task failed to receive: {err:?}"))
     }
@@ -659,7 +673,9 @@ mod tests {
             },
         };
         assert_eq!(
-            ResponseItemEnvelope::new(expected_response.into()),
+            ToolCallResponse::Response(Box::new(ResponseItemEnvelope::new(
+                expected_response.into()
+            ))),
             response
         );
 
@@ -671,5 +687,25 @@ mod tests {
         assert_eq!(vec![ToolCallOutcome::Completed { success: true }], actual);
 
         Ok(())
+    }
+
+    #[test]
+    fn terminal_tool_result_does_not_create_response_item() {
+        let result = AnyToolResult {
+            call_id: "call-1".to_string(),
+            payload: ToolPayload::Function {
+                arguments: "{}".to_string(),
+            },
+            result: Box::new(
+                FunctionToolOutput::from_text(String::new(), Some(true))
+                    .into_terminal_no_response(),
+            ),
+            post_tool_use_payload: None,
+        };
+
+        assert_eq!(
+            ToolCallResponse::TerminalNoResponse,
+            ToolCallRuntime::response_for_tool_result(result)
+        );
     }
 }

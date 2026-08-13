@@ -6,10 +6,12 @@
 )]
 
 use crate::DbTelemetry;
+use crate::migrations::repair_frodex_goal_supervisor_state_migration;
 use crate::migrations::repair_legacy_recency_migration_version;
 use crate::runtime::RuntimeDbInitError;
 use crate::telemetry;
 use crate::telemetry::DbKind;
+use anyhow::Context;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use log::LevelFilter;
 use sqlx::ConnectOptions;
@@ -21,6 +23,8 @@ use sqlx::sqlite::SqliteConnectOptions;
 use sqlx::sqlite::SqliteJournalMode;
 use sqlx::sqlite::SqlitePoolOptions;
 use sqlx::sqlite::SqliteSynchronous;
+use std::fs::File;
+use std::fs::OpenOptions;
 use std::path::Path;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -32,6 +36,36 @@ const MEMORIES_DB_FILENAME: &str = "memories_1.sqlite";
 const QUEUE_DB_FILENAME: &str = "queue_1.sqlite";
 const STATE_DB_FILENAME: &str = "state_5.sqlite";
 const THREAD_HISTORY_DB_FILENAME: &str = "thread_history_1.sqlite";
+const STATE_MIGRATION_LOCK_FILENAME: &str = ".state_5.sqlite.migration.lock";
+
+/// Holds cross-process ownership of state migration and compatibility repair.
+struct StateMigrationGuard {
+    _file: File,
+}
+
+async fn acquire_state_migration_lock(sqlite_home: &Path) -> anyhow::Result<StateMigrationGuard> {
+    let path = sqlite_home.join(STATE_MIGRATION_LOCK_FILENAME);
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&path)
+        .with_context(|| format!("failed to open state migration lock {}", path.display()))?;
+    loop {
+        match file.try_lock() {
+            Ok(()) => return Ok(StateMigrationGuard { _file: file }),
+            Err(std::fs::TryLockError::WouldBlock) => {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            Err(std::fs::TryLockError::Error(error)) => {
+                return Err(error).with_context(|| {
+                    format!("failed to acquire state migration lock {}", path.display())
+                });
+            }
+        }
+    }
+}
 
 #[derive(Clone, Copy)]
 struct RuntimeDbSpec {
@@ -252,7 +286,15 @@ impl SqliteConfig {
         })?;
         let started = Instant::now();
         let migrate_result = async {
+            // SQLite's SQLx migration lock is a no-op. Keep deletion of a released Frodex
+            // collision row and the official migration run inside one cross-process exclusion.
+            let _state_migration_guard = if matches!(spec.kind, DbKind::State) {
+                Some(acquire_state_migration_lock(self.home()).await?)
+            } else {
+                None
+            };
             if matches!(spec.kind, DbKind::State) {
+                repair_frodex_goal_supervisor_state_migration(&pool).await?;
                 repair_legacy_recency_migration_version(&pool, migrator).await?;
             }
             migrator.run(&pool).await.map_err(anyhow::Error::from)

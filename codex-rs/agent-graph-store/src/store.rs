@@ -57,4 +57,15 @@ pub trait AgentGraphStore: Send + Sync {
         root_thread_id: ThreadId,
         status_filter: Option<ThreadSpawnEdgeStatus>,
     ) -> AgentGraphStoreFuture<'_, Vec<ThreadId>>;
+
+    /// Return open descendant identities together when this graph owns their indexed metadata.
+    ///
+    /// Stores that cannot combine graph authorization with identity lookup retain the existing
+    /// descendant-list and individual metadata restoration behavior.
+    fn list_open_thread_spawn_descendant_identities(
+        &self,
+        _root_thread_id: ThreadId,
+    ) -> Option<AgentGraphStoreFuture<'_, Vec<codex_state::ThreadSpawnDescendantIdentity>>> {
+        None
+    }
 }

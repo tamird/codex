@@ -13483,6 +13483,94 @@ async fn root_agent_prompt_prefers_user_goal_over_coordination() {
 }
 
 #[tokio::test]
+async fn root_agent_role_prompt_includes_persistent_goal_scheduling() {
+    let codex_home = tempfile::tempdir().expect("create temp dir");
+    let mut config = build_test_config(codex_home.path()).await;
+    for feature in [
+        Feature::AgentPromptInjection,
+        Feature::Goals,
+        Feature::GoalSupervisor,
+    ] {
+        config
+            .features
+            .enable(feature)
+            .expect("test config should enable goal supervisor prompt injection");
+    }
+
+    let prompt = load_agent_role_prompt(&config, &SessionSource::Cli)
+        .await
+        .expect("root agent should receive goal supervisor instructions");
+
+    assert!(prompt.contains("# You are the Root Agent"));
+    assert!(prompt.contains("recur on a schedule"));
+    assert!(prompt.contains("continue indefinitely"));
+    assert!(prompt.contains("create a goal with `create_goal` or `/goal`"));
+    assert!(prompt.contains("timezone, deadline, polling limit"));
+    assert!(prompt.contains("let the supervisor manage future deadlines and polling"));
+
+    config
+        .features
+        .disable(Feature::GoalSupervisor)
+        .expect("test config should disable goal supervisor prompt injection");
+    let prompt = load_agent_role_prompt(&config, &SessionSource::Cli)
+        .await
+        .expect("root agent prompt should remain available");
+    assert!(!prompt.contains("let the supervisor manage future deadlines and polling"));
+
+    config
+        .features
+        .enable(Feature::GoalSupervisor)
+        .expect("test config should enable goal supervisor prompt injection");
+    config
+        .features
+        .disable(Feature::Goals)
+        .expect("test config should disable goals");
+    let prompt = load_agent_role_prompt(&config, &SessionSource::Cli)
+        .await
+        .expect("root agent prompt should remain available");
+    assert!(!prompt.contains("let the supervisor manage future deadlines and polling"));
+}
+
+#[tokio::test]
+async fn goal_supervisor_role_prompt_includes_deadline_aware_polling() {
+    let codex_home = tempfile::tempdir().expect("create temp dir");
+    let mut config = build_test_config(codex_home.path()).await;
+    config
+        .features
+        .enable(Feature::AgentPromptInjection)
+        .expect("test config should enable goal supervisor prompt injection");
+    let session_source = SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+        parent_thread_id: ThreadId::default(),
+        depth: 1,
+        agent_path: None,
+        agent_nickname: None,
+        agent_role: Some("goal_supervisor".to_string()),
+    });
+
+    let prompt = load_agent_role_prompt(&config, &session_source)
+        .await
+        .expect("goal supervisor should receive its own role instructions");
+
+    assert!(prompt.contains("You are also a **goal supervisor**"));
+    assert!(prompt.contains("# Goal Supervisor Continuity"));
+    assert!(prompt.contains("previous_supervisor_action.snoozed_seconds"));
+    assert!(prompt.contains("bounded exponential backoff"));
+    assert!(prompt.contains("next actual occurrence in the requested timezone"));
+    assert!(prompt.contains("Keep a perpetual or recurring goal active"));
+    assert!(prompt.contains("If any authorized part of the goal can proceed now"));
+    assert!(prompt.contains("A running subagent does not block independent work"));
+    assert!(
+        prompt.contains("An `active` or `inProgress` status alone does not establish progress")
+    );
+    assert!(prompt.contains("only when every unfinished part of the goal is waiting"));
+    assert!(prompt.contains("If an essential inspection fails or exceeds a reasonable time"));
+    assert!(prompt.contains(
+        "Include a final `message` only when the parent needs to know why the goal is complete"
+    ));
+    assert!(!prompt.contains("# You are the Root Agent"));
+}
+
+#[tokio::test]
 async fn subagent_prompt_is_for_regular_subagents_only() {
     let codex_home = tempfile::tempdir().expect("create temp dir");
 
@@ -13506,6 +13594,18 @@ async fn agent_prompt_loader_prefers_home_overrides() {
     )
     .await
     .expect("write subagent override");
+    tokio::fs::write(
+        codex_home.path().join("AGENTS.supervisor.md"),
+        "custom supervisor",
+    )
+    .await
+    .expect("write supervisor override");
+    tokio::fs::write(
+        codex_home.path().join("AGENTS.root-supervisor.md"),
+        "custom root supervisor",
+    )
+    .await
+    .expect("write root supervisor override");
 
     assert_eq!(
         load_root_agent_prompt(codex_home.path()).await,
@@ -13514,6 +13614,14 @@ async fn agent_prompt_loader_prefers_home_overrides() {
     assert_eq!(
         load_subagent_prompt(codex_home.path()).await,
         "custom subagent"
+    );
+    assert_eq!(
+        load_supervisor_agent_prompt(codex_home.path()).await,
+        "custom supervisor"
+    );
+    assert_eq!(
+        load_root_agent_supervisor_prompt(codex_home.path()).await,
+        "custom root supervisor"
     );
 }
 

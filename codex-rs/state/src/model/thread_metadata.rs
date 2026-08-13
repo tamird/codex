@@ -120,6 +120,21 @@ pub struct ExtractionOutcome {
     pub parse_errors: usize,
 }
 
+/// Persisted identity needed to register an open spawned agent without loading full thread metadata.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ThreadSpawnDescendantIdentity {
+    /// Identifier from the open parent-child relationship.
+    pub thread_id: ThreadId,
+    /// Serialized session source, or `None` when the thread metadata row is missing.
+    pub source: Option<String>,
+    /// Canonical agent path recorded on the persisted thread.
+    pub agent_path: Option<String>,
+    /// Role recorded on the persisted thread.
+    pub agent_role: Option<String>,
+    /// Nickname recorded on the persisted thread.
+    pub agent_nickname: Option<String>,
+}
+
 /// Canonical persisted thread metadata.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ThreadMetadata {

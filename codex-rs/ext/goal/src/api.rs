@@ -18,7 +18,6 @@ use crate::runtime::PreviousGoalSnapshot;
 use crate::tool::fill_empty_thread_preview_if_possible;
 use crate::tool::protocol_goal_from_state;
 use crate::tool::state_status_from_protocol;
-use crate::tool::validate_goal_budget;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GoalServiceError {
@@ -151,8 +150,18 @@ impl GoalService {
             objective,
             status,
             token_budget,
-            max_goal_token_budget,
+            max_goal_token_budget: _,
         } = request;
+        if matches!(token_budget, GoalTokenBudgetUpdate::Set(Some(_))) {
+            return Err(GoalServiceError::InvalidRequest(
+                "thread goal token budgets are disabled in Frodex".to_string(),
+            ));
+        }
+        if status == Some(ThreadGoalStatus::BudgetLimited) {
+            return Err(GoalServiceError::InvalidRequest(
+                "thread goal budget-limited status is disabled in Frodex".to_string(),
+            ));
+        }
         let status = status.map(state_status_from_protocol);
         let objective = match objective {
             GoalObjectiveUpdate::Keep => None,
@@ -160,19 +169,12 @@ impl GoalService {
         };
         let token_budget = match token_budget {
             GoalTokenBudgetUpdate::Keep => None,
-            GoalTokenBudgetUpdate::Set(token_budget) => {
-                Some(token_budget.or(max_goal_token_budget))
-            }
+            GoalTokenBudgetUpdate::Set(token_budget) => Some(token_budget),
         };
 
         if let Some(objective) = objective {
             validate_thread_goal_objective(objective).map_err(GoalServiceError::InvalidRequest)?;
         }
-        if objective.is_some() || token_budget.is_some() {
-            validate_goal_budget(token_budget.flatten(), max_goal_token_budget)
-                .map_err(GoalServiceError::InvalidRequest)?;
-        }
-
         let runtime = self.runtime_for_thread(thread_id);
         // Hold this through the prepare/write window so idle continuation cannot
         // launch from goal state that this external mutation is about to change.
@@ -229,7 +231,7 @@ impl GoalService {
                         thread_id,
                         objective,
                         status.unwrap_or(codex_state::ThreadGoalStatus::Active),
-                        token_budget.flatten().or(max_goal_token_budget),
+                        token_budget.flatten(),
                     )
                     .await
                     .map_err(|err| {

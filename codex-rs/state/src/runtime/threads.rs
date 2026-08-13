@@ -203,6 +203,55 @@ ON CONFLICT(child_thread_id) DO UPDATE SET
             .await
     }
 
+    /// Load identities reachable through open relationships without reading unrelated thread data.
+    pub async fn list_open_thread_spawn_descendant_identities(
+        &self,
+        root_thread_id: ThreadId,
+    ) -> anyhow::Result<Vec<crate::ThreadSpawnDescendantIdentity>> {
+        let rows = sqlx::query(
+            r#"
+WITH RECURSIVE subtree(child_thread_id, depth) AS (
+    SELECT child_thread_id, 1
+    FROM thread_spawn_edges
+    WHERE parent_thread_id = ? AND status = ? AND child_thread_id != ?
+    UNION ALL
+    SELECT edge.child_thread_id, subtree.depth + 1
+    FROM thread_spawn_edges AS edge
+    JOIN subtree ON edge.parent_thread_id = subtree.child_thread_id
+    WHERE edge.status = ? AND edge.child_thread_id != ?
+)
+SELECT
+    subtree.child_thread_id,
+    threads.source,
+    threads.agent_path,
+    threads.agent_role,
+    threads.agent_nickname
+FROM subtree
+LEFT JOIN threads ON threads.id = subtree.child_thread_id
+ORDER BY subtree.depth ASC, subtree.child_thread_id ASC
+            "#,
+        )
+        .bind(root_thread_id.to_string())
+        .bind(crate::DirectionalThreadSpawnEdgeStatus::Open.as_ref())
+        .bind(root_thread_id.to_string())
+        .bind(crate::DirectionalThreadSpawnEdgeStatus::Open.as_ref())
+        .bind(root_thread_id.to_string())
+        .fetch_all(self.pool.as_ref())
+        .await?;
+
+        rows.into_iter()
+            .map(|row| {
+                Ok(crate::ThreadSpawnDescendantIdentity {
+                    thread_id: ThreadId::try_from(row.try_get::<String, _>("child_thread_id")?)?,
+                    source: row.try_get("source")?,
+                    agent_path: row.try_get("agent_path")?,
+                    agent_role: row.try_get("agent_role")?,
+                    agent_nickname: row.try_get("agent_nickname")?,
+                })
+            })
+            .collect()
+    }
+
     /// Find a direct spawned child of `parent_thread_id` by canonical agent path.
     pub async fn find_thread_spawn_child_by_path(
         &self,
@@ -815,6 +864,103 @@ WHERE id = ?
         .execute(self.pool.as_ref())
         .await?;
         Ok(result.rows_affected() > 0)
+    }
+
+    /// Advances the top-level ancestor after spawned-descendant activity when the persisted
+    /// debounce interval has elapsed.
+    pub async fn touch_root_thread_recency_for_descendant(
+        &self,
+        descendant_thread_id: ThreadId,
+        activity_at: DateTime<Utc>,
+        minimum_interval: std::time::Duration,
+    ) -> anyhow::Result<Option<std::time::Duration>> {
+        let activity_at_millis = datetime_to_epoch_millis(activity_at);
+        let minimum_interval_millis =
+            i64::try_from(minimum_interval.as_millis()).unwrap_or(i64::MAX);
+        let eligible_before_millis = activity_at_millis.saturating_sub(minimum_interval_millis);
+        let retry_after = |recency_at_millis: i64| {
+            let remaining_millis = recency_at_millis
+                .saturating_add(minimum_interval_millis)
+                .saturating_sub(activity_at_millis)
+                .max(0);
+            std::time::Duration::from_millis(u64::try_from(remaining_millis).unwrap_or(u64::MAX))
+        };
+        let recency_at = self.allocate_thread_recency_at(activity_at)?;
+        let recency_at_seconds = datetime_to_epoch_seconds(recency_at);
+        let recency_at_millis = datetime_to_epoch_millis(recency_at);
+        let updated_recency_at_millis = sqlx::query_scalar::<_, i64>(
+            r#"
+WITH RECURSIVE ancestor_ids(thread_id) AS (
+    SELECT parent_thread_id
+    FROM thread_spawn_edges
+    WHERE child_thread_id = ?
+    UNION
+    SELECT edge.parent_thread_id
+    FROM thread_spawn_edges AS edge
+    JOIN ancestor_ids AS ancestors
+        ON edge.child_thread_id = ancestors.thread_id
+),
+root_id(thread_id) AS (
+    SELECT ancestors.thread_id
+    FROM ancestor_ids AS ancestors
+    WHERE NOT EXISTS (
+        SELECT 1
+        FROM thread_spawn_edges AS incoming
+        WHERE incoming.child_thread_id = ancestors.thread_id
+    )
+    LIMIT 1
+)
+UPDATE threads
+SET
+    recency_at = MAX(?, MAX(?, recency_at_ms + 1) / 1000),
+    recency_at_ms = MAX(?, recency_at_ms + 1)
+WHERE id = (SELECT thread_id FROM root_id)
+  AND recency_at_ms <= ?
+RETURNING recency_at_ms
+            "#,
+        )
+        .bind(descendant_thread_id.to_string())
+        .bind(recency_at_seconds)
+        .bind(recency_at_millis)
+        .bind(recency_at_millis)
+        .bind(eligible_before_millis)
+        .fetch_optional(self.pool.as_ref())
+        .await?;
+        if let Some(updated_recency_at_millis) = updated_recency_at_millis {
+            return Ok(Some(retry_after(updated_recency_at_millis)));
+        }
+
+        let current_recency_at_millis = sqlx::query_scalar::<_, i64>(
+            r#"
+WITH RECURSIVE ancestor_ids(thread_id) AS (
+    SELECT parent_thread_id
+    FROM thread_spawn_edges
+    WHERE child_thread_id = ?
+    UNION
+    SELECT edge.parent_thread_id
+    FROM thread_spawn_edges AS edge
+    JOIN ancestor_ids AS ancestors
+        ON edge.child_thread_id = ancestors.thread_id
+),
+root_id(thread_id) AS (
+    SELECT ancestors.thread_id
+    FROM ancestor_ids AS ancestors
+    WHERE NOT EXISTS (
+        SELECT 1
+        FROM thread_spawn_edges AS incoming
+        WHERE incoming.child_thread_id = ancestors.thread_id
+    )
+    LIMIT 1
+)
+SELECT threads.recency_at_ms
+FROM root_id
+JOIN threads ON threads.id = root_id.thread_id
+            "#,
+        )
+        .bind(descendant_thread_id.to_string())
+        .fetch_optional(self.pool.as_ref())
+        .await?;
+        Ok(current_recency_at_millis.map(retry_after))
     }
 
     /// Allocate a persisted `updated_at` value for thread-list cursor ordering.
@@ -3138,6 +3284,153 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn descendant_activity_debounces_top_level_root_recency() {
+        let codex_home = unique_temp_dir();
+        let runtime = StateRuntime::init(
+            crate::SqliteConfig::new_for_testing(codex_home.as_path().abs()),
+            "test-provider".to_string(),
+        )
+        .await
+        .expect("state db should initialize");
+        let root_id = ThreadId::new();
+        let child_id = ThreadId::new();
+        let grandchild_id = ThreadId::new();
+        let initial_recency_at =
+            DateTime::<Utc>::from_timestamp_millis(1_700_000_000_000).expect("timestamp");
+
+        for thread_id in [root_id, child_id, grandchild_id] {
+            let mut metadata = test_thread_metadata(&codex_home, thread_id, codex_home.clone());
+            metadata.created_at = initial_recency_at;
+            metadata.updated_at = initial_recency_at;
+            metadata.recency_at = initial_recency_at;
+            runtime
+                .upsert_thread(&metadata)
+                .await
+                .expect("thread insert should succeed");
+        }
+        runtime
+            .upsert_thread_spawn_edge(root_id, child_id, DirectionalThreadSpawnEdgeStatus::Open)
+            .await
+            .expect("child edge should persist");
+        runtime
+            .upsert_thread_spawn_edge(
+                child_id,
+                grandchild_id,
+                DirectionalThreadSpawnEdgeStatus::Open,
+            )
+            .await
+            .expect("grandchild edge should persist");
+        let initial_child_recency_at = runtime
+            .get_thread(child_id)
+            .await
+            .expect("child should load")
+            .expect("child should exist")
+            .recency_at;
+
+        let first_activity_at = initial_recency_at + chrono::Duration::hours(2);
+        assert_eq!(
+            runtime
+                .touch_root_thread_recency_for_descendant(
+                    grandchild_id,
+                    first_activity_at,
+                    std::time::Duration::from_secs(60 * 60),
+                )
+                .await
+                .expect("root recency touch should succeed"),
+            Some(std::time::Duration::from_secs(60 * 60))
+        );
+        let first_root_recency_at = runtime
+            .get_thread(root_id)
+            .await
+            .expect("root should load")
+            .expect("root should exist")
+            .recency_at;
+        assert!(first_root_recency_at >= first_activity_at);
+
+        assert_eq!(
+            runtime
+                .touch_root_thread_recency_for_descendant(
+                    grandchild_id,
+                    first_activity_at + chrono::Duration::minutes(30),
+                    std::time::Duration::from_secs(60 * 60),
+                )
+                .await
+                .expect("debounced root recency touch should succeed"),
+            Some(std::time::Duration::from_secs(30 * 60))
+        );
+        assert_eq!(
+            runtime
+                .get_thread(root_id)
+                .await
+                .expect("root should load")
+                .expect("root should exist")
+                .recency_at,
+            first_root_recency_at
+        );
+
+        let second_activity_at = first_root_recency_at + chrono::Duration::hours(1);
+        assert_eq!(
+            runtime
+                .touch_root_thread_recency_for_descendant(
+                    grandchild_id,
+                    second_activity_at,
+                    std::time::Duration::from_secs(60 * 60),
+                )
+                .await
+                .expect("second root recency touch should succeed"),
+            Some(std::time::Duration::from_secs(60 * 60))
+        );
+        assert!(
+            runtime
+                .get_thread(root_id)
+                .await
+                .expect("root should load")
+                .expect("root should exist")
+                .recency_at
+                > first_root_recency_at
+        );
+        assert_eq!(
+            runtime
+                .get_thread(child_id)
+                .await
+                .expect("child should load")
+                .expect("child should exist")
+                .recency_at,
+            initial_child_recency_at
+        );
+        assert_eq!(
+            runtime
+                .touch_root_thread_recency_for_descendant(
+                    root_id,
+                    second_activity_at + chrono::Duration::hours(2),
+                    std::time::Duration::from_secs(60 * 60),
+                )
+                .await
+                .expect("root input should be ignored"),
+            None
+        );
+        runtime
+            .upsert_thread_spawn_edge(
+                grandchild_id,
+                root_id,
+                DirectionalThreadSpawnEdgeStatus::Open,
+            )
+            .await
+            .expect("cycle edge should persist");
+        assert_eq!(
+            runtime
+                .touch_root_thread_recency_for_descendant(
+                    grandchild_id,
+                    second_activity_at + chrono::Duration::hours(2),
+                    std::time::Duration::from_secs(60 * 60),
+                )
+                .await
+                .expect("cycle should be ignored"),
+            None
+        );
+    }
+
+    #[tokio::test]
     async fn list_threads_orders_and_pages_by_recency_at() {
         let codex_home = unique_temp_dir();
         let runtime = StateRuntime::init(
@@ -3539,6 +3832,161 @@ mod tests {
             .await
             .expect("all descendants should load");
         assert_eq!(all_descendants, vec![child_thread_id, grandchild_thread_id]);
+    }
+
+    #[tokio::test]
+    async fn open_thread_spawn_descendant_identities_preserve_open_ancestry_and_missing_rows() {
+        let codex_home = unique_temp_dir();
+        let runtime = StateRuntime::init(
+            crate::SqliteConfig::new_for_testing(codex_home.as_path().abs()),
+            "test-provider".to_string(),
+        )
+        .await
+        .expect("state db should initialize");
+        let root_thread_id = ThreadId::new();
+        let open_child_thread_id = ThreadId::new();
+        let open_grandchild_thread_id = ThreadId::new();
+        let closed_child_thread_id = ThreadId::new();
+        let hidden_grandchild_thread_id = ThreadId::new();
+        let missing_metadata_thread_id = ThreadId::new();
+        let other_root_thread_id = ThreadId::new();
+        let other_child_thread_id = ThreadId::new();
+
+        for (thread_id, agent_path, agent_role, agent_nickname) in [
+            (
+                open_child_thread_id,
+                "/root/worker",
+                Some("worker"),
+                Some("first worker"),
+            ),
+            (
+                open_grandchild_thread_id,
+                "/root/worker/researcher",
+                Some("researcher"),
+                Some("nested worker"),
+            ),
+            (closed_child_thread_id, "/root/closed", None, None),
+            (
+                hidden_grandchild_thread_id,
+                "/root/closed/hidden",
+                None,
+                None,
+            ),
+            (other_child_thread_id, "/root/other", None, None),
+        ] {
+            let mut metadata = test_thread_metadata(&codex_home, thread_id, codex_home.clone());
+            metadata.agent_path = Some(agent_path.to_string());
+            metadata.agent_role = agent_role.map(str::to_string);
+            metadata.agent_nickname = agent_nickname.map(str::to_string);
+            runtime
+                .upsert_thread(&metadata)
+                .await
+                .expect("thread metadata should persist");
+        }
+
+        for (parent_thread_id, child_thread_id, status) in [
+            (
+                root_thread_id,
+                open_child_thread_id,
+                DirectionalThreadSpawnEdgeStatus::Open,
+            ),
+            (
+                open_child_thread_id,
+                open_grandchild_thread_id,
+                DirectionalThreadSpawnEdgeStatus::Open,
+            ),
+            (
+                root_thread_id,
+                closed_child_thread_id,
+                DirectionalThreadSpawnEdgeStatus::Closed,
+            ),
+            (
+                closed_child_thread_id,
+                hidden_grandchild_thread_id,
+                DirectionalThreadSpawnEdgeStatus::Open,
+            ),
+            (
+                root_thread_id,
+                missing_metadata_thread_id,
+                DirectionalThreadSpawnEdgeStatus::Open,
+            ),
+            (
+                other_root_thread_id,
+                other_child_thread_id,
+                DirectionalThreadSpawnEdgeStatus::Open,
+            ),
+            (
+                open_grandchild_thread_id,
+                root_thread_id,
+                DirectionalThreadSpawnEdgeStatus::Open,
+            ),
+        ] {
+            runtime
+                .upsert_thread_spawn_edge(parent_thread_id, child_thread_id, status)
+                .await
+                .expect("thread spawn edge should persist");
+        }
+
+        let identities = runtime
+            .list_open_thread_spawn_descendant_identities(root_thread_id)
+            .await
+            .expect("open descendant identities should load");
+
+        assert_eq!(identities.len(), 3);
+        assert_eq!(identities[2].thread_id, open_grandchild_thread_id);
+        let open_child = identities
+            .iter()
+            .find(|identity| identity.thread_id == open_child_thread_id)
+            .expect("open child should be included");
+        assert_eq!(open_child.source.as_deref(), Some("cli"));
+        assert_eq!(open_child.agent_path.as_deref(), Some("/root/worker"));
+        assert_eq!(open_child.agent_role.as_deref(), Some("worker"));
+        assert_eq!(open_child.agent_nickname.as_deref(), Some("first worker"));
+
+        let missing_metadata = identities
+            .iter()
+            .find(|identity| identity.thread_id == missing_metadata_thread_id)
+            .expect("open edge without a metadata row should remain available for fallback");
+        assert_eq!(missing_metadata.source, None);
+        assert!(
+            identities.iter().all(|identity| {
+                identity.thread_id != closed_child_thread_id
+                    && identity.thread_id != hidden_grandchild_thread_id
+                    && identity.thread_id != other_child_thread_id
+            }),
+            "closed ancestors and unrelated roots must remain inaccessible"
+        );
+    }
+
+    #[tokio::test]
+    async fn open_thread_spawn_descendant_identities_ignore_root_self_loop() {
+        let codex_home = unique_temp_dir();
+        let runtime = StateRuntime::init(
+            crate::SqliteConfig::new_for_testing(codex_home.as_path().abs()),
+            "test-provider".to_string(),
+        )
+        .await
+        .expect("state db should initialize");
+        let root_thread_id = ThreadId::new();
+        let child_thread_id = ThreadId::new();
+        for child_thread_id in [root_thread_id, child_thread_id] {
+            runtime
+                .upsert_thread_spawn_edge(
+                    root_thread_id,
+                    child_thread_id,
+                    DirectionalThreadSpawnEdgeStatus::Open,
+                )
+                .await
+                .expect("thread spawn edge should persist");
+        }
+
+        let identities = runtime
+            .list_open_thread_spawn_descendant_identities(root_thread_id)
+            .await
+            .expect("root self-loop must not recurse indefinitely");
+
+        assert_eq!(identities.len(), 1);
+        assert_eq!(identities[0].thread_id, child_thread_id);
     }
 
     #[tokio::test]

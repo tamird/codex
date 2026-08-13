@@ -106,6 +106,7 @@ use crate::ThreadStoreError;
 use crate::ThreadStoreFuture;
 use crate::ThreadStoreResult;
 use crate::TimelinePage;
+use crate::TouchRootThreadRecencyParams;
 use crate::TurnPage;
 use crate::UpdateProjectParams;
 use crate::UpdateThreadMetadataParams;
@@ -968,6 +969,27 @@ impl ThreadStore for LocalThreadStore {
         })
     }
 
+    fn touch_root_thread_recency(
+        &self,
+        params: TouchRootThreadRecencyParams,
+    ) -> ThreadStoreFuture<'_, Option<std::time::Duration>> {
+        Box::pin(async move {
+            let Some(state_db) = self.state_db().await else {
+                return Ok(None);
+            };
+            state_db
+                .touch_root_thread_recency_for_descendant(
+                    params.descendant_thread_id,
+                    params.activity_at,
+                    params.minimum_interval,
+                )
+                .await
+                .map_err(|err| ThreadStoreError::Internal {
+                    message: format!("failed to advance root thread recency: {err}"),
+                })
+        })
+    }
+
     fn move_thread_to_section(
         &self,
         params: MoveThreadToSectionParams,
@@ -1164,6 +1186,114 @@ mod tests {
         );
         assert_eq!(metadata.preview.as_deref(), Some("observed append"));
         assert_eq!(metadata.title, "observed append");
+    }
+
+    #[tokio::test]
+    async fn descendant_activity_advances_root_recency_with_persisted_debounce() {
+        let home = TempDir::new().expect("temp dir");
+        let config = test_config(home.path());
+        let runtime = codex_state::StateRuntime::init(
+            config.sqlite.clone(),
+            config.default_model_provider_id.clone(),
+        )
+        .await
+        .expect("state db should initialize");
+        let store = Arc::new(LocalThreadStore::new(config, Some(runtime.clone())));
+        let root_id = ThreadId::new();
+        let child_id = ThreadId::new();
+        let root = LiveThread::create(store.clone(), create_thread_params(root_id))
+            .await
+            .expect("create root thread");
+        let mut child_params = create_thread_params(child_id);
+        child_params.parent_thread_id = Some(root_id);
+        child_params.history_mode = ThreadHistoryMode::Paginated;
+        let child = LiveThread::create(store.clone(), child_params)
+            .await
+            .expect("create child thread");
+        let initial_recency_at =
+            chrono::DateTime::<chrono::Utc>::from_timestamp(1_700_000_000, 0).expect("timestamp");
+
+        for (thread_id, rollout_path) in [
+            (
+                root_id,
+                root.local_rollout_path()
+                    .await
+                    .expect("root rollout path")
+                    .expect("local root rollout"),
+            ),
+            (
+                child_id,
+                child
+                    .local_rollout_path()
+                    .await
+                    .expect("child rollout path")
+                    .expect("local child rollout"),
+            ),
+        ] {
+            let mut builder = codex_state::ThreadMetadataBuilder::new(
+                thread_id,
+                rollout_path,
+                initial_recency_at,
+                SessionSource::Exec,
+            );
+            builder.updated_at = Some(initial_recency_at);
+            builder.recency_at = Some(initial_recency_at);
+            builder.cwd = home.path().to_path_buf();
+            runtime
+                .upsert_thread(&builder.build("test-provider"))
+                .await
+                .expect("thread metadata should persist");
+        }
+        runtime
+            .upsert_thread_spawn_edge(
+                root_id,
+                child_id,
+                codex_state::DirectionalThreadSpawnEdgeStatus::Open,
+            )
+            .await
+            .expect("spawn edge should persist");
+
+        child
+            .append_items(&[response_user_message_item("background child output")])
+            .await
+            .expect("child activity should persist");
+        let first_root = runtime
+            .get_thread(root_id)
+            .await
+            .expect("root should load")
+            .expect("root should exist");
+        assert!(first_root.recency_at > initial_recency_at);
+        assert_eq!(first_root.updated_at, initial_recency_at);
+
+        child.shutdown().await.expect("shutdown child thread");
+        let resumed_child = LiveThread::resume(
+            store,
+            ThreadHistoryMode::Paginated,
+            ResumeThreadParams {
+                thread_id: child_id,
+                rollout_path: None,
+                history: Some(Arc::new(vec![response_user_message_item(
+                    "bounded context without session metadata",
+                )])),
+                include_archived: false,
+                metadata: thread_metadata(),
+            },
+        )
+        .await
+        .expect("resume child thread");
+        resumed_child
+            .append_items(&[response_user_message_item("more background child output")])
+            .await
+            .expect("resumed child activity should persist");
+        assert_eq!(
+            runtime
+                .get_thread(root_id)
+                .await
+                .expect("root should load")
+                .expect("root should exist")
+                .recency_at,
+            first_root.recency_at
+        );
     }
 
     #[tokio::test]
@@ -2490,6 +2620,21 @@ mod tests {
             text_elements: Vec::new(),
             ..Default::default()
         }))
+    }
+
+    fn response_user_message_item(message: &str) -> RolloutItem {
+        RolloutItem::ResponseItem(
+            ResponseItem::Message {
+                id: None,
+                role: "user".to_string(),
+                content: vec![ContentItem::InputText {
+                    text: message.to_string(),
+                }],
+                phase: None,
+                internal_chat_message_metadata_passthrough: None,
+            }
+            .into(),
+        )
     }
 
     async fn assert_rollout_contains_message(path: &std::path::Path, expected: &str) {

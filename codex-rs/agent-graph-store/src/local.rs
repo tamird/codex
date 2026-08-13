@@ -107,6 +107,18 @@ impl AgentGraphStore for LocalAgentGraphStore {
             }
         })
     }
+
+    fn list_open_thread_spawn_descendant_identities(
+        &self,
+        root_thread_id: ThreadId,
+    ) -> Option<AgentGraphStoreFuture<'_, Vec<codex_state::ThreadSpawnDescendantIdentity>>> {
+        Some(Box::pin(async move {
+            self.state_db
+                .list_open_thread_spawn_descendant_identities(root_thread_id)
+                .await
+                .map_err(internal_error)
+        }))
+    }
 }
 
 fn to_state_status(status: ThreadSpawnEdgeStatus) -> codex_state::DirectionalThreadSpawnEdgeStatus {
@@ -323,6 +335,18 @@ mod tests {
             .await
             .expect("state open descendants should load");
         assert_eq!(open_descendants, state_open_descendants);
+        let open_identities = store
+            .list_open_thread_spawn_descendant_identities(root_thread_id)
+            .expect("local store should expose descendant identities")
+            .await
+            .expect("open descendant identities should load");
+        assert_eq!(
+            open_identities
+                .into_iter()
+                .map(|identity| identity.thread_id)
+                .collect::<Vec<_>>(),
+            open_descendants
+        );
         assert_eq!(
             open_descendants,
             vec![

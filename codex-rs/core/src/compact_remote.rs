@@ -10,6 +10,7 @@ use crate::compact::build_compaction_initial_context;
 use crate::compact::compaction_status_from_result;
 use crate::compact::insert_initial_context_before_last_real_user_or_summary;
 use crate::compact::is_compaction_filtered_history_item;
+use crate::compact::retain_subagent_assignment_and_recent_messages;
 use crate::compact_model_fallback::record_model_fallback;
 use crate::compact_model_fallback::should_retry_with_current_model;
 use crate::compact_remote_history::HistoryItemGroup;
@@ -361,10 +362,18 @@ pub(crate) async fn process_annotated_compacted_history(
     let (initial_context, world_state_baseline) =
         build_compaction_initial_context(sess, initial_context_injection).await;
 
-    let compacted_history = history_item_groups(compacted_history)
+    let mut compacted_history = history_item_groups(compacted_history)
         .filter(|group| should_keep_compacted_history_item(&group.source.item))
         .flat_map(HistoryItemGroup::into_items)
         .collect();
+    if let Some(agent_path) = sess.session_source().await.get_agent_path() {
+        let previous_history = sess.clone_history().await;
+        retain_subagent_assignment_and_recent_messages(
+            previous_history.annotated_items(),
+            &mut compacted_history,
+            &agent_path,
+        );
+    }
     (
         insert_initial_context_before_last_real_user_or_summary(compacted_history, initial_context),
         world_state_baseline,
