@@ -279,7 +279,31 @@ async fn supervisor_tools_are_visible_only_to_goal_supervisor_helpers() {
     .await;
     assert_eq!(
         supervisor.namespace_function_names("supervisor"),
-        ["close_self", "compact_parent_context", "snooze"]
+        [
+            "close_self",
+            "compact_parent_context",
+            "followup_parent",
+            "snooze"
+        ]
+    );
+    let ToolSpec::Namespace(supervisor_namespace) = supervisor.visible_spec("supervisor") else {
+        panic!("expected supervisor namespace");
+    };
+    let Some(ResponsesApiNamespaceTool::Function(followup_parent)) =
+        supervisor_namespace.tools.iter().find(|tool| {
+            matches!(tool, ResponsesApiNamespaceTool::Function(tool) if tool.name == "followup_parent")
+        })
+    else {
+        panic!("expected supervisor.followup_parent");
+    };
+    assert_eq!(
+        followup_parent
+            .parameters
+            .properties
+            .as_ref()
+            .and_then(|properties| properties.get("message"))
+            .and_then(|schema| schema.encrypted),
+        None
     );
 
     let supervisor_path_without_role = probe(|turn| {
@@ -293,6 +317,7 @@ async fn supervisor_tools_are_visible_only_to_goal_supervisor_helpers() {
     );
     supervisor_path_without_role.assert_registered_lacks(&[
         "supervisor.close_self",
+        "supervisor.followup_parent",
         "supervisor.snooze",
         "supervisor.compact_parent_context",
     ]);
@@ -306,7 +331,12 @@ async fn supervisor_tools_are_visible_only_to_goal_supervisor_helpers() {
     .await;
     assert_eq!(
         supervisor_role_on_custom_path.namespace_function_names("supervisor"),
-        ["close_self", "compact_parent_context", "snooze"]
+        [
+            "close_self",
+            "compact_parent_context",
+            "followup_parent",
+            "snooze"
+        ]
     );
 
     let root = probe(|turn| turn.session_source = SessionSource::Exec).await;
@@ -3197,7 +3227,7 @@ async fn multi_agent_v2_bedrock_workers_only_delegate_when_model_supports_v2() {
 }
 
 #[tokio::test]
-async fn goal_supervisor_keeps_collaboration_tools_when_model_does_not_advertise_v2() {
+async fn goal_supervisor_uses_supervisor_tools_when_model_does_not_advertise_v2() {
     let plan = probe(|turn| {
         set_feature(turn, Feature::MultiAgentV2, /*enabled*/ true);
         update_turn_settings_for_test(turn, |settings| {
@@ -3216,11 +3246,20 @@ async fn goal_supervisor_keeps_collaboration_tools_when_model_does_not_advertise
     })
     .await;
 
-    plan.assert_visible_contains(&[MULTI_AGENT_V2_NAMESPACE]);
-    plan.assert_registered_contains(&[
+    plan.assert_visible_lacks(&[MULTI_AGENT_V2_NAMESPACE]);
+    plan.assert_registered_lacks(&[
         &ToolName::namespaced(MULTI_AGENT_V2_NAMESPACE, "followup_task").to_string(),
         &ToolName::namespaced(MULTI_AGENT_V2_NAMESPACE, "list_agents").to_string(),
     ]);
+    assert_eq!(
+        plan.namespace_function_names("supervisor"),
+        [
+            "close_self",
+            "compact_parent_context",
+            "followup_parent",
+            "snooze"
+        ]
+    );
 }
 
 #[tokio::test]

@@ -159,6 +159,21 @@ pub trait ModelsManager: fmt::Debug + Send + Sync {
         presets
     }
 
+    /// Build presets for upstream-owned contracts before custom aliases are added.
+    fn build_upstream_available_models(
+        &self,
+        mut remote_models: Vec<ModelInfo>,
+    ) -> Vec<ModelPreset> {
+        remote_models.sort_by_key(|model| model.priority);
+        let presets = remote_models.into_iter().map(Into::into).collect();
+        let uses_codex_backend = self
+            .auth_manager()
+            .is_some_and(AuthManager::current_auth_uses_codex_backend);
+        let mut presets = ModelPreset::filter_by_auth(presets, uses_codex_backend);
+        ModelPreset::mark_default_by_picker_visibility(&mut presets);
+        presets
+    }
+
     /// List collaboration mode presets.
     ///
     /// Returns a static set of presets seeded with the configured model.
@@ -170,6 +185,12 @@ pub trait ModelsManager: fmt::Debug + Send + Sync {
     fn try_list_models(&self) -> Result<Vec<ModelPreset>, TryLockError> {
         let remote_models = self.try_get_remote_models()?;
         Ok(self.build_available_models(remote_models))
+    }
+
+    /// Attempt to list presets for upstream-owned contracts without blocking.
+    fn try_list_upstream_models(&self) -> Result<Vec<ModelPreset>, TryLockError> {
+        let remote_models = self.try_get_remote_models()?;
+        Ok(self.build_upstream_available_models(remote_models))
     }
 
     // todo(aibrahim): should be visible to core only and sent on session_configured event

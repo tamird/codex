@@ -19,7 +19,7 @@ impl ToolExecutor<ToolInvocation> for Handler {
 
     fn search_info(&self) -> Option<ToolSearchInfo> {
         multi_agent_tool_search_info(
-            "resume_agent reload open cold agent subagent thread id target",
+            "resume_agent resume reopen closed agent subagent thread id target",
             self.spec(),
         )
     }

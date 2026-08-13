@@ -252,6 +252,7 @@ pub struct TurnContext {
     // TODO(anp): Reconcile this parallel turn snapshot with TurnEnvironment::sandbox_context
     // so owner-provided environment settings govern the remaining sandbox decisions.
     pub(crate) windows_sandbox_level: WindowsSandboxLevel,
+    /// Remote model presets rendered in upstream-owned tool contracts.
     pub(crate) available_models: Vec<ModelPreset>,
     pub(crate) unified_exec_shell_mode: UnifiedExecShellMode,
     pub(crate) final_output_json_schema: Option<Value>,
@@ -508,7 +509,7 @@ impl TurnContext {
         };
         config.model_reasoning_effort = reasoning_effort.clone();
 
-        let available_models = models_manager
+        let _ = models_manager
             .list_models(
                 RefreshStrategy::OnlineIfUncached,
                 config.http_client_factory(),
@@ -528,6 +529,9 @@ impl TurnContext {
         ));
         config.service_tier = step_settings.service_tier.clone();
         let session_telemetry = step_settings.telemetry(&self.session_telemetry);
+        let available_models = models_manager
+            .try_list_upstream_models()
+            .unwrap_or_default();
 
         Self {
             sub_id: self.sub_id.clone(),
@@ -640,12 +644,10 @@ impl TurnContext {
             models_manager_config.model_auto_compact_token_limit = custom_model
                 .model_auto_compact_token_limit
                 .or(models_manager_config.model_auto_compact_token_limit);
-            model_info = Arc::new(
-                codex_models_manager::model_info::with_config_overrides(
-                    model_info.as_ref().clone(),
-                    &models_manager_config,
-                ),
-            );
+            model_info = Arc::new(codex_models_manager::model_info::with_config_overrides(
+                model_info.as_ref().clone(),
+                &models_manager_config,
+            ));
         }
         let has_authoritative_metadata = !model_info.used_fallback_model_metadata;
         let reasoning_effort = if let Some(reasoning_effort) = candidate.reasoning_effort.as_ref() {
@@ -717,7 +719,6 @@ impl TurnContext {
         routed.model_routing_candidate = Some(candidate.clone());
         Some(routed)
     }
-
 
     fn non_legacy_file_system_sandbox_policy(&self) -> Option<RawFileSystemSandboxPolicy> {
         // Omit the derived split filesystem policy when it is equivalent to
@@ -897,7 +898,9 @@ impl Session {
         let model_info = &step_settings.model_info;
         let session_telemetry_for_context = step_settings.telemetry(session_telemetry);
         let session_source = session_configuration.session_source.clone();
-        let available_models = models_manager.try_list_models().unwrap_or_default();
+        let available_models = models_manager
+            .try_list_upstream_models()
+            .unwrap_or_default();
         let unified_exec_shell_mode = UnifiedExecShellMode::for_session(
             per_turn_config.features.get(),
             crate::tools::tool_user_shell_type(user_shell),
@@ -1200,7 +1203,10 @@ impl Session {
             turn_context.cyber_access_program = options.cyber_access_program;
         }
         if resolve_model_routing {
-            let profile_name = session_configuration.step_settings.collaboration_mode.model();
+            let profile_name = session_configuration
+                .step_settings
+                .collaboration_mode
+                .model();
             if let Some(selection) = self
                 .select_model_routing_context(&turn_context, profile_name, &HashSet::new())
                 .await

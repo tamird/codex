@@ -740,6 +740,83 @@ impl AgentControl {
         Ok(agents)
     }
 
+    /// Projects authoritative current membership through the upstream `list_agents` contract.
+    pub(crate) async fn list_agents_canonical(
+        &self,
+        current_session_source: &SessionSource,
+        path_prefix: Option<&str>,
+    ) -> CodexResult<Vec<ListedAgent>> {
+        let state = self.upgrade()?;
+        let resolved_prefix = path_prefix
+            .map(|prefix| {
+                current_session_source
+                    .get_agent_path()
+                    .unwrap_or_else(AgentPath::root)
+                    .resolve(prefix)
+                    .map_err(CodexErr::UnsupportedOperation)
+            })
+            .transpose()?;
+        let root_path = AgentPath::root();
+        let root_thread_id = self.state.agent_id_for_path(&root_path);
+        let mut current_members = self.current_agent_members().await?;
+        current_members.sort_by(|left, right| {
+            left.agent_path
+                .as_ref()
+                .map(AgentPath::as_str)
+                .unwrap_or_default()
+                .cmp(
+                    right
+                        .agent_path
+                        .as_ref()
+                        .map(AgentPath::as_str)
+                        .unwrap_or_default(),
+                )
+                .then_with(|| left.thread_id.to_string().cmp(&right.thread_id.to_string()))
+        });
+
+        let mut agents = Vec::with_capacity(current_members.len().saturating_add(1));
+        if resolved_prefix
+            .as_ref()
+            .is_none_or(|prefix| agent_matches_prefix(Some(&root_path), prefix))
+            && let Some(root_thread_id) = root_thread_id
+            && let Ok(root_thread) = state.get_thread(root_thread_id).await
+        {
+            agents.push(ListedAgent {
+                agent_id: root_thread_id,
+                parent_agent_id: None,
+                agent_name: root_path.to_string(),
+                agent_status: root_thread.agent_status().await,
+                last_task_message: None,
+            });
+        }
+
+        for member in current_members {
+            if Some(member.thread_id) == root_thread_id
+                || resolved_prefix
+                    .as_ref()
+                    .is_some_and(|prefix| !agent_matches_prefix(member.agent_path.as_ref(), prefix))
+            {
+                continue;
+            }
+            agents.push(ListedAgent {
+                agent_id: member.thread_id,
+                parent_agent_id: Some(member.parent_thread_id),
+                agent_name: member
+                    .agent_path
+                    .as_ref()
+                    .map(ToString::to_string)
+                    .unwrap_or_else(|| member.thread_id.to_string()),
+                agent_status: member.status,
+                last_task_message: member
+                    .last_task_message
+                    .as_deref()
+                    .map(bounded_list_agents_preview),
+            });
+        }
+
+        Ok(agents)
+    }
+
     pub(crate) async fn list_agents_page(
         &self,
         current_session_source: &SessionSource,

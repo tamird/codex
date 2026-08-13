@@ -38,6 +38,7 @@ use crate::tools::handlers::multi_agents::ResumeAgentHandler;
 use crate::tools::handlers::multi_agents::SendInputHandler;
 use crate::tools::handlers::multi_agents::SpawnAgentHandler;
 use crate::tools::handlers::multi_agents::SupervisorCompactParentContextHandler;
+use crate::tools::handlers::multi_agents::SupervisorFollowupParentHandler;
 use crate::tools::handlers::multi_agents::SupervisorSelfCloseHandler;
 use crate::tools::handlers::multi_agents::SupervisorSnoozeHandler;
 use crate::tools::handlers::multi_agents::WaitAgentHandler;
@@ -669,9 +670,6 @@ fn collab_tools_enabled(turn_context: &TurnContext, model_info: &ModelInfo) -> b
         MultiAgentVersion::V2 => {
             turn_context.session_source.get_agent_path().is_none()
                 || model_info.multi_agent_version == Some(MultiAgentVersion::V2)
-                || crate::goal_supervisor::is_goal_supervisor_helper_source(
-                    &turn_context.session_source,
-                )
         }
     }
 }
@@ -1383,6 +1381,7 @@ fn add_collaboration_tools(context: &CoreToolPlanContext<'_>, registry: &mut Too
     }
     if crate::goal_supervisor::is_goal_supervisor_helper_source(&turn_context.session_source) {
         registry.add(SupervisorSelfCloseHandler);
+        registry.add(SupervisorFollowupParentHandler);
         registry.add(SupervisorSnoozeHandler);
         registry.add(SupervisorCompactParentContextHandler);
     }
@@ -1568,3 +1567,7 @@ fn code_mode_namespace_name<'a>(
 #[cfg(test)]
 #[path = "spec_plan_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "collaboration_contract_tests.rs"]
+mod collaboration_contract_tests;

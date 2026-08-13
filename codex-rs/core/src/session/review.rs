@@ -15,7 +15,7 @@ pub(super) async fn spawn_review_thread(
         .review_model
         .clone()
         .unwrap_or_else(|| parent_turn_context.model_info().slug.clone());
-    let available_models = sess
+    let _ = sess
         .services
         .models_manager
         .list_models(
@@ -23,6 +23,11 @@ pub(super) async fn spawn_review_thread(
             config.http_client_factory(),
         )
         .await;
+    let available_models = sess
+        .services
+        .models_manager
+        .try_list_upstream_models()
+        .unwrap_or_default();
     let review_model_info = sess
         .services
         .models_manager

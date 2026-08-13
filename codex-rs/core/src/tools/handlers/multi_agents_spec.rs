@@ -351,32 +351,19 @@ pub fn create_wait_agent_tool_v2(options: WaitAgentTimeoutOptions) -> ToolSpec {
 }
 
 pub fn create_list_agents_tool() -> ToolSpec {
-    let properties = BTreeMap::from([
-        (
-            "path_prefix".to_string(),
-            JsonSchema::string(Some(
-                "Task-path prefix filter without a trailing slash. Omit to list all current subagents."
-                    .to_string(),
-            )),
-        ),
-        (
-            "cursor".to_string(),
-            JsonSchema::string(Some(
-                "Opaque cursor returned by a previous list_agents call.".to_string(),
-            )),
-        ),
-        (
-            "limit".to_string(),
-            JsonSchema::number(Some(
-                "Maximum agents to return. Values above 25 are clamped to 25.".to_string(),
-            )),
-        ),
-    ]);
+    let properties = BTreeMap::from([(
+        "path_prefix".to_string(),
+        JsonSchema::string(Some(
+            "Task-path prefix filter without a trailing slash. Omit to list all live agents."
+                .to_string(),
+        )),
+    )]);
 
     ToolSpec::Function(ResponsesApiTool {
         name: "list_agents".to_string(),
-        description: "List subagents currently registered in this root's membership. This includes registered ephemeral agents and excludes the root thread, cold historical persisted-open descendants, permanently closed agents, and unrelated fork history. Optionally filter by task-path prefix."
-            .to_string(),
+        description:
+            "List live agents in the current root thread tree. Optionally filter by task-path prefix."
+                .to_string(),
         strict: false,
         defer_loading: None,
         parameters: JsonSchema::object(properties, /*required*/ None, Some(false.into())),
@@ -455,6 +442,39 @@ pub fn create_supervisor_close_self_tool() -> ToolSpec {
                 }
             },
             "required": ["completed"],
+            "additionalProperties": false
+        })),
+    })
+}
+
+pub fn create_supervisor_followup_parent_tool() -> ToolSpec {
+    let properties = BTreeMap::from([(
+        "message".to_string(),
+        JsonSchema::string(Some(
+            "Actionable guidance to send to the supervised parent thread.".to_string(),
+        )),
+    )]);
+
+    ToolSpec::Function(ResponsesApiTool {
+        name: "followup_parent".to_string(),
+        description: "Supervisor-only: send actionable guidance to the supervised parent, trigger its next turn, and end this supervisor check-in immediately."
+            .to_string(),
+        strict: false,
+        defer_loading: None,
+        parameters: JsonSchema::object(
+            properties,
+            Some(vec!["message".to_string()]),
+            Some(false.into()),
+        ),
+        output_schema: Some(json!({
+            "type": "object",
+            "properties": {
+                "delivered": {
+                    "type": "boolean",
+                    "description": "Whether the guidance was delivered to the supervised parent."
+                }
+            },
+            "required": ["delivered"],
             "additionalProperties": false
         })),
     })
@@ -673,44 +693,18 @@ fn list_agents_output_schema() -> Value {
                             "type": "string",
                             "description": "Canonical task name for the agent when available, otherwise the agent id."
                         },
-                        "agent_id": {
-                            "type": "string",
-                            "description": "Thread id for the agent."
-                        },
-                        "parent_agent_id": {
-                            "type": ["string", "null"],
-                            "description": "Immediate owner thread id."
-                        },
                         "agent_status": {
                             "description": "Last known status of the agent.",
                             "allOf": [agent_status_output_schema()]
-                        },
-                        "last_task_message": {
-                            "type": ["string", "null"],
-                            "description": "Bounded preview of the agent's latest assigned task."
                         }
                     },
-                    "required": [
-                        "agent_id",
-                        "parent_agent_id",
-                        "agent_name",
-                        "agent_status",
-                        "last_task_message"
-                    ],
+                    "required": ["agent_name", "agent_status"],
                     "additionalProperties": false
                 },
-                "description": "Subagents currently registered in the root membership, including registered ephemeral agents and excluding the root thread and cold historical persisted-open descendants."
-            },
-            "next_cursor": {
-                "type": ["string", "null"],
-                "description": "Cursor for the next page, or null when this is the final page."
-            },
-            "total_count": {
-                "type": "integer",
-                "description": "Total current subagents matching the request."
+                "description": "Live agents visible in the current root thread tree."
             }
         },
-        "required": ["agents", "next_cursor", "total_count"],
+        "required": ["agents"],
         "additionalProperties": false
     })
 }

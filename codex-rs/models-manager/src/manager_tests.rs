@@ -821,6 +821,76 @@ async fn custom_model_alias_uses_backing_model_metadata_and_request_model() {
 }
 
 #[tokio::test]
+async fn upstream_model_presets_exclude_custom_aliases_and_preserve_slug_collisions() {
+    let remote = remote_model("gpt-real", "Real", /*priority*/ 0);
+    let custom_models = HashMap::from([
+        (
+            "frontier-local".to_string(),
+            CustomModelConfig {
+                model: "gpt-real-preview".to_string(),
+                routing_profile: None,
+                model_context_window: None,
+                model_auto_compact_token_limit: None,
+            },
+        ),
+        (
+            "gpt-real".to_string(),
+            CustomModelConfig {
+                model: "gpt-other".to_string(),
+                routing_profile: None,
+                model_context_window: None,
+                model_auto_compact_token_limit: None,
+            },
+        ),
+    ]);
+    let manager = StaticModelsManager::new_with_custom_models(
+        /*auth_manager*/ None,
+        ModelsResponse {
+            models: vec![remote],
+        },
+        custom_models,
+    );
+
+    let picker_models = manager
+        .list_models(RefreshStrategy::Offline, DEFAULT_HTTP_CLIENT_FACTORY)
+        .await;
+    assert!(
+        picker_models
+            .iter()
+            .any(|preset| preset.model == "frontier-local")
+    );
+    let upstream_models = manager
+        .try_list_upstream_models()
+        .expect("model catalog is unlocked");
+    assert_eq!(
+        upstream_models
+            .iter()
+            .map(|preset| preset.model.as_str())
+            .collect::<Vec<_>>(),
+        ["gpt-real"]
+    );
+
+    manager.replace_custom_models(HashMap::from([(
+        "replacement-alias".to_string(),
+        CustomModelConfig {
+            model: "gpt-real".to_string(),
+            routing_profile: None,
+            model_context_window: None,
+            model_auto_compact_token_limit: None,
+        },
+    )]));
+    assert_eq!(
+        manager
+            .try_list_upstream_models()
+            .expect("model catalog is unlocked")
+            .iter()
+            .map(|preset| preset.model.as_str())
+            .collect::<Vec<_>>(),
+        ["gpt-real"]
+    );
+}
+
+#[tokio::test]
 async fn replacing_custom_models_updates_picker_and_fallback_lookup() {
     let remote = remote_model("gpt-real", "Real", /*priority*/ 0);
     let manager = StaticModelsManager::new(

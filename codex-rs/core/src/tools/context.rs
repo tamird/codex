@@ -255,6 +255,7 @@ impl FunctionToolOutput {
         function_call_output_content_items_to_text(&self.body).unwrap_or_default()
     }
 
+    #[cfg(test)]
     pub fn into_terminal_no_response(mut self) -> Self {
         self.terminal_no_response = true;
         self

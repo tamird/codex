@@ -15,6 +15,7 @@ use crate::session::turn_context::TurnContext;
 use crate::session_prefix::format_inter_agent_completion_message;
 use crate::thread_manager::thread_store_from_config;
 use crate::tools::context::ToolOutput;
+use crate::tools::handlers::multi_agents::SupervisorFollowupParentHandler;
 use crate::tools::handlers::multi_agents_v2::AdoptAgentHandler;
 use crate::tools::handlers::multi_agents_v2::CloseAgentHandler as CloseAgentHandlerV2;
 use crate::tools::handlers::multi_agents_v2::FollowupTaskHandler as FollowupTaskHandlerV2;
@@ -215,17 +216,12 @@ where
 #[derive(Debug, Deserialize)]
 struct ListAgentsResult {
     agents: Vec<ListedAgentResult>,
-    next_cursor: Option<String>,
-    total_count: usize,
 }
 
 #[derive(Debug, Deserialize)]
 struct ListedAgentResult {
-    agent_id: ThreadId,
-    parent_agent_id: Option<ThreadId>,
     agent_name: String,
     agent_status: serde_json::Value,
-    last_task_message: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -922,6 +918,44 @@ async fn multi_agent_v2_spawn_requires_task_name() {
 }
 
 #[tokio::test]
+async fn multi_agent_v2_spawn_rejects_adoption_fields() {
+    let (mut session, mut turn) = make_session_and_context().await;
+    let manager = thread_manager(&turn);
+    let root = manager
+        .start_thread(StartThreadOptions::new((*turn.config).clone()))
+        .await
+        .expect("root thread should start");
+    session.services.agent_control = manager.agent_control();
+    session.thread_id = root.thread_id;
+    let mut config = (*turn.config).clone();
+    config
+        .features
+        .enable(Feature::MultiAgentV2)
+        .expect("test config should allow feature update");
+    set_turn_config(&mut turn, config);
+
+    let Err(err) = SpawnAgentHandlerV2::default()
+        .handle(invocation(
+            Arc::new(session),
+            Arc::new(turn),
+            "spawn_agent",
+            function_payload(json!({
+                "message": "inspect this repo",
+                "task_name": "worker",
+                "existing_thread_id": ThreadId::new(),
+            })),
+        ))
+        .await
+    else {
+        panic!("canonical spawn_agent must reject ownership-transfer fields");
+    };
+    let FunctionCallError::RespondToModel(message) = err else {
+        panic!("adoption field should surface as a model-facing error");
+    };
+    assert!(message.contains("unknown field `existing_thread_id`"));
+}
+
+#[tokio::test]
 async fn multi_agent_v2_ownership_transfer_is_disabled_by_default() {
     let (mut session, mut turn) = make_session_and_context().await;
     let manager = thread_manager(&turn);
@@ -940,7 +974,7 @@ async fn multi_agent_v2_ownership_transfer_is_disabled_by_default() {
     let session = Arc::new(session);
     let turn = Arc::new(turn);
 
-    let Err(adopt_error) = AdoptAgentHandler::new(false)
+    let Err(adopt_error) = AdoptAgentHandler::new(/*hide_agent_metadata*/ false)
         .handle(invocation(
             session.clone(),
             turn.clone(),
@@ -1014,7 +1048,7 @@ async fn multi_agent_v2_adoption_rejects_fork_and_configuration_overrides() {
                     .clone(),
             );
 
-        let Err(error) = AdoptAgentHandler::new(false)
+        let Err(error) = AdoptAgentHandler::new(/*hide_agent_metadata*/ false)
             .handle(invocation(
                 session.clone(),
                 turn.clone(),
@@ -1025,12 +1059,10 @@ async fn multi_agent_v2_adoption_rejects_fork_and_configuration_overrides() {
         else {
             panic!("adoption must reject fork and configuration overrides");
         };
-        assert_eq!(
-            error,
-            FunctionCallError::RespondToModel(
-                "existing_thread_id cannot be combined with fork, agent type, model, reasoning effort, or service tier overrides".to_string(),
-            )
-        );
+        let FunctionCallError::RespondToModel(message) = error else {
+            panic!("adoption overrides should surface as model-facing parse errors");
+        };
+        assert!(message.contains("unknown field"), "{message}");
     }
 }
 
@@ -1526,8 +1558,7 @@ async fn multi_agent_v2_followup_task_rejects_root_target_from_child() {
     assert_eq!(
         err,
         FunctionCallError::RespondToModel(
-            "Only supervisor check-in threads can use followup_task with target `parent`; use send_message for parent updates."
-                .to_string()
+            "Follow-up tasks can't target the root agent".to_string()
         )
     );
     let root_ops = manager
@@ -1543,9 +1574,111 @@ async fn multi_agent_v2_followup_task_rejects_root_target_from_child() {
     );
 }
 
+#[tokio::test]
+async fn multi_agent_v2_parent_target_prefers_an_owned_child_named_parent() {
+    let (mut session, mut turn) = make_session_and_context().await;
+    let manager = thread_manager(&turn);
+    let mut config = (*turn.config).clone();
+    config
+        .features
+        .enable(Feature::MultiAgentV2)
+        .expect("test config should allow feature update");
+    set_turn_config(&mut turn, config.clone());
+    let root = manager
+        .start_thread(StartThreadOptions::new(config.clone()))
+        .await
+        .expect("root thread should start");
+    session.services.agent_control = manager.agent_control();
+
+    let worker_path = AgentPath::try_from("/root/worker").expect("worker path");
+    let worker_thread_id = session
+        .services
+        .agent_control
+        .spawn_agent_with_metadata(
+            config.clone(),
+            vec![UserInput::Text {
+                text: "worker".to_string(),
+                text_elements: Vec::new(),
+            }],
+            Some(SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+                parent_thread_id: root.thread_id,
+                depth: 1,
+                agent_path: Some(worker_path.clone()),
+                agent_nickname: None,
+                agent_role: None,
+            })),
+            crate::agent::control::SpawnAgentOptions::default(),
+        )
+        .await
+        .expect("worker should start")
+        .thread_id;
+    let named_parent_path =
+        AgentPath::try_from("/root/worker/parent").expect("named parent child path");
+    let named_parent_thread_id = session
+        .services
+        .agent_control
+        .spawn_agent_with_metadata(
+            config,
+            vec![UserInput::Text {
+                text: "named parent child".to_string(),
+                text_elements: Vec::new(),
+            }],
+            Some(SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+                parent_thread_id: worker_thread_id,
+                depth: 2,
+                agent_path: Some(named_parent_path.clone()),
+                agent_nickname: None,
+                agent_role: None,
+            })),
+            crate::agent::control::SpawnAgentOptions::default(),
+        )
+        .await
+        .expect("named parent child should start")
+        .thread_id;
+
+    session.thread_id = worker_thread_id;
+    turn.session_source = SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+        parent_thread_id: root.thread_id,
+        depth: 1,
+        agent_path: Some(worker_path),
+        agent_nickname: None,
+        agent_role: None,
+    });
+    SendMessageHandlerV2
+        .handle(invocation(
+            Arc::new(session),
+            Arc::new(turn),
+            "send_message",
+            function_payload(json!({
+                "target": "parent",
+                "message": "address the owned child",
+            })),
+        ))
+        .await
+        .expect("owned child named parent should receive the message");
+
+    assert!(manager.captured_ops().iter().any(|(thread_id, op)| {
+        *thread_id == named_parent_thread_id
+            && matches!(
+                op,
+                Op::InterAgentCommunication {
+                    communication,
+                    start_options: _,
+                }
+                    if communication.recipient == named_parent_path
+            )
+    }));
+    assert!(!manager.captured_ops().iter().any(|(thread_id, op)| {
+        *thread_id == root.thread_id && matches!(op, Op::InterAgentCommunication { .. })
+    }));
+
+    let _ = manager
+        .shutdown_all_threads_bounded(Duration::from_secs(5))
+        .await;
+}
+
 #[test]
-fn multi_agent_v2_goal_supervisor_followup_targets_parent_and_retires_helper() -> anyhow::Result<()>
-{
+fn multi_agent_v2_goal_supervisor_uses_separate_followup_contract() -> anyhow::Result<()> {
     std::thread::Builder::new()
         .name("goal-supervisor-followup-handler".to_string())
         .stack_size(32 * 1024 * 1024)
@@ -1554,18 +1687,30 @@ fn multi_agent_v2_goal_supervisor_followup_targets_parent_and_retires_helper() -
                 .enable_all()
                 .build()
                 .expect("build goal supervisor test runtime")
-                .block_on(
-                    multi_agent_v2_goal_supervisor_followup_targets_parent_and_retires_helper_inner(
-                    ),
-                )
+                .block_on(async {
+                    for source in [
+                        crate::tools::context::ToolCallSource::DirectPlaintextMessage,
+                        crate::tools::context::ToolCallSource::CodeMode {
+                            cell_id: "cell-1".to_string(),
+                            runtime_tool_call_id: "runtime-1".to_string(),
+                        },
+                    ] {
+                        multi_agent_v2_goal_supervisor_uses_separate_followup_contract_inner(
+                            source,
+                        )
+                        .await?;
+                    }
+                    anyhow::Ok(())
+                })
         })
         .expect("spawn goal supervisor test thread")
         .join()
         .unwrap_or_else(|err| std::panic::resume_unwind(err))
 }
 
-async fn multi_agent_v2_goal_supervisor_followup_targets_parent_and_retires_helper_inner()
--> anyhow::Result<()> {
+async fn multi_agent_v2_goal_supervisor_uses_separate_followup_contract_inner(
+    source: crate::tools::context::ToolCallSource,
+) -> anyhow::Result<()> {
     let server = start_mock_server().await;
     let request_log = mount_response_sequence(
         &server,
@@ -1661,19 +1806,43 @@ async fn multi_agent_v2_goal_supervisor_followup_targets_parent_and_retires_help
         .await
         .get_agent_path()
         .expect("goal supervisor helper should have an agent path");
-    let output = FollowupTaskHandlerV2
+    let root_ops_before = manager.captured_ops().len();
+    let Err(error) = SupervisorFollowupParentHandler
         .handle(invocation(
             Arc::clone(&helper.session),
             helper.session.new_default_turn().await,
-            "followup_task",
+            "followup_parent",
             function_payload(json!({
-                "target": "parent",
                 "message": "continue the active goal",
             })),
         ))
         .await
-        .expect("goal supervisor followup should succeed");
+    else {
+        anyhow::bail!("encrypted direct supervisor followup must fail");
+    };
 
+    assert_eq!(
+        error,
+        FunctionCallError::RespondToModel(
+            "supervisor.followup_parent does not accept encrypted direct arguments.".to_string()
+        )
+    );
+    assert!(manager.get_thread(helper_thread_id).await.is_ok());
+    assert_eq!(manager.captured_ops().len(), root_ops_before);
+
+    let mut valid_invocation = invocation(
+        Arc::clone(&helper.session),
+        helper.session.new_default_turn().await,
+        "followup_parent",
+        function_payload(json!({
+            "message": "continue the active goal",
+        })),
+    );
+    valid_invocation.source = source;
+    let output = SupervisorFollowupParentHandler
+        .handle(valid_invocation)
+        .await
+        .expect("plaintext supervisor followup should succeed");
     assert!(output.terminal_no_response());
     assert!(manager.captured_ops().iter().any(|(thread_id, op)| {
         *thread_id == root.thread_id
@@ -1685,6 +1854,8 @@ async fn multi_agent_v2_goal_supervisor_followup_targets_parent_and_retires_help
                 }
                     if communication.author == helper_path
                         && communication.recipient == AgentPath::root()
+                        && communication.encrypted_content.is_none()
+                        && communication.content.contains("continue the active goal")
                         && communication.trigger_turn
             )
     }));
@@ -1694,7 +1865,7 @@ async fn multi_agent_v2_goal_supervisor_followup_targets_parent_and_retires_help
         }
     })
     .await
-    .expect("successful followup should retire the active goal supervisor helper");
+    .expect("successful supervisor followup should retire the helper");
 
     let continuity = crate::goal_supervisor::supervisor_continuity_context_item(
         &root.thread.session,
@@ -1716,6 +1887,21 @@ async fn multi_agent_v2_goal_supervisor_followup_targets_parent_and_retires_help
             ))
     ));
 
+    assert!(!manager.captured_ops().iter().any(|(thread_id, op)| {
+        *thread_id == root.thread_id
+            && matches!(
+                op,
+                Op::InterAgentCommunication {
+                    communication,
+                    start_options: _,
+                }
+                    if communication.author == helper_path
+                        && communication.recipient == AgentPath::root()
+                        && communication.encrypted_content.is_some()
+                        && communication.trigger_turn
+            )
+    }));
+
     let _ = manager
         .shutdown_all_threads_bounded(Duration::from_secs(5))
         .await;
@@ -1734,31 +1920,30 @@ async fn multi_agent_v2_list_agents_returns_completed_status() {
     session.services.agent_control = manager.agent_control();
     session.thread_id = root.thread_id;
     let _ = config.features.enable(Feature::MultiAgentV2);
-    set_turn_config(&mut turn, config);
+    set_turn_config(&mut turn, config.clone());
 
-    let session = Arc::new(session);
-    let turn = Arc::new(turn);
-    let spawn_output = SpawnAgentHandlerV2::default()
-        .handle(invocation(
-            session.clone(),
-            turn.clone(),
-            "spawn_agent",
-            function_payload(json!({
-                "message": "inspect this repo",
-                "task_name": "worker",
-                "fork_turns": "none"
-            })),
-        ))
-        .await
-        .expect("spawn_agent should succeed");
-    let _ = expect_text_output(spawn_output);
-
+    let worker_path = AgentPath::try_from("/root/worker").expect("worker path");
     let agent_id = session
         .services
         .agent_control
-        .resolve_agent_reference(session.thread_id, &turn.session_source, "worker")
+        .spawn_agent_with_metadata(
+            config,
+            vec![UserInput::Text {
+                text: "inspect this repo".to_string(),
+                text_elements: Vec::new(),
+            }],
+            Some(SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+                parent_thread_id: root.thread_id,
+                depth: 1,
+                agent_path: Some(worker_path),
+                agent_nickname: None,
+                agent_role: None,
+            })),
+            crate::agent::control::SpawnAgentOptions::default(),
+        )
         .await
-        .expect("worker path should resolve");
+        .expect("worker should start")
+        .thread_id;
     let child_thread = manager
         .get_thread(agent_id)
         .await
@@ -1780,6 +1965,8 @@ async fn multi_agent_v2_list_agents_returns_completed_status() {
         )
         .await;
 
+    let session = Arc::new(session);
+    let turn = Arc::new(turn);
     let output = ListAgentsHandlerV2
         .handle(invocation(
             session,
@@ -1790,6 +1977,20 @@ async fn multi_agent_v2_list_agents_returns_completed_status() {
         .await
         .expect("list_agents should succeed");
     let (content, success) = expect_text_output(output);
+    let raw_result: serde_json::Value =
+        serde_json::from_str(&content).expect("list_agents result should be json");
+    for agent in raw_result["agents"]
+        .as_array()
+        .expect("list_agents should return an agents array")
+    {
+        let keys = agent
+            .as_object()
+            .expect("each listed agent should be an object")
+            .keys()
+            .map(String::as_str)
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(keys, ["agent_name", "agent_status"].into_iter().collect());
+    }
     let result: ListAgentsResult =
         serde_json::from_str(&content).expect("list_agents result should be json");
 
@@ -1798,18 +1999,13 @@ async fn multi_agent_v2_list_agents_returns_completed_status() {
         .iter()
         .map(|agent| agent.agent_name.as_str())
         .collect::<Vec<_>>();
-    assert_eq!(agent_names, vec!["/root/worker"]);
+    assert_eq!(agent_names, vec!["/root", "/root/worker"]);
     let worker = result
         .agents
         .iter()
         .find(|agent| agent.agent_name == "/root/worker")
         .expect("worker agent should be listed");
     assert_eq!(worker.agent_status, json!({"completed": "done"}));
-    assert_eq!(worker.agent_id, agent_id);
-    assert_eq!(worker.parent_agent_id, Some(root.thread_id));
-    assert_eq!(worker.last_task_message, None);
-    assert_eq!(result.next_cursor, None);
-    assert_eq!(result.total_count, 1);
     assert_eq!(success, Some(true));
 }
 
@@ -1954,9 +2150,8 @@ async fn multi_agent_v2_list_agents_omits_closed_agents() {
     let result: ListAgentsResult =
         serde_json::from_str(&content).expect("list_agents result should be json");
 
-    assert!(result.agents.is_empty());
-    assert_eq!(result.next_cursor, None);
-    assert_eq!(result.total_count, 0);
+    assert_eq!(result.agents.len(), 1);
+    assert_eq!(result.agents[0].agent_name, "/root");
 }
 
 #[tokio::test]
@@ -2027,8 +2222,19 @@ async fn multi_agent_v2_list_agents_keeps_interrupted_resident_agents() {
     let result: ListAgentsResult =
         serde_json::from_str(&content).expect("list_agents result should be json");
 
-    assert_eq!(result.agents.len(), 1);
-    assert_eq!(result.agents[0].agent_name, agent_path.as_str());
+    assert_eq!(result.agents.len(), 2);
+    assert!(
+        result
+            .agents
+            .iter()
+            .any(|agent| agent.agent_name == "/root")
+    );
+    assert!(
+        result
+            .agents
+            .iter()
+            .any(|agent| agent.agent_name == agent_path.as_str())
+    );
 }
 
 #[tokio::test]

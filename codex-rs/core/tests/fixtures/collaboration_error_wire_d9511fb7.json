@@ -1,0 +1,71 @@
+[
+  {
+    "call_id": "list-success",
+    "tool": "list_agents",
+    "arguments": {},
+    "output": "{\"agents\":[{\"agent_name\":\"/root\",\"agent_status\":\"running\"}]}",
+    "success": null
+  },
+  {
+    "call_id": "list-error",
+    "tool": "list_agents",
+    "arguments": {
+      "cursor": "x"
+    },
+    "output": "failed to parse function arguments: unknown field `cursor`, expected `path_prefix` at line 1 column 9",
+    "success": null
+  },
+  {
+    "call_id": "spawn-error",
+    "tool": "spawn_agent",
+    "arguments": {
+      "message": "x",
+      "task_name": "x",
+      "unexpected": true
+    },
+    "output": "failed to parse function arguments: unknown field `unexpected`, expected one of `message`, `task_name`, `agent_type`, `model`, `reasoning_effort`, `fork_turns`, `fork_context` at line 1 column 43",
+    "success": null
+  },
+  {
+    "call_id": "send-error",
+    "tool": "send_message",
+    "arguments": {
+      "target": "x",
+      "message": "x",
+      "unexpected": true
+    },
+    "output": "failed to parse function arguments: unknown field `unexpected`, expected `target` or `message` at line 1 column 40",
+    "success": null
+  },
+  {
+    "call_id": "followup-error",
+    "tool": "followup_task",
+    "arguments": {
+      "target": "x",
+      "message": "x",
+      "unexpected": true
+    },
+    "output": "failed to parse function arguments: unknown field `unexpected`, expected `target` or `message` at line 1 column 40",
+    "success": null
+  },
+  {
+    "call_id": "wait-error",
+    "tool": "wait_agent",
+    "arguments": {
+      "timeout_ms": 1,
+      "unexpected": true
+    },
+    "output": "failed to parse function arguments: unknown field `unexpected`, expected `timeout_ms` at line 1 column 28",
+    "success": null
+  },
+  {
+    "call_id": "interrupt-error",
+    "tool": "interrupt_agent",
+    "arguments": {
+      "target": "x",
+      "unexpected": true
+    },
+    "output": "failed to parse function arguments: unknown field `unexpected`, expected `target` at line 1 column 26",
+    "success": null
+  }
+]
