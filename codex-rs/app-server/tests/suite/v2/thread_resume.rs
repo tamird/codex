@@ -188,6 +188,7 @@ async fn thread_resume_paginated_model_context_preserves_original_metadata() -> 
             first_window_id: None,
             previous_window_id: None,
             window_id: None,
+            segment_state_checkpoint: None,
         }),
     )
     .await?;

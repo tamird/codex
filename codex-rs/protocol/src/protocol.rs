@@ -151,15 +151,22 @@ pub fn strip_user_message_prefix(text: &str) -> &str {
 
 // TODO(anp): Replace `TurnEnvironmentSelection` with `PathUri` once path URIs carry environment
 // identifiers.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, JsonSchema, TS)]
 pub struct TurnEnvironmentSelection {
     pub environment_id: String,
     pub cwd: PathUri,
     pub workspace_roots: Vec<PathUri>,
+    /// Runtime environment configuration is resolved by the environment owner.
+    ///
+    /// Rollout checkpoints retain the selected environment and roots but must not persist shell
+    /// environment policy values or transient pending and failure states.
+    #[serde(skip, default)]
+    #[schemars(skip)]
+    #[ts(skip)]
     pub config: EnvironmentConfigState,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, JsonSchema, TS)]
 pub struct TurnEnvironmentSelections {
     pub legacy_fallback_cwd: AbsolutePathBuf,
     pub environments: Vec<TurnEnvironmentSelection>,
@@ -2177,6 +2184,35 @@ pub struct ThreadSettingsSnapshot {
     #[ts(optional)]
     pub active_permission_profile: Option<ActivePermissionProfile>,
     pub cwd: AbsolutePathBuf,
+    /// Sticky environment selections used by future turns.
+    ///
+    /// New checkpoint records use `Some`. Older rollout records omit this field and readers retain
+    /// environment selections derived from current configuration.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub environments: Option<TurnEnvironmentSelections>,
+    /// Effective workspace roots used to materialize symbolic `:workspace_roots` entries in
+    /// `permission_profile`.
+    ///
+    /// New checkpoint records use `Some`, including `Some(Vec::new())`. Older rollout records omit
+    /// this field; readers may fall back to the latest `TurnContextItem::workspace_roots`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub workspace_roots: Option<Vec<AbsolutePathBuf>>,
+    /// Workspace roots supplied by the persisted active permission profile.
+    ///
+    /// New checkpoint records use `Some`, including `Some(Vec::new())`. Older rollout records omit
+    /// this field and readers retain roots resolved from current configuration.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub profile_workspace_roots: Option<Vec<AbsolutePathBuf>>,
+    /// Effective Windows sandbox mode for future turns.
+    ///
+    /// New checkpoint records use `Some`. Older rollout records omit this field and readers retain
+    /// the mode resolved from current configuration.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub windows_sandbox_level: Option<WindowsSandboxLevel>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<ReasoningEffortConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -2184,6 +2220,49 @@ pub struct ThreadSettingsSnapshot {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub personality: Option<Personality>,
     pub collaboration_mode: CollaborationMode,
+}
+
+/// Versioned state needed in addition to replacement history to resume from one rollout segment.
+///
+/// Full world-state and reference-context payloads remain ordinary adjacent rollout items. This
+/// descriptor records whether each payload is present or intentionally cleared and preserves
+/// previous-turn settings that are otherwise available only in older segments. Version 1 also
+/// requires adjacent `ThreadSettingsApplied` and `TokenCount` events.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema, TS)]
+pub struct SegmentStateCheckpoint {
+    /// Checkpoint grammar version interpreted by rollout readers.
+    pub version: u32,
+    /// Settings from the newest completed real user turn, or `None` when no such turn exists.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_turn_settings: Option<SegmentPreviousTurnSettings>,
+    /// Whether an adjacent full `WorldStateItem` establishes the comparison baseline.
+    pub world_state: SegmentStateCheckpointDisposition,
+    /// Whether an adjacent `TurnContextItem` establishes the reference-context baseline.
+    pub reference_context: SegmentStateCheckpointDisposition,
+}
+
+/// Previous-turn settings required to construct model-visible settings changes after resume.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema, TS)]
+pub struct SegmentPreviousTurnSettings {
+    /// Model used by the previous completed real user turn.
+    pub model: String,
+    /// Compact prompt hash used by the previous completed real user turn.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub comp_hash: Option<String>,
+    /// Whether realtime mode was active for the previous completed real user turn.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub realtime_active: Option<bool>,
+}
+
+/// Whether a checkpoint establishes or intentionally clears an adjacent comparison baseline.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(rename_all = "snake_case")]
+pub enum SegmentStateCheckpointDisposition {
+    /// The checkpoint contains the corresponding adjacent full snapshot.
+    Established,
+    /// The checkpoint intentionally has no baseline for the corresponding state.
+    Cleared,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, Default, PartialEq, Eq, JsonSchema, TS)]
@@ -4493,6 +4572,24 @@ mod tests {
     use std::path::PathBuf;
     use tempfile::NamedTempFile;
     use tempfile::TempDir;
+
+    #[test]
+    fn turn_environment_selection_does_not_persist_runtime_config() -> Result<()> {
+        let cwd = test_path_buf("/workspace").abs();
+        let selection = TurnEnvironmentSelection {
+            environment_id: "remote".to_string(),
+            cwd: PathUri::from_abs_path(&cwd),
+            workspace_roots: vec![PathUri::from_abs_path(&cwd)],
+            config: EnvironmentConfigState::Pending,
+        };
+
+        let value = serde_json::to_value(&selection)?;
+        assert_eq!(value.get("config"), None);
+
+        let decoded: TurnEnvironmentSelection = serde_json::from_value(value)?;
+        assert_eq!(decoded.config, EnvironmentConfigState::FromThread);
+        Ok(())
+    }
 
     #[test]
     fn review_decision_denied_round_trip() -> Result<()> {

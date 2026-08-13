@@ -196,6 +196,7 @@ fn compacted_replacement_history_stores_metadata_in_an_aligned_sidecar() -> Resu
         first_window_id: None,
         previous_window_id: None,
         window_id: None,
+        segment_state_checkpoint: None,
     };
 
     let serialized = serde_json::to_value(item)?;
@@ -300,6 +301,7 @@ fn compacted_metadata_remains_compatible_with_legacy_response_item_readers() -> 
         first_window_id: None,
         previous_window_id: None,
         window_id: None,
+        segment_state_checkpoint: None,
     }))?;
 
     let LegacyRolloutItem::Compacted(legacy) =
@@ -452,6 +454,7 @@ fn compacted_item_serializes_window_number_and_id() -> Result<()> {
         first_window_id: Some("019b3f6e-0000-7000-8000-000000000001".to_string()),
         previous_window_id: Some("019b3f6e-0000-7000-8000-000000000002".to_string()),
         window_id: Some("019b3f6e-7a10-7cc3-8b6e-1d09e2f7a001".to_string()),
+        segment_state_checkpoint: None,
     };
 
     assert_eq!(
@@ -464,6 +467,31 @@ fn compacted_item_serializes_window_number_and_id() -> Result<()> {
             "window_id": "019b3f6e-7a10-7cc3-8b6e-1d09e2f7a001",
         })
     );
+    Ok(())
+}
+
+#[test]
+fn compacted_item_round_trips_segment_state_checkpoint() -> Result<()> {
+    let value = json!({
+        "message": "summary",
+        "replacement_history": [],
+        "window_number": 3,
+        "first_window_id": "019b3f6e-0000-7000-8000-000000000001",
+        "window_id": "019b3f6e-7a10-7cc3-8b6e-1d09e2f7a001",
+        "segment_state_checkpoint": {
+            "version": 1,
+            "previous_turn_settings": {
+                "model": "gpt-test",
+                "comp_hash": "settings-hash",
+                "realtime_active": false,
+            },
+            "world_state": "established",
+            "reference_context": "cleared",
+        },
+    });
+
+    let item = serde_json::from_value::<CompactedItem>(value.clone())?;
+    assert_eq!(serde_json::to_value(item)?, value);
     Ok(())
 }
 
@@ -485,6 +513,7 @@ fn compacted_item_migrates_legacy_numeric_window_id() -> Result<()> {
             first_window_id: None,
             previous_window_id: None,
             window_id: None,
+            segment_state_checkpoint: None,
         }
     );
     Ok(())

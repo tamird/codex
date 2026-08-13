@@ -1080,7 +1080,7 @@ async fn process_compacted_history_preserves_separate_guardian_developer_message
         step_context,
     };
 
-    let (refreshed, _) = crate::compact_remote::process_compacted_history(
+    let (refreshed, _, _) = crate::compact_remote::process_compacted_history(
         &session,
         vec![
             ResponseItem::Message {

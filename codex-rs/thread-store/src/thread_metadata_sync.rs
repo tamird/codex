@@ -591,6 +591,7 @@ mod tests {
             first_window_id: None,
             previous_window_id: None,
             window_id: None,
+            segment_state_checkpoint: None,
         });
 
         let first = sync
@@ -651,6 +652,10 @@ mod tests {
                     permission_profile: permission_profile.clone(),
                     active_permission_profile: None,
                     cwd: cwd.clone().try_into().expect("absolute settings cwd"),
+                    environments: None,
+                    workspace_roots: None,
+                    profile_workspace_roots: None,
+                    windows_sandbox_level: None,
                     reasoning_effort: Some(ReasoningEffort::Ultra),
                     reasoning_summary: Some(ReasoningSummary::Auto),
                     personality: None,

@@ -3,6 +3,7 @@ use crate::context::world_state::WorldStateSnapshot;
 use crate::context_manager::is_user_turn_boundary;
 use codex_history::ResponseItemEnvelope;
 use codex_protocol::protocol::SessionContextWindow;
+use codex_rollout::validated_segment_state_checkpoint;
 use uuid::Uuid;
 
 // Return value of `Session::reconstruct_history_from_rollout`, bundling the rebuilt history with
@@ -45,13 +46,27 @@ enum TurnReferenceContextItem {
 
 #[derive(Debug, Default)]
 struct ActiveReplaySegment<'a> {
+    newest_item_index: usize,
     turn_id: Option<String>,
     counts_as_user_turn: bool,
     previous_turn_settings: Option<PreviousTurnSettings>,
+    /// Checkpoint value, including an explicit `None` that clears older settings.
+    checkpoint_previous_turn_settings: Option<Option<PreviousTurnSettings>>,
+    has_segment_state_checkpoint: bool,
+    has_context_baseline_after_checkpoint: bool,
     reference_context_item: TurnReferenceContextItem,
     world_state_replay: Vec<&'a RolloutItem>,
     base_replacement_history: Option<&'a [ResponseItemEnvelope]>,
     window: Option<ReconstructedWindow>,
+}
+
+impl ActiveReplaySegment<'_> {
+    fn new(newest_item_index: usize) -> Self {
+        Self {
+            newest_item_index,
+            ..Default::default()
+        }
+    }
 }
 
 fn turn_ids_are_compatible(active_turn_id: Option<&str>, item_turn_id: Option<&str>) -> bool {
@@ -59,10 +74,15 @@ fn turn_ids_are_compatible(active_turn_id: Option<&str>, item_turn_id: Option<&s
         .is_none_or(|turn_id| item_turn_id.is_none_or(|item_turn_id| item_turn_id == turn_id))
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "segment replay updates distinct reconstruction accumulators from one finalized segment"
+)]
 fn finalize_active_segment<'a>(
     active_segment: ActiveReplaySegment<'a>,
     base_replacement_history: &mut Option<&'a [ResponseItemEnvelope]>,
     previous_turn_settings: &mut Option<PreviousTurnSettings>,
+    previous_turn_settings_resolved: &mut bool,
     reference_context_item: &mut TurnReferenceContextItem,
     world_state_replay: &mut Vec<&'a RolloutItem>,
     window: &mut Option<ReconstructedWindow>,
@@ -102,15 +122,28 @@ fn finalize_active_segment<'a>(
         *window = active_segment.window;
     }
 
-    // Restore settings from the newest surviving context baseline.
-    if previous_turn_settings.is_none() && has_context_baseline {
-        *previous_turn_settings = active_segment.previous_turn_settings;
+    // A certified footer owns its saved settings, including an explicit reset. Only a
+    // surviving user turn or a full context baseline outside that footer can replace them.
+    if !*previous_turn_settings_resolved {
+        if has_context_baseline
+            && (!active_segment.has_segment_state_checkpoint
+                || active_segment.counts_as_user_turn
+                || active_segment.has_context_baseline_after_checkpoint)
+            && let Some(settings) = active_segment.previous_turn_settings
+        {
+            *previous_turn_settings = Some(settings);
+            *previous_turn_settings_resolved = true;
+        } else if let Some(settings) = active_segment.checkpoint_previous_turn_settings {
+            *previous_turn_settings = settings;
+            *previous_turn_settings_resolved = true;
+        }
     }
 
     // `reference_context_item` comes from the newest surviving context baseline, or
     // from a surviving compaction that explicitly cleared that baseline.
     if matches!(reference_context_item, TurnReferenceContextItem::NeverSet)
         && (has_context_baseline
+            || active_segment.has_segment_state_checkpoint
             || matches!(
                 active_segment.reference_context_item,
                 TurnReferenceContextItem::Cleared
@@ -149,6 +182,7 @@ impl Session {
         };
         let mut base_replacement_history: Option<&[ResponseItemEnvelope]> = None;
         let mut previous_turn_settings = None;
+        let mut previous_turn_settings_resolved = false;
         let mut reference_context_item = TurnReferenceContextItem::NeverSet;
         let mut world_state_replay = Vec::new();
         let mut window = None;
@@ -163,10 +197,58 @@ impl Session {
         let mut active_segment: Option<ActiveReplaySegment<'_>> = None;
 
         for (index, item) in rollout_items.iter().enumerate().rev() {
+            let mut reached_segment_state_checkpoint = false;
             match item {
                 RolloutItem::Compacted(compacted) => {
                     let active_segment =
-                        active_segment.get_or_insert_with(ActiveReplaySegment::default);
+                        active_segment.get_or_insert_with(|| ActiveReplaySegment::new(index));
+                    if let Some((checkpoint, footer_len)) =
+                        validated_segment_state_checkpoint(compacted, &rollout_items[index + 1..])
+                    {
+                        active_segment.has_segment_state_checkpoint = true;
+                        // A checkpoint's own full snapshot and context are comparison-state
+                        // sidecars, not a newer turn. Limit the candidate baseline to this
+                        // surviving segment's tail after the validator's complete footer.
+                        let footer_end = index + 1 + footer_len;
+                        let segment_end = active_segment.newest_item_index + 1;
+                        if footer_end < segment_end {
+                            let newer_tail = &rollout_items[footer_end..segment_end];
+                            let has_full_snapshot = newer_tail
+                                .iter()
+                                .rev()
+                                .take_while(|item| !matches!(item, RolloutItem::Compacted(_)))
+                                .any(|item| matches!(item, RolloutItem::WorldState(state) if state.full));
+                            if (active_segment.counts_as_user_turn || has_full_snapshot)
+                                && let Some(context) = newer_tail.iter().find_map(|item| {
+                                    let RolloutItem::TurnContext(context) = item else {
+                                        return None;
+                                    };
+                                    turn_ids_are_compatible(
+                                        active_segment.turn_id.as_deref(),
+                                        context.turn_id.as_deref(),
+                                    )
+                                    .then_some(context)
+                                })
+                            {
+                                active_segment.previous_turn_settings =
+                                    Some(PreviousTurnSettings {
+                                        model: context.model.clone(),
+                                        comp_hash: context.comp_hash.clone(),
+                                        realtime_active: context.realtime_active,
+                                    });
+                                active_segment.has_context_baseline_after_checkpoint = true;
+                            }
+                        }
+                        active_segment.checkpoint_previous_turn_settings =
+                            Some(checkpoint.previous_turn_settings.as_ref().map(|settings| {
+                                PreviousTurnSettings {
+                                    model: settings.model.clone(),
+                                    comp_hash: settings.comp_hash.clone(),
+                                    realtime_active: settings.realtime_active,
+                                }
+                            }));
+                        reached_segment_state_checkpoint = pending_rollback_turns == 0;
+                    }
                     active_segment.world_state_replay.push(item);
                     if active_segment.window.is_none()
                         && let Some(window_number) = compacted.window_number
@@ -194,6 +276,11 @@ impl Session {
                     {
                         active_segment.base_replacement_history = Some(replacement_history);
                         rollout_suffix = &rollout_items[index + 1..];
+                        // A newer rollback still applies to this complete history base. Continue
+                        // metadata replay, but retain the checkpoint history while doing so.
+                        if pending_rollback_turns > 0 && base_replacement_history.is_none() {
+                            base_replacement_history = Some(replacement_history);
+                        }
                     }
                 }
                 RolloutItem::EventMsg(EventMsg::ThreadRolledBack(rollback)) => {
@@ -202,7 +289,7 @@ impl Session {
                 }
                 RolloutItem::EventMsg(EventMsg::TurnComplete(event)) => {
                     let active_segment =
-                        active_segment.get_or_insert_with(ActiveReplaySegment::default);
+                        active_segment.get_or_insert_with(|| ActiveReplaySegment::new(index));
                     // Reverse replay often sees `TurnComplete` before any turn-scoped metadata.
                     // Capture the turn id early so later `TurnContext` / abort items can match it.
                     if active_segment.turn_id.is_none() {
@@ -219,18 +306,18 @@ impl Session {
                     } else if let Some(turn_id) = &event.turn_id {
                         active_segment = Some(ActiveReplaySegment {
                             turn_id: Some(turn_id.clone()),
-                            ..Default::default()
+                            ..ActiveReplaySegment::new(index)
                         });
                     }
                 }
                 RolloutItem::EventMsg(EventMsg::UserMessage(_)) => {
                     let active_segment =
-                        active_segment.get_or_insert_with(ActiveReplaySegment::default);
+                        active_segment.get_or_insert_with(|| ActiveReplaySegment::new(index));
                     active_segment.counts_as_user_turn = true;
                 }
                 RolloutItem::TurnContext(ctx) => {
                     let active_segment =
-                        active_segment.get_or_insert_with(ActiveReplaySegment::default);
+                        active_segment.get_or_insert_with(|| ActiveReplaySegment::new(index));
                     // `TurnContextItem` can attach metadata to an existing segment, but only a
                     // real `UserMessage` event should make the segment count as a user turn.
                     if active_segment.turn_id.is_none() {
@@ -256,7 +343,7 @@ impl Session {
                 }
                 RolloutItem::WorldState(_) => {
                     let active_segment =
-                        active_segment.get_or_insert_with(ActiveReplaySegment::default);
+                        active_segment.get_or_insert_with(|| ActiveReplaySegment::new(index));
                     active_segment.world_state_replay.push(item);
                 }
                 RolloutItem::EventMsg(EventMsg::TurnStarted(event)) => {
@@ -272,6 +359,7 @@ impl Session {
                             active_segment,
                             &mut base_replacement_history,
                             &mut previous_turn_settings,
+                            &mut previous_turn_settings_resolved,
                             &mut reference_context_item,
                             &mut world_state_replay,
                             &mut window,
@@ -281,13 +369,13 @@ impl Session {
                 }
                 RolloutItem::ResponseItem(response_item) => {
                     let active_segment =
-                        active_segment.get_or_insert_with(ActiveReplaySegment::default);
+                        active_segment.get_or_insert_with(|| ActiveReplaySegment::new(index));
                     active_segment.counts_as_user_turn |=
                         is_user_turn_boundary(&response_item.item);
                 }
                 RolloutItem::InterAgentCommunication(_) => {
                     let active_segment =
-                        active_segment.get_or_insert_with(ActiveReplaySegment::default);
+                        active_segment.get_or_insert_with(|| ActiveReplaySegment::new(index));
                     active_segment.counts_as_user_turn = true;
                 }
                 RolloutItem::EventMsg(_)
@@ -298,8 +386,24 @@ impl Session {
                 | RolloutItem::InterAgentCommunicationMetadata { .. } => {}
             }
 
+            if reached_segment_state_checkpoint {
+                if let Some(active_segment) = active_segment.take() {
+                    finalize_active_segment(
+                        active_segment,
+                        &mut base_replacement_history,
+                        &mut previous_turn_settings,
+                        &mut previous_turn_settings_resolved,
+                        &mut reference_context_item,
+                        &mut world_state_replay,
+                        &mut window,
+                        &mut pending_rollback_turns,
+                    );
+                }
+                break;
+            }
+
             if base_replacement_history.is_some()
-                && previous_turn_settings.is_some()
+                && previous_turn_settings_resolved
                 && !matches!(reference_context_item, TurnReferenceContextItem::NeverSet)
             {
                 // At this point we have both eager resume metadata values and the replacement-
@@ -314,6 +418,7 @@ impl Session {
                 active_segment,
                 &mut base_replacement_history,
                 &mut previous_turn_settings,
+                &mut previous_turn_settings_resolved,
                 &mut reference_context_item,
                 &mut world_state_replay,
                 &mut window,

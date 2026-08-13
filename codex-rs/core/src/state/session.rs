@@ -13,6 +13,7 @@ use super::AdditionalContextStore;
 use super::auto_compact_window::AutoCompactWindow;
 use super::auto_compact_window::AutoCompactWindowIds;
 use super::auto_compact_window::AutoCompactWindowSnapshot;
+use super::auto_compact_window::PreparedAutoCompactWindowAdvance;
 use crate::context_manager::ContextManager;
 use crate::session::PreviousTurnSettings;
 use crate::session::session::SessionConfiguration;
@@ -51,6 +52,17 @@ pub(crate) struct SessionState {
     pub(crate) pending_session_start_sources: VecDeque<codex_hooks::SessionStartSource>,
     granted_permissions_by_environment_id: HashMap<String, AdditionalPermissionProfile>,
     next_turn_is_first: bool,
+}
+
+/// Model state restored when a rollback checkpoint is proven not to have committed.
+///
+/// Rollback replaces only these fields before durable publication. Runtime handles and session
+/// configuration remain unchanged and therefore do not belong in this snapshot.
+pub(crate) struct CheckpointMutationSnapshot {
+    history: ContextManager,
+    latest_rate_limits: Option<RateLimitSnapshot>,
+    previous_turn_settings: Option<PreviousTurnSettings>,
+    auto_compact_window: AutoCompactWindow,
 }
 
 impl SessionState {
@@ -119,6 +131,33 @@ impl SessionState {
 
     pub(crate) fn clone_history(&self) -> ContextManager {
         self.history.clone()
+    }
+
+    pub(crate) fn checkpoint_mutation_snapshot(&self) -> CheckpointMutationSnapshot {
+        CheckpointMutationSnapshot {
+            history: self.history.clone(),
+            latest_rate_limits: self.latest_rate_limits.clone(),
+            previous_turn_settings: self.previous_turn_settings.clone(),
+            auto_compact_window: self.auto_compact_window,
+        }
+    }
+
+    pub(crate) fn restore_checkpoint_mutation(&mut self, snapshot: CheckpointMutationSnapshot) {
+        self.history = snapshot.history;
+        self.latest_rate_limits = snapshot.latest_rate_limits;
+        self.previous_turn_settings = snapshot.previous_turn_settings;
+        self.auto_compact_window = snapshot.auto_compact_window;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_same_checkpoint_mutation_state(
+        &self,
+        snapshot: &CheckpointMutationSnapshot,
+    ) -> bool {
+        self.history.has_same_fork_metadata(&snapshot.history)
+            && self.latest_rate_limits == snapshot.latest_rate_limits
+            && self.previous_turn_settings == snapshot.previous_turn_settings
+            && self.auto_compact_window == snapshot.auto_compact_window
     }
 
     #[cfg(test)]
@@ -221,8 +260,20 @@ impl SessionState {
         self.auto_compact_window.restore(window_number, ids);
     }
 
+    #[cfg(test)]
     pub(crate) fn advance_auto_compact_window(&mut self) -> (u64, AutoCompactWindowIds) {
         self.auto_compact_window.advance()
+    }
+
+    pub(crate) fn prepare_auto_compact_window_advance(&self) -> PreparedAutoCompactWindowAdvance {
+        self.auto_compact_window.prepare_advance()
+    }
+
+    pub(crate) fn commit_prepared_auto_compact_window_advance(
+        &mut self,
+        prepared: PreparedAutoCompactWindowAdvance,
+    ) -> Option<(u64, AutoCompactWindowIds)> {
+        self.auto_compact_window.commit_prepared_advance(prepared)
     }
 
     pub(crate) fn request_new_context_window(&mut self) {
@@ -231,12 +282,6 @@ impl SessionState {
 
     pub(crate) fn take_new_context_window_request(&mut self) -> bool {
         self.auto_compact_window.take_new_context_window_request()
-    }
-
-    pub(crate) fn start_new_context_window(&mut self) -> (u64, AutoCompactWindowIds) {
-        let window = self.auto_compact_window.advance();
-        self.auto_compact_window.clear_prefill();
-        window
     }
 
     pub(crate) fn token_info(&self) -> Option<TokenUsageInfo> {

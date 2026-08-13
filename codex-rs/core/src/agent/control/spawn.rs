@@ -461,6 +461,8 @@ impl AgentControl {
                     selection.config = EnvironmentConfigState::Ready(bounded_config);
                 }
             }
+            // The validated owner must override stale persisted child environments.
+            environment_selections.get_or_insert_with(|| parent_environments.to_selections());
             (
                 Some(parent_environments.clone()),
                 Some(Arc::clone(&parent.session.services.exec_policy)),

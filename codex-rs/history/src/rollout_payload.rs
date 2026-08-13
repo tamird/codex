@@ -14,6 +14,7 @@ use super::SessionMetaLine;
 use super::TurnContextItem;
 use super::WorldStateItem;
 use codex_protocol::protocol::RolloutReferenceItem;
+use codex_protocol::protocol::SegmentStateCheckpoint;
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde::Serialize;
@@ -161,6 +162,8 @@ pub(super) struct CompactedItemWire<'a> {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(with = "Option<String>")]
     window_id: Option<WindowIdWire<'a>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    segment_state_checkpoint: Option<Cow<'a, SegmentStateCheckpoint>>,
 }
 
 impl<'a> From<&'a CompactedItem> for CompactedItemWire<'a> {
@@ -196,6 +199,7 @@ impl<'a> From<&'a CompactedItem> for CompactedItemWire<'a> {
                 .window_id
                 .as_deref()
                 .map(|window_id| WindowIdWire::Id(Cow::Borrowed(window_id))),
+            segment_state_checkpoint: item.segment_state_checkpoint.as_ref().map(Cow::Borrowed),
         }
     }
 }
@@ -257,6 +261,7 @@ impl TryFrom<CompactedItemWire<'_>> for CompactedItem {
             first_window_id: item.first_window_id.map(Cow::into_owned),
             previous_window_id: item.previous_window_id.map(Cow::into_owned),
             window_id,
+            segment_state_checkpoint: item.segment_state_checkpoint.map(Cow::into_owned),
         })
     }
 }

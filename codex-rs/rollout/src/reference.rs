@@ -19,7 +19,6 @@ use codex_protocol::SegmentId;
 use codex_protocol::ThreadId;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::ResponseItem;
-use codex_protocol::protocol::DEFAULT_ROLLOUT_REFERENCE_DEPTH;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::RolloutReferenceItem;
 use codex_protocol::protocol::SessionMetaLine;
@@ -27,7 +26,6 @@ use codex_protocol::protocol::ThreadHistoryMode;
 
 use crate::ARCHIVED_SESSIONS_SUBDIR;
 use crate::ModelContextScan;
-use crate::ModelContextScanProgress;
 use crate::ROTATED_ROLLOUT_SEGMENTS_SUBDIR;
 use crate::SESSIONS_SUBDIR;
 use crate::compression;
@@ -483,17 +481,33 @@ pub async fn materialize_rollout_lines_from(
 
 /// Reconstructs model context from an immutable fork prefix without replaying obsolete history.
 ///
-/// Ordinary predecessor references are expanded only until a valid compaction checkpoint and
-/// its required completed-turn context are available. Without such a checkpoint, the complete
-/// model-visible prefix is necessary and is expanded in full.
+/// Ordinary predecessor references are expanded only until a certified segment-state checkpoint
+/// is available. Unmarked compactions still require predecessor traversal for sticky settings and
+/// token state, even though the returned model-visible history remains bounded.
 pub async fn materialize_model_context_rollout_items_from(
     codex_home: &Path,
     lines: Vec<RolloutLine>,
 ) -> io::Result<Vec<RolloutItem>> {
     let session_meta = canonical_session_meta(&lines)?.clone();
+    // A checkpoint in the supplied root is independent of its predecessor. Inspect it before
+    // resolving references so a missing predecessor cannot prevent a certified cold resume.
+    let mut root_scan = ModelContextScan::default();
+    for line in lines.iter().rev() {
+        if matches!(
+            line.item,
+            RolloutItem::SessionMeta(_) | RolloutItem::RolloutReference(_)
+        ) {
+            continue;
+        }
+        if root_scan.push(line.item.clone()).is_complete() {
+            if root_scan.completed_at_segment_checkpoint() {
+                return Ok(root_scan.finish(session_meta));
+            }
+            break;
+        }
+    }
     let mut cache = ImmutableRolloutCache::default();
     let mut ordinary_reference_limit = 0_usize;
-    let mut latest_valid_items = None;
 
     loop {
         let mut has_older_reference = false;
@@ -504,24 +518,7 @@ pub async fn materialize_model_context_rollout_items_from(
             &mut has_older_reference,
             Some(&mut cache),
         )
-        .await;
-        let materialized = match materialized {
-            Ok(materialized) => materialized,
-            Err(error)
-                if matches!(session_meta.meta.history_mode, ThreadHistoryMode::Legacy)
-                    && matches!(
-                        error.kind(),
-                        io::ErrorKind::InvalidData | io::ErrorKind::NotFound
-                    )
-                    && !cache.saw_fork_boundary_constraints
-                    && !cache.saw_cross_thread_reference
-                    && ordinary_reference_limit > DEFAULT_ROLLOUT_REFERENCE_DEPTH
-                    && latest_valid_items.is_some() =>
-            {
-                return latest_valid_items.ok_or(error);
-            }
-            Err(error) => return Err(error),
-        };
+        .await?;
         let mut scan = ModelContextScan::default();
 
         for line in materialized.iter().rev() {
@@ -531,10 +528,8 @@ pub async fn materialize_model_context_rollout_items_from(
             ) {
                 continue;
             }
-            if matches!(
-                scan.push(line.item.clone()),
-                ModelContextScanProgress::Complete
-            ) && (!cache.saw_fork_boundary_constraints || !has_older_reference)
+            if scan.push(line.item.clone()).is_complete()
+                && (!cache.saw_fork_boundary_constraints || !has_older_reference)
             {
                 return Ok(scan.finish(session_meta));
             }
@@ -547,8 +542,6 @@ pub async fn materialize_model_context_rollout_items_from(
         if !has_older_reference {
             return Ok(items);
         }
-        latest_valid_items = Some(items);
-
         ordinary_reference_limit = ordinary_reference_limit.saturating_mul(2).max(/*other*/ 1);
     }
 }

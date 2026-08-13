@@ -21,6 +21,25 @@ pub(super) async fn update(
     submission_id: String,
     overrides: ThreadSettingsOverrides,
 ) {
+    let _checkpoint_admission = match session
+        .lock_checkpoint_admission("update thread settings")
+        .await
+    {
+        Ok(admission) => admission,
+        Err(error) => {
+            session
+                .send_event_raw(Event {
+                    id: submission_id,
+                    msg: EventMsg::Error(ErrorEvent {
+                        misalignment: None,
+                        message: error.to_string(),
+                        codex_error_info: Some(CodexErrorInfo::Other),
+                    }),
+                })
+                .await;
+            return;
+        }
+    };
     let previous = session.thread_config_snapshot().await;
     let updates = prepare_update(overrides);
     match session.update_settings(updates).await {

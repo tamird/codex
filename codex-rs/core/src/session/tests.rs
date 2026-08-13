@@ -755,6 +755,37 @@ pub(super) fn raw_history_items(history: &ContextManager) -> Vec<ResponseItem> {
     history.raw_items().cloned().collect()
 }
 
+fn assert_contains_certified_segment_state_checkpoint(items: &[RolloutItem]) -> &CompactedItem {
+    let (checkpoint_index, compacted) = items
+        .iter()
+        .enumerate()
+        .find_map(|(index, item)| match item {
+            RolloutItem::Compacted(compacted) if compacted.segment_state_checkpoint.is_some() => {
+                Some((index, compacted))
+            }
+            _ => None,
+        })
+        .expect("fork rollout should contain a local state checkpoint");
+    let descriptor = compacted
+        .segment_state_checkpoint
+        .as_ref()
+        .expect("marked checkpoint descriptor");
+    let checkpoint_len =
+        3 + usize::from(matches!(
+            descriptor.world_state,
+            codex_protocol::protocol::SegmentStateCheckpointDisposition::Established
+        )) + usize::from(matches!(
+            descriptor.reference_context,
+            codex_protocol::protocol::SegmentStateCheckpointDisposition::Established
+        ));
+    let checkpoint_items = items
+        .get(checkpoint_index..checkpoint_index + checkpoint_len)
+        .expect("fork rollout should contain the complete checkpoint");
+    codex_rollout::validate_certified_segment_state_checkpoint(checkpoint_items)
+        .expect("fork-local records should form a certified checkpoint");
+    compacted
+}
+
 fn raw_envelopes(items: &[ResponseItemEnvelope]) -> Vec<ResponseItem> {
     items.iter().map(|envelope| envelope.item.clone()).collect()
 }
@@ -2419,6 +2450,7 @@ async fn reconstruct_history_uses_replacement_history_verbatim() {
         first_window_id: Some(first_window_id.to_string()),
         previous_window_id: Some(previous_window_id.to_string()),
         window_id: Some(window_id.to_string()),
+        segment_state_checkpoint: None,
     })];
 
     let reconstructed = session
@@ -3119,6 +3151,17 @@ async fn record_initial_history_seeds_token_info_from_rollout() {
         },
         model_context_window: Some(2_000),
     };
+    let rate_limits = RateLimitSnapshot {
+        limit_id: Some("codex".to_string()),
+        limit_name: Some("Codex".to_string()),
+        primary: None,
+        secondary: None,
+        credits: None,
+        individual_limit: None,
+        spend_control_reached: None,
+        plan_type: None,
+        rate_limit_reached_type: None,
+    };
 
     rollout_items.push(RolloutItem::EventMsg(EventMsg::TokenCount(
         TokenCountEvent {
@@ -3129,7 +3172,7 @@ async fn record_initial_history_seeds_token_info_from_rollout() {
     rollout_items.push(RolloutItem::EventMsg(EventMsg::TokenCount(
         TokenCountEvent {
             info: None,
-            rate_limits: None,
+            rate_limits: Some(rate_limits.clone()),
         },
     )));
     rollout_items.push(RolloutItem::EventMsg(EventMsg::TokenCount(
@@ -3154,8 +3197,9 @@ async fn record_initial_history_seeds_token_info_from_rollout() {
         .await
         .expect("record initial history");
 
-    let actual = session.state.lock().await.token_info();
-    assert_eq!(actual, Some(info2));
+    let state = session.state.lock().await;
+    assert_eq!(state.token_info(), Some(info2));
+    assert_eq!(state.latest_rate_limits, Some(rate_limits));
 }
 
 #[tokio::test]
@@ -3672,7 +3716,8 @@ disabled_tools = [
 
 #[tokio::test]
 async fn record_initial_history_reconstructs_forked_transcript() {
-    let (session, turn_context) = make_session_and_context().await;
+    let (mut session, turn_context) = make_session_and_context().await;
+    attach_thread_persistence(&mut session).await;
     let (rollout_items, expected) = sample_rollout(&session, &turn_context).await;
 
     session
@@ -3690,7 +3735,7 @@ async fn record_initial_history_reconstructs_forked_transcript() {
 #[tokio::test]
 async fn record_initial_history_preserves_all_segmented_legacy_fork_model_messages() {
     let (mut session, _turn_context) = make_session_and_context().await;
-    attach_thread_persistence(&mut session).await;
+    let rollout_path = attach_thread_persistence(&mut session).await;
 
     for index in 0..6 {
         session
@@ -3733,6 +3778,29 @@ async fn record_initial_history_preserves_all_segmented_legacy_fork_model_messag
         ]))
         .await
         .expect("reconstruct complete fork model context");
+    session
+        .flush_rollout()
+        .await
+        .expect("flush fork checkpoint");
+
+    let persisted_items = RolloutRecorder::load_rollout_items(&rollout_path)
+        .await
+        .expect("load fork checkpoint")
+        .0;
+    let checkpoint = assert_contains_certified_segment_state_checkpoint(&persisted_items);
+    assert_eq!(
+        checkpoint
+            .replacement_history
+            .as_ref()
+            .expect("fork checkpoint replacement history")
+            .iter()
+            .filter(
+                |item| matches!(item.item, ResponseItem::Message { ref role, .. } if role == "user")
+            )
+            .count(),
+        6,
+        "the local checkpoint should contain the complete referenced model context"
+    );
 
     let history = session.clone_history().await;
     let user_messages = history
@@ -3813,6 +3881,28 @@ async fn prepared_fork_preserves_parent_cached_model_state_without_copying_histo
         last_token_usage: TokenUsage::default(),
         model_context_window: Some(1_024),
     };
+    let authoritative_rate_limits = RateLimitSnapshot {
+        limit_id: Some("authoritative-parent-limit".to_string()),
+        limit_name: Some("Authoritative parent limit".to_string()),
+        primary: None,
+        secondary: None,
+        credits: None,
+        individual_limit: None,
+        spend_control_reached: None,
+        plan_type: None,
+        rate_limit_reached_type: None,
+    };
+    let stale_rate_limits = RateLimitSnapshot {
+        limit_id: Some("stale-rollout-limit".to_string()),
+        limit_name: Some("Stale rollout limit".to_string()),
+        primary: None,
+        secondary: None,
+        credits: None,
+        individual_limit: None,
+        spend_control_reached: None,
+        plan_type: None,
+        rate_limit_reached_type: None,
+    };
     let window_ids = AutoCompactWindowIds {
         first_window_id: Uuid::now_v7(),
         previous_window_id: Some(Uuid::now_v7()),
@@ -3830,6 +3920,7 @@ async fn prepared_fork_preserves_parent_cached_model_state_without_copying_histo
             Some(reference_context_item.clone()),
         );
         state.set_token_info(Some(authoritative_tokens.clone()));
+        state.set_rate_limits(authoritative_rate_limits.clone());
         state
             .history
             .set_world_state_baseline(world_state.snapshot());
@@ -3847,7 +3938,7 @@ async fn prepared_fork_preserves_parent_cached_model_state_without_copying_histo
                 vec![RolloutItem::EventMsg(EventMsg::TokenCount(
                     TokenCountEvent {
                         info: Some(stale_tokens),
-                        rate_limits: None,
+                        rate_limits: Some(stale_rate_limits),
                     },
                 ))],
                 Some(Arc::clone(&source_response_items)),
@@ -3856,37 +3947,62 @@ async fn prepared_fork_preserves_parent_cached_model_state_without_copying_histo
         )
         .await?;
 
-    let mut child_state = child.state.lock().await;
-    assert!(Arc::ptr_eq(
-        &child_state.history.shared_annotated_items(),
-        &source_response_items
-    ));
-    assert!(
-        child_state.history.shared_annotated_items()[0]
-            .metadata
-            .as_ref()
-            .is_some_and(|metadata| metadata.client_authored)
-    );
-    assert_eq!(
-        child_state.reference_context_item(),
-        Some(reference_context_item)
-    );
-    assert_eq!(
-        child_state.previous_turn_settings(),
-        Some(previous_turn_settings)
-    );
-    assert_eq!(child_state.token_info(), Some(authoritative_tokens));
-    assert_eq!(child_state.auto_compact_window_number(), 7);
-    assert_eq!(child_state.auto_compact_window_ids(), window_ids);
-    assert_eq!(child_state.history.history_version(), 1);
-    assert!(
-        child_state
-            .history
-            .update_world_state(&world_state)
-            .1
-            .is_none(),
-        "an unchanged parent world-state baseline must not be reintroduced"
-    );
+    {
+        let mut child_state = child.state.lock().await;
+        assert!(Arc::ptr_eq(
+            &child_state.history.shared_annotated_items(),
+            &source_response_items
+        ));
+        assert!(
+            child_state.history.shared_annotated_items()[0]
+                .metadata
+                .as_ref()
+                .is_some_and(|metadata| metadata.client_authored)
+        );
+        assert_eq!(
+            child_state.reference_context_item(),
+            Some(reference_context_item)
+        );
+        assert_eq!(
+            child_state.previous_turn_settings(),
+            Some(previous_turn_settings)
+        );
+        assert_eq!(child_state.token_info(), Some(authoritative_tokens));
+        assert_eq!(
+            child_state.token_info_and_rate_limits().1,
+            Some(authoritative_rate_limits.clone())
+        );
+        assert_eq!(child_state.auto_compact_window_number(), 7);
+        assert_eq!(child_state.auto_compact_window_ids(), window_ids);
+        assert_eq!(child_state.history.history_version(), 1);
+        assert!(
+            child_state
+                .history
+                .update_world_state(&world_state)
+                .1
+                .is_none(),
+            "an unchanged parent world-state baseline must not be reintroduced"
+        );
+    }
+
+    child.flush_rollout().await?;
+    let child_rollout_path = child
+        .current_rollout_path()
+        .await?
+        .expect("prepared fork should have a rollout path");
+    let child_rollout_items = RolloutRecorder::load_rollout_items(&child_rollout_path)
+        .await?
+        .0;
+    assert_contains_certified_segment_state_checkpoint(&child_rollout_items);
+    assert!(child_rollout_items.iter().any(|item| {
+        matches!(
+            item,
+            RolloutItem::EventMsg(EventMsg::TokenCount(TokenCountEvent {
+                rate_limits: Some(rate_limits),
+                ..
+            })) if rate_limits == &authoritative_rate_limits
+        )
+    }));
 
     Ok(())
 }
@@ -4114,6 +4230,7 @@ async fn indexed_paginated_fork_appends_interrupted_suffix_after_capturing_paren
     let child_rollout_items = RolloutRecorder::load_rollout_items(child_rollout_path.as_path())
         .await?
         .0;
+    assert_contains_certified_segment_state_checkpoint(&child_rollout_items);
     assert_eq!(
         child_rollout_items
             .iter()
@@ -4688,7 +4805,8 @@ async fn fork_startup_context_then_first_turn_diff_snapshot() -> anyhow::Result<
 
 #[tokio::test]
 async fn record_initial_history_forked_hydrates_previous_turn_settings() {
-    let (session, turn_context) = make_session_and_context().await;
+    let (mut session, turn_context) = make_session_and_context().await;
+    attach_thread_persistence(&mut session).await;
     let previous_model = "forked-rollout-model";
     let previous_context_item = TurnContextItem {
         turn_id: Some(turn_context.sub_id.clone()),
@@ -5106,6 +5224,7 @@ async fn thread_rollback_restores_cleared_reference_context_item_after_compactio
             first_window_id: Some(first_window_id.to_string()),
             previous_window_id: Some(previous_window_id.to_string()),
             window_id: Some(compacted_window_id.to_string()),
+            segment_state_checkpoint: None,
         }),
         RolloutItem::EventMsg(EventMsg::TurnComplete(TurnCompleteEvent {
             turn_id: compact_turn_id,
@@ -5304,18 +5423,44 @@ async fn thread_rollback_persists_marker_and_replays_cumulatively() {
         ]
     );
 
-    let InitialHistory::Resumed(resumed) = RolloutRecorder::get_rollout_history(&rollout_path)
-        .await
-        .expect("read rollout history")
-    else {
-        panic!("expected resumed rollout history");
-    };
-    let rollback_markers = resumed
-        .history
+    let (active_lines, active_thread_id, parse_errors) =
+        RolloutRecorder::load_rollout_lines(&rollout_path)
+            .await
+            .expect("read active rollout history");
+    assert_eq!(active_thread_id, Some(sess.thread_id));
+    assert_eq!(parse_errors, 0);
+    let full_history = codex_rollout::materialize_rollout_lines_from(
+        sess.codex_home().await.as_path(),
+        active_lines,
+    )
+    .await
+    .expect("materialize complete rollback history");
+    let rollback_markers = full_history
         .iter()
-        .filter(|item| matches!(item, RolloutItem::EventMsg(EventMsg::ThreadRolledBack(_))))
+        .filter(|line| {
+            matches!(
+                &line.item,
+                RolloutItem::EventMsg(EventMsg::ThreadRolledBack(_))
+            )
+        })
         .count();
     assert_eq!(rollback_markers, 2);
+
+    let (active_items, _, _) = RolloutRecorder::load_rollout_items(&rollout_path)
+        .await
+        .expect("read active rollout");
+    let active_rollback_indexes = active_items
+        .iter()
+        .enumerate()
+        .filter_map(|(index, item)| {
+            matches!(item, RolloutItem::EventMsg(EventMsg::ThreadRolledBack(_))).then_some(index)
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(active_rollback_indexes.len(), 1);
+    codex_rollout::validate_certified_segment_state_checkpoint(
+        &active_items[active_rollback_indexes[0] + 1..],
+    )
+    .expect("rollback marker must be followed by one complete certified checkpoint");
 }
 
 #[tokio::test]
@@ -5943,20 +6088,17 @@ async fn replace_compacted_history_freezes_the_previous_rollout_segment() {
         })
         .expect("pre-compaction segment id");
     let replacement_history = vec![ResponseItemEnvelope::new(user_message("compacted summary"))];
-    let (window_number, window_ids) = {
-        let mut state = session.state.lock().await;
-        state.start_new_context_window()
-    };
+    let prepared_window_advance = session.prepare_auto_compact_window_advance().await;
 
     session
         .replace_compacted_history(
+            &turn_context,
             replacement_history.clone(),
             Some(turn_context.to_turn_context_item()),
             Some(world_state),
             CompactedHistoryMetadata {
                 message: "compacted summary".to_string(),
-                window_number,
-                window_ids,
+                prepared_window_advance,
             },
         )
         .await
@@ -5996,6 +6138,7 @@ async fn replace_compacted_history_freezes_the_previous_rollout_segment() {
             item,
             RolloutItem::Compacted(CompactedItem {
                 replacement_history: Some(history),
+                segment_state_checkpoint: Some(_),
                 ..
             }) if strip_response_item_ids(
                 &history.iter().map(|item| item.item.clone()).collect::<Vec<_>>()
@@ -6007,6 +6150,32 @@ async fn replace_compacted_history_freezes_the_previous_rollout_segment() {
             )
         )
     }));
+    assert!(replacement_items.iter().any(|item| {
+        matches!(
+            item,
+            RolloutItem::EventMsg(EventMsg::ThreadSettingsApplied(settings))
+                if settings.thread_settings.environments.is_some()
+                    && settings.thread_settings.workspace_roots.is_some()
+                    && settings.thread_settings.profile_workspace_roots.is_some()
+                    && settings.thread_settings.windows_sandbox_level.is_some()
+        )
+    }));
+    assert!(
+        replacement_items
+            .iter()
+            .any(|item| { matches!(item, RolloutItem::EventMsg(EventMsg::TokenCount(_))) })
+    );
+    let persisted_token_state = replacement_items.iter().rev().find_map(|item| match item {
+        RolloutItem::EventMsg(EventMsg::TokenCount(event)) => {
+            Some((event.info.clone(), event.rate_limits.clone()))
+        }
+        _ => None,
+    });
+    assert_eq!(
+        persisted_token_state,
+        Some(session.state.lock().await.token_info_and_rate_limits()),
+        "the certified checkpoint must contain replacement-history token state"
+    );
 
     let materialized =
         codex_rollout::materialize_rollout_items(codex_home.as_path(), current_path.as_path())
@@ -6034,6 +6203,72 @@ async fn replace_compacted_history_freezes_the_previous_rollout_segment() {
         reconstructed.world_state_baseline,
         Some(expected_world_state)
     );
+}
+
+#[tokio::test]
+async fn failed_compaction_restores_state_and_allows_persisted_continuation() {
+    let (mut session, turn_context, _) = make_session_and_context_with_rx().await;
+    let session = Arc::get_mut(&mut session).expect("session should have one owner");
+    attach_in_memory_thread_store(session).await;
+    session
+        .record_conversation_items(
+            turn_context.as_ref(),
+            &[user_message("history before failed compaction")],
+        )
+        .await;
+    session
+        .flush_rollout()
+        .await
+        .expect("flush initial history");
+    let state_before_compaction = session.state.lock().await.checkpoint_mutation_snapshot();
+    let prepared_window_advance = session.prepare_auto_compact_window_advance().await;
+
+    session
+        .replace_compacted_history(
+            &turn_context,
+            vec![ResponseItemEnvelope::new(user_message(
+                "replacement that must be restored",
+            ))],
+            /*reference_context_item*/ None,
+            /*world_state_baseline*/ None,
+            CompactedHistoryMetadata {
+                message: "failed compaction".to_string(),
+                prepared_window_advance,
+            },
+        )
+        .await
+        .expect_err("unsupported checkpoint persistence must not commit");
+    assert!(
+        session
+            .state
+            .lock()
+            .await
+            .has_same_checkpoint_mutation_state(&state_before_compaction),
+        "NotCommitted must restore history, token state, settings, and window identity"
+    );
+    assert!(!session.persistence_restart_required());
+
+    session
+        .record_conversation_items(
+            turn_context.as_ref(),
+            &[user_message("continued after failed compaction")],
+        )
+        .await;
+    session
+        .flush_rollout()
+        .await
+        .expect("flush continuation after restored checkpoint state");
+    assert!(session.clone_history().await.raw_items().any(|item| {
+        matches!(
+            item,
+            ResponseItem::Message { content, .. }
+                if content.iter().any(|content| matches!(
+                    content,
+                    ContentItem::InputText { text }
+                        if text == "continued after failed compaction"
+                ))
+        )
+    }));
 }
 
 fn text_block(s: &str) -> serde_json::Value {
@@ -7533,6 +7768,7 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
         conversation: Arc::new(RealtimeConversationManager::new()),
         active_turn: Mutex::new(None),
         async_hook_results,
+        checkpoint_admission_lock: Arc::new(Mutex::new(())),
         input_queue: super::input_queue::InputQueue::new(),
         guardian_review_session: crate::guardian::GuardianReviewSessionManager::default(),
         goal_supervisor_runtime: crate::goal_supervisor::GoalSupervisorRuntimeState::new(),
@@ -8744,6 +8980,64 @@ fn submission_dispatch_span_uses_debug_for_realtime_audio() {
 }
 
 #[tokio::test]
+async fn queued_thread_settings_fail_after_checkpoint_becomes_indeterminate() {
+    let (session, _turn_context, rx) = make_session_and_context_with_rx().await;
+    let original_personality = session.thread_config_snapshot().await.personality;
+    let admission = Arc::clone(&session.checkpoint_admission_lock)
+        .lock_owned()
+        .await;
+    let task_session = Arc::clone(&session);
+    let update = tokio::spawn(async move {
+        thread_settings::update(
+            &task_session,
+            "settings-after-checkpoint".to_string(),
+            ThreadSettingsOverrides {
+                personality: Some(Personality::Friendly),
+                ..Default::default()
+            },
+        )
+        .await;
+    });
+
+    tokio::task::yield_now().await;
+    assert!(
+        !update.is_finished(),
+        "settings update must wait for checkpoint classification"
+    );
+    session
+        .persistence_restart_required
+        .store(true, Ordering::Release);
+    drop(admission);
+    update.await.expect("settings update task");
+
+    assert_eq!(
+        session.thread_config_snapshot().await.personality,
+        original_personality,
+        "rejected settings must not mutate the session"
+    );
+    let mut saw_restart_error = false;
+    let deadline = tokio::time::Instant::now() + StdDuration::from_millis(250);
+    while let Ok(Ok(event)) = tokio::time::timeout_at(deadline, rx.recv()).await {
+        match event.msg {
+            EventMsg::Error(error)
+                if error.codex_error_info == Some(CodexErrorInfo::Other)
+                    && error.message.contains("restart this thread") =>
+            {
+                saw_restart_error = true;
+            }
+            EventMsg::ThreadSettingsApplied(_) => {
+                panic!("rejected settings must not emit ThreadSettingsApplied")
+            }
+            _ => {}
+        }
+    }
+    assert!(
+        saw_restart_error,
+        "settings rejection must explain the restart requirement"
+    );
+}
+
+#[tokio::test]
 async fn turn_environments_set_primary_environment() {
     let (session, _turn_context, _rx) = make_session_and_context_with_rx().await;
     let selected_cwd =
@@ -9822,6 +10116,7 @@ where
         conversation: Arc::new(RealtimeConversationManager::new()),
         active_turn: Mutex::new(None),
         async_hook_results,
+        checkpoint_admission_lock: Arc::new(Mutex::new(())),
         input_queue: super::input_queue::InputQueue::new(),
         guardian_review_session: crate::guardian::GuardianReviewSessionManager::default(),
         goal_supervisor_runtime: crate::goal_supervisor::GoalSupervisorRuntimeState::new(),
@@ -13346,6 +13641,7 @@ async fn sample_rollout(
         first_window_id: Some(window_ids.first_window_id.to_string()),
         previous_window_id: window_ids.previous_window_id.map(|id| id.to_string()),
         window_id: Some(window_ids.window_id.to_string()),
+        segment_state_checkpoint: None,
     }));
 
     let user2 = user_message("second user");
@@ -13376,6 +13672,7 @@ async fn sample_rollout(
         first_window_id: Some(window_ids.first_window_id.to_string()),
         previous_window_id: window_ids.previous_window_id.map(|id| id.to_string()),
         window_id: Some(window_ids.window_id.to_string()),
+        segment_state_checkpoint: None,
     }));
 
     let user3 = user_message("third user");

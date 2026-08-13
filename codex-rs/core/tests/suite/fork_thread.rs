@@ -136,11 +136,11 @@ async fn fork_thread_twice_drops_to_first_message() {
             .iter()
             .all(|item| !matches!(item, RolloutItem::ResponseItem(_)))
     );
-    let fork1_items = without_session_meta(
+    let fork1_items = without_certified_checkpoints(without_session_meta(
         materialize_rollout_items(test.config.codex_home.as_path(), &fork1_path)
             .await
             .expect("materialize first fork"),
-    );
+    ));
     pretty_assertions::assert_eq!(
         serde_json::to_value(&fork1_items).unwrap(),
         serde_json::to_value(&expected_after_first).unwrap()
@@ -184,11 +184,11 @@ async fn fork_thread_twice_drops_to_first_message() {
             .iter()
             .all(|item| !matches!(item, RolloutItem::ResponseItem(_)))
     );
-    let fork2_items = without_session_meta(
+    let fork2_items = without_certified_checkpoints(without_session_meta(
         materialize_rollout_items(test.config.codex_home.as_path(), &fork2_path)
             .await
             .expect("materialize second fork"),
-    );
+    ));
     pretty_assertions::assert_eq!(
         serde_json::to_value(&fork2_items).unwrap(),
         serde_json::to_value(&expected_after_second).unwrap()
@@ -212,17 +212,17 @@ async fn fork_thread_twice_drops_to_first_message() {
     let refork_path = codex_refork.rollout_path().expect("re-fork rollout path");
     let refork_raw_items = read_rollout_items(&refork_path);
     assert!(matches!(
-        without_session_meta(refork_raw_items).as_slice(),
+        without_certified_checkpoints(without_session_meta(refork_raw_items)).as_slice(),
         [
             RolloutItem::RolloutReference(_),
             RolloutItem::EventMsg(EventMsg::ThreadSettingsApplied(_))
         ]
     ));
-    let refork_items = without_session_meta(
+    let refork_items = without_certified_checkpoints(without_session_meta(
         materialize_rollout_items(test.config.codex_home.as_path(), &refork_path)
             .await
             .expect("materialize re-forked history"),
-    );
+    ));
     let mut expected_refork_items = fork1_items;
     expected_refork_items.push(thread_settings_applied_item(
         codex_refork.thread_settings_snapshot().await,
@@ -239,6 +239,42 @@ fn thread_settings_applied_item(snapshot: ThreadSettingsSnapshot) -> RolloutItem
             thread_settings: snapshot,
         },
     ))
+}
+
+// Certified fork checkpoints repeat model state, not conversation events. Validate the complete
+// checkpoint before comparing the inherited event prefix, retaining its settings update.
+fn without_certified_checkpoints(items: Vec<RolloutItem>) -> Vec<RolloutItem> {
+    let mut result = Vec::new();
+    let mut index = 0;
+    while index < items.len() {
+        if let RolloutItem::Compacted(compacted) = &items[index]
+            && let Some(descriptor) = &compacted.segment_state_checkpoint
+        {
+            use codex_protocol::protocol::SegmentStateCheckpointDisposition::Established;
+            let len = 3
+                + usize::from(descriptor.world_state == Established)
+                + usize::from(descriptor.reference_context == Established);
+            let checkpoint = &items[index..index + len];
+            codex_rollout::validate_certified_segment_state_checkpoint(checkpoint)
+                .expect("complete certified fork checkpoint");
+            result.extend(
+                checkpoint
+                    .iter()
+                    .filter(|item| {
+                        matches!(
+                            item,
+                            RolloutItem::EventMsg(EventMsg::ThreadSettingsApplied(_))
+                        )
+                    })
+                    .cloned(),
+            );
+            index += len;
+        } else {
+            result.push(items[index].clone());
+            index += 1;
+        }
+    }
+    result
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

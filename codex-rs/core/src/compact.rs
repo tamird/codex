@@ -20,7 +20,7 @@ use crate::session::session::Session;
 use crate::session::step_context::StepContext;
 use crate::session::turn::get_last_assistant_message_from_turn;
 use crate::session::turn_context::TurnContext;
-use crate::state::AutoCompactWindowIds;
+use crate::state::PreparedAutoCompactWindowAdvance;
 use crate::util::backoff;
 use codex_analytics::CodexCompactionEvent;
 use codex_analytics::CompactionImplementation;
@@ -114,24 +114,30 @@ pub(crate) enum InitialContextInjection {
 /// `CompactedItem`, ensuring the live and persisted histories remain identical.
 pub(crate) struct CompactedHistoryMetadata {
     pub(crate) message: String,
-    pub(crate) window_number: u64,
-    pub(crate) window_ids: AutoCompactWindowIds,
+    /// The nonmutating window transition used while rendering the replacement history.
+    pub(crate) prepared_window_advance: PreparedAutoCompactWindowAdvance,
 }
 
 pub(crate) async fn build_compaction_initial_context(
     sess: &Session,
     initial_context_injection: &InitialContextInjection,
-) -> (Vec<ResponseItemEnvelope>, Option<Arc<WorldState>>) {
+) -> (
+    Vec<ResponseItemEnvelope>,
+    Option<Arc<WorldState>>,
+    PreparedAutoCompactWindowAdvance,
+) {
+    let prepared_window_advance = sess.prepare_auto_compact_window_advance().await;
     // Return the rendered state with its items so history and its baseline stay identical.
-    match initial_context_injection {
+    let (items, world_state_baseline) = match initial_context_injection {
         InitialContextInjection::BeforeLastUserMessage {
             world_state,
             step_context,
         } => {
             let items = sess
-                .build_initial_context_with_world_state(
+                .build_initial_context_with_world_state_for_auto_compact_window(
                     step_context.turn.as_ref(),
                     world_state.as_ref(),
+                    &prepared_window_advance,
                 )
                 .await;
             (
@@ -140,7 +146,8 @@ pub(crate) async fn build_compaction_initial_context(
             )
         }
         InitialContextInjection::DoNotInject => (Vec::new(), None),
-    }
+    };
+    (items, world_state_baseline, prepared_window_advance)
 }
 
 pub(crate) async fn run_inline_auto_compact_task(
@@ -418,9 +425,7 @@ async fn run_compact_task_inner_impl(
     if let Some(agent_path) = agent_path.as_ref() {
         retain_subagent_assignment_and_recent_messages(history_items, &mut new_history, agent_path);
     }
-    let (window_number, window_ids) = sess.advance_auto_compact_window().await;
-
-    let (initial_context, world_state_baseline) =
+    let (initial_context, world_state_baseline, prepared_window_advance) =
         build_compaction_initial_context(sess.as_ref(), &initial_context_injection).await;
     if !initial_context.is_empty() {
         new_history =
@@ -433,17 +438,16 @@ async fn run_compact_task_inner_impl(
         }
     };
     sess.replace_compacted_history(
+        &turn_context,
         new_history,
         reference_context_item,
         world_state_baseline,
         CompactedHistoryMetadata {
             message: summary_text,
-            window_number,
-            window_ids,
+            prepared_window_advance,
         },
     )
     .await?;
-    sess.recompute_token_usage(&turn_context).await;
 
     if reporting.defers_lifecycle() {
         sess.emit_turn_item_started(&turn_context, &compaction_item)

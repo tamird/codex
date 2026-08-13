@@ -14,7 +14,6 @@ use std::path::PathBuf;
 
 use codex_protocol::protocol::SessionMetaLine;
 use codex_rollout::ModelContextScan;
-use codex_rollout::ModelContextScanProgress;
 use codex_rollout::ReverseJsonlScanner;
 use codex_rollout::RolloutItem;
 use codex_rollout::ScanOutcome;
@@ -45,11 +44,17 @@ pub(super) async fn select_bounded_context(
             let Ok(Some(line)) = line_parser::parse_legacy_rollout_value(value) else {
                 continue;
             };
-            if scan.push(line.item) == ModelContextScanProgress::Complete {
+            if scan.push(line.item).is_complete() {
                 let mut items = scan.finish(session_meta);
                 items.retain(|item| !matches!(item, RolloutItem::SessionMeta(_)));
                 return Ok(Some(items));
             }
+        }
+
+        if scan.has_bounded_context() {
+            let mut items = scan.finish(session_meta);
+            items.retain(|item| !matches!(item, RolloutItem::SessionMeta(_)));
+            return Ok(Some(items));
         }
 
         Ok(None)

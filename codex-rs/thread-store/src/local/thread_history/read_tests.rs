@@ -2125,6 +2125,7 @@ async fn segmented_legacy_index_preserves_implicit_compaction_only_turn() {
         first_window_id: None,
         previous_window_id: None,
         window_id: None,
+        segment_state_checkpoint: None,
     });
     let mut file = fs::OpenOptions::new()
         .append(true)

@@ -9,9 +9,10 @@ use codex_utils_path_uri::PathUri;
 
 /// Configuration supplied for a thread's selected environment.
 #[allow(clippy::large_enum_variant)]
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub enum EnvironmentConfigState {
     /// Preserve the existing thread-derived environment configuration.
+    #[default]
     FromThread,
     /// The owner will supply environment configuration later.
     Pending,

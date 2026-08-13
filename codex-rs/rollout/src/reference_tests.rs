@@ -9,8 +9,14 @@ use codex_history::RolloutItem;
 use codex_history::RolloutLine;
 use codex_protocol::SegmentId;
 use codex_protocol::ThreadId;
+use codex_protocol::config_types::ApprovalsReviewer;
+use codex_protocol::config_types::CollaborationMode;
+use codex_protocol::config_types::ModeKind;
 use codex_protocol::config_types::ReasoningSummary;
+use codex_protocol::config_types::Settings;
+use codex_protocol::config_types::WindowsSandboxLevel;
 use codex_protocol::models::ContentItem;
+use codex_protocol::models::PermissionProfile;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::AgentMessageEvent;
 use codex_protocol::protocol::AskForApproval;
@@ -22,8 +28,12 @@ use codex_protocol::protocol::SessionMetaLine;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::ThreadHistoryMode;
 use codex_protocol::protocol::ThreadRolledBackEvent;
+use codex_protocol::protocol::ThreadSettingsAppliedEvent;
+use codex_protocol::protocol::ThreadSettingsSnapshot;
+use codex_protocol::protocol::TokenCountEvent;
 use codex_protocol::protocol::TurnCompleteEvent;
 use codex_protocol::protocol::TurnContextItem;
+use codex_protocol::protocol::TurnEnvironmentSelections;
 use codex_protocol::protocol::TurnStartedEvent;
 use codex_protocol::protocol::UserMessageEvent;
 use pretty_assertions::assert_eq;
@@ -44,9 +54,11 @@ use super::materialize_recent_rollout_lines;
 use super::materialize_rollout_lines;
 use super::resolve_rollout_reference_path;
 use crate::ARCHIVED_SESSIONS_SUBDIR;
+use crate::CertifiedSegmentStateCheckpoint;
 use crate::ROTATED_ROLLOUT_SEGMENTS_SUBDIR;
 use crate::ResponseItemEnvelope;
 use crate::SESSIONS_SUBDIR;
+use codex_utils_absolute_path::AbsolutePathBuf;
 
 fn meta_line(thread_id: ThreadId, segment_id: SegmentId, ordinal: u64) -> RolloutLine {
     meta_line_with_segment(thread_id, Some(segment_id), ordinal)
@@ -198,8 +210,71 @@ fn compacted_line(message: &str, ordinal: u64) -> RolloutLine {
             first_window_id: None,
             previous_window_id: None,
             window_id: None,
+            segment_state_checkpoint: None,
         }),
     }
+}
+
+fn checkpoint_lines(message: &str, first_ordinal: u64) -> Vec<RolloutLine> {
+    let cwd: AbsolutePathBuf = serde_json::from_value(json!("/tmp")).expect("absolute test cwd");
+    let compacted = CompactedItem {
+        message: message.to_string(),
+        replacement_history: Some(Vec::new()),
+        mcp_resource_origins: None,
+        window_number: Some(1),
+        first_window_id: Some("019b3f6e-0000-7000-8000-000000000001".to_string()),
+        previous_window_id: None,
+        window_id: Some("019b3f6e-0000-7000-8000-000000000002".to_string()),
+        segment_state_checkpoint: None,
+    };
+    let settings = ThreadSettingsAppliedEvent {
+        thread_settings: ThreadSettingsSnapshot {
+            model: "test-model".to_string(),
+            model_provider_id: "test-provider".to_string(),
+            service_tier: None,
+            approval_policy: AskForApproval::Never,
+            approvals_reviewer: ApprovalsReviewer::User,
+            permission_profile: PermissionProfile::workspace_write(),
+            active_permission_profile: None,
+            cwd: cwd.clone(),
+            environments: Some(TurnEnvironmentSelections::new(cwd, Vec::new())),
+            workspace_roots: Some(Vec::new()),
+            profile_workspace_roots: Some(Vec::new()),
+            windows_sandbox_level: Some(WindowsSandboxLevel::Disabled),
+            reasoning_effort: None,
+            reasoning_summary: None,
+            personality: None,
+            collaboration_mode: CollaborationMode {
+                mode: ModeKind::Default,
+                settings: Settings {
+                    model: "test-model".to_string(),
+                    reasoning_effort: None,
+                    developer_instructions: None,
+                },
+            },
+        },
+    };
+    CertifiedSegmentStateCheckpoint::new(
+        compacted,
+        None,
+        None,
+        None,
+        settings,
+        TokenCountEvent {
+            info: None,
+            rate_limits: None,
+        },
+    )
+    .expect("valid checkpoint")
+    .into_items()
+    .into_iter()
+    .enumerate()
+    .map(|(index, item)| RolloutLine {
+        timestamp: "2026-07-13T00:00:01Z".to_string(),
+        ordinal: Some(first_ordinal + u64::try_from(index).expect("checkpoint index")),
+        item,
+    })
+    .collect()
 }
 
 fn developer_line(message: &str, ordinal: u64) -> RolloutLine {
@@ -773,15 +848,14 @@ async fn model_context_checkpoint_does_not_open_obsolete_legacy_predecessor() ->
         .join(thread_id.to_string())
         .join(missing_segment.to_string())
         .join("missing.jsonl");
-    let lines = vec![
+    let mut lines = vec![
         meta_line(thread_id, current_segment, /*ordinal*/ 0),
         reference_line(missing_path, thread_id, missing_segment, /*ordinal*/ 1),
-        turn_started_line("recent-turn", /*ordinal*/ 2),
-        user_event_line("recent user", /*ordinal*/ 3),
-        turn_context_line(home.path(), "recent-turn", /*ordinal*/ 4),
-        compacted_line("latest checkpoint", /*ordinal*/ 5),
-        turn_complete_line("recent-turn", /*ordinal*/ 6),
     ];
+    lines.extend(checkpoint_lines(
+        "latest checkpoint",
+        /*first_ordinal*/ 2,
+    ));
 
     let items = materialize_model_context_rollout_items_from(home.path(), lines).await?;
 
@@ -919,23 +993,20 @@ async fn model_context_cross_thread_checkpoint_does_not_open_obsolete_parent() -
     };
     let parent_path = segment_path(parent_thread, parent_segment);
     let missing_path = segment_path(parent_thread, missing_segment);
-    write_rollout(
-        parent_path.as_path(),
-        &[
-            meta_line(parent_thread, parent_segment, /*ordinal*/ 0),
-            reference_line(
-                missing_path,
-                parent_thread,
-                missing_segment,
-                /*ordinal*/ 1,
-            ),
-            turn_started_line("parent-turn", /*ordinal*/ 2),
-            user_event_line("parent user", /*ordinal*/ 3),
-            turn_context_line(home.path(), "parent-turn", /*ordinal*/ 4),
-            compacted_line("parent checkpoint", /*ordinal*/ 5),
-            turn_complete_line("parent-turn", /*ordinal*/ 6),
-        ],
-    )?;
+    let mut parent_lines = vec![
+        meta_line(parent_thread, parent_segment, /*ordinal*/ 0),
+        reference_line(
+            missing_path,
+            parent_thread,
+            missing_segment,
+            /*ordinal*/ 1,
+        ),
+    ];
+    parent_lines.extend(checkpoint_lines(
+        "parent checkpoint",
+        /*first_ordinal*/ 2,
+    ));
+    write_rollout(parent_path.as_path(), &parent_lines)?;
     let lines = vec![
         meta_line(child_thread, child_segment, /*ordinal*/ 7),
         reference_line(

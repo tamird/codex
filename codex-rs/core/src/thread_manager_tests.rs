@@ -17,8 +17,13 @@ use codex_history::InitialHistory;
 use codex_history::ResumedHistory;
 use codex_models_manager::manager::RefreshStrategy;
 use codex_protocol::ResponseItemId;
+use codex_protocol::SegmentId;
 use codex_protocol::capabilities::CapabilityRootLocation;
 use codex_protocol::capabilities::SelectedCapabilityRoot;
+use codex_protocol::config_types::ApprovalsReviewer;
+use codex_protocol::config_types::CollaborationMode;
+use codex_protocol::config_types::ModeKind;
+use codex_protocol::config_types::Settings;
 use codex_protocol::config_types::WindowsSandboxLevel;
 use codex_protocol::mcp::ClientMcpExtensions;
 use codex_protocol::mcp::MCP_APP_UI_EXTENSION_ID;
@@ -26,21 +31,31 @@ use codex_protocol::mcp::OPENAI_FORM_EXTENSION_ID;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::ContentItemKind;
 use codex_protocol::models::InternalChatMessageMetadataPassthrough;
+use codex_protocol::models::PermissionProfile;
 use codex_protocol::models::ReasoningItemReasoningSummary;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::openai_models::ModelsResponse;
 use codex_protocol::protocol::AgentMessageEvent;
+use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::EnvironmentConfigState;
+use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::InternalSessionSource;
+use codex_protocol::protocol::RolloutReferenceItem;
 use codex_protocol::protocol::SessionMeta;
 use codex_protocol::protocol::SessionMetaLine;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::SubAgentSource;
+use codex_protocol::protocol::ThreadHistoryMode;
+use codex_protocol::protocol::ThreadSettingsAppliedEvent;
+use codex_protocol::protocol::ThreadSettingsSnapshot;
 use codex_protocol::protocol::ThreadSource;
+use codex_protocol::protocol::TurnEnvironmentSelections;
 use codex_protocol::protocol::TurnStartedEvent;
 use codex_protocol::protocol::UserMessageEvent;
 use codex_protocol::user_input::UserInput;
 use codex_thread_store::DeleteThreadParams;
+use codex_thread_store::FrozenRolloutSegment;
+use codex_thread_store::PreparedFork;
 use codex_utils_path_uri::PathUri;
 use core_test_support::PathBufExt;
 use core_test_support::PathExt;
@@ -52,6 +67,45 @@ use tempfile::tempdir;
 use wiremock::MockServer;
 
 const TEST_INSTALLATION_ID: &str = "11111111-1111-4111-8111-111111111111";
+
+fn checkpoint_settings_item(
+    config: &Config,
+    cwd: AbsolutePathBuf,
+    environment: TurnEnvironmentSelection,
+) -> RolloutItem {
+    RolloutItem::EventMsg(EventMsg::ThreadSettingsApplied(
+        ThreadSettingsAppliedEvent {
+            thread_settings: ThreadSettingsSnapshot {
+                model: "test-model".to_string(),
+                model_provider_id: config.model_provider_id.clone(),
+                service_tier: config.service_tier.clone(),
+                approval_policy: AskForApproval::Never,
+                approvals_reviewer: ApprovalsReviewer::User,
+                permission_profile: PermissionProfile::workspace_write(),
+                active_permission_profile: None,
+                cwd: cwd.clone(),
+                environments: Some(TurnEnvironmentSelections::new(
+                    cwd.clone(),
+                    vec![environment],
+                )),
+                workspace_roots: Some(vec![cwd]),
+                profile_workspace_roots: Some(Vec::new()),
+                windows_sandbox_level: Some(WindowsSandboxLevel::Disabled),
+                reasoning_effort: config.model_reasoning_effort.clone(),
+                reasoning_summary: config.model_reasoning_summary,
+                personality: config.personality,
+                collaboration_mode: CollaborationMode {
+                    mode: ModeKind::Default,
+                    settings: Settings {
+                        model: "test-model".to_string(),
+                        reasoning_effort: config.model_reasoning_effort.clone(),
+                        developer_instructions: None,
+                    },
+                },
+            },
+        },
+    ))
+}
 
 #[tokio::test]
 async fn resumed_root_reuses_retained_agent_control() {
@@ -262,6 +316,252 @@ async fn thread_id_generator_applies_to_roots_children_and_forks() {
         .shutdown_all_threads_bounded(Duration::from_secs(10))
         .await;
     assert_eq!(report.completed.len(), 3);
+}
+
+#[tokio::test]
+async fn prepared_fork_uses_latest_checkpoint_environment_without_source_runtime() {
+    let temp_dir = tempdir().expect("tempdir");
+    let mut config = test_config().await;
+    config.codex_home = temp_dir.path().join("codex-home").abs();
+    config.cwd = config.codex_home.clone();
+    std::fs::create_dir_all(config.codex_home.as_path()).expect("create codex home");
+    let boundary_cwd = config.codex_home.join("boundary-environment");
+    let latest_cwd = config.codex_home.join("latest-environment");
+    std::fs::create_dir_all(boundary_cwd.as_path()).expect("create boundary environment");
+    std::fs::create_dir_all(latest_cwd.as_path()).expect("create latest environment");
+    let boundary_environment = TurnEnvironmentSelection {
+        environment_id: codex_exec_server::LOCAL_ENVIRONMENT_ID.to_string(),
+        cwd: PathUri::from_abs_path(&boundary_cwd),
+        workspace_roots: vec![PathUri::from_abs_path(&boundary_cwd)],
+        config: EnvironmentConfigState::FromThread,
+    };
+    let latest_environment = TurnEnvironmentSelection {
+        environment_id: codex_exec_server::LOCAL_ENVIRONMENT_ID.to_string(),
+        cwd: PathUri::from_abs_path(&latest_cwd),
+        workspace_roots: vec![PathUri::from_abs_path(&latest_cwd)],
+        config: EnvironmentConfigState::FromThread,
+    };
+    let boundary_context = vec![
+        RolloutItem::ResponseItem(user_msg("boundary response").into()),
+        checkpoint_settings_item(&config, boundary_cwd, boundary_environment),
+    ];
+    let latest_context = vec![checkpoint_settings_item(
+        &config,
+        latest_cwd,
+        latest_environment.clone(),
+    )];
+    let source_thread_id = ThreadId::new();
+    let source_segment_id = SegmentId::new();
+    let source_path = config
+        .codex_home
+        .join(codex_rollout::ROTATED_ROLLOUT_SEGMENTS_SUBDIR)
+        .join(source_thread_id.to_string())
+        .join(source_segment_id.to_string())
+        .join("rollout-source.jsonl")
+        .to_path_buf();
+    std::fs::create_dir_all(source_path.parent().expect("source parent"))
+        .expect("create source parent");
+    let source_session_meta = SessionMetaLine {
+        meta: SessionMeta {
+            session_id: source_thread_id.into(),
+            id: source_thread_id,
+            segment_id: Some(source_segment_id),
+            cwd: config.cwd.to_path_buf(),
+            model_provider: Some(config.model_provider_id.clone()),
+            history_mode: ThreadHistoryMode::Paginated,
+            ..SessionMeta::default()
+        },
+        git: None,
+    };
+    std::fs::write(
+        &source_path,
+        format!(
+            "{}\n",
+            serde_json::to_string(&codex_rollout::RolloutLine {
+                timestamp: "2026-08-13T00:00:00Z".to_string(),
+                ordinal: Some(0),
+                item: RolloutItem::SessionMeta(source_session_meta.clone()),
+            })
+            .expect("serialize source metadata")
+        ),
+    )
+    .expect("write source segment");
+    let frozen_segment = FrozenRolloutSegment {
+        reference: RolloutReferenceItem {
+            rollout_path: source_path,
+            thread_id: Some(source_thread_id),
+            rollout_id: None,
+            rollout_timestamp: None,
+            segment_id: Some(source_segment_id),
+            max_depth: codex_protocol::protocol::DEFAULT_ROLLOUT_REFERENCE_DEPTH,
+            nth_user_message: None,
+            compacted_replacement_history_filter_texts: None,
+        },
+        source_session_meta,
+        history_mode: ThreadHistoryMode::Paginated,
+        next_rollout_ordinal: Some(1),
+    };
+    let prepared = PreparedFork::new(
+        source_thread_id,
+        /*history_base*/ None,
+        frozen_segment,
+        Arc::new(boundary_context.clone()),
+        Arc::new(latest_context),
+        Arc::new(boundary_context),
+        /*interrupt_if_open*/ false,
+        (),
+    );
+    let manager = ThreadManager::with_models_provider_and_home_for_tests(
+        CodexAuth::from_api_key("dummy"),
+        config.model_provider.clone(),
+        config.codex_home.to_path_buf(),
+        Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
+    );
+
+    let (forked, _) = manager
+        .fork_prepared_thread(
+            config,
+            prepared,
+            /*thread_source*/ None,
+            /*parent_trace*/ None,
+            ClientMcpExtensions::default(),
+            /*reserved_thread_id*/ None,
+        )
+        .await
+        .expect("fork prepared checkpoint history");
+
+    assert_eq!(
+        forked.thread.environment_selections().await,
+        vec![latest_environment]
+    );
+    forked
+        .thread
+        .shutdown_and_wait()
+        .await
+        .expect("shutdown forked thread");
+}
+
+#[tokio::test]
+async fn cold_resume_uses_checkpoint_environment_selections() {
+    let temp_dir = tempdir().expect("tempdir");
+    let mut config = test_config().await;
+    config.codex_home = temp_dir.path().join("codex-home").abs();
+    config.cwd = config.codex_home.clone();
+    std::fs::create_dir_all(config.codex_home.as_path()).expect("create codex home");
+    let restored_cwd = config.codex_home.join("restored-environment");
+    std::fs::create_dir_all(restored_cwd.as_path()).expect("create restored environment");
+    let restored_environment = TurnEnvironmentSelection {
+        environment_id: codex_exec_server::LOCAL_ENVIRONMENT_ID.to_string(),
+        cwd: PathUri::from_abs_path(&restored_cwd),
+        workspace_roots: vec![PathUri::from_abs_path(&restored_cwd)],
+        config: EnvironmentConfigState::FromThread,
+    };
+    let thread_id = ThreadId::new();
+    let manager = ThreadManager::with_models_provider_and_home_for_tests(
+        CodexAuth::from_api_key("dummy"),
+        config.model_provider.clone(),
+        config.codex_home.to_path_buf(),
+        Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
+    );
+    let auth_manager =
+        AuthManager::from_auth_for_testing(CodexAuth::create_dummy_chatgpt_auth_for_testing());
+    let rollout_path = config
+        .codex_home
+        .join("sessions/2026/08/13")
+        .join(format!("rollout-2026-08-13T00-00-00-{thread_id}.jsonl"))
+        .to_path_buf();
+    std::fs::create_dir_all(rollout_path.parent().expect("rollout parent"))
+        .expect("create rollout parent");
+    let session_meta = SessionMetaLine {
+        meta: SessionMeta {
+            session_id: thread_id.into(),
+            id: thread_id,
+            segment_id: Some(SegmentId::new()),
+            cwd: config.cwd.to_path_buf(),
+            model_provider: Some(config.model_provider_id.clone()),
+            history_mode: ThreadHistoryMode::Paginated,
+            ..SessionMeta::default()
+        },
+        git: None,
+    };
+    std::fs::write(
+        &rollout_path,
+        format!(
+            "{}\n",
+            serde_json::to_string(&codex_rollout::RolloutLine {
+                timestamp: "2026-08-13T00:00:00Z".to_string(),
+                ordinal: Some(0),
+                item: RolloutItem::SessionMeta(session_meta.clone()),
+            })
+            .expect("serialize resumed metadata")
+        ),
+    )
+    .expect("write resumed rollout");
+
+    let resumed = manager
+        .resume_thread_with_history(
+            config.clone(),
+            InitialHistory::Resumed(ResumedHistory {
+                conversation_id: thread_id,
+                history: Arc::new(vec![
+                    RolloutItem::SessionMeta(session_meta),
+                    checkpoint_settings_item(&config, restored_cwd, restored_environment.clone()),
+                ]),
+                rollout_path: Some(rollout_path),
+            }),
+            auth_manager,
+            /*parent_trace*/ None,
+            ClientMcpExtensions::default(),
+        )
+        .await
+        .expect("resume checkpoint history");
+
+    assert_eq!(
+        resumed.thread.environment_selections().await,
+        vec![restored_environment]
+    );
+    resumed
+        .thread
+        .shutdown_and_wait()
+        .await
+        .expect("shutdown resumed thread");
+}
+
+#[tokio::test]
+async fn cold_resume_named_profile_uses_current_roots_without_rewriting_environment_cwd() {
+    let mut config = test_config().await;
+    let old_root = config.codex_home.join("old-workspace");
+    let current_root = config.codex_home.join("current-workspace");
+    config
+        .permissions
+        .set_workspace_roots(vec![current_root.clone()]);
+    let selected = TurnEnvironmentSelection {
+        environment_id: "selected-environment".to_string(),
+        cwd: PathUri::from_abs_path(&old_root),
+        workspace_roots: vec![PathUri::from_abs_path(&old_root)],
+        config: EnvironmentConfigState::FromThread,
+    };
+    let mut item = checkpoint_settings_item(&config, old_root, selected.clone());
+    let RolloutItem::EventMsg(EventMsg::ThreadSettingsApplied(event)) = &mut item else {
+        panic!("checkpoint settings");
+    };
+    event.thread_settings.active_permission_profile =
+        Some(codex_protocol::models::ActivePermissionProfile {
+            id: "removed-profile".to_string(),
+            extends: None,
+        });
+    let mut expected = selected;
+    expected.workspace_roots = vec![PathUri::from_abs_path(&current_root)];
+    assert_eq!(
+        super::persisted_root_environment_selections(&config, std::slice::from_ref(&item)),
+        Some(vec![expected.clone()]),
+    );
+    config.permissions.set_workspace_roots(Vec::new());
+    expected.workspace_roots.clear();
+    assert_eq!(
+        super::persisted_root_environment_selections(&config, &[item]),
+        Some(vec![expected]),
+    );
 }
 
 /// Resuming a thread preserves its stored ID instead of invoking the new manager's factory.

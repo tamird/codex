@@ -1124,6 +1124,17 @@ impl RolloutRecorder {
         ))
     }
 
+    /// Parses one persisted rollout value with the compatibility transforms used by full loads.
+    pub fn parse_rollout_line_value(
+        mut value: Value,
+    ) -> Result<Option<RolloutLine>, serde_json::Error> {
+        if strip_legacy_ghost_snapshot_rollout_line(&mut value) {
+            return Ok(None);
+        }
+        normalize_legacy_sleep_item_completed_rollout_line(&mut value);
+        crate::decode_rollout_line(value).map(Some)
+    }
+
     /// Loads physical rollout records without discarding their lineage ordinals.
     pub async fn load_rollout_lines(
         path: &Path,
@@ -1139,7 +1150,7 @@ impl RolloutRecorder {
                 continue;
             }
             saw_non_empty_line = true;
-            let mut value: Value = match serde_json::from_str(&line) {
+            let value: Value = match serde_json::from_str(&line) {
                 Ok(value) => value,
                 Err(e) => {
                     warn!("failed to parse line as JSON: {line:?}, error: {e}");
@@ -1147,13 +1158,6 @@ impl RolloutRecorder {
                     continue;
                 }
             };
-            if strip_legacy_ghost_snapshot_rollout_line(&mut value) {
-                trace!("skipping legacy ghost_snapshot rollout line");
-                continue;
-            }
-            if normalize_legacy_sleep_item_completed_rollout_line(&mut value) {
-                trace!("normalized legacy item_completed Sleep rollout line");
-            }
             if thread_id.is_none() {
                 // The first SessionMeta belongs to this rollout. Later SessionMeta lines
                 // can be copied from fork history, so only validate unknown history modes
@@ -1165,8 +1169,12 @@ impl RolloutRecorder {
                 value.get("type").and_then(Value::as_str),
                 Some("rollout_reference" | "fork_reference")
             );
-            let rollout_line = match crate::decode_rollout_line(value) {
-                Ok(rollout_line) => rollout_line,
+            let rollout_line = match Self::parse_rollout_line_value(value) {
+                Ok(Some(rollout_line)) => rollout_line,
+                Ok(None) => {
+                    trace!("skipping legacy ghost_snapshot rollout line");
+                    continue;
+                }
                 Err(e) => {
                     if is_rollout_reference {
                         return Err(IoError::new(

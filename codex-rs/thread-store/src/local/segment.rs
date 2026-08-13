@@ -473,6 +473,13 @@ pub(super) async fn persist_segment_checkpoint(
             },
         };
     }
+    if let Err(error) = params.validate_checkpoint() {
+        return SegmentCheckpointPersistenceOutcome::NotCommitted {
+            error: ThreadStoreError::InvalidRequest {
+                message: error.to_string(),
+            },
+        };
+    }
     let store_for_persistence = store.clone();
     let result = tokio::spawn(async move {
         let reservation = match reserve_segment_writers(&store_for_persistence, thread_id).await {

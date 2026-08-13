@@ -15,6 +15,7 @@ use codex_protocol::models::BaseInstructions;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::openai_models::ReasoningEffort;
 use codex_protocol::protocol::AskForApproval;
+use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::GitInfo;
 use codex_protocol::protocol::HistoryPosition;
 use codex_protocol::protocol::MultiAgentVersion;
@@ -23,6 +24,7 @@ use codex_protocol::protocol::SessionMetaLine;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::ThreadHistoryMode;
 use codex_protocol::protocol::ThreadMemoryMode as MemoryMode;
+use codex_protocol::protocol::ThreadRolledBackEvent;
 use codex_protocol::protocol::ThreadSource;
 use codex_protocol::protocol::TokenUsage;
 use codex_rollout::ResponseItemEnvelope;
@@ -187,6 +189,7 @@ pub struct AppendThreadItemsParams {
 pub struct FreezeRolloutSegmentParams {
     mode: FreezeRolloutSegmentMode,
     initial_items: Vec<RolloutItem>,
+    certified_checkpoint_start: Option<usize>,
 }
 
 /// Authoritative result of persisting one segment-state checkpoint.
@@ -216,6 +219,7 @@ impl FreezeRolloutSegmentParams {
         Self {
             mode: FreezeRolloutSegmentMode::Snapshot,
             initial_items: Vec::new(),
+            certified_checkpoint_start: None,
         }
     }
 
@@ -224,6 +228,33 @@ impl FreezeRolloutSegmentParams {
         Self {
             mode: FreezeRolloutSegmentMode::Rotate,
             initial_items,
+            certified_checkpoint_start: None,
+        }
+    }
+
+    /// Rotates the source rollout and writes a certified current-state checkpoint after its
+    /// predecessor reference.
+    pub fn rotate_checkpoint(checkpoint: codex_rollout::CertifiedSegmentStateCheckpoint) -> Self {
+        Self {
+            mode: FreezeRolloutSegmentMode::Rotate,
+            initial_items: checkpoint.into_items(),
+            certified_checkpoint_start: Some(0),
+        }
+    }
+
+    /// Rotates the source rollout and publishes one rollback marker with the certified state that
+    /// results from applying it. The marker and checkpoint share one atomic publication.
+    pub fn rotate_after_rollback(
+        rollback: ThreadRolledBackEvent,
+        checkpoint: codex_rollout::CertifiedSegmentStateCheckpoint,
+    ) -> Self {
+        let mut initial_items = Vec::with_capacity(checkpoint.items().len() + 1);
+        initial_items.push(RolloutItem::EventMsg(EventMsg::ThreadRolledBack(rollback)));
+        initial_items.extend(checkpoint.into_items());
+        Self {
+            mode: FreezeRolloutSegmentMode::Rotate,
+            initial_items,
+            certified_checkpoint_start: Some(1),
         }
     }
 
@@ -233,6 +264,20 @@ impl FreezeRolloutSegmentParams {
 
     pub(crate) fn initial_items(&self) -> &[RolloutItem] {
         self.initial_items.as_slice()
+    }
+
+    pub(crate) fn validate_checkpoint(
+        &self,
+    ) -> Result<(), codex_rollout::SegmentStateCheckpointError> {
+        let Some(checkpoint_start) = self.certified_checkpoint_start else {
+            #[cfg(test)]
+            return Ok(());
+            #[cfg(not(test))]
+            return Err(codex_rollout::SegmentStateCheckpointError::uncertified());
+        };
+        codex_rollout::validate_certified_segment_state_checkpoint(
+            &self.initial_items[checkpoint_start..],
+        )
     }
 }
 

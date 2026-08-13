@@ -1616,6 +1616,7 @@ async fn segmented_legacy_index_preserves_full_items_cursors_and_restart() -> Re
                 first_window_id: None,
                 previous_window_id: None,
                 window_id: None,
+                segment_state_checkpoint: None,
             }));
             items.push(RolloutItem::TurnContext(TurnContextItem {
                 turn_id: Some(turn_id.clone()),

@@ -33,7 +33,7 @@ async fn process_compacted_history_with_test_session(
         world_state,
         step_context,
     };
-    let (refreshed, _) = crate::compact_remote::process_compacted_history(
+    let (refreshed, _, _) = crate::compact_remote::process_compacted_history(
         &session,
         compacted_history,
         &initial_context_injection,

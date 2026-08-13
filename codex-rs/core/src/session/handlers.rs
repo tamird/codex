@@ -333,8 +333,6 @@ pub async fn thread_rollback(sess: &Arc<Session>, sub_id: String, num_turns: u32
         .into_iter()
         .chain(std::iter::once(RolloutItem::EventMsg(rollback_msg.clone())))
         .collect::<Vec<_>>();
-    sess.apply_rollout_reconstruction(turn_context.as_ref(), replay_items.as_slice())
-        .await;
     if sess
         .services
         .thread_extension_data
@@ -345,30 +343,12 @@ pub async fn thread_rollback(sess: &Arc<Session>, sub_id: String, num_turns: u32
             .invalidate_for_node_repl_evidence()
             .await;
     }
-    sess.services
-        .agent_control
-        .rollout_budget()
-        .rearm_reminder(sess.thread_id());
-    sess.recompute_token_usage(turn_context.as_ref()).await;
-
-    sess.persist_rollout_items(&[RolloutItem::EventMsg(rollback_msg.clone())])
-        .await;
-    if let Err(err) = sess.flush_rollout().await {
-        sess.send_event(
-            turn_context.as_ref(),
-            EventMsg::Warning(WarningEvent {
-                message: format!(
-                    "Rolled the thread back, but failed to save the rollback marker. Codex will continue retrying. Error: {err}"
-                ),
-            }),
-        )
-        .await;
-    }
-
-    sess.deliver_event_raw(Event {
-        id: turn_context.sub_id.clone(),
-        msg: rollback_msg,
-    })
+    sess.complete_thread_rollback(
+        turn_context,
+        replay_items,
+        rollback_event,
+        live_thread.clone(),
+    )
     .await;
 }
 

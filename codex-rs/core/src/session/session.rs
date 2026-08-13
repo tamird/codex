@@ -73,6 +73,8 @@ pub(crate) struct Session {
     pub(crate) conversation: Arc<RealtimeConversationManager>,
     pub(crate) active_turn: Mutex<Option<ActiveTurn>>,
     pub(crate) async_hook_results: async_channel::Receiver<HookCompletedEvent>,
+    /// Orders mutations before checkpoint capture or after commit classification.
+    pub(super) checkpoint_admission_lock: Arc<Mutex<()>>,
     pub(crate) input_queue: InputQueue,
     pub(crate) guardian_review_session: GuardianReviewSessionManager,
     /// Runtime state for the active goal supervisor helper, its retry deadline, and its last
@@ -277,6 +279,7 @@ impl SessionConfiguration {
             ),
             workspace_roots,
             profile_workspace_roots: permission_profile.profile_workspace_roots().to_vec(),
+            windows_sandbox_level: self.windows_sandbox_level,
             ephemeral: self.original_config_do_not_use.ephemeral,
             reasoning_effort: self.step_settings.collaboration_mode.reasoning_effort(),
             reasoning_summary: self.step_settings.reasoning_summary,
@@ -305,6 +308,19 @@ impl SessionConfiguration {
             permission_profile: self.materialized_permission_profile(environment_selections),
             active_permission_profile: self.active_permission_profile(),
             cwd: self.legacy_fallback_cwd.clone(),
+            environments: Some(TurnEnvironmentSelections::new(
+                self.legacy_fallback_cwd.clone(),
+                environment_selections.to_vec(),
+            )),
+            workspace_roots: Some(ThreadEnvironments::primary_workspace_roots_for(
+                environment_selections,
+            )),
+            profile_workspace_roots: Some(
+                self.permission_profile_state
+                    .profile_workspace_roots()
+                    .to_vec(),
+            ),
+            windows_sandbox_level: Some(self.windows_sandbox_level),
             reasoning_effort: self.step_settings.collaboration_mode.reasoning_effort(),
             reasoning_summary: self.step_settings.reasoning_summary,
             personality: self.step_settings.personality,
@@ -733,11 +749,12 @@ impl Session {
                     _ => None,
                 })
             }
-            InitialHistory::Forked(items) => {
-                (session_configuration.history_mode == ThreadHistoryMode::Paginated
-                    && items.iter().any(|item| matches!(item, RolloutItem::RolloutReference(_))))
-                    .then_some(initial_rollout_ordinal)
-            }
+            InitialHistory::Forked(items) => (session_configuration.history_mode
+                == ThreadHistoryMode::Paginated
+                && items
+                    .iter()
+                    .any(|item| matches!(item, RolloutItem::RolloutReference(_))))
+            .then_some(initial_rollout_ordinal),
             InitialHistory::New | InitialHistory::Cleared => None,
         }
         .filter(|_| forked_from_id.is_some());
@@ -1555,6 +1572,7 @@ impl Session {
                 conversation: Arc::new(RealtimeConversationManager::new()),
                 active_turn: Mutex::new(None),
                 async_hook_results,
+                checkpoint_admission_lock: Arc::new(Mutex::new(())),
                 input_queue: InputQueue::new(),
                 guardian_review_session: GuardianReviewSessionManager::default(),
                 goal_supervisor_runtime: crate::goal_supervisor::GoalSupervisorRuntimeState::new(),
