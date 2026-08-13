@@ -250,7 +250,7 @@ async fn handle_agent_start(
         message,
         &source,
         /*trigger_turn*/ true,
-    );
+    )?;
     let context = AgentCommunicationContext::new(AgentCommunicationKind::Spawn, session.thread_id);
     let multi_agent_v2_usage_hints =
         if is_full_history_fork && turn.multi_agent_version == MultiAgentVersion::V2 {

@@ -50,6 +50,10 @@ mod send_message;
 mod spawn;
 pub(crate) mod wait;
 
+#[cfg(test)]
+#[path = "multi_agents_v2_tests.rs"]
+mod tests;
+
 pub(crate) async fn emit_sub_agent_activity(
     session: &crate::session::session::Session,
     turn: &crate::session::turn_context::TurnContext,
@@ -66,18 +70,24 @@ fn communication_from_tool_message(
     message: String,
     source: &crate::tools::context::ToolCallSource,
     trigger_turn: bool,
-) -> InterAgentCommunication {
-    if !matches!(
-        source,
-        crate::tools::context::ToolCallSource::DirectPlaintextMessage
-    ) {
-        return InterAgentCommunication::new_encrypted(
-            author,
-            recipient,
-            Vec::new(),
-            message,
-            trigger_turn,
-        );
+) -> Result<InterAgentCommunication, FunctionCallError> {
+    match source {
+        crate::tools::context::ToolCallSource::Direct => {
+            return Ok(InterAgentCommunication::new_encrypted(
+                author,
+                recipient,
+                Vec::new(),
+                message,
+                trigger_turn,
+            ));
+        }
+        crate::tools::context::ToolCallSource::CodeMode { .. } => {
+            return Err(FunctionCallError::RespondToModel(
+                "collaboration tools with encrypted message arguments cannot be called from code mode; call the tool directly instead"
+                    .to_string(),
+            ));
+        }
+        crate::tools::context::ToolCallSource::DirectPlaintextMessage => {}
     }
     let message_type = if trigger_turn {
         InterAgentMessageType::NewTask
@@ -86,5 +96,11 @@ fn communication_from_tool_message(
     };
     let content =
         InterAgentMessage::new(message_type, recipient.clone(), author.clone(), message).render();
-    InterAgentCommunication::new(author, recipient, Vec::new(), content, trigger_turn)
+    Ok(InterAgentCommunication::new(
+        author,
+        recipient,
+        Vec::new(),
+        content,
+        trigger_turn,
+    ))
 }

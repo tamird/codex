@@ -3317,6 +3317,46 @@ async fn code_mode_only_can_expose_namespaced_multi_agent_v2_as_normal_tools() {
 }
 
 #[tokio::test]
+async fn encrypted_multi_agent_tools_stay_out_of_nested_code_mode() {
+    let plan = probe(|turn| {
+        set_features(turn, &[Feature::CodeMode, Feature::MultiAgentV2]);
+        update_config(turn, |config| {
+            config.multi_agent_v2.non_code_mode_only = false;
+            config.multi_agent_v2.tool_namespace = Some("agents".to_string());
+        });
+    })
+    .await;
+
+    assert_eq!(
+        plan.namespace_function_names("agents"),
+        &[
+            "followup_task".to_string(),
+            "interrupt_agent".to_string(),
+            "list_agents".to_string(),
+            "send_message".to_string(),
+            "spawn_agent".to_string(),
+            "wait_agent".to_string(),
+        ]
+    );
+    for tool_name in ["spawn_agent", "send_message", "followup_task"] {
+        assert_eq!(
+            plan.exposure(&ToolName::namespaced("agents", tool_name).to_string()),
+            ToolExposure::Direct
+        );
+    }
+    let ToolSpec::Freeform(exec) = plan.visible_spec(codex_code_mode::PUBLIC_TOOL_NAME) else {
+        panic!("expected exec tool");
+    };
+    for encrypted_tool in [
+        "agents__spawn_agent",
+        "agents__send_message",
+        "agents__followup_task",
+    ] {
+        assert!(!exec.description.contains(encrypted_tool));
+    }
+}
+
+#[tokio::test]
 async fn hosted_web_search_fallback_follows_winning_browser_runtime() {
     let plan = probe_with(
         |turn| {

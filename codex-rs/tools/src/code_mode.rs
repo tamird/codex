@@ -122,6 +122,13 @@ fn code_mode_tool_definition_for_spec(spec: &ToolSpec) -> Option<CodeModeToolDef
 }
 
 fn code_mode_tool_definitions_for_spec(spec: &ToolSpec) -> Vec<CodeModeToolDefinition> {
+    code_mode_tool_definitions_for_spec_unfiltered(spec)
+        .into_iter()
+        .filter(|definition| !code_mode_definition_has_encrypted_input(definition))
+        .collect()
+}
+
+fn code_mode_tool_definitions_for_spec_unfiltered(spec: &ToolSpec) -> Vec<CodeModeToolDefinition> {
     match spec {
         ToolSpec::Function(tool) => {
             let name = tool.name.clone();
@@ -174,6 +181,27 @@ fn code_mode_tool_definitions_for_spec(spec: &ToolSpec) -> Vec<CodeModeToolDefin
             })
             .collect(),
         ToolSpec::ToolSearch { .. } | ToolSpec::WebSearch { .. } => Vec::new(),
+    }
+}
+
+fn code_mode_definition_has_encrypted_input(definition: &CodeModeToolDefinition) -> bool {
+    definition
+        .input_schema
+        .as_ref()
+        .is_some_and(json_value_has_encrypted_marker)
+}
+
+fn json_value_has_encrypted_marker(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Object(object) => {
+            object.get("encrypted") == Some(&serde_json::Value::Bool(true))
+                || object.values().any(json_value_has_encrypted_marker)
+        }
+        serde_json::Value::Array(values) => values.iter().any(json_value_has_encrypted_marker),
+        serde_json::Value::Null
+        | serde_json::Value::Bool(_)
+        | serde_json::Value::Number(_)
+        | serde_json::Value::String(_) => false,
     }
 }
 

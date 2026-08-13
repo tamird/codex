@@ -1,5 +1,6 @@
 use super::augment_tool_spec_for_code_mode;
 use super::code_mode_name_for_tool_name;
+use super::collect_code_mode_tool_definitions;
 use super::tool_spec_to_code_mode_tool_definition;
 use crate::AdditionalProperties;
 use crate::FreeformTool;
@@ -191,4 +192,72 @@ fn tool_spec_to_code_mode_tool_definition_skips_unsupported_variants() {
         }),
         None
     );
+}
+
+#[test]
+fn encrypted_input_tools_are_excluded_from_code_mode_definitions() {
+    let encrypted_tool = ResponsesApiTool {
+        name: "send_message".to_string(),
+        description: "Send a message".to_string(),
+        strict: false,
+        defer_loading: None,
+        parameters: JsonSchema::object(
+            BTreeMap::from([(
+                "message".to_string(),
+                JsonSchema::string(/*description*/ None).with_encrypted(),
+            )]),
+            Some(vec!["message".to_string()]),
+            Some(AdditionalProperties::Boolean(false)),
+        ),
+        output_schema: None,
+    };
+    let ordinary_tool = ResponsesApiTool {
+        name: "list_agents".to_string(),
+        description: "List agents".to_string(),
+        strict: false,
+        defer_loading: None,
+        parameters: JsonSchema::object(
+            BTreeMap::new(),
+            Some(Vec::new()),
+            Some(AdditionalProperties::Boolean(false)),
+        ),
+        output_schema: None,
+    };
+    let spec = ToolSpec::Namespace(ResponsesApiNamespace {
+        name: "collaboration".to_string(),
+        description: "Collaboration tools".to_string(),
+        tools: vec![
+            ResponsesApiNamespaceTool::Function(encrypted_tool),
+            ResponsesApiNamespaceTool::Function(ordinary_tool),
+        ],
+    });
+
+    assert_eq!(
+        collect_code_mode_tool_definitions([&spec])
+            .into_iter()
+            .map(|definition| definition.name)
+            .collect::<Vec<_>>(),
+        vec!["collaboration__list_agents".to_string()]
+    );
+}
+
+#[test]
+fn encrypted_input_function_keeps_its_direct_model_description() {
+    let spec = ToolSpec::Function(ResponsesApiTool {
+        name: "send_message".to_string(),
+        description: "Send a message".to_string(),
+        strict: false,
+        defer_loading: None,
+        parameters: JsonSchema::object(
+            BTreeMap::from([(
+                "message".to_string(),
+                JsonSchema::string(/*description*/ None).with_encrypted(),
+            )]),
+            Some(vec!["message".to_string()]),
+            Some(AdditionalProperties::Boolean(false)),
+        ),
+        output_schema: None,
+    });
+
+    assert_eq!(augment_tool_spec_for_code_mode(spec.clone()), spec);
 }
