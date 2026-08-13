@@ -269,11 +269,26 @@ async fn attach_history_if_requested(
         return Ok(());
     }
     let thread_id = thread.thread_id;
-    let Some(path) = thread.rollout_path.clone() else {
+    let Some(mut path) = thread.rollout_path.clone() else {
         return Err(ThreadStoreError::Internal {
             message: format!("failed to load thread history for thread {thread_id}"),
         });
     };
+    let _history_access =
+        super::goal_supervisor_runtime_repair::repair_recent_history_before_access(
+            store,
+            thread_id,
+            path.as_path(),
+        )
+        .await?;
+    path = codex_rollout::existing_rollout_path(path.as_path())
+        .await
+        .ok_or_else(|| ThreadStoreError::Internal {
+            message: format!(
+                "rollout {} disappeared after history repair",
+                path.display()
+            ),
+        })?;
     let items = load_history_items(store.config.codex_home.as_path(), &path).await?;
     thread.history = Some(StoredThreadHistory { thread_id, items });
     Ok(())

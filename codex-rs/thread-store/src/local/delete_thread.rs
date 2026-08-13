@@ -45,13 +45,22 @@ pub(super) async fn delete_thread(
     let mut writer_guards = store.acquire_writer_locks(&[thread_id]).await?;
     let owned_rollouts = owned_rollouts_for_thread(store, thread_id).await?;
     let reference_index = scan_reference_index(store).await?;
-    if owned_rollouts
+    let targeted_rollout_ids = owned_rollouts
         .iter()
         .map(|rollout| rollout.rollout_id)
-        .collect::<HashSet<_>>()
-        .into_iter()
-        .any(|rollout_id| reference_index.reference_count(rollout_id) > 0)
-    {
+        .collect::<HashSet<_>>();
+    let internal_reference_counts = internal_reference_counts(
+        &reference_index,
+        &targeted_rollout_ids,
+        targeted_rollout_ids.iter().copied(),
+    );
+    if targeted_rollout_ids.into_iter().any(|rollout_id| {
+        reference_index.reference_count(rollout_id)
+            > internal_reference_counts
+                .get(&rollout_id)
+                .copied()
+                .unwrap_or_default()
+    }) {
         return Err(referenced_thread_error(thread_id));
     }
     delete_thread_after_reference_check(store, thread_id, owned_rollouts, &mut writer_guards)
@@ -116,26 +125,13 @@ where
     let reference_index = scan_reference_index(store).await?;
     // References from children in this delete set are removed by the same request, so only
     // references from children outside the set should block it.
-    let mut internal_reference_counts = HashMap::new();
-    for child_rollouts in owned_rollouts_by_thread.values() {
-        let child_rollout_ids = child_rollouts
-            .iter()
-            .map(|rollout| rollout.rollout_id)
-            .collect::<HashSet<_>>();
-        for child_rollout_id in child_rollout_ids {
-            if let Some(direct_references) = reference_index.direct_references(child_rollout_id) {
-                for referenced_rollout_id in direct_references {
-                    if *referenced_rollout_id != child_rollout_id
-                        && targeted_rollout_ids.contains(referenced_rollout_id)
-                    {
-                        *internal_reference_counts
-                            .entry(*referenced_rollout_id)
-                            .or_default() += 1;
-                    }
-                }
-            }
-        }
-    }
+    let child_rollout_ids = owned_rollouts_by_thread
+        .values()
+        .flatten()
+        .map(|rollout| rollout.rollout_id)
+        .collect::<HashSet<_>>();
+    let internal_reference_counts =
+        internal_reference_counts(&reference_index, &targeted_rollout_ids, child_rollout_ids);
     for thread_id in &thread_ids {
         let rollout_ids = owned_rollouts_by_thread
             .get(thread_id)
@@ -195,6 +191,27 @@ where
         deleted_thread_ids,
         failure: None,
     })
+}
+
+fn internal_reference_counts(
+    reference_index: &RolloutReferenceIndex,
+    targeted_rollout_ids: &HashSet<RolloutId>,
+    child_rollout_ids: impl IntoIterator<Item = RolloutId>,
+) -> HashMap<RolloutId, usize> {
+    let mut counts = HashMap::new();
+    for child_rollout_id in child_rollout_ids {
+        let Some(direct_references) = reference_index.direct_references(child_rollout_id) else {
+            continue;
+        };
+        for referenced_rollout_id in direct_references {
+            if *referenced_rollout_id != child_rollout_id
+                && targeted_rollout_ids.contains(referenced_rollout_id)
+            {
+                *counts.entry(*referenced_rollout_id).or_default() += 1;
+            }
+        }
+    }
+    counts
 }
 
 async fn scan_reference_index(
@@ -1078,9 +1095,16 @@ mod tests {
         let sibling_link = imported_path.with_extension("jsonl.zst");
         symlink(&outside_sibling, &sibling_link).expect("link outside sibling");
         let store = LocalThreadStore::new(config, Some(state_db));
-        super::super::thread_history::apply_projection(&store, thread_id, 0, 0, 0, Vec::new())
-            .await
-            .expect("seed projection");
+        super::super::thread_history::apply_projection(
+            &store,
+            thread_id,
+            /*start_offset*/ 0,
+            /*next_offset*/ 0,
+            /*initial_ordinal*/ 0,
+            Vec::new(),
+        )
+        .await
+        .expect("seed projection");
 
         let error = store
             .delete_thread(DeleteThreadParams { thread_id })

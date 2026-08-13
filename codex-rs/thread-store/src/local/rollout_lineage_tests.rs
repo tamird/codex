@@ -64,6 +64,7 @@ async fn resolves_nested_lineage_with_empty_intermediate_segments() {
                 rollout_path: root_path.clone(),
                 start_ordinal: 1,
                 end_ordinal_exclusive: Some(root_end.end_ordinal_exclusive),
+                jsonl_end_byte_offset: Some(root_end.end_byte_offset),
                 end_byte_offset: Some(root_end.end_byte_offset),
                 filter_texts: Vec::new(),
             },
@@ -73,6 +74,7 @@ async fn resolves_nested_lineage_with_empty_intermediate_segments() {
                 rollout_path: middle_path.clone(),
                 start_ordinal: 5,
                 end_ordinal_exclusive: Some(middle_end.end_ordinal_exclusive),
+                jsonl_end_byte_offset: Some(middle_end.end_byte_offset),
                 end_byte_offset: Some(middle_end.end_byte_offset),
                 filter_texts: Vec::new(),
             },
@@ -82,6 +84,7 @@ async fn resolves_nested_lineage_with_empty_intermediate_segments() {
                 rollout_path: child_path,
                 start_ordinal: 6,
                 end_ordinal_exclusive: None,
+                jsonl_end_byte_offset: Some(child_len),
                 end_byte_offset: Some(child_len),
                 filter_texts: Vec::new(),
             },
@@ -118,6 +121,68 @@ async fn resolves_archived_ancestors() {
         .expect("resolve archived ancestor");
 
     assert_eq!(lineage.segments[0].rollout_path, root_path);
+}
+
+#[tokio::test]
+async fn preserves_history_position_byte_boundary_for_compressed_ancestor() {
+    let home = TempDir::new().expect("temp dir");
+    let store = LocalThreadStore::new(test_config(home.path()), /*state_db*/ None);
+    let parent = ThreadId::default();
+    let child = ThreadId::default();
+    let parent_path = write_rollout(
+        home.path(),
+        parent,
+        /*history_base*/ None,
+        /*next_ordinal*/ 6,
+    );
+    let parent_end = history_position(
+        parent_path.as_path(),
+        parent,
+        /*end_ordinal_exclusive*/ 4,
+    );
+    let compressed_parent = compress_rollout(parent_path.as_path());
+    write_rollout(
+        home.path(),
+        child,
+        Some(parent_end),
+        /*next_ordinal*/ 2,
+    );
+
+    let lineage = store
+        .resolve_rollout_lineage(child)
+        .await
+        .expect("resolve compressed ancestor");
+    let parent_segment = lineage.segments.first().expect("parent segment");
+
+    assert_eq!(parent_segment.rollout_path(), compressed_parent);
+    assert_eq!(parent_segment.end_byte_offset(), None);
+    assert_eq!(
+        parent_segment.jsonl_end_byte_offset(),
+        Some(parent_end.end_byte_offset)
+    );
+}
+
+#[tokio::test]
+async fn unbounded_compressed_segment_has_no_decoded_byte_boundary() {
+    let home = TempDir::new().expect("temp dir");
+    let store = LocalThreadStore::new(test_config(home.path()), /*state_db*/ None);
+    let thread_id = ThreadId::default();
+    let rollout_path = write_rollout(
+        home.path(),
+        thread_id,
+        /*history_base*/ None,
+        /*next_ordinal*/ 3,
+    );
+    let compressed_path = compress_rollout(rollout_path.as_path());
+
+    let lineage = store
+        .resolve_rollout_lineage(thread_id)
+        .await
+        .expect("resolve compressed rollout");
+    let segment = lineage.segments.first().expect("root segment");
+
+    assert_eq!(segment.rollout_path(), compressed_path);
+    assert_eq!(segment.jsonl_end_byte_offset(), None);
 }
 
 #[tokio::test]
@@ -210,6 +275,7 @@ async fn resolves_lineage_at_explicit_history_position() {
                 rollout_path: root_path.clone(),
                 start_ordinal: 1,
                 end_ordinal_exclusive: Some(root_end.end_ordinal_exclusive),
+                jsonl_end_byte_offset: Some(root_end.end_byte_offset),
                 end_byte_offset: Some(root_end.end_byte_offset),
                 filter_texts: Vec::new(),
             },
@@ -219,6 +285,7 @@ async fn resolves_lineage_at_explicit_history_position() {
                 rollout_path: child_path.clone(),
                 start_ordinal: 5,
                 end_ordinal_exclusive: Some(end.end_ordinal_exclusive),
+                jsonl_end_byte_offset: Some(end.end_byte_offset),
                 end_byte_offset: Some(end.end_byte_offset),
                 filter_texts: Vec::new(),
             },
@@ -480,6 +547,11 @@ fn expected_segment(
         thread_id,
         rollout_id: thread_id,
         end_ordinal_exclusive: end.map(|position| position.end_ordinal_exclusive),
+        jsonl_end_byte_offset: end.map(|position| position.end_byte_offset).or_else(|| {
+            fs::metadata(rollout_path.as_path())
+                .ok()
+                .map(|metadata| metadata.len())
+        }),
         end_byte_offset: end.map(|position| position.end_byte_offset).or_else(|| {
             fs::metadata(rollout_path.as_path())
                 .ok()
@@ -1019,6 +1091,16 @@ fn rollout_end_byte_offset(path: &Path, end_ordinal_exclusive: u64) -> u64 {
         .map(<[u8]>::len)
         .sum::<usize>();
     u64::try_from(end_byte_offset).expect("rollout byte offset fits u64")
+}
+
+fn compress_rollout(path: &Path) -> std::path::PathBuf {
+    let compressed_path = path.with_extension("jsonl.zst");
+    let source = fs::read(path).expect("read rollout for compression");
+    let compressed =
+        zstd::stream::encode_all(source.as_slice(), /*level*/ 0).expect("compress rollout");
+    fs::write(compressed_path.as_path(), compressed).expect("write compressed rollout");
+    fs::remove_file(path).expect("remove plain rollout");
+    compressed_path
 }
 
 fn unchecked_history_position(thread_id: ThreadId, end_ordinal_exclusive: u64) -> HistoryPosition {

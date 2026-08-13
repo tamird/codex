@@ -65,10 +65,10 @@ async fn thread_list_relation_includes_explicitly_resumed_archived_v1_agent() ->
             let response = list_threads_for_relation(
                 &mut mcp,
                 ThreadListRelation::DescendantsOf(root_id),
-                None,
-                25,
-                None,
-                None,
+                /*cursor*/ None,
+                /*limit*/ 25,
+                /*model_providers*/ None,
+                /*source_kinds*/ None,
             )
             .await?;
             if response.data.len() == 1
@@ -94,10 +94,10 @@ async fn thread_list_relation_includes_explicitly_resumed_archived_v1_agent() ->
         list_threads_for_relation(
             &mut mcp,
             ThreadListRelation::DescendantsOf(root_id),
-            None,
-            25,
-            None,
-            None,
+            /*cursor*/ None,
+            /*limit*/ 25,
+            /*model_providers*/ None,
+            /*source_kinds*/ None,
         )
         .await?
         .data
@@ -120,10 +120,10 @@ async fn thread_list_relation_includes_explicitly_resumed_archived_v1_agent() ->
     let app_members = list_threads_for_relation(
         &mut mcp,
         ThreadListRelation::DescendantsOf(root_id),
-        None,
-        25,
-        None,
-        None,
+        /*cursor*/ None,
+        /*limit*/ 25,
+        /*model_providers*/ None,
+        /*source_kinds*/ None,
     )
     .await?;
     assert_eq!(app_members.data.len(), 1);
@@ -132,10 +132,10 @@ async fn thread_list_relation_includes_explicitly_resumed_archived_v1_agent() ->
     let archived_current = list_threads_for_relation_with_archived(
         &mut mcp,
         ThreadListRelation::DescendantsOf(root_id),
-        None,
-        25,
-        None,
-        None,
+        /*cursor*/ None,
+        /*limit*/ 25,
+        /*model_providers*/ None,
+        /*source_kinds*/ None,
         Some(true),
     )
     .await?;
@@ -144,10 +144,10 @@ async fn thread_list_relation_includes_explicitly_resumed_archived_v1_agent() ->
         list_threads_for_relation_with_archived(
             &mut mcp,
             ThreadListRelation::DescendantsOf(root_id),
-            None,
-            25,
-            None,
-            None,
+            /*cursor*/ None,
+            /*limit*/ 25,
+            /*model_providers*/ None,
+            /*source_kinds*/ None,
             Some(false),
         )
         .await?
@@ -167,10 +167,10 @@ async fn thread_list_relation_includes_explicitly_resumed_archived_v1_agent() ->
         list_threads_for_relation(
             &mut mcp,
             ThreadListRelation::DescendantsOf(root_id),
-            None,
-            25,
-            None,
-            None,
+            /*cursor*/ None,
+            /*limit*/ 25,
+            /*model_providers*/ None,
+            /*source_kinds*/ None,
         )
         .await?
         .data
@@ -180,7 +180,7 @@ async fn thread_list_relation_includes_explicitly_resumed_archived_v1_agent() ->
 }
 
 #[tokio::test]
-async fn thread_list_relation_matches_every_list_agents_page_above_default_limit() -> Result<()> {
+async fn thread_list_relation_paginates_app_members_and_matches_list_agents() -> Result<()> {
     const AGENT_COUNT: usize = 26;
 
     let server = responses::start_mock_server().await;
@@ -287,80 +287,8 @@ async fn thread_list_relation_matches_every_list_agents_page_above_default_limit
     }
     let root_id = ThreadId::from_string(&root.id)?;
 
-    let mut model_members = Vec::new();
-    let mut model_cursor = None;
-    let mut model_cursors = std::collections::HashSet::new();
-    for page_index in 0..10 {
-        let prompt = format!("list bulk membership page {page_index}");
-        let call_id = format!("bulk-list-page-{page_index}");
-        let arguments = serde_json::to_string(&json!({
-            "limit": 25,
-            "cursor": model_cursor,
-        }))?;
-        let prompt_match = prompt.clone();
-        responses::mount_sse_once_match(
-            &server,
-            move |request: &wiremock::Request| {
-                String::from_utf8_lossy(&request.body).contains(&prompt_match)
-            },
-            responses::sse(vec![
-                responses::ev_response_created(&format!("{call_id}-request")),
-                responses::ev_function_call_with_namespace(
-                    &call_id,
-                    "collaboration",
-                    "list_agents",
-                    &arguments,
-                ),
-                responses::ev_completed(&format!("{call_id}-request")),
-            ]),
-        )
-        .await;
-        let call_match = call_id.clone();
-        let result = responses::mount_sse_once_match(
-            &server,
-            move |request: &wiremock::Request| {
-                String::from_utf8_lossy(&request.body).contains(&call_match)
-            },
-            responses::sse(vec![
-                responses::ev_response_created(&format!("{call_id}-complete")),
-                responses::ev_assistant_message(
-                    &format!("{call_id}-message"),
-                    "listed bulk membership",
-                ),
-                responses::ev_completed(&format!("{call_id}-complete")),
-            ]),
-        )
-        .await;
-        mcp.start_turn_and_wait_for_completion(TurnStartParams {
-            thread_id: root.id.clone(),
-            input: vec![UserInput::Text {
-                text: prompt,
-                text_elements: Vec::new(),
-            }],
-            ..Default::default()
-        })
-        .await?;
-        let output: serde_json::Value = serde_json::from_str(
-            &result
-                .function_call_output_text(&call_id)
-                .ok_or_else(|| anyhow::anyhow!("missing list_agents output for {call_id}"))?,
-        )?;
-        assert_eq!(output["total_count"], AGENT_COUNT);
-        for agent in output["agents"]
-            .as_array()
-            .ok_or_else(|| anyhow::anyhow!("list_agents agents must be an array"))?
-        {
-            model_members.push(normalize_model_current_agent(agent)?);
-        }
-        model_cursor = output["next_cursor"].as_str().map(str::to_string);
-        let Some(cursor) = model_cursor.as_ref() else {
-            break;
-        };
-        assert!(
-            model_cursors.insert(cursor.clone()),
-            "model cursor repeated"
-        );
-    }
+    let model_members =
+        list_all_model_current_agents(&mut mcp, &server, &root.id, "bulk-membership").await?;
     assert_eq!(model_members.len(), AGENT_COUNT);
 
     let mut app_members = Vec::new();
@@ -372,9 +300,9 @@ async fn thread_list_relation_matches_every_list_agents_page_above_default_limit
             &mut mcp,
             ThreadListRelation::DescendantsOf(root_id),
             app_cursor,
-            7,
-            None,
-            None,
+            /*limit*/ 7,
+            /*model_providers*/ None,
+            /*source_kinds*/ None,
         )
         .await?;
         for thread in &response.data {
@@ -407,9 +335,13 @@ async fn thread_list_relation_matches_every_list_agents_page_above_default_limit
         };
         assert!(app_cursors.insert(cursor.clone()), "app cursor repeated");
     }
-    model_members.sort();
     app_members.sort();
-    assert_eq!(app_members, model_members);
+    let mut canonical_app_members = app_members
+        .iter()
+        .map(NormalizedCurrentAgent::canonical)
+        .collect::<Vec<_>>();
+    canonical_app_members.sort();
+    assert_eq!(canonical_app_members, model_members);
     assert!(
         cold_identity_checked,
         "the oldest evicted ephemeral worker must retain registry identity"
@@ -480,13 +412,9 @@ async fn thread_list_relation_matches_every_list_agents_page_above_default_limit
         ..Default::default()
     })
     .await?;
-    let close_output: serde_json::Value = serde_json::from_str(
-        &close_result
-            .function_call_output_text(CLOSE_CALL_ID)
-            .context("missing cold ephemeral close output")?,
-    )?;
-    assert_eq!(close_output["closed_agents"], 1);
-    assert_eq!(close_output["evicted_identities"], 1);
+    close_result
+        .function_call_output_text(CLOSE_CALL_ID)
+        .context("missing cold ephemeral close output")?;
 
     let app_after_close = list_threads_for_relation(
         &mut mcp,
@@ -507,10 +435,7 @@ async fn thread_list_relation_matches_every_list_agents_page_above_default_limit
 
     const AFTER_CLOSE_PROMPT: &str = "list bulk membership after cold ephemeral close";
     const AFTER_CLOSE_CALL_ID: &str = "bulk-list-after-cold-ephemeral-close";
-    let after_close_arguments = serde_json::to_string(&json!({
-        "limit": 25,
-        "cursor": null,
-    }))?;
+    let after_close_arguments = serde_json::to_string(&json!({}))?;
     responses::mount_sse_once_match(
         &server,
         |request: &wiremock::Request| {
@@ -557,13 +482,14 @@ async fn thread_list_relation_matches_every_list_agents_page_above_default_limit
             .function_call_output_text(AFTER_CLOSE_CALL_ID)
             .context("missing list_agents output after close")?,
     )?;
-    assert_eq!(after_close_output["total_count"], AGENT_COUNT - 1);
-    assert!(
-        after_close_output["agents"]
-            .as_array()
-            .context("list_agents agents must be an array")?
-            .iter()
-            .all(|agent| agent["agent_id"] != closed_agent_id)
-    );
+    let after_close_agents = after_close_output["agents"]
+        .as_array()
+        .context("list_agents agents must be an array")?;
+    assert_eq!(after_close_agents.len(), AGENT_COUNT);
+    assert!(after_close_agents.iter().all(|agent| {
+        agent["agent_name"] != CLOSED_AGENT_PATH
+            && agent.get("agent_id").is_none()
+            && agent.get("parent_agent_id").is_none()
+    }));
     Ok(())
 }

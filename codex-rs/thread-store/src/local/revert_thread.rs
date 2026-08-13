@@ -70,10 +70,11 @@ pub(super) async fn revert(
 
     // Preserve old-reader compatibility when introducing the first reference to a standalone
     // source. Already-shared ancestors stay read-only; their offsets address decoded JSONL bytes.
+    let standalone =
+        super::rollout_lineage::rollout_is_standalone(source_path.as_path(), thread_id).await?;
     let mut lineage = store.resolve_rollout_lineage(thread_id).await?;
     for segment in &mut lineage.segments {
-        if segment.rollout_id() == current_rollout.rollout_id && source_meta.history_base.is_none()
-        {
+        if segment.rollout_id() == current_rollout.rollout_id && standalone {
             segment.rollout_path =
                 codex_rollout::materialize_rollout_for_reference(segment.rollout_path.as_path())
                     .await
@@ -91,6 +92,9 @@ pub(super) async fn revert(
         )
         .await?;
     }
+    // Re-resolve after materializing the standalone source so paths reflect the published
+    // representation while every boundary continues to address decoded JSONL bytes.
+    let lineage = store.resolve_rollout_lineage(thread_id).await?;
     let history_base = paginated_fork::history_base_at_boundary(
         store,
         thread_id,

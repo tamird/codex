@@ -6,7 +6,6 @@ use std::path::PathBuf;
 
 use codex_app_server_protocol::ThreadItem;
 use codex_protocol::RolloutId;
-use codex_protocol::SegmentId;
 use codex_protocol::ThreadId;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::ResponseItem;
@@ -38,6 +37,12 @@ pub(super) struct RolloutLineageSegment {
     pub(super) rollout_path: PathBuf,
     pub(super) start_ordinal: u64,
     pub(super) end_ordinal_exclusive: Option<u64>,
+    /// End of the consumed decoded JSONL prefix.
+    ///
+    /// Repair publication uses this authoritative `HistoryPosition` after decoding the rollout.
+    /// The reverse scanner's `end_byte_offset` also addresses decoded JSONL bytes, including for
+    /// compressed files opened through the seekable rollout reader.
+    pub(super) jsonl_end_byte_offset: Option<u64>,
     pub(super) end_byte_offset: Option<u64>,
     pub(super) filter_texts: Vec<String>,
 }
@@ -80,6 +85,46 @@ impl LocalThreadStore {
         .await?;
         Ok(RolloutLineage {
             root_rollout_id: resolved.rollout_id,
+            segments,
+        })
+    }
+
+    /// Resolves the lineage rooted at one explicit physical rollout rather than the thread's
+    /// currently selected rollout.
+    pub(super) async fn resolve_rollout_lineage_from_path(
+        &self,
+        requested_thread_id: ThreadId,
+        rollout_path: &Path,
+    ) -> ThreadStoreResult<RolloutLineage> {
+        let resolved_path = codex_rollout::existing_rollout_path(rollout_path)
+            .await
+            .ok_or_else(|| malformed_lineage(requested_thread_id, "missing source rollout"))?;
+        let session_meta = codex_rollout::read_session_meta_line(resolved_path.as_path())
+            .await
+            .map_err(lineage_io_error)?;
+        if session_meta.meta.id != requested_thread_id {
+            return Err(malformed_lineage(
+                requested_thread_id,
+                "source rollout belongs to another thread",
+            ));
+        }
+        let plain_path = codex_rollout::plain_rollout_path(resolved_path.as_path());
+        let rollout_id = codex_rollout::rollout_id_from_path(plain_path.as_path())
+            .unwrap_or(requested_thread_id);
+        let mut active_paths = HashSet::new();
+        let segments = resolve_path(
+            self,
+            requested_thread_id,
+            rollout_id,
+            resolved_path,
+            /*end*/ None,
+            /*inherited_filter_texts*/ None,
+            /*graph_depth*/ 0,
+            &mut active_paths,
+        )
+        .await?;
+        Ok(RolloutLineage {
+            root_rollout_id: rollout_id,
             segments,
         })
     }
@@ -169,6 +214,56 @@ impl LocalThreadStore {
         }
     }
 
+    /// Resolves and materializes a fork lineage while the caller retains every writer owner.
+    pub(super) async fn resolve_rollout_lineage_for_reference_reserved(
+        &self,
+        requested_thread_id: ThreadId,
+        expected_rollout_id: Option<codex_protocol::RolloutId>,
+        reservation: &RolloutWriterReservation,
+    ) -> ThreadStoreResult<(RolloutLineage, bool)> {
+        let source =
+            thread_rollout_resolver::resolve_current_including_archived(self, requested_thread_id)
+                .await?
+                .ok_or_else(|| malformed_lineage(requested_thread_id, "missing source rollout"))?;
+        if expected_rollout_id.is_some_and(|expected| expected != source.rollout_id) {
+            return Err(ThreadStoreError::InvalidRequest {
+                message: format!(
+                    "rollout path does not select the current rollout for thread {requested_thread_id}"
+                ),
+            });
+        }
+        super::helpers::scoped_rollout_path(
+            self.config.codex_home.clone(),
+            source.path.as_path(),
+            "Codex home",
+        )?;
+        let source_projection_was_missing =
+            super::thread_history::projection_state(self, source.rollout_id)
+                .await?
+                .is_none();
+        let lineage = self.resolve_rollout_lineage(requested_thread_id).await?;
+        let mut discovered_ids = lineage
+            .segments
+            .iter()
+            .map(|segment| segment.thread_id)
+            .collect::<Vec<_>>();
+        discovered_ids.push(requested_thread_id);
+        discovered_ids.sort_unstable_by_key(ThreadId::to_string);
+        discovered_ids.dedup();
+        if let Some(unreserved) = discovered_ids
+            .iter()
+            .find(|thread_id| !reservation.contains(**thread_id))
+        {
+            return Err(ThreadStoreError::Conflict {
+                message: format!("fork lineage discovered unreserved writer owner {unreserved}"),
+            });
+        }
+        let lineage = self
+            .materialize_rollout_lineage_for_reference(requested_thread_id, lineage, reservation)
+            .await?;
+        Ok((lineage, source_projection_was_missing))
+    }
+
     async fn materialize_rollout_lineage_for_reference(
         &self,
         requested_thread_id: ThreadId,
@@ -200,17 +295,9 @@ impl LocalThreadStore {
                 rollout_path.as_path(),
                 "Codex home",
             )?;
-            let head = read_rollout_head(rollout_path.as_path()).await?;
-            if head.session_meta.meta.id != segment.thread_id {
-                return Err(malformed_lineage(
-                    segment.thread_id,
-                    "source rollout belongs to another thread",
-                ));
-            }
-            let materialized_path = if segment.rollout_id == source.rollout_id
-                && head.session_meta.meta.history_base.is_none()
-                && head.leading_reference.is_none()
-            {
+            let standalone =
+                rollout_is_standalone(rollout_path.as_path(), segment.thread_id).await?;
+            let materialized_path = if segment.rollout_id == source.rollout_id && standalone {
                 // Newly shared standalone sources must remain readable by older binaries.
                 codex_rollout::materialize_rollout_for_reference(rollout_path.as_path())
                     .await
@@ -224,61 +311,36 @@ impl LocalThreadStore {
                 // Already shared compressed ancestors remain immutable and read-only.
                 rollout_path
             };
-            // A previously computed boundary is reusable only when it still names the same
-            // immutable segment under the combined writer reservation.
-            let reusable_end_byte_offset = if materialized_path == segment.rollout_path
-                && segment.end_ordinal_exclusive.is_some()
-                && let Some(end_byte_offset) = segment.end_byte_offset
-            {
-                if segment.thread_id == requested_thread_id {
-                    Some(end_byte_offset)
-                } else {
-                    let immutable_thread_root = self
-                        .config
-                        .codex_home
-                        .join(codex_rollout::ROTATED_ROLLOUT_SEGMENTS_SUBDIR)
-                        .join(segment.thread_id.to_string());
-                    let immutable_segment_id = materialized_path
-                        .strip_prefix(immutable_thread_root.as_path())
-                        .ok()
-                        .and_then(|relative_path| {
-                            let mut components = relative_path.components();
-                            let segment_id = components
-                                .next()
-                                .and_then(|component| component.as_os_str().to_str())
-                                .and_then(|component| SegmentId::from_string(component).ok())?;
-                            let file_name = components.next()?.as_os_str();
-                            let is_expected_rollout = components.next().is_none()
-                                && codex_rollout::rollout_id_from_path(Path::new(file_name))
-                                    == Some(segment.rollout_id);
-                            is_expected_rollout.then_some(segment_id)
-                        });
-                    if let Some(segment_id) = immutable_segment_id {
-                        let session_meta =
-                            codex_rollout::read_session_meta_line(materialized_path.as_path())
-                                .await
-                                .map_err(lineage_io_error)?;
-                        (session_meta.meta.id == segment.thread_id
-                            && session_meta.meta.segment_id == Some(segment_id))
-                        .then_some(end_byte_offset)
+            segment.rollout_path = materialized_path;
+            match segment.end_ordinal_exclusive {
+                Some(end_ordinal_exclusive) => {
+                    if let Some(end_byte_offset) =
+                        segment.jsonl_end_byte_offset.or(segment.end_byte_offset)
+                    {
+                        // The authenticated prefix may end before later unordinaled records.
+                        // Revalidate that exact boundary even for cross-thread ancestors whose
+                        // canonical file is still under sessions/ or has since been compressed.
+                        let end = HistoryPosition {
+                            thread_id: segment.rollout_id,
+                            end_ordinal_exclusive,
+                            end_byte_offset,
+                        };
+                        trim_segment_to_history_position(segment, end).await?;
                     } else {
-                        None
+                        segment.end_byte_offset = byte_offset_for_ordinal(
+                            segment.rollout_path.as_path(),
+                            end_ordinal_exclusive,
+                        )
+                        .await?;
+                        segment.jsonl_end_byte_offset = segment.end_byte_offset;
                     }
                 }
-            } else {
-                None
-            };
-            segment.end_byte_offset = match segment.end_ordinal_exclusive {
-                Some(end_ordinal_exclusive) => match reusable_end_byte_offset {
-                    Some(end_byte_offset) => Some(end_byte_offset),
-                    None => {
-                        byte_offset_for_ordinal(materialized_path.as_path(), end_ordinal_exclusive)
-                            .await?
-                    }
-                },
-                None => Some(decoded_rollout_len(materialized_path.as_path()).await?),
-            };
-            segment.rollout_path = materialized_path;
+                None => {
+                    segment.end_byte_offset =
+                        Some(decoded_rollout_len(segment.rollout_path.as_path()).await?);
+                    segment.jsonl_end_byte_offset = segment.end_byte_offset;
+                }
+            }
         }
         Ok(lineage)
     }
@@ -398,6 +460,21 @@ impl RolloutLineageSegment {
 
     pub(super) fn rollout_id(&self) -> ThreadId {
         self.rollout_id
+    }
+
+    pub(super) fn rollout_path(&self) -> &Path {
+        self.rollout_path.as_path()
+    }
+
+    pub(super) fn end_byte_offset(&self) -> Option<u64> {
+        self.end_byte_offset
+    }
+
+    /// Returns the consumed byte boundary in decoded JSONL coordinates.
+    ///
+    /// `None` means the complete decoded rollout is consumed.
+    pub(super) fn jsonl_end_byte_offset(&self) -> Option<u64> {
+        self.jsonl_end_byte_offset
     }
 
     pub(super) fn start_ordinal(&self) -> u64 {
@@ -657,12 +734,14 @@ async fn resolve_path_iteratively(
         }
 
         let file_len = decoded_rollout_len(pending.rollout_path.as_path()).await?;
+        let jsonl_end_byte_offset = Some(file_len);
         segments.push(RolloutLineageSegment {
             thread_id: pending.thread_id,
             rollout_id: pending.rollout_id,
             rollout_path: pending.rollout_path,
             start_ordinal: pending.first_local_ordinal,
             end_ordinal_exclusive: None,
+            jsonl_end_byte_offset,
             end_byte_offset: Some(file_len),
             filter_texts: pending.filter_texts,
         });
@@ -711,6 +790,20 @@ async fn read_rollout_head(path: &Path) -> ThreadStoreResult<RolloutHead> {
     })
 }
 
+pub(super) async fn rollout_is_standalone(
+    path: &Path,
+    expected_thread_id: ThreadId,
+) -> ThreadStoreResult<bool> {
+    let head = read_rollout_head(path).await?;
+    if head.session_meta.meta.id != expected_thread_id {
+        return Err(malformed_lineage(
+            expected_thread_id,
+            "source rollout belongs to another thread",
+        ));
+    }
+    Ok(head.session_meta.meta.history_base.is_none() && head.leading_reference.is_none())
+}
+
 async fn next_rollout_line(
     reader: &mut codex_rollout::RolloutLineReader,
 ) -> ThreadStoreResult<Option<RolloutLine>> {
@@ -742,6 +835,13 @@ async fn trim_to_history_position(
             "cutoff is outside resolved source rollout",
         ));
     };
+    trim_segment_to_history_position(segment, end).await
+}
+
+async fn trim_segment_to_history_position(
+    segment: &mut RolloutLineageSegment,
+    end: HistoryPosition,
+) -> ThreadStoreResult<()> {
     segment.rollout_path = codex_rollout::existing_rollout_path(segment.rollout_path.as_path())
         .await
         .ok_or_else(|| malformed_lineage(end.thread_id, "missing source rollout"))?;
@@ -764,6 +864,7 @@ async fn trim_to_history_position(
         segment.end_byte_offset =
             byte_offset_for_ordinal(segment.rollout_path.as_path(), end.end_ordinal_exclusive)
                 .await?;
+        segment.jsonl_end_byte_offset = segment.end_byte_offset;
         return Ok(());
     }
     let ordinal_end_byte_offset =
@@ -796,6 +897,7 @@ async fn trim_to_history_position(
     // The recorded offset remains authoritative when unordinaled records were appended after the
     // selected boundary; ordinal-only reconstruction cannot recover that earlier cutoff.
     segment.end_byte_offset = Some(end.end_byte_offset);
+    segment.jsonl_end_byte_offset = segment.end_byte_offset;
     Ok(())
 }
 
@@ -839,6 +941,7 @@ async fn trim_to_ordinal(
     segment.end_ordinal_exclusive = Some(end_ordinal_exclusive);
     segment.end_byte_offset =
         byte_offset_for_ordinal(segment.rollout_path.as_path(), end_ordinal_exclusive).await?;
+    segment.jsonl_end_byte_offset = segment.end_byte_offset;
     Ok(())
 }
 
@@ -976,6 +1079,7 @@ async fn trim_before_nth_user_message(
     segment.end_ordinal_exclusive = Some(boundary.rollout_ordinal);
     segment.end_byte_offset =
         byte_offset_for_ordinal(segment.rollout_path.as_path(), boundary.rollout_ordinal).await?;
+    segment.jsonl_end_byte_offset = segment.end_byte_offset;
     Ok(())
 }
 

@@ -54,10 +54,10 @@ pub(super) async fn load_latest_model_context(
     .ok_or_else(|| ThreadStoreError::InvalidRequest {
         message: format!("no rollout found for thread id {}", params.thread_id),
     })?;
-    let path = resolved.path;
+    let mut path = resolved.path;
     let rollout_id = resolved.rollout_id;
 
-    let session_meta = codex_rollout::read_session_meta_line(path.as_path())
+    let mut session_meta = codex_rollout::read_session_meta_line(path.as_path())
         .await
         .map_err(|err| ThreadStoreError::Internal {
             message: format!("failed to read session metadata {}: {err}", path.display()),
@@ -73,13 +73,72 @@ pub(super) async fn load_latest_model_context(
         });
     }
 
+    let projected_active =
+        scan_projected_active_model_context(store, rollout_id, &path, &session_meta).await?;
+    let used_active_checkpoint = projected_active.is_some();
+    let mut history_access = if used_active_checkpoint {
+        super::goal_supervisor_runtime_repair::repair_active_history_before_access(
+            store,
+            params.thread_id,
+            path.as_path(),
+        )
+        .await?
+    } else {
+        super::goal_supervisor_runtime_repair::repair_compatibility_history_before_access(
+            store,
+            params.thread_id,
+            path.as_path(),
+        )
+        .await?
+    };
+    path = codex_rollout::existing_rollout_path(path.as_path())
+        .await
+        .ok_or_else(|| ThreadStoreError::Internal {
+            message: format!(
+                "rollout {} disappeared after history repair",
+                path.display()
+            ),
+        })?;
+    session_meta = codex_rollout::read_session_meta_line(path.as_path())
+        .await
+        .map_err(|err| ThreadStoreError::Internal {
+            message: format!("failed to read session metadata {}: {err}", path.display()),
+        })?;
+
+    let mut projected_after_repair =
+        scan_projected_active_model_context(store, rollout_id, &path, &session_meta).await?;
+    if used_active_checkpoint && projected_after_repair.is_none() {
+        drop(history_access);
+        history_access =
+            super::goal_supervisor_runtime_repair::repair_compatibility_history_before_access(
+                store,
+                params.thread_id,
+                path.as_path(),
+            )
+            .await?;
+        path = codex_rollout::existing_rollout_path(path.as_path())
+            .await
+            .ok_or_else(|| ThreadStoreError::Internal {
+                message: format!(
+                    "rollout {} disappeared after compatibility repair",
+                    path.display()
+                ),
+            })?;
+        session_meta = codex_rollout::read_session_meta_line(path.as_path())
+            .await
+            .map_err(|err| ThreadStoreError::Internal {
+                message: format!("failed to read session metadata {}: {err}", path.display()),
+            })?;
+        projected_after_repair =
+            scan_projected_active_model_context(store, rollout_id, &path, &session_meta).await?;
+    }
+    let _history_access = history_access;
+
     let items = if matches!(session_meta.meta.history_mode, ThreadHistoryMode::Paginated)
         || (matches!(session_meta.meta.history_mode, ThreadHistoryMode::Legacy)
             && session_meta.meta.segment_id.is_some())
     {
-        if let Some(items) =
-            scan_projected_active_model_context(store, rollout_id, &path, &session_meta).await?
-        {
+        if let Some(items) = projected_after_repair {
             items
         } else if matches!(session_meta.meta.history_mode, ThreadHistoryMode::Legacy) {
             read_thread::load_history_items(store.config.codex_home.as_path(), path.as_path())

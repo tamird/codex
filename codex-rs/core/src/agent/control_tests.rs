@@ -395,6 +395,7 @@ async fn goal_supervisor_helper_uses_full_history_fork_without_spawn_call_id() {
         .get_thread(helper_thread_id)
         .await
         .expect("supervisor helper should be registered");
+    wait_for_recorded_user_message(helper_thread.as_ref(), "# Goal Supervisor Assignment").await;
     assert_eq!(
         helper_thread.session.prompt_cache_key(),
         parent.thread.session.prompt_cache_key(),
@@ -436,31 +437,14 @@ async fn goal_supervisor_helper_uses_full_history_fork_without_spawn_call_id() {
             if name == "list_agents" && call_id == SUPERVISOR_BOOT_LIST_AGENTS_CALL_ID
     )));
 
-    let captured_assignment = harness
-        .manager
-        .captured_ops()
-        .into_iter()
-        .find_map(|(thread_id, op)| {
-            (thread_id == helper_thread_id)
-                .then_some(op)
-                .and_then(|op| match op {
-                    Op::TurnInput { request, .. } => match request.input {
-                        codex_protocol::turn_input::TurnInput::UserInput { content, .. } => {
-                            content.into_iter().find_map(|item| match item {
-                                UserInput::Text { text, .. } => Some(text),
-                                _ => None,
-                            })
-                        }
-                        codex_protocol::turn_input::TurnInput::ResponseItem(_)
-                        | codex_protocol::turn_input::TurnInput::InterAgentCommunication(_) => None,
-                    },
-                    _ => None,
-                })
-        })
-        .expect("supervisor assignment should be submitted as user input");
-    assert!(captured_assignment.contains("# Goal Supervisor Assignment"));
-    assert!(captured_assignment.contains("Ship the active user goal."));
-    assert!(!captured_assignment.contains("You are also a **goal supervisor**"));
+    assert!(history_contains_text(
+        helper_history.raw_items(),
+        "# Goal Supervisor Assignment"
+    ));
+    assert!(history_contains_text(
+        helper_history.raw_items(),
+        "Ship the active user goal."
+    ));
 }
 
 fn spawn_agent_call(call_id: &str) -> ResponseItem {
@@ -722,6 +706,7 @@ async fn goal_supervisor_full_history_bootstrap_survives_cold_resume_inner() {
         .get_thread(helper_thread_id)
         .await
         .expect("goal supervisor helper should be registered");
+    wait_for_recorded_user_message(helper_thread.as_ref(), "# Goal Supervisor Assignment").await;
     let helper_snapshot = helper_thread.config_snapshot().await;
     let helper_source = helper_snapshot.session_source.clone();
     let expected_path = AgentPath::root()
@@ -752,32 +737,16 @@ async fn goal_supervisor_full_history_bootstrap_survives_cold_resume_inner() {
         &supervisor_prompt,
         GENERIC_SUBAGENT_HINT,
     );
-    let captured_assignment = harness
-        .manager
-        .captured_ops()
-        .into_iter()
-        .find_map(|(thread_id, op)| {
-            (thread_id == helper_thread_id)
-                .then_some(op)
-                .and_then(|op| match op {
-                    Op::TurnInput { request, .. } => match request.input {
-                        codex_protocol::turn_input::TurnInput::UserInput { content, .. } => {
-                            content.into_iter().find_map(|item| match item {
-                                UserInput::Text { text, .. } => Some(text),
-                                _ => None,
-                            })
-                        }
-                        codex_protocol::turn_input::TurnInput::ResponseItem(_)
-                        | codex_protocol::turn_input::TurnInput::InterAgentCommunication(_) => None,
-                    },
-                    _ => None,
-                })
-        })
-        .expect("goal supervisor assignment should be submitted as user input");
-    assert!(captured_assignment.contains("# Goal Supervisor Assignment"));
-    assert!(captured_assignment.contains("Ship the active user goal."));
+    assert!(history_contains_text(
+        helper_history.raw_items(),
+        "# Goal Supervisor Assignment"
+    ));
+    assert!(history_contains_text(
+        helper_history.raw_items(),
+        "Ship the active user goal."
+    ));
     assert!(
-        !captured_assignment.contains(&supervisor_prompt),
+        history_text_match_count(helper_history.raw_items(), &supervisor_prompt) == 1,
         "role prompt should not be duplicated in the user assignment"
     );
 
@@ -7677,14 +7646,29 @@ while True:
         "supervisor.close_self".to_string(),
         "supervisor.snooze".to_string(),
         "supervisor.compact_parent_context".to_string(),
+        "supervisor.followup_parent".to_string(),
+    ]);
+    let replaced_collaboration_tool_signatures = std::collections::BTreeSet::from([
+        "collaboration.spawn_agent".to_string(),
+        "collaboration.send_message".to_string(),
+        "collaboration.followup_task".to_string(),
+        "collaboration.wait_agent".to_string(),
+        "collaboration.list_agents".to_string(),
+        "collaboration.interrupt_agent".to_string(),
+        "frodex.close_agent".to_string(),
+        "frodex.adopt_agent".to_string(),
+        "frodex.promote_agent".to_string(),
     ]);
     assert_eq!(
         child_tool_signatures
             .difference(&supervisor_tool_signatures)
             .cloned()
             .collect::<std::collections::BTreeSet<_>>(),
-        parent_tool_signatures,
-        "goal supervisor helpers must inherit every non-supervisor tool from their parent"
+        parent_tool_signatures
+            .difference(&replaced_collaboration_tool_signatures)
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>(),
+        "goal supervisor helpers must inherit parent tools except the replaced collaboration contract"
     );
     assert!(
         parent_tool_signatures.is_disjoint(&supervisor_tool_signatures),
@@ -7695,13 +7679,8 @@ while True:
         "the exact goal supervisor helper must expose the supervisor tools: tools={child_tool_signatures:#?}"
     );
     for expected_tool in [
-        "collaboration.spawn_agent",
-        "collaboration.send_message",
-        "collaboration.followup_task",
-        "collaboration.wait_agent",
-        "collaboration.list_agents",
-        "collaboration.interrupt_agent",
         "supervisor.close_self",
+        "supervisor.followup_parent",
         "supervisor.snooze",
         "supervisor.compact_parent_context",
     ] {

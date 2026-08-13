@@ -46,6 +46,9 @@ use crate::ThreadPersistenceMode;
 use crate::ThreadStoreError;
 use crate::ThreadStoreResult;
 
+pub(crate) mod confined_publication;
+pub(super) mod history_repair_publication;
+
 #[cfg(test)]
 static SEGMENT_REOPEN_FAILURES: LazyLock<StdMutex<HashSet<ThreadId>>> =
     LazyLock::new(|| StdMutex::new(HashSet::new()));

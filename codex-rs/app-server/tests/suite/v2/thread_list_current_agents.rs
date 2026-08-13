@@ -52,6 +52,12 @@ struct NormalizedCurrentAgent {
     status: String,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
+struct NormalizedCanonicalAgent {
+    path: String,
+    status: String,
+}
+
 fn model_agent_status_class(status: &serde_json::Value) -> Result<String> {
     if let Some(status) = status.as_str() {
         return Ok(status.to_string());
@@ -67,22 +73,23 @@ fn model_agent_status_class(status: &serde_json::Value) -> Result<String> {
     Ok(status.to_string())
 }
 
-fn normalize_model_current_agent(agent: &serde_json::Value) -> Result<NormalizedCurrentAgent> {
-    Ok(NormalizedCurrentAgent {
-        id: agent["agent_id"]
-            .as_str()
-            .ok_or_else(|| anyhow::anyhow!("model agent is missing agent_id"))?
-            .to_string(),
-        parent_id: agent["parent_agent_id"]
-            .as_str()
-            .ok_or_else(|| anyhow::anyhow!("model agent is missing parent_agent_id"))?
-            .to_string(),
+fn normalize_model_current_agent(agent: &serde_json::Value) -> Result<NormalizedCanonicalAgent> {
+    Ok(NormalizedCanonicalAgent {
         path: agent["agent_name"]
             .as_str()
             .ok_or_else(|| anyhow::anyhow!("model agent is missing agent_name"))?
             .to_string(),
         status: model_agent_status_class(&agent["agent_status"])?,
     })
+}
+
+impl NormalizedCurrentAgent {
+    fn canonical(&self) -> NormalizedCanonicalAgent {
+        NormalizedCanonicalAgent {
+            path: self.path.clone(),
+            status: self.status.clone(),
+        }
+    }
 }
 
 fn normalize_app_current_agent(
@@ -190,36 +197,27 @@ async fn list_all_model_current_agents(
     server: &wiremock::MockServer,
     thread_id: &str,
     label: &str,
-) -> Result<Vec<NormalizedCurrentAgent>> {
-    let mut agents = Vec::new();
-    let mut cursor = None;
-    let mut cursors = std::collections::HashSet::new();
-    for page_index in 0..100 {
-        let output = invoke_model_tool(
-            app,
-            server,
-            thread_id,
-            &format!("list current agents {label} page {page_index}"),
-            &format!("{label}-list-agents-{page_index}"),
-            "collaboration",
-            "list_agents",
-            json!({"limit": 25, "cursor": cursor}),
-        )
-        .await?;
-        for agent in output["agents"]
-            .as_array()
-            .context("list_agents agents must be an array")?
-        {
-            agents.push(normalize_model_current_agent(agent)?);
-        }
-        cursor = output["next_cursor"].as_str().map(str::to_string);
-        let Some(next_cursor) = cursor.as_ref() else {
-            agents.sort();
-            return Ok(agents);
-        };
-        assert!(cursors.insert(next_cursor.clone()), "model cursor repeated");
-    }
-    anyhow::bail!("list_agents did not terminate for {label}")
+) -> Result<Vec<NormalizedCanonicalAgent>> {
+    let output = invoke_model_tool(
+        app,
+        server,
+        thread_id,
+        &format!("list current agents {label}"),
+        &format!("{label}-list-agents"),
+        "collaboration",
+        "list_agents",
+        json!({}),
+    )
+    .await?;
+    let mut agents = output["agents"]
+        .as_array()
+        .context("list_agents agents must be an array")?
+        .iter()
+        .map(normalize_model_current_agent)
+        .collect::<Result<Vec<_>>>()?;
+    agents.retain(|agent| agent.path != "/root");
+    agents.sort();
+    Ok(agents)
 }
 
 async fn init_mcp(codex_home: &Path) -> Result<TestAppServer> {

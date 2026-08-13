@@ -857,6 +857,7 @@ mod tests {
             rollout_path: PathBuf::from(path),
             start_ordinal,
             end_ordinal_exclusive,
+            jsonl_end_byte_offset: None,
             end_byte_offset: None,
             filter_texts: Vec::new(),
         }

@@ -69,9 +69,11 @@ pub(super) async fn resume_thread(
     store: &LocalThreadStore,
     params: ResumeThreadParams,
 ) -> ThreadStoreResult<()> {
-    let _live_writer_guard = store.live_writer_locks.lock(params.thread_id).await;
+    // Keep the duplicate-writer error ahead of history inspection.
     store.ensure_live_recorder_absent(params.thread_id).await?;
-    let writer_lock = store.writer_lock_coordinator.acquire(params.thread_id)?;
+    if let Some(history) = params.history.as_deref() {
+        super::goal_supervisor_runtime_repair::reject_malformed_supplied_history(history)?;
+    }
     if let Some(requested_path) = params.rollout_path.as_deref()
         && let Some(selected_path) = selected_rollout_path(store, params.thread_id).await?
         && codex_rollout::plain_rollout_path(requested_path)
@@ -110,13 +112,15 @@ pub(super) async fn resume_thread(
     };
     let rollout_path = match (params.rollout_path, params.history) {
         (Some(rollout_path), _history) => rollout_path,
-        (None, history) => {
+        (None, _history) => {
             let thread = super::read_thread::read_thread(
                 store,
                 ReadThreadParams {
                     thread_id: params.thread_id,
                     include_archived: params.include_archived,
-                    include_history: history.is_none(),
+                    // History is consumed only after the active checkpoint decision below. Path
+                    // discovery must not traverse predecessors first.
+                    include_history: false,
                 },
             )
             .await?;
@@ -126,6 +130,60 @@ pub(super) async fn resume_thread(
                     message: format!("thread {} does not have a rollout path", params.thread_id),
                 })?
         }
+    };
+    let supplied_empty_placeholder = has_supplied_history
+        && std::fs::metadata(rollout_path.as_path()).is_ok_and(|metadata| metadata.len() == 0);
+    let mut history_access = if !supplied_empty_placeholder {
+        let session_meta = codex_rollout::read_session_meta_line(rollout_path.as_path())
+            .await
+            .map_err(|error| ThreadStoreError::Internal {
+                message: format!("failed to resume local thread recorder: {error}"),
+            })?;
+        let rollout_id =
+            codex_rollout::rollout_id_from_path(rollout_path.as_path()).unwrap_or(params.thread_id);
+        if super::model_context::scan_projected_active_model_context(
+            store,
+            rollout_id,
+            rollout_path.as_path(),
+            &session_meta,
+        )
+        .await?
+        .is_some()
+        {
+            super::goal_supervisor_runtime_repair::repair_active_history_before_access(
+                store,
+                params.thread_id,
+                rollout_path.as_path(),
+            )
+            .await?
+        } else {
+            super::goal_supervisor_runtime_repair::repair_compatibility_history_before_access(
+                store,
+                params.thread_id,
+                rollout_path.as_path(),
+            )
+            .await?
+        }
+    } else {
+        super::goal_supervisor_runtime_repair::GoalSupervisorHistoryAccess::clean()
+    };
+    let _live_writer_guard = if history_access.is_reserved() {
+        None
+    } else {
+        Some(store.live_writer_locks.lock(params.thread_id).await)
+    };
+    store.ensure_live_recorder_absent(params.thread_id).await?;
+    let writer_lock = if history_access.is_reserved() {
+        history_access
+            .take_writer_lock(params.thread_id)
+            .ok_or_else(|| ThreadStoreError::Internal {
+                message: format!(
+                    "goal-supervisor repair did not retain writer ownership for thread {}",
+                    params.thread_id
+                ),
+            })?
+    } else {
+        store.writer_lock_coordinator.acquire(params.thread_id)?
     };
     let cwd = params
         .metadata

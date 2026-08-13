@@ -265,6 +265,7 @@ async fn indexed_same_thread_lineage(
             rollout_path,
             start_ordinal: 0,
             end_ordinal_exclusive: None,
+            jsonl_end_byte_offset: None,
             end_byte_offset: None,
             filter_texts: Vec::new(),
         }],
