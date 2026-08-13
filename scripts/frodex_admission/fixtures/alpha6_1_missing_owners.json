@@ -1,0 +1,26 @@
+{
+  "schema_version": 1,
+  "candidate_source": "8c222c60a9ba139722ec63e5b799278fe3f2e90f",
+  "owners": [
+    {
+      "id": "custom-model-self-alias",
+      "required": true,
+      "resolution": "missing"
+    },
+    {
+      "id": "five-segment-normal-rollout-read",
+      "required": true,
+      "resolution": "missing"
+    },
+    {
+      "id": "five-segment-subagent-history-projection",
+      "required": true,
+      "resolution": "missing"
+    },
+    {
+      "id": "agent-tree-shared-mcp",
+      "required": true,
+      "resolution": "missing"
+    }
+  ]
+}

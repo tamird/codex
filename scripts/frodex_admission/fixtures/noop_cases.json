@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "cases": [
+    {
+      "name": "noop",
+      "argv": [
+        "/usr/bin/true"
+      ],
+      "timeout_seconds": 5,
+      "network": false,
+      "auth": false
+    }
+  ]
+}

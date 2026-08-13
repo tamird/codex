@@ -1,0 +1,48 @@
+{
+  "schema_version": 1,
+  "cases": [
+    {
+      "name": "persisted-checkpoint-thread-resume",
+      "argv": [
+        "/usr/bin/python3",
+        "{source}/scripts/frodex_thread_resume_smoke.py",
+        "--codex", "{candidate}",
+        "--source", "{source}",
+        "--report", "{report}"
+      ],
+      "timeout_seconds": 60,
+      "network": false,
+      "auth": false,
+      "report_schema": "thread_resume"
+    },
+    {
+      "name": "workspace-switch-next-client-turn",
+      "argv": [
+        "/usr/bin/python3",
+        "{source}/scripts/frodex_workspace_turn_smoke.py",
+        "--codex", "{candidate}",
+        "--source", "{source}",
+        "--report", "{report}"
+      ],
+      "timeout_seconds": 60,
+      "network": false,
+      "auth": false,
+      "report_schema": "assertions"
+    },
+    {
+      "name": "configured-model-six-tool-smoke",
+      "argv": [
+        "/usr/bin/python3",
+        "{source}/scripts/frodex_six_tool_smoke.py",
+        "--codex", "{candidate}",
+        "--source", "{source}",
+        "--model", "gpt-5.6-sol",
+        "--report", "{report}"
+      ],
+      "timeout_seconds": 300,
+      "network": true,
+      "auth": true,
+      "report_schema": "six_tool_smoke"
+    }
+  ]
+}
