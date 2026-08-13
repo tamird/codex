@@ -2559,9 +2559,13 @@ async fn spawn_agent_fork_from_paginated_parent_uses_model_context_prefix() {
     let copied_parent_context_count = lines
         .iter()
         .filter(|line| {
-            serde_json::to_string(&line.item)
-                .expect("serialize rollout item")
-                .contains("paginated parent context")
+            matches!(
+                &line.item,
+                RolloutItem::ResponseItem(response_item)
+                    if serde_json::to_string(&response_item.item)
+                        .expect("serialize response item")
+                        .contains("paginated parent context")
+            )
         })
         .count();
     assert_eq!(

@@ -301,6 +301,11 @@ async fn thread_id_generator_applies_to_roots_children_and_forks() {
         )
         .await
         .expect("spawn actual child agent");
+    root.thread.ensure_rollout_materialized().await;
+    root.thread
+        .flush_rollout()
+        .await
+        .expect("flush fork source");
     let fork = manager
         .spawn_subagent(root.thread_id, StartThreadOptions::new(config))
         .await

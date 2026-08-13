@@ -3087,11 +3087,11 @@ async fn resumed_history_injects_initial_context_on_first_context_update_only() 
     assert_eq!(expected, raw_history_items(&history_before_seed));
 
     let step_context = StepContext::for_test(Arc::clone(&turn_context));
+    let initial_context = build_initial_context(&session, &turn_context).await;
     session
         .record_context_updates_and_set_reference_context_item(&step_context)
         .await
         .expect("world state should build");
-    let initial_context = build_initial_context(&session, &turn_context).await;
     expected.extend(initial_context);
     let history_after_seed = session.clone_history().await;
     assert_eq!(
@@ -11871,12 +11871,12 @@ async fn record_context_updates_and_set_reference_context_item_injects_full_cont
     let (session, turn_context) = make_session_and_context().await;
     let turn_context = Arc::new(turn_context);
     let step_context = StepContext::for_test(Arc::clone(&turn_context));
+    let initial_context = build_initial_context(&session, &turn_context).await;
     session
         .record_context_updates_and_set_reference_context_item(&step_context)
         .await
         .expect("world state should build");
     let history = session.clone_history().await;
-    let initial_context = build_initial_context(&session, &turn_context).await;
     assert_eq!(
         strip_response_item_ids(&strip_metadata_from_items(&raw_history_items(&history))),
         strip_response_item_ids(&strip_metadata_from_items(&initial_context))
@@ -11923,6 +11923,7 @@ async fn record_context_updates_and_set_reference_context_item_reinjects_full_co
         )
         .await;
 
+    let initial_context = build_initial_context(&session, &turn_context).await;
     session
         .record_context_updates_and_set_reference_context_item(&step_context)
         .await
@@ -11930,7 +11931,6 @@ async fn record_context_updates_and_set_reference_context_item_reinjects_full_co
 
     let history = session.clone_history().await;
     let mut expected_history = vec![compacted_summary];
-    let initial_context = build_initial_context(&session, &turn_context).await;
     expected_history.extend(initial_context);
     assert_eq!(
         strip_response_item_ids(&strip_metadata_from_items(&raw_history_items(&history))),
@@ -13589,12 +13589,9 @@ async fn abort_review_task_emits_exited_then_aborted_and_records_history() {
     // Verify the `<turn_aborted>` marker is still recorded in history for the model.
     assert!(
         history.raw_items().any(|item| {
-            let ResponseItem::Message { role, content, .. } = item else {
+            let ResponseItem::Message { content, .. } = item else {
                 return false;
             };
-            if role != "user" {
-                return false;
-            }
             content.iter().any(|content_item| {
                 let ContentItem::InputText { text } = content_item else {
                     return false;

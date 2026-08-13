@@ -190,6 +190,7 @@ pub(crate) type ThreadIdGenerator = Arc<dyn Fn() -> ThreadId + Send + Sync>;
 fn capture_test_op(op: &Op) -> Option<Op> {
     match op {
         Op::Interrupt => Some(Op::Interrupt),
+        Op::Compact => Some(Op::Compact),
         Op::InterAgentCommunication {
             communication,
             start_options,
@@ -3256,7 +3257,11 @@ fn snapshot_turn_state(history: &InitialHistory) -> SnapshotTurnState {
         ends_mid_turn: !rollout_items[last_user_position + 1..].iter().any(|item| {
             matches!(
                 item,
-                RolloutItem::EventMsg(EventMsg::TurnComplete(_) | EventMsg::TurnAborted(_))
+                RolloutItem::EventMsg(
+                    EventMsg::AgentMessage(_)
+                        | EventMsg::TurnComplete(_)
+                        | EventMsg::TurnAborted(_)
+                )
             )
         }),
         active_turn_id: None,
