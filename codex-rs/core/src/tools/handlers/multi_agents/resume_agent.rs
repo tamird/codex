@@ -19,7 +19,7 @@ impl ToolExecutor<ToolInvocation> for Handler {
 
     fn search_info(&self) -> Option<ToolSearchInfo> {
         multi_agent_tool_search_info(
-            "resume_agent resume reopen closed agent subagent thread id target",
+            "resume_agent reload open cold agent subagent thread id target",
             self.spec(),
         )
     }
@@ -88,14 +88,7 @@ async fn handle_resume_agent(
         .get_status(receiver_thread_id)
         .await;
     let (receiver_agent, error) = if matches!(status, AgentStatus::NotFound) {
-        match Box::pin(try_resume_closed_agent(
-            &session,
-            &turn,
-            receiver_thread_id,
-            child_depth,
-        ))
-        .await
-        {
+        match Box::pin(try_resume_open_agent(&session, &turn, receiver_thread_id)).await {
             Ok(()) => {
                 status = session
                     .services
@@ -188,24 +181,28 @@ impl ToolOutput for ResumeAgentResult {
     }
 }
 
-async fn try_resume_closed_agent(
+async fn try_resume_open_agent(
     session: &Arc<Session>,
     turn: &Arc<TurnContext>,
     receiver_thread_id: ThreadId,
-    child_depth: i32,
 ) -> Result<(), FunctionCallError> {
+    session
+        .services
+        .agent_control
+        .register_session_root(session.thread_id(), turn.parent_thread_id);
+    session
+        .services
+        .agent_control
+        .ensure_open_agent_known_by_id_for_explicit_resume(session.thread_id(), receiver_thread_id)
+        .await
+        .map_err(|err| collab_agent_error(receiver_thread_id, err))?;
     let config = build_agent_resume_config(turn.as_ref())?;
-    Box::pin(session.services.agent_control.resume_agent_from_rollout(
-        config,
-        receiver_thread_id,
-        thread_spawn_source(
-            session.thread_id(),
-            &turn.session_source,
-            child_depth,
-            /*agent_role*/ None,
-            /*task_name*/ None,
-        )?,
-    ))
+    Box::pin(
+        session
+            .services
+            .agent_control
+            .ensure_agent_loaded(config, receiver_thread_id),
+    )
     .await
     .map(|_| ())
     .map_err(|err| collab_agent_error(receiver_thread_id, err))

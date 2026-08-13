@@ -54,6 +54,43 @@ use wiremock::MockServer;
 const TEST_INSTALLATION_ID: &str = "11111111-1111-4111-8111-111111111111";
 
 #[tokio::test]
+async fn resumed_root_reuses_retained_agent_control() {
+    let temp_dir = tempdir().expect("tempdir");
+    let mut config = test_config().await;
+    config.codex_home = temp_dir.path().join("codex-home").abs();
+    config.cwd = config.codex_home.abs();
+    std::fs::create_dir_all(&config.codex_home).expect("create codex home");
+    let manager = ThreadManager::with_models_provider_and_home_for_tests(
+        CodexAuth::from_api_key("dummy"),
+        config.model_provider.clone(),
+        config.codex_home.to_path_buf(),
+        Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
+    );
+    let root_thread_id = ThreadId::new();
+    let retained = manager.agent_control_for_config(&config);
+    retained.register_session_root(root_thread_id, /*current_parent_thread_id*/ None);
+    manager
+        .state
+        .retained_agent_controls
+        .lock()
+        .expect("retained controls lock")
+        .insert(root_thread_id, retained.clone());
+    let history = InitialHistory::Resumed(ResumedHistory {
+        conversation_id: root_thread_id,
+        history: Arc::new(Vec::new()),
+        rollout_path: Some(config.codex_home.join("retained-root.jsonl").to_path_buf()),
+    });
+
+    let (selected, lifecycle_mutation) = manager
+        .agent_control_for_initial_history(&config, &history)
+        .await
+        .expect("select retained root control");
+
+    assert!(selected.shares_current_agent_registry(&retained));
+    assert!(lifecycle_mutation.is_some());
+}
+
+#[tokio::test]
 async fn persisted_v1_history_wins_over_configured_v2_for_spawn() {
     let temp_dir = tempdir().expect("tempdir");
     let mut config = test_config().await;

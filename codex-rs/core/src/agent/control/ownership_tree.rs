@@ -19,6 +19,7 @@ struct OwnedDescendant {
     original_config: Config,
     original_metadata: StoredThread,
     original_visible_when_cold: bool,
+    original_cold_terminal_status: Option<AgentStatus>,
     was_loaded: bool,
 }
 
@@ -162,6 +163,19 @@ impl AgentControl {
                 )));
             }
 
+            let loaded_terminal_status = if let Some(thread) = loaded_thread.as_ref() {
+                let status = thread.agent_status().await;
+                matches!(
+                    status,
+                    AgentStatus::Completed(_)
+                        | AgentStatus::Errored(_)
+                        | AgentStatus::Interrupted
+                        | AgentStatus::Shutdown
+                )
+                .then_some(status)
+            } else {
+                None
+            };
             let (original_source, original_control, original_config, was_loaded) =
                 match loaded_thread {
                     Some(thread) => {
@@ -190,9 +204,14 @@ impl AgentControl {
                         )
                     }
                 };
-            let original_visible_when_cold = original_control
-                .get_agent_metadata(thread_id)
+            let original_agent_metadata = original_control.get_agent_metadata(thread_id);
+            let original_visible_when_cold = original_agent_metadata
+                .as_ref()
                 .is_some_and(|metadata| metadata.lifecycle.is_visible_when_cold());
+            let original_cold_terminal_status = loaded_terminal_status.or_else(|| {
+                original_agent_metadata
+                    .and_then(|metadata| metadata.lifecycle.cold_terminal_status())
+            });
             descendants.push(OwnedDescendant {
                 thread_id,
                 parent_thread_id,
@@ -201,6 +220,7 @@ impl AgentControl {
                 original_config,
                 original_metadata,
                 original_visible_when_cold,
+                original_cold_terminal_status,
                 was_loaded,
             });
         }
@@ -391,14 +411,24 @@ impl AgentControl {
             persisted.push(descendant);
         }
 
-        for prepared_descendant in prepared.descendants {
+        for (descendant, prepared_descendant) in tree.descendants.iter().zip(prepared.descendants) {
             if prepared_descendant.metadata.agent_role.as_deref()
                 != Some(crate::goal_supervisor::GOAL_SUPERVISOR_ROLE_NAME)
             {
-                prepared_descendant
-                    .metadata
-                    .lifecycle
-                    .mark_visible_when_cold();
+                if let Some(status) = descendant.original_cold_terminal_status.as_ref() {
+                    prepared_descendant
+                        .metadata
+                        .lifecycle
+                        .remember_cold_terminal_status(
+                            status.clone(),
+                            /*visible_when_cold*/ true,
+                        );
+                } else {
+                    prepared_descendant
+                        .metadata
+                        .lifecycle
+                        .mark_visible_when_cold();
+                }
             }
             prepared_descendant
                 .reservation
@@ -460,12 +490,18 @@ impl AgentControl {
                         super::ownership::ResumedThreadOwnership::Transfer,
                     )
                     .await?;
-                if descendant.original_visible_when_cold
-                    && let Some(metadata) = descendant
-                        .original_control
-                        .get_agent_metadata(descendant.thread_id)
+                if let Some(metadata) = descendant
+                    .original_control
+                    .get_agent_metadata(descendant.thread_id)
                 {
-                    metadata.lifecycle.mark_visible_when_cold();
+                    if let Some(status) = descendant.original_cold_terminal_status.as_ref() {
+                        metadata.lifecycle.remember_cold_terminal_status(
+                            status.clone(),
+                            /*visible_when_cold*/ true,
+                        );
+                    } else if descendant.original_visible_when_cold {
+                        metadata.lifecycle.mark_visible_when_cold();
+                    }
                 }
             } else if descendant
                 .original_control
@@ -506,7 +542,12 @@ impl AgentControl {
                     descendant.original_metadata.agent_nickname.clone(),
                 )?;
                 metadata.agent_id = Some(descendant.thread_id);
-                if descendant.original_visible_when_cold {
+                if let Some(status) = descendant.original_cold_terminal_status.as_ref() {
+                    metadata.lifecycle.remember_cold_terminal_status(
+                        status.clone(),
+                        descendant.original_visible_when_cold,
+                    );
+                } else if descendant.original_visible_when_cold {
                     metadata.lifecycle.mark_visible_when_cold();
                 }
                 reservation.commit(metadata);

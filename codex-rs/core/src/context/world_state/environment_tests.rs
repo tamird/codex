@@ -210,6 +210,60 @@ fn changing_primary_environment_updates_model_context_and_persisted_state() -> R
 }
 
 #[test]
+fn subagent_diffs_add_change_remove_and_escape_xml() {
+    let empty = EnvironmentsState::default();
+    let first = EnvironmentsState::default()
+        .with_subagents("- /root/worker: <ready> & waiting".to_string());
+    let second = EnvironmentsState::default()
+        .with_subagents("- /root/worker: </subagents>\n- /root/reviewer".to_string());
+
+    assert_eq!(
+        first
+            .render_diff(PreviousSectionState::Known(&empty.snapshot()))
+            .expect("adding subagents should update the model")
+            .render(),
+        "<environment_context>\n  <subagents>\n    - /root/worker: &lt;ready&gt; &amp; waiting\n  </subagents>\n</environment_context>"
+    );
+    assert_eq!(
+        second
+            .render_diff(PreviousSectionState::Known(&first.snapshot()))
+            .expect("changing subagents should update the model")
+            .render(),
+        "<environment_context>\n  <subagents>\n    - /root/worker: &lt;/subagents&gt;\n    - /root/reviewer\n  </subagents>\n</environment_context>"
+    );
+    assert_eq!(
+        empty
+            .render_diff(PreviousSectionState::Known(&second.snapshot()))
+            .expect("removing subagents should update the model")
+            .render(),
+        "<environment_context>\n  <subagents />\n</environment_context>"
+    );
+    assert!(
+        empty
+            .render_diff(PreviousSectionState::Known(&empty.snapshot()))
+            .is_none(),
+        "an initial absent subagent value should remain omitted"
+    );
+}
+
+#[test]
+fn escaped_subagent_payload_remains_byte_bounded() {
+    let state = EnvironmentsState::default().with_subagents(format!(
+        "- /root/legacy: {}",
+        "<&".repeat(MAX_RENDERED_SUBAGENTS_BYTES)
+    ));
+    let rendered = state.body();
+    let start = rendered.find("  <subagents>").expect("subagents start");
+    let end = rendered
+        .find("  </subagents>")
+        .map(|end| end + "  </subagents>\n".len())
+        .expect("subagents end");
+    assert!(end - start <= MAX_RENDERED_SUBAGENTS_BYTES);
+    assert!(end - start < 1_000);
+    assert!(rendered.contains("additional current subagents omitted"));
+}
+
+#[test]
 fn legacy_single_environment_snapshot_does_not_change() -> Result<()> {
     let environment = EnvironmentsState {
         environments: [("local".to_string(), primary("file:///repo", "bash")?)]

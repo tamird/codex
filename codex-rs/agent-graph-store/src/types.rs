@@ -11,6 +11,14 @@ pub enum ThreadSpawnEdgeStatus {
     Closed,
 }
 
+/// One persisted incoming thread-spawn edge selected by child thread ID.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ThreadSpawnEdge {
+    pub parent_thread_id: codex_protocol::ThreadId,
+    pub child_thread_id: codex_protocol::ThreadId,
+    pub status: ThreadSpawnEdgeStatus,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

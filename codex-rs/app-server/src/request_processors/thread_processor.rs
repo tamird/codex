@@ -11,10 +11,12 @@ use codex_app_server_protocol::ThreadHistoryMode as ApiThreadHistoryMode;
 use codex_app_server_protocol::ThreadRevertParams;
 use codex_app_server_protocol::ThreadRevertResponse;
 use codex_app_server_protocol::ThreadRevertedNotification;
+use codex_app_server_protocol::SessionSource;
 use codex_app_server_protocol::ThreadSection;
 use codex_app_server_protocol::ThreadSectionAppearance;
 use codex_app_server_protocol::ThreadSectionMoveParams;
 use codex_app_server_protocol::ThreadSectionMoveResponse;
+use codex_core::CurrentAgentMember;
 use codex_extension_api::ExtensionDataInit;
 use codex_extension_api::ThreadIdleCause;
 use codex_protocol::SanitizedGitUrl;
@@ -22,6 +24,7 @@ use codex_protocol::config_types::MultiAgentMode;
 use codex_protocol::error::CodexErrorDetails;
 use codex_protocol::mcp::ClientMcpExtensions;
 use codex_protocol::protocol::DEFAULT_ROLLOUT_REFERENCE_DEPTH;
+use codex_protocol::protocol::SubAgentSource;
 use codex_protocol::protocol::ThreadHistoryMode;
 use codex_rollout::ReverseJsonlScanner;
 use codex_rollout::RolloutLine;
@@ -31,6 +34,9 @@ use std::collections::VecDeque;
 use std::fs::File;
 use std::sync::LazyLock;
 use std::time::SystemTime;
+
+mod current_agent_list;
+use current_agent_list::CurrentAgentThreadListParams;
 
 pub(super) const THREAD_LIST_DEFAULT_LIMIT: usize = 25;
 pub(super) const THREAD_LIST_MAX_LIMIT: usize = 100;
@@ -1130,7 +1136,7 @@ impl ThreadRequestProcessor {
             .map_err(|err| internal_error(format!("failed to set app server client info: {err}")))
     }
 
-    async fn finalize_thread_teardown(&self, thread_id: ThreadId) {
+    pub(super) async fn finalize_thread_teardown(&self, thread_id: ThreadId) {
         self.pending_thread_unloads.lock().await.remove(&thread_id);
         self.outgoing
             .cancel_requests_for_thread(thread_id, /*error*/ None)
@@ -1787,20 +1793,32 @@ impl ThreadRequestProcessor {
         let thread_id = ThreadId::from_string(&params.thread_id)
             .map_err(|err| invalid_request(format!("invalid session id: {err}")))?;
 
-        let subtree_thread_ids = self.state_db_spawn_subtree_thread_ids(thread_id).await?;
+        let current_agent_membership = self
+            .thread_manager
+            .prepare_current_agent_membership_eviction(thread_id)
+            .await
+            .map_err(|err| {
+                internal_error(format!(
+                    "failed to prepare thread subtree {thread_id} for archive: {err}"
+                ))
+            })?;
+        let subtree_thread_ids = current_agent_membership.candidate_thread_ids().to_vec();
 
         let mut archive_thread_ids = Vec::new();
+        let mut already_archived_thread_ids = Vec::new();
         match self
             .thread_store
             .read_thread(StoreReadThreadParams {
                 thread_id,
-                include_archived: false,
+                include_archived: true,
                 include_history: false,
             })
             .await
         {
             Ok(thread) => {
-                if thread.archived_at.is_none() {
+                if thread.archived_at.is_some() {
+                    already_archived_thread_ids.push(thread_id);
+                } else {
                     archive_thread_ids.push(thread_id);
                 }
             }
@@ -1817,10 +1835,13 @@ impl ThreadRequestProcessor {
                 .await
             {
                 Ok(thread) => {
-                    if thread.archived_at.is_none() {
+                    if thread.archived_at.is_some() {
+                        already_archived_thread_ids.push(descendant_thread_id);
+                    } else {
                         archive_thread_ids.push(descendant_thread_id);
                     }
                 }
+                Err(ThreadStoreError::ThreadNotFound { .. }) => {}
                 Err(err) => {
                     warn!(
                         "failed to read spawned descendant thread {descendant_thread_id} while archiving {thread_id}: {err}"
@@ -1830,42 +1851,83 @@ impl ThreadRequestProcessor {
         }
 
         if archive_thread_ids.is_empty() {
+            let current_agent_ids_to_evict = current_agent_membership
+                .current_ids_with_current_only_descendants(&already_archived_thread_ids);
+            if let Err(err) = current_agent_membership
+                .evict_exact(&current_agent_ids_to_evict)
+                .await
+            {
+                warn!(
+                    "reconciled archived thread {thread_id}, but runtime shutdown reported an error: {err}"
+                );
+            }
             return Ok((ThreadArchiveResponse {}, Vec::new()));
         }
 
-        archive_thread_ids[1..].reverse();
+        if archive_thread_ids.first().copied() == Some(thread_id) {
+            archive_thread_ids[1..].reverse();
+        } else {
+            archive_thread_ids.reverse();
+        }
         // Collaboration may resume an archived descendant without unarchiving it.
-        self.prepare_thread_for_archive(thread_id).await;
-        for &descendant_thread_id in subtree_thread_ids.iter().skip(1).rev() {
-            self.prepare_thread_for_archive(descendant_thread_id).await;
+        for thread_id_to_archive in std::iter::once(thread_id)
+            .chain(subtree_thread_ids.iter().copied().skip(1).rev())
+        {
+            let identity_preserved = current_agent_membership
+                .unload_candidate_runtime_preserving_identity(thread_id_to_archive)
+                .await
+                .map_err(|err| {
+                    internal_error(format!(
+                        "failed to prepare thread {thread_id_to_archive} for archive: {err}"
+                    ))
+                })?;
+            if identity_preserved {
+                self.finalize_thread_teardown(thread_id_to_archive).await;
+            } else {
+                self.prepare_thread_for_archive(thread_id_to_archive).await;
+            }
         }
 
-        let archived_thread_ids = self
+        let archive_result = self
             .thread_store
             .archive_threads(StoreArchiveThreadsParams {
                 thread_ids: archive_thread_ids,
                 writer_lock_thread_ids: subtree_thread_ids,
             })
+            .await;
+        let archived_thread_ids = match archive_result {
+            Ok(archived_thread_ids) => archived_thread_ids,
+            Err(err) => {
+                let current_agent_ids_to_evict = current_agent_membership
+                    .current_ids_with_current_only_descendants(&already_archived_thread_ids);
+                if let Err(cleanup_err) = current_agent_membership
+                    .evict_exact(&current_agent_ids_to_evict)
+                    .await
+                {
+                    warn!(
+                        "archive failed for thread {thread_id}; prior archived identities were retired, but runtime shutdown reported an error: {cleanup_err}"
+                    );
+                }
+                return Err(thread_store_mutation_error("archive", err));
+            }
+        };
+        let mut current_agent_ids_to_evict = already_archived_thread_ids;
+        current_agent_ids_to_evict.extend(archived_thread_ids.iter().copied());
+        let current_agent_ids_to_evict = current_agent_membership
+            .current_ids_with_current_only_descendants(&current_agent_ids_to_evict);
+        if let Err(err) = current_agent_membership
+            .evict_exact(&current_agent_ids_to_evict)
             .await
-            .map_err(|err| thread_store_mutation_error("archive", err))?
+        {
+            warn!(
+                "archived thread {thread_id} and retired its current identities, but runtime shutdown reported an error: {err}"
+            );
+        }
+        let archived_thread_ids = archived_thread_ids
             .into_iter()
             .map(|thread_id| thread_id.to_string())
             .collect();
         Ok((ThreadArchiveResponse {}, archived_thread_ids))
-    }
-
-    pub(super) async fn state_db_spawn_subtree_thread_ids(
-        &self,
-        thread_id: ThreadId,
-    ) -> Result<Vec<ThreadId>, JSONRPCErrorError> {
-        self.thread_manager
-            .list_agent_subtree_thread_ids(thread_id)
-            .await
-            .map_err(|err| {
-                internal_error(format!(
-                    "failed to list spawned descendants for thread id {thread_id}: {err}"
-                ))
-            })
     }
 
     async fn thread_increment_elicitation_inner(
@@ -2670,21 +2732,58 @@ impl ThreadRequestProcessor {
             }
         }
         let cwd_filters = normalize_thread_list_cwd_filters(cwd)?;
-        let relation_filter = match (parent_thread_id, ancestor_thread_id) {
-            (Some(_), Some(_)) => {
-                return Err(invalid_request(
-                    "parentThreadId and ancestorThreadId are mutually exclusive",
-                ));
+        let (relation_filter, relation_root_id, direct_children_only) =
+            match (parent_thread_id, ancestor_thread_id) {
+                (Some(_), Some(_)) => {
+                    return Err(invalid_request(
+                        "parentThreadId and ancestorThreadId are mutually exclusive",
+                    ));
+                }
+                (Some(parent_thread_id), None) => {
+                    let parent_thread_id =
+                        ThreadId::from_string(&parent_thread_id).map_err(|err| {
+                            invalid_request(format!("invalid parent thread id: {err}"))
+                        })?;
+                    (
+                        Some(StoreThreadRelationFilter::DirectChildrenOf(
+                            parent_thread_id,
+                        )),
+                        Some(parent_thread_id),
+                        true,
+                    )
+                }
+                (None, Some(ancestor_thread_id)) => {
+                    let ancestor_thread_id =
+                        ThreadId::from_string(&ancestor_thread_id).map_err(|err| {
+                            invalid_request(format!("invalid ancestor thread id: {err}"))
+                        })?;
+                    (
+                        Some(StoreThreadRelationFilter::DescendantsOf(ancestor_thread_id)),
+                        Some(ancestor_thread_id),
+                        false,
+                    )
+                }
+                (None, None) => (None, None, false),
+            };
+
+        let current_agent_members = if let Some(relation_root_id) = relation_root_id {
+            match self
+                .thread_manager
+                .current_agent_membership_snapshot(relation_root_id)
+                .await
+            {
+                Ok(snapshot) => Some(snapshot.members),
+                Err(err) if matches!(err.details(), CodexErrorDetails::ThreadNotFound(_)) => {
+                    Some(Vec::new())
+                }
+                Err(err) => {
+                    return Err(internal_error(format!(
+                        "failed to list current agents for thread {relation_root_id}: {err}"
+                    )));
+                }
             }
-            (Some(parent_thread_id), None) => Some(StoreThreadRelationFilter::DirectChildrenOf(
-                ThreadId::from_string(&parent_thread_id)
-                    .map_err(|err| invalid_request(format!("invalid parent thread id: {err}")))?,
-            )),
-            (None, Some(ancestor_thread_id)) => Some(StoreThreadRelationFilter::DescendantsOf(
-                ThreadId::from_string(&ancestor_thread_id)
-                    .map_err(|err| invalid_request(format!("invalid ancestor thread id: {err}")))?,
-            )),
-            (None, None) => None,
+        } else {
+            None
         };
 
         let requested_page_size = limit
@@ -2703,6 +2802,25 @@ impl ThreadRequestProcessor {
             | StoreThreadSortKey::UpdatedAt
             | StoreThreadSortKey::RecencyAt => SortDirection::Desc,
         });
+        if let (Some(root_thread_id), Some(members)) = (relation_root_id, current_agent_members) {
+            return self
+                .current_agent_thread_list_response(CurrentAgentThreadListParams {
+                    root_thread_id,
+                    direct_children_only,
+                    members,
+                    cursor,
+                    limit: requested_page_size,
+                    sort_key: store_sort_key,
+                    sort_direction,
+                    model_providers,
+                    source_kinds,
+                    archived,
+                    section_id,
+                    cwd_filters,
+                    search_term,
+                })
+                .await;
+        }
         let (stored_threads, next_cursor) = self
             .list_threads_common(
                 requested_page_size,
@@ -2877,14 +2995,55 @@ impl ThreadRequestProcessor {
         &self,
         params: ThreadLoadedListParams,
     ) -> Result<ThreadLoadedListResponse, JSONRPCErrorError> {
-        let ThreadLoadedListParams { cursor, limit } = params;
-        let mut data: Vec<String> = self
-            .thread_manager
-            .list_thread_ids()
-            .await
-            .into_iter()
-            .map(|thread_id| thread_id.to_string())
-            .collect();
+        let ThreadLoadedListParams {
+            cursor,
+            limit,
+            ancestor_thread_id,
+        } = params;
+        let mut data: Vec<String> = match ancestor_thread_id {
+            Some(ancestor_thread_id) => {
+                let ancestor_thread_id = ThreadId::from_string(&ancestor_thread_id)
+                    .map_err(|err| invalid_request(format!("invalid ancestor thread id: {err}")))?;
+                let indexed_descendants: HashSet<_> = self
+                    .thread_manager
+                    .list_open_agent_subtree_thread_ids(ancestor_thread_id)
+                    .await
+                    .map_err(|err| {
+                        internal_error(format!(
+                            "failed to list open spawned descendants for thread id {ancestor_thread_id}: {err}"
+                        ))
+                    })?
+                    .into_iter()
+                    .collect();
+                let mut descendants = Vec::new();
+                for thread_id in self.thread_manager.list_thread_ids().await {
+                    if thread_id == ancestor_thread_id {
+                        continue;
+                    }
+                    if indexed_descendants.contains(&thread_id)
+                        || self
+                            .thread_manager
+                            .loaded_thread_descends_from(thread_id, ancestor_thread_id)
+                            .await
+                            .map_err(|err| {
+                                internal_error(format!(
+                                    "failed to resolve loaded thread ancestry for {thread_id}: {err}"
+                                ))
+                            })?
+                    {
+                        descendants.push(thread_id.to_string());
+                    }
+                }
+                descendants
+            }
+            None => self
+                .thread_manager
+                .list_thread_ids()
+                .await
+                .into_iter()
+                .map(|thread_id| thread_id.to_string())
+                .collect(),
+        };
 
         if data.is_empty() {
             return Ok(ThreadLoadedListResponse {
@@ -7573,6 +7732,7 @@ pub(crate) fn thread_from_stored_thread(
         updated_at: thread.updated_at.timestamp(),
         recency_at: Some(thread.recency_at.timestamp()),
         status: ThreadStatus::NotLoaded,
+        agent_status: None,
         path,
         cwd,
         cli_version: thread.cli_version,
@@ -7744,6 +7904,7 @@ fn build_thread_from_snapshot(
         updated_at: now,
         recency_at: Some(now),
         status: ThreadStatus::NotLoaded,
+        agent_status: None,
         path,
         cwd: config_snapshot.cwd().clone(),
         cli_version: env!("CARGO_PKG_VERSION").to_string(),

@@ -13,7 +13,13 @@ pub(crate) async fn resolve_agent_target(
 ) -> Result<ThreadId, FunctionCallError> {
     register_session_root(session, turn);
     if let Ok(thread_id) = ThreadId::from_string(target) {
-        return Ok(thread_id);
+        return session
+            .services
+            .agent_control
+            .ensure_open_agent_known_by_id(session.thread_id, thread_id)
+            .await
+            .map(|_| thread_id)
+            .map_err(|err| FunctionCallError::RespondToModel(err.to_string()));
     }
 
     session

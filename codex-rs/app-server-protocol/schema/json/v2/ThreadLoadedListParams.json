@@ -1,6 +1,13 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
   "properties": {
+    "ancestorThreadId": {
+      "description": "Optional ancestor thread filter for spawned descendants.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
     "cursor": {
       "description": "Opaque pagination cursor returned by a previous call.",
       "type": [

@@ -4,6 +4,7 @@ use std::pin::Pin;
 use codex_protocol::ThreadId;
 
 use crate::AgentGraphStoreResult;
+use crate::ThreadSpawnEdge;
 use crate::ThreadSpawnEdgeStatus;
 
 /// Future returned by [`AgentGraphStore`] operations.
@@ -58,6 +59,21 @@ pub trait AgentGraphStore: Send + Sync {
         status_filter: Option<ThreadSpawnEdgeStatus>,
     ) -> AgentGraphStoreFuture<'_, Vec<ThreadId>>;
 
+    /// Return existing incoming edges for the supplied child thread IDs.
+    ///
+    /// Missing child IDs have no persisted ownership edge. Implementations should batch this
+    /// lookup so large current registries do not issue one query per identity.
+    fn list_thread_spawn_edges_by_child_ids(
+        &self,
+        _child_thread_ids: &[ThreadId],
+    ) -> AgentGraphStoreFuture<'_, Vec<ThreadSpawnEdge>> {
+        Box::pin(async {
+            Err(crate::AgentGraphStoreError::Internal {
+                message: "incoming thread-spawn edge lookup is not implemented".to_string(),
+            })
+        })
+    }
+
     /// Return open descendant identities together when this graph owns their indexed metadata.
     ///
     /// Stores that cannot combine graph authorization with identity lookup retain the existing
@@ -67,5 +83,25 @@ pub trait AgentGraphStore: Send + Sync {
         _root_thread_id: ThreadId,
     ) -> Option<AgentGraphStoreFuture<'_, Vec<codex_state::ThreadSpawnDescendantIdentity>>> {
         None
+    }
+
+    /// Find one open-owned descendant by thread id without restoring its siblings.
+    fn find_open_thread_spawn_descendant_by_id(
+        &self,
+        _root_thread_id: ThreadId,
+        _descendant_thread_id: ThreadId,
+    ) -> AgentGraphStoreFuture<'_, Option<codex_state::ThreadSpawnDescendantIdentity>> {
+        Box::pin(async { Ok(None) })
+    }
+
+    /// Find one open-owned descendant by canonical agent path without restoring its siblings.
+    ///
+    /// Implementations must reject an ambiguous canonical path instead of selecting one result.
+    fn find_open_thread_spawn_descendant_by_path(
+        &self,
+        _root_thread_id: ThreadId,
+        _agent_path: &str,
+    ) -> AgentGraphStoreFuture<'_, Option<codex_state::ThreadSpawnDescendantIdentity>> {
+        Box::pin(async { Ok(None) })
     }
 }

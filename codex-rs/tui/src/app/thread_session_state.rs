@@ -426,6 +426,7 @@ mod tests {
             updated_at: 2,
             recency_at: Some(2),
             status: codex_app_server_protocol::ThreadStatus::Idle,
+            agent_status: None,
             path: None,
             cwd: test_path_buf("/tmp/read").abs(),
             cli_version: "0.0.0".to_string(),

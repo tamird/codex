@@ -215,12 +215,17 @@ where
 #[derive(Debug, Deserialize)]
 struct ListAgentsResult {
     agents: Vec<ListedAgentResult>,
+    next_cursor: Option<String>,
+    total_count: usize,
 }
 
 #[derive(Debug, Deserialize)]
 struct ListedAgentResult {
+    agent_id: ThreadId,
+    parent_agent_id: Option<ThreadId>,
     agent_name: String,
     agent_status: serde_json::Value,
+    last_task_message: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1721,13 +1726,13 @@ async fn multi_agent_v2_goal_supervisor_followup_targets_parent_and_retires_help
 async fn multi_agent_v2_list_agents_returns_completed_status() {
     let (mut session, mut turn) = make_session_and_context().await;
     let manager = thread_manager(&turn);
+    let mut config = (*turn.config).clone();
     let root = manager
         .start_thread(StartThreadOptions::new((*turn.config).clone()))
         .await
         .expect("root thread should start");
     session.services.agent_control = manager.agent_control();
     session.thread_id = root.thread_id;
-    let mut config = (*turn.config).clone();
     let _ = config.features.enable(Feature::MultiAgentV2);
     set_turn_config(&mut turn, config);
 
@@ -1740,7 +1745,8 @@ async fn multi_agent_v2_list_agents_returns_completed_status() {
             "spawn_agent",
             function_payload(json!({
                 "message": "inspect this repo",
-                "task_name": "worker"
+                "task_name": "worker",
+                "fork_turns": "none"
             })),
         ))
         .await
@@ -1792,13 +1798,18 @@ async fn multi_agent_v2_list_agents_returns_completed_status() {
         .iter()
         .map(|agent| agent.agent_name.as_str())
         .collect::<Vec<_>>();
-    assert_eq!(agent_names, vec!["/root", "/root/worker"]);
+    assert_eq!(agent_names, vec!["/root/worker"]);
     let worker = result
         .agents
         .iter()
         .find(|agent| agent.agent_name == "/root/worker")
         .expect("worker agent should be listed");
     assert_eq!(worker.agent_status, json!({"completed": "done"}));
+    assert_eq!(worker.agent_id, agent_id);
+    assert_eq!(worker.parent_agent_id, Some(root.thread_id));
+    assert_eq!(worker.last_task_message, None);
+    assert_eq!(result.next_cursor, None);
+    assert_eq!(result.total_count, 1);
     assert_eq!(success, Some(true));
 }
 
@@ -1890,13 +1901,13 @@ async fn multi_agent_v2_list_agents_filters_by_relative_path_prefix() {
 async fn multi_agent_v2_list_agents_omits_closed_agents() {
     let (mut session, mut turn) = make_session_and_context().await;
     let manager = thread_manager(&turn);
+    let mut config = (*turn.config).clone();
     let root = manager
         .start_thread(StartThreadOptions::new((*turn.config).clone()))
         .await
         .expect("root thread should start");
     session.services.agent_control = manager.agent_control();
     session.thread_id = root.thread_id;
-    let mut config = (*turn.config).clone();
     let _ = config.features.enable(Feature::MultiAgentV2);
     set_turn_config(&mut turn, config);
 
@@ -1909,7 +1920,8 @@ async fn multi_agent_v2_list_agents_omits_closed_agents() {
             "spawn_agent",
             function_payload(json!({
                 "message": "inspect this repo",
-                "task_name": "worker"
+                "task_name": "worker",
+                "fork_turns": "none"
             })),
         ))
         .await
@@ -1942,21 +1954,22 @@ async fn multi_agent_v2_list_agents_omits_closed_agents() {
     let result: ListAgentsResult =
         serde_json::from_str(&content).expect("list_agents result should be json");
 
-    assert_eq!(result.agents.len(), 1);
-    assert_eq!(result.agents[0].agent_name, "/root");
+    assert!(result.agents.is_empty());
+    assert_eq!(result.next_cursor, None);
+    assert_eq!(result.total_count, 0);
 }
 
 #[tokio::test]
 async fn multi_agent_v2_list_agents_keeps_interrupted_resident_agents() {
     let (mut session, mut turn) = make_session_and_context().await;
     let manager = thread_manager(&turn);
+    let mut config = (*turn.config).clone();
     let root = manager
         .start_thread(StartThreadOptions::new((*turn.config).clone()))
         .await
         .expect("root thread should start");
     session.services.agent_control = manager.agent_control();
     session.thread_id = root.thread_id;
-    let mut config = (*turn.config).clone();
     let _ = config.features.enable(Feature::MultiAgentV2);
     set_turn_config(&mut turn, config);
 
@@ -1969,7 +1982,8 @@ async fn multi_agent_v2_list_agents_keeps_interrupted_resident_agents() {
             "spawn_agent",
             function_payload(json!({
                 "message": "inspect this repo",
-                "task_name": "worker"
+                "task_name": "worker",
+                "fork_turns": "none"
             })),
         ))
         .await
@@ -2013,9 +2027,8 @@ async fn multi_agent_v2_list_agents_keeps_interrupted_resident_agents() {
     let result: ListAgentsResult =
         serde_json::from_str(&content).expect("list_agents result should be json");
 
-    assert_eq!(result.agents.len(), 2);
-    assert_eq!(result.agents[0].agent_name, "/root");
-    assert_eq!(result.agents[1].agent_name, agent_path.as_str());
+    assert_eq!(result.agents.len(), 1);
+    assert_eq!(result.agents[0].agent_name, agent_path.as_str());
 }
 
 #[tokio::test]
@@ -4360,8 +4373,7 @@ async fn multi_agent_v2_interrupt_agent_accepts_unloaded_task_name_target() {
     let (content, _) = expect_text_output(output);
     let result: ListAgentsResult =
         serde_json::from_str(&content).expect("list_agents result should be json");
-    assert_eq!(result.agents.len(), 1);
-    assert_eq!(result.agents[0].agent_name, "/root");
+    assert!(result.agents.is_empty());
 }
 
 #[tokio::test]

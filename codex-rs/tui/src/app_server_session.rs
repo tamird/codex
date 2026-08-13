@@ -3717,6 +3717,7 @@ model = "gpt-5.1-codex"
                 updated_at: 2,
                 recency_at: Some(2),
                 status: ThreadStatus::Idle,
+                agent_status: None,
                 path: None,
                 cwd: test_path_buf("/tmp/project").abs(),
                 cli_version: "0.0.0".to_string(),

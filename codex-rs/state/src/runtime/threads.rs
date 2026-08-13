@@ -89,6 +89,41 @@ WHERE id = ?
         .await?;
         Ok(result.rows_affected() > 0)
     }
+
+    /// Load valid thread metadata in bounded batches while omitting individually corrupt rows.
+    ///
+    /// Query failures remain fatal. Current-membership projection uses this variant so one
+    /// corrupt persisted identity does not hide otherwise valid registered members.
+    pub async fn get_threads_valid(
+        &self,
+        thread_ids: &[ThreadId],
+    ) -> anyhow::Result<std::collections::HashMap<ThreadId, crate::ThreadMetadata>> {
+        const MAX_THREAD_IDS_PER_QUERY: usize = 256;
+
+        let mut threads = std::collections::HashMap::with_capacity(thread_ids.len());
+        for thread_ids in thread_ids.chunks(MAX_THREAD_IDS_PER_QUERY) {
+            let mut builder = QueryBuilder::<Sqlite>::new("");
+            push_thread_select_columns(&mut builder);
+            builder.push(" FROM threads WHERE threads.id IN (");
+            let mut separated = builder.separated(", ");
+            for thread_id in thread_ids {
+                separated.push_bind(thread_id.to_string());
+            }
+            separated.push_unseparated(")");
+
+            let rows = builder.build().fetch_all(self.pool.as_ref()).await?;
+            for row in rows {
+                match ThreadRow::try_from_row(&row).and_then(ThreadMetadata::try_from) {
+                    Ok(thread) => {
+                        threads.insert(thread.id, thread);
+                    }
+                    Err(err) => warn!("omitting corrupt thread metadata from batch read: {err}"),
+                }
+            }
+        }
+        Ok(threads)
+    }
+
     pub async fn get_thread_memory_mode(&self, id: ThreadId) -> anyhow::Result<Option<String>> {
         let row = sqlx::query("SELECT memory_mode FROM threads WHERE id = ?")
             .bind(id.to_string())
@@ -161,6 +196,42 @@ ON CONFLICT(child_thread_id) DO UPDATE SET
         Ok(())
     }
 
+    /// Return existing incoming edges for a bounded batch of child thread IDs.
+    pub async fn list_thread_spawn_edges_by_child_ids(
+        &self,
+        child_thread_ids: &[ThreadId],
+    ) -> anyhow::Result<Vec<crate::DirectionalThreadSpawnEdge>> {
+        const THREAD_SPAWN_EDGE_QUERY_CHUNK_SIZE: usize = 900;
+
+        let mut edges = Vec::new();
+        for child_thread_ids in child_thread_ids.chunks(THREAD_SPAWN_EDGE_QUERY_CHUNK_SIZE) {
+            let mut query = QueryBuilder::<Sqlite>::new(
+                "SELECT parent_thread_id, child_thread_id, status FROM thread_spawn_edges WHERE child_thread_id IN (",
+            );
+            let mut separated = query.separated(", ");
+            for child_thread_id in child_thread_ids {
+                separated.push_bind(child_thread_id.to_string());
+            }
+            separated.push_unseparated(") ORDER BY child_thread_id");
+            let rows = query.build().fetch_all(self.pool.as_ref()).await?;
+            for row in rows {
+                edges.push(crate::DirectionalThreadSpawnEdge {
+                    parent_thread_id: ThreadId::try_from(
+                        row.try_get::<String, _>("parent_thread_id")?,
+                    )?,
+                    child_thread_id: ThreadId::try_from(
+                        row.try_get::<String, _>("child_thread_id")?,
+                    )?,
+                    status: row
+                        .try_get::<String, _>("status")?
+                        .parse::<crate::DirectionalThreadSpawnEdgeStatus>()?,
+                });
+            }
+        }
+        edges.sort_by_key(|edge| edge.child_thread_id.to_string());
+        Ok(edges)
+    }
+
     /// List direct spawned children of `parent_thread_id` whose edge matches `status`.
     pub async fn list_thread_spawn_children_with_status(
         &self,
@@ -210,18 +281,26 @@ ON CONFLICT(child_thread_id) DO UPDATE SET
     ) -> anyhow::Result<Vec<crate::ThreadSpawnDescendantIdentity>> {
         let rows = sqlx::query(
             r#"
-WITH RECURSIVE subtree(child_thread_id, depth) AS (
-    SELECT child_thread_id, 1
+WITH RECURSIVE subtree(child_thread_id, parent_thread_id, depth, visited) AS (
+    SELECT child_thread_id, parent_thread_id, 1, '|' || ? || '|' || child_thread_id || '|'
     FROM thread_spawn_edges
     WHERE parent_thread_id = ? AND status = ? AND child_thread_id != ?
     UNION ALL
-    SELECT edge.child_thread_id, subtree.depth + 1
+    SELECT
+        edge.child_thread_id,
+        edge.parent_thread_id,
+        subtree.depth + 1,
+        subtree.visited || edge.child_thread_id || '|'
     FROM thread_spawn_edges AS edge
     JOIN subtree ON edge.parent_thread_id = subtree.child_thread_id
-    WHERE edge.status = ? AND edge.child_thread_id != ?
+    WHERE edge.status = ?
+      AND edge.child_thread_id != ?
+      AND instr(subtree.visited, '|' || edge.child_thread_id || '|') = 0
 )
 SELECT
     subtree.child_thread_id,
+    subtree.parent_thread_id,
+    subtree.depth,
     threads.source,
     threads.agent_path,
     threads.agent_role,
@@ -231,6 +310,7 @@ LEFT JOIN threads ON threads.id = subtree.child_thread_id
 ORDER BY subtree.depth ASC, subtree.child_thread_id ASC
             "#,
         )
+        .bind(root_thread_id.to_string())
         .bind(root_thread_id.to_string())
         .bind(crate::DirectionalThreadSpawnEdgeStatus::Open.as_ref())
         .bind(root_thread_id.to_string())
@@ -243,6 +323,10 @@ ORDER BY subtree.depth ASC, subtree.child_thread_id ASC
             .map(|row| {
                 Ok(crate::ThreadSpawnDescendantIdentity {
                     thread_id: ThreadId::try_from(row.try_get::<String, _>("child_thread_id")?)?,
+                    parent_thread_id: ThreadId::try_from(
+                        row.try_get::<String, _>("parent_thread_id")?,
+                    )?,
+                    depth: u32::try_from(row.try_get::<i64, _>("depth")?)?,
                     source: row.try_get("source")?,
                     agent_path: row.try_get("agent_path")?,
                     agent_role: row.try_get("agent_role")?,
@@ -250,6 +334,138 @@ ORDER BY subtree.depth ASC, subtree.child_thread_id ASC
                 })
             })
             .collect()
+    }
+
+    /// Find one descendant by id when every ownership edge from `root_thread_id` is open.
+    pub async fn find_open_thread_spawn_descendant_by_id(
+        &self,
+        root_thread_id: ThreadId,
+        descendant_thread_id: ThreadId,
+    ) -> anyhow::Result<Option<crate::ThreadSpawnDescendantIdentity>> {
+        let row = sqlx::query(
+            r#"
+WITH RECURSIVE open_ancestry(child_thread_id, parent_thread_id, depth, visited) AS (
+    SELECT child_thread_id, parent_thread_id, 1, '|' || child_thread_id || '|'
+    FROM thread_spawn_edges
+    WHERE child_thread_id = ? AND status = ? AND child_thread_id != ?
+    UNION ALL
+    SELECT
+        edge.child_thread_id,
+        edge.parent_thread_id,
+        open_ancestry.depth + 1,
+        open_ancestry.visited || edge.child_thread_id || '|'
+    FROM thread_spawn_edges AS edge
+    JOIN open_ancestry ON edge.child_thread_id = open_ancestry.parent_thread_id
+    WHERE edge.status = ?
+      AND open_ancestry.parent_thread_id != ?
+      AND instr(open_ancestry.visited, '|' || edge.child_thread_id || '|') = 0
+),
+authorized(depth) AS (
+    SELECT depth
+    FROM open_ancestry
+    WHERE parent_thread_id = ?
+    LIMIT 1
+)
+SELECT
+    target_edge.child_thread_id,
+    target_edge.parent_thread_id,
+    authorized.depth,
+    threads.source,
+    threads.agent_path,
+    threads.agent_role,
+    threads.agent_nickname
+FROM authorized
+JOIN thread_spawn_edges AS target_edge ON target_edge.child_thread_id = ?
+LEFT JOIN threads ON threads.id = target_edge.child_thread_id
+            "#,
+        )
+        .bind(descendant_thread_id.to_string())
+        .bind(crate::DirectionalThreadSpawnEdgeStatus::Open.as_ref())
+        .bind(root_thread_id.to_string())
+        .bind(crate::DirectionalThreadSpawnEdgeStatus::Open.as_ref())
+        .bind(root_thread_id.to_string())
+        .bind(root_thread_id.to_string())
+        .bind(descendant_thread_id.to_string())
+        .fetch_optional(self.pool.as_ref())
+        .await?;
+        row.as_ref()
+            .map(thread_spawn_descendant_identity_from_row)
+            .transpose()
+    }
+
+    /// Find one descendant by canonical path when every ownership edge from the root is open.
+    pub async fn find_open_thread_spawn_descendant_by_path(
+        &self,
+        root_thread_id: ThreadId,
+        agent_path: &str,
+    ) -> anyhow::Result<Option<crate::ThreadSpawnDescendantIdentity>> {
+        let rows = sqlx::query(
+            r#"
+WITH RECURSIVE matching_thread_ids(id) AS MATERIALIZED (
+    SELECT id
+    FROM threads
+    WHERE agent_path = ?
+),
+open_ancestry(target_thread_id, child_thread_id, parent_thread_id, depth, visited) AS (
+    SELECT
+        matching_thread_ids.id,
+        edge.child_thread_id,
+        edge.parent_thread_id,
+        1,
+        '|' || edge.child_thread_id || '|'
+    FROM matching_thread_ids
+    JOIN thread_spawn_edges AS edge
+        ON edge.child_thread_id = matching_thread_ids.id
+    WHERE edge.status = ? AND edge.child_thread_id != ?
+    UNION ALL
+    SELECT
+        open_ancestry.target_thread_id,
+        edge.child_thread_id,
+        edge.parent_thread_id,
+        open_ancestry.depth + 1,
+        open_ancestry.visited || edge.child_thread_id || '|'
+    FROM thread_spawn_edges AS edge
+    JOIN open_ancestry ON edge.child_thread_id = open_ancestry.parent_thread_id
+    WHERE edge.status = ?
+      AND open_ancestry.parent_thread_id != ?
+      AND instr(open_ancestry.visited, '|' || edge.child_thread_id || '|') = 0
+),
+authorized(target_thread_id, depth) AS (
+    SELECT target_thread_id, depth
+    FROM open_ancestry
+    WHERE parent_thread_id = ?
+)
+SELECT
+    target_edge.child_thread_id,
+    target_edge.parent_thread_id,
+    authorized.depth,
+    threads.source,
+    threads.agent_path,
+    threads.agent_role,
+    threads.agent_nickname
+FROM authorized
+JOIN thread_spawn_edges AS target_edge ON target_edge.child_thread_id = authorized.target_thread_id
+JOIN threads ON threads.id = target_edge.child_thread_id
+ORDER BY target_edge.child_thread_id
+LIMIT 2
+            "#,
+        )
+        .bind(agent_path)
+        .bind(crate::DirectionalThreadSpawnEdgeStatus::Open.as_ref())
+        .bind(root_thread_id.to_string())
+        .bind(crate::DirectionalThreadSpawnEdgeStatus::Open.as_ref())
+        .bind(root_thread_id.to_string())
+        .bind(root_thread_id.to_string())
+        .fetch_all(self.pool.as_ref())
+        .await?;
+
+        match rows.as_slice() {
+            [] => Ok(None),
+            [row] => thread_spawn_descendant_identity_from_row(row).map(Some),
+            [_, _, ..] => Err(anyhow::anyhow!(
+                "multiple agents found for canonical path `{agent_path}`"
+            )),
+        }
     }
 
     /// Find a direct spawned child of `parent_thread_id` by canonical agent path.
@@ -337,12 +553,19 @@ LIMIT 2
     ) -> anyhow::Result<Vec<ThreadId>> {
         let mut builder = QueryBuilder::<Sqlite>::new(
             r#"
-WITH RECURSIVE subtree(child_thread_id, depth) AS (
-    SELECT child_thread_id, 1
+WITH RECURSIVE subtree(child_thread_id, depth, visited) AS (
+    SELECT child_thread_id, 1, '|' ||
+            "#,
+        );
+        builder.push_bind(root_thread_id.to_string());
+        builder.push(
+            r#" || '|' || child_thread_id || '|'
     FROM thread_spawn_edges
     WHERE parent_thread_id =
             "#,
         );
+        builder.push_bind(root_thread_id.to_string());
+        builder.push(" AND child_thread_id != ");
         builder.push_bind(root_thread_id.to_string());
         if let Some(status) = status {
             let status = status.to_string();
@@ -350,22 +573,34 @@ WITH RECURSIVE subtree(child_thread_id, depth) AS (
             builder.push(
                 r#"
     UNION ALL
-    SELECT edge.child_thread_id, subtree.depth + 1
+    SELECT
+        edge.child_thread_id,
+        subtree.depth + 1,
+        subtree.visited || edge.child_thread_id || '|'
     FROM thread_spawn_edges AS edge
     JOIN subtree ON edge.parent_thread_id = subtree.child_thread_id
-    WHERE status =
+    WHERE edge.child_thread_id !=
                 "#,
             );
+            builder.push_bind(root_thread_id.to_string());
+            builder.push(" AND edge.status = ");
             builder.push_bind(status);
+            builder.push(" AND instr(subtree.visited, '|' || edge.child_thread_id || '|') = 0");
         } else {
             builder.push(
                 r#"
     UNION ALL
-    SELECT edge.child_thread_id, subtree.depth + 1
+    SELECT
+        edge.child_thread_id,
+        subtree.depth + 1,
+        subtree.visited || edge.child_thread_id || '|'
     FROM thread_spawn_edges AS edge
     JOIN subtree ON edge.parent_thread_id = subtree.child_thread_id
+    WHERE edge.child_thread_id !=
                 "#,
             );
+            builder.push_bind(root_thread_id.to_string());
+            builder.push(" AND instr(subtree.visited, '|' || edge.child_thread_id || '|') = 0");
         }
         builder.push(
             r#"
@@ -1341,6 +1576,20 @@ ON CONFLICT(id) DO UPDATE SET
 
         Ok(rows_affected)
     }
+}
+
+fn thread_spawn_descendant_identity_from_row(
+    row: &sqlx::sqlite::SqliteRow,
+) -> anyhow::Result<crate::ThreadSpawnDescendantIdentity> {
+    Ok(crate::ThreadSpawnDescendantIdentity {
+        thread_id: ThreadId::try_from(row.try_get::<String, _>("child_thread_id")?)?,
+        parent_thread_id: ThreadId::try_from(row.try_get::<String, _>("parent_thread_id")?)?,
+        depth: u32::try_from(row.try_get::<i64, _>("depth")?)?,
+        source: row.try_get("source")?,
+        agent_path: row.try_get("agent_path")?,
+        agent_role: row.try_get("agent_role")?,
+        agent_nickname: row.try_get("agent_nickname")?,
+    })
 }
 
 fn one_thread_id_from_rows(
@@ -3938,6 +4187,8 @@ mod tests {
             .iter()
             .find(|identity| identity.thread_id == open_child_thread_id)
             .expect("open child should be included");
+        assert_eq!(open_child.parent_thread_id, root_thread_id);
+        assert_eq!(open_child.depth, 1);
         assert_eq!(open_child.source.as_deref(), Some("cli"));
         assert_eq!(open_child.agent_path.as_deref(), Some("/root/worker"));
         assert_eq!(open_child.agent_role.as_deref(), Some("worker"));
@@ -3948,6 +4199,8 @@ mod tests {
             .find(|identity| identity.thread_id == missing_metadata_thread_id)
             .expect("open edge without a metadata row should remain available for fallback");
         assert_eq!(missing_metadata.source, None);
+        assert_eq!(missing_metadata.parent_thread_id, root_thread_id);
+        assert_eq!(missing_metadata.depth, 1);
         assert!(
             identities.iter().all(|identity| {
                 identity.thread_id != closed_child_thread_id
@@ -3955,6 +4208,141 @@ mod tests {
                     && identity.thread_id != other_child_thread_id
             }),
             "closed ancestors and unrelated roots must remain inaccessible"
+        );
+    }
+
+    #[tokio::test]
+    async fn open_thread_spawn_descendant_lookup_requires_open_ownership_path() {
+        let codex_home = unique_temp_dir();
+        let runtime = StateRuntime::init(
+            crate::SqliteConfig::new_for_testing(codex_home.as_path().abs()),
+            "test-provider".to_string(),
+        )
+        .await
+        .expect("state db should initialize");
+        let root_thread_id = ThreadId::new();
+        let open_child_thread_id = ThreadId::new();
+        let open_grandchild_thread_id = ThreadId::new();
+        let closed_child_thread_id = ThreadId::new();
+        let hidden_grandchild_thread_id = ThreadId::new();
+
+        for (thread_id, agent_path) in [
+            (open_child_thread_id, "/root/open"),
+            (open_grandchild_thread_id, "/root/open/nested"),
+            (closed_child_thread_id, "/root/closed"),
+            (hidden_grandchild_thread_id, "/root/closed/hidden"),
+        ] {
+            let mut metadata = test_thread_metadata(&codex_home, thread_id, codex_home.clone());
+            metadata.agent_path = Some(agent_path.to_string());
+            runtime
+                .upsert_thread(&metadata)
+                .await
+                .expect("thread metadata should persist");
+        }
+        for (parent_thread_id, child_thread_id, status) in [
+            (
+                root_thread_id,
+                open_child_thread_id,
+                DirectionalThreadSpawnEdgeStatus::Open,
+            ),
+            (
+                open_child_thread_id,
+                open_grandchild_thread_id,
+                DirectionalThreadSpawnEdgeStatus::Open,
+            ),
+            (
+                root_thread_id,
+                closed_child_thread_id,
+                DirectionalThreadSpawnEdgeStatus::Closed,
+            ),
+            (
+                closed_child_thread_id,
+                hidden_grandchild_thread_id,
+                DirectionalThreadSpawnEdgeStatus::Open,
+            ),
+        ] {
+            runtime
+                .upsert_thread_spawn_edge(parent_thread_id, child_thread_id, status)
+                .await
+                .expect("thread spawn edge should persist");
+        }
+
+        let by_id = runtime
+            .find_open_thread_spawn_descendant_by_id(root_thread_id, open_grandchild_thread_id)
+            .await
+            .expect("open descendant id lookup should succeed")
+            .expect("open grandchild should be found");
+        let by_path = runtime
+            .find_open_thread_spawn_descendant_by_path(root_thread_id, "/root/open/nested")
+            .await
+            .expect("open descendant path lookup should succeed")
+            .expect("open grandchild should be found");
+        assert_eq!(by_id, by_path);
+        assert_eq!(by_id.thread_id, open_grandchild_thread_id);
+        assert_eq!(by_id.parent_thread_id, open_child_thread_id);
+        assert_eq!(by_id.depth, 2);
+
+        for inaccessible_thread_id in [closed_child_thread_id, hidden_grandchild_thread_id] {
+            assert_eq!(
+                runtime
+                    .find_open_thread_spawn_descendant_by_id(
+                        root_thread_id,
+                        inaccessible_thread_id,
+                    )
+                    .await
+                    .expect("inaccessible descendant lookup should succeed"),
+                None
+            );
+        }
+        assert_eq!(
+            runtime
+                .find_open_thread_spawn_descendant_by_path(root_thread_id, "/root/closed/hidden")
+                .await
+                .expect("hidden path lookup should succeed"),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn incoming_edge_batch_lookup_chunks_large_current_registries() {
+        let codex_home = unique_temp_dir();
+        let runtime = StateRuntime::init(
+            crate::SqliteConfig::new_for_testing(codex_home.as_path().abs()),
+            "test-provider".to_string(),
+        )
+        .await
+        .expect("state db should initialize");
+        let parent_thread_id = ThreadId::new();
+        let mut expected = Vec::new();
+        for index in 0..901 {
+            let child_thread_id = ThreadId::new();
+            let status = if index % 2 == 0 {
+                DirectionalThreadSpawnEdgeStatus::Open
+            } else {
+                DirectionalThreadSpawnEdgeStatus::Closed
+            };
+            runtime
+                .upsert_thread_spawn_edge(parent_thread_id, child_thread_id, status)
+                .await
+                .expect("thread spawn edge should persist");
+            expected.push(crate::DirectionalThreadSpawnEdge {
+                parent_thread_id,
+                child_thread_id,
+                status,
+            });
+        }
+        expected.sort_by_key(|edge| edge.child_thread_id.to_string());
+        let child_thread_ids = expected
+            .iter()
+            .map(|edge| edge.child_thread_id)
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            runtime
+                .list_thread_spawn_edges_by_child_ids(&child_thread_ids)
+                .await
+                .expect("batch lookup should succeed"),
+            expected
         );
     }
 

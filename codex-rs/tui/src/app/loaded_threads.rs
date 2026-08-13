@@ -159,6 +159,7 @@ mod tests {
             updated_at: 0,
             recency_at: Some(0),
             status: ThreadStatus::Idle,
+            agent_status: None,
             path: None,
             cwd: test_path_buf("/tmp").abs(),
             cli_version: "0.0.0".to_string(),

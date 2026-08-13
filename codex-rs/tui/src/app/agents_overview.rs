@@ -127,6 +127,7 @@ impl App {
                             params: ThreadLoadedListParams {
                                 cursor,
                                 limit: Some(100),
+                                ancestor_thread_id: None,
                             },
                         })
                         .await

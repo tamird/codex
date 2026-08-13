@@ -5,6 +5,7 @@ use std::sync::Arc;
 use crate::AgentGraphStore;
 use crate::AgentGraphStoreError;
 use crate::AgentGraphStoreFuture;
+use crate::ThreadSpawnEdge;
 use crate::ThreadSpawnEdgeStatus;
 
 /// SQLite-backed implementation of [`AgentGraphStore`] using an existing state runtime.
@@ -29,6 +30,33 @@ impl LocalAgentGraphStore {
 }
 
 impl AgentGraphStore for LocalAgentGraphStore {
+    fn find_open_thread_spawn_descendant_by_id(
+        &self,
+        root_thread_id: ThreadId,
+        descendant_thread_id: ThreadId,
+    ) -> AgentGraphStoreFuture<'_, Option<codex_state::ThreadSpawnDescendantIdentity>> {
+        Box::pin(async move {
+            self.state_db
+                .find_open_thread_spawn_descendant_by_id(root_thread_id, descendant_thread_id)
+                .await
+                .map_err(internal_error)
+        })
+    }
+
+    fn find_open_thread_spawn_descendant_by_path(
+        &self,
+        root_thread_id: ThreadId,
+        agent_path: &str,
+    ) -> AgentGraphStoreFuture<'_, Option<codex_state::ThreadSpawnDescendantIdentity>> {
+        let agent_path = agent_path.to_string();
+        Box::pin(async move {
+            self.state_db
+                .find_open_thread_spawn_descendant_by_path(root_thread_id, &agent_path)
+                .await
+                .map_err(internal_error)
+        })
+    }
+
     fn upsert_thread_spawn_edge(
         &self,
         parent_thread_id: ThreadId,
@@ -108,6 +136,29 @@ impl AgentGraphStore for LocalAgentGraphStore {
         })
     }
 
+    fn list_thread_spawn_edges_by_child_ids(
+        &self,
+        child_thread_ids: &[ThreadId],
+    ) -> AgentGraphStoreFuture<'_, Vec<ThreadSpawnEdge>> {
+        let child_thread_ids = child_thread_ids.to_vec();
+        Box::pin(async move {
+            self.state_db
+                .list_thread_spawn_edges_by_child_ids(&child_thread_ids)
+                .await
+                .map(|edges| {
+                    edges
+                        .into_iter()
+                        .map(|edge| ThreadSpawnEdge {
+                            parent_thread_id: edge.parent_thread_id,
+                            child_thread_id: edge.child_thread_id,
+                            status: from_state_status(edge.status),
+                        })
+                        .collect()
+                })
+                .map_err(internal_error)
+        })
+    }
+
     fn list_open_thread_spawn_descendant_identities(
         &self,
         root_thread_id: ThreadId,
@@ -125,6 +176,15 @@ fn to_state_status(status: ThreadSpawnEdgeStatus) -> codex_state::DirectionalThr
     match status {
         ThreadSpawnEdgeStatus::Open => codex_state::DirectionalThreadSpawnEdgeStatus::Open,
         ThreadSpawnEdgeStatus::Closed => codex_state::DirectionalThreadSpawnEdgeStatus::Closed,
+    }
+}
+
+fn from_state_status(
+    status: codex_state::DirectionalThreadSpawnEdgeStatus,
+) -> ThreadSpawnEdgeStatus {
+    match status {
+        codex_state::DirectionalThreadSpawnEdgeStatus::Open => ThreadSpawnEdgeStatus::Open,
+        codex_state::DirectionalThreadSpawnEdgeStatus::Closed => ThreadSpawnEdgeStatus::Closed,
     }
 }
 
@@ -340,6 +400,12 @@ mod tests {
             .expect("local store should expose descendant identities")
             .await
             .expect("open descendant identities should load");
+        let nested_identity = open_identities
+            .iter()
+            .find(|identity| identity.thread_id == open_grandchild_thread_id)
+            .expect("open grandchild identity should load");
+        assert_eq!(nested_identity.parent_thread_id, earlier_child_thread_id);
+        assert_eq!(nested_identity.depth, 2);
         assert_eq!(
             open_identities
                 .into_iter()
@@ -353,6 +419,49 @@ mod tests {
                 earlier_child_thread_id,
                 later_child_thread_id,
                 open_grandchild_thread_id,
+            ]
+        );
+
+        assert_eq!(
+            store
+                .find_open_thread_spawn_descendant_by_id(root_thread_id, open_grandchild_thread_id,)
+                .await
+                .expect("open descendant lookup should load")
+                .expect("open grandchild identity should exist")
+                .thread_id,
+            open_grandchild_thread_id
+        );
+        assert_eq!(
+            store
+                .find_open_thread_spawn_descendant_by_id(
+                    root_thread_id,
+                    closed_grandchild_thread_id,
+                )
+                .await
+                .expect("closed descendant lookup should load"),
+            None
+        );
+
+        let incoming_edges = store
+            .list_thread_spawn_edges_by_child_ids(&[
+                open_grandchild_thread_id,
+                closed_child_thread_id,
+            ])
+            .await
+            .expect("incoming edges should load");
+        assert_eq!(
+            incoming_edges,
+            vec![
+                ThreadSpawnEdge {
+                    parent_thread_id: earlier_child_thread_id,
+                    child_thread_id: open_grandchild_thread_id,
+                    status: ThreadSpawnEdgeStatus::Open,
+                },
+                ThreadSpawnEdge {
+                    parent_thread_id: root_thread_id,
+                    child_thread_id: closed_child_thread_id,
+                    status: ThreadSpawnEdgeStatus::Closed,
+                },
             ]
         );
 

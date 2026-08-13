@@ -14,6 +14,7 @@ const ACTIVE_ADOPTION_IDLE_RECHECK: Duration = Duration::from_millis(10);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum ResumedThreadOwnership {
+    #[cfg(test)]
     Preserve,
     Transfer,
 }

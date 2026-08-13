@@ -13,6 +13,8 @@ use crate::CreateThreadSectionParams;
 use crate::CreatedProject;
 use crate::DeleteThreadParams;
 use crate::DeleteThreadSectionParams;
+use crate::DeleteThreadsFailure;
+use crate::DeleteThreadsOutcome;
 use crate::DeleteThreadsParams;
 use crate::DeletedProject;
 use crate::FreezeRolloutSegmentParams;
@@ -30,6 +32,7 @@ use crate::PreparedFork;
 use crate::ProjectMoveOutcome;
 use crate::ReadThreadByRolloutPathParams;
 use crate::ReadThreadParams;
+use crate::ReadThreadsParams;
 use crate::RenameThreadSectionParams;
 use crate::ResumeThreadParams;
 use crate::RevertThreadParams;
@@ -207,6 +210,28 @@ pub trait ThreadStore: Any + Send + Sync {
 
     /// Reads a thread summary and optionally its persisted history.
     fn read_thread(&self, params: ReadThreadParams) -> ThreadStoreFuture<'_, StoredThread>;
+
+    /// Reads persisted metadata for a bounded set of threads in one store operation.
+    fn read_threads(&self, params: ReadThreadsParams) -> ThreadStoreFuture<'_, Vec<StoredThread>> {
+        Box::pin(async move {
+            let mut threads = Vec::new();
+            for thread_id in params.thread_ids {
+                match self
+                    .read_thread(ReadThreadParams {
+                        thread_id,
+                        include_archived: true,
+                        include_history: false,
+                    })
+                    .await
+                {
+                    Ok(thread) => threads.push(thread),
+                    Err(ThreadStoreError::ThreadNotFound { .. }) => {}
+                    Err(err) => return Err(err),
+                }
+            }
+            Ok(threads)
+        })
+    }
 
     /// Reads a rollout-backed thread by path when the store supports path-addressed lookups.
     ///
@@ -474,6 +499,33 @@ pub trait ThreadStore: Any + Send + Sync {
                 }
             }
             Ok(())
+        })
+    }
+
+    /// Deletes threads in order and reports the exact completed prefix on a later failure.
+    fn delete_threads_with_outcome(
+        &self,
+        params: DeleteThreadsParams,
+    ) -> ThreadStoreFuture<'_, DeleteThreadsOutcome> {
+        Box::pin(async move {
+            let mut deleted_thread_ids = Vec::new();
+            for thread_id in params.thread_ids {
+                match self.delete_thread(DeleteThreadParams { thread_id }).await {
+                    Ok(()) | Err(ThreadStoreError::ThreadNotFound { .. }) => {
+                        deleted_thread_ids.push(thread_id);
+                    }
+                    Err(error) => {
+                        return Ok(DeleteThreadsOutcome {
+                            deleted_thread_ids,
+                            failure: Some(DeleteThreadsFailure { thread_id, error }),
+                        });
+                    }
+                }
+            }
+            Ok(DeleteThreadsOutcome {
+                deleted_thread_ids,
+                failure: None,
+            })
         })
     }
 }

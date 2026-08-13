@@ -4202,7 +4202,7 @@
           ]
         },
         "parentThreadId": {
-          "description": "The ID of the parent thread. This will only be set if this thread is a subagent.",
+          "description": "The ID of the parent thread. Relation-scoped `thread/list` responses use the canonical immediate owner from current-agent membership.",
           "type": [
             "string",
             "null"

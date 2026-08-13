@@ -973,6 +973,7 @@ async fn known_thread_started_preserves_session_without_reading_unmaterialized_r
             thread_source: None,
             agent_nickname: Some("Robie".to_string()),
             agent_role: Some("explorer".to_string()),
+            agent_status: None,
             git_info: None,
             name: Some("notification title".to_string()),
             turns: Vec::new(),

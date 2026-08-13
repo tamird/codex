@@ -159,7 +159,7 @@ async fn thread_archive_shuts_down_resumed_archived_descendant() -> Result<()> {
         .upsert_thread_spawn_edge(
             parent_thread_id,
             child_thread_id,
-            DirectionalThreadSpawnEdgeStatus::Closed,
+            DirectionalThreadSpawnEdgeStatus::Open,
         )
         .await?;
 
@@ -499,7 +499,7 @@ async fn thread_archive_archives_spawned_descendants() -> Result<()> {
         .upsert_thread_spawn_edge(
             parent_thread_id,
             child_thread_id,
-            DirectionalThreadSpawnEdgeStatus::Closed,
+            DirectionalThreadSpawnEdgeStatus::Open,
         )
         .await?;
     state_db
@@ -611,7 +611,7 @@ async fn thread_archive_succeeds_when_descendant_archive_fails() -> Result<()> {
         .upsert_thread_spawn_edge(
             parent_thread_id,
             child_thread_id,
-            DirectionalThreadSpawnEdgeStatus::Closed,
+            DirectionalThreadSpawnEdgeStatus::Open,
         )
         .await?;
     state_db

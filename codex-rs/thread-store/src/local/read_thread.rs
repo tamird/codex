@@ -22,6 +22,7 @@ use super::helpers::sqlite_thread_name;
 use super::helpers::stored_thread_from_rollout_item;
 use super::thread_rollout_resolver;
 use crate::ReadThreadParams;
+use crate::ReadThreadsParams;
 use crate::StoredThread;
 use crate::StoredThreadHistory;
 use crate::ThreadStoreError;
@@ -102,6 +103,49 @@ pub(super) async fn read_thread(
     }
     attach_history_if_requested(store, &mut thread, params.include_history).await?;
     Ok(thread)
+}
+
+pub(super) async fn read_threads(
+    store: &LocalThreadStore,
+    params: ReadThreadsParams,
+) -> ThreadStoreResult<Vec<StoredThread>> {
+    let thread_ids = params.thread_ids;
+    let Some(state_db) = store.state_db().await else {
+        let mut threads = Vec::new();
+        for thread_id in thread_ids {
+            match read_thread(
+                store,
+                ReadThreadParams {
+                    thread_id,
+                    include_archived: true,
+                    include_history: false,
+                },
+            )
+            .await
+            {
+                Ok(thread) => threads.push(thread),
+                Err(ThreadStoreError::ThreadNotFound { .. }) => {}
+                Err(ThreadStoreError::InvalidRequest { message })
+                    if message == format!("no rollout found for thread id {thread_id}") => {}
+                Err(err) => return Err(err),
+            }
+        }
+        return Ok(threads);
+    };
+    let mut metadata_by_id = state_db
+        .get_threads_valid(&thread_ids)
+        .await
+        .map_err(|err| ThreadStoreError::Internal {
+            message: format!("failed to read thread metadata batch: {err}"),
+        })?;
+    let mut threads = Vec::with_capacity(metadata_by_id.len());
+    for thread_id in thread_ids {
+        let Some(metadata) = metadata_by_id.remove(&thread_id) else {
+            continue;
+        };
+        threads.push(stored_thread_from_sqlite_metadata(store, metadata).await?);
+    }
+    Ok(threads)
 }
 
 async fn sqlite_rollout_path_can_load_history_for_thread(
@@ -623,6 +667,96 @@ mod tests {
         assert_eq!(
             thread.history.expect("history should load").thread_id,
             thread_id
+        );
+    }
+
+    #[tokio::test]
+    async fn read_threads_without_sqlite_preserves_requested_order_and_omits_missing() {
+        let home = TempDir::new().expect("temp dir");
+        let store = LocalThreadStore::new(test_config(home.path()), /*state_db*/ None);
+        let first_uuid = Uuid::from_u128(19_999);
+        let first_thread_id =
+            ThreadId::from_string(&first_uuid.to_string()).expect("valid first thread id");
+        write_session_file(home.path(), "2025-01-03T12-00-00", first_uuid)
+            .expect("first session file");
+        let second_uuid = Uuid::from_u128(20_000);
+        let second_thread_id =
+            ThreadId::from_string(&second_uuid.to_string()).expect("valid second thread id");
+        write_session_file(home.path(), "2025-01-03T12-00-01", second_uuid)
+            .expect("second session file");
+
+        let threads = store
+            .read_threads(crate::ReadThreadsParams {
+                thread_ids: vec![second_thread_id, ThreadId::new(), first_thread_id],
+            })
+            .await
+            .expect("rollout-only batch read");
+
+        assert_eq!(
+            threads
+                .into_iter()
+                .map(|thread| thread.thread_id)
+                .collect::<Vec<_>>(),
+            vec![second_thread_id, first_thread_id]
+        );
+    }
+
+    #[tokio::test]
+    async fn read_threads_batches_sqlite_metadata_without_opening_rollouts() {
+        let home = TempDir::new().expect("temp dir");
+        let external = TempDir::new().expect("external temp dir");
+        let config = test_config(home.path());
+        let runtime = codex_state::StateRuntime::init(
+            config.sqlite.clone(),
+            config.default_model_provider_id.clone(),
+        )
+        .await
+        .expect("state db should initialize");
+        let store = LocalThreadStore::new(config, Some(runtime.clone()));
+        let thread_ids = (0_u128..32)
+            .map(|index| {
+                let thread_id = ThreadId::from_string(&Uuid::from_u128(30_000 + index).to_string())
+                    .expect("valid thread id");
+                let mut builder = ThreadMetadataBuilder::new(
+                    thread_id,
+                    external.path().join(format!("missing-{index}.jsonl")),
+                    Utc::now(),
+                    SessionSource::Cli,
+                );
+                builder.model_provider = Some("sqlite-provider".to_string());
+                builder.cwd = external.path().join("workspace");
+                builder.cli_version = Some("sqlite-cli".to_string());
+                (thread_id, builder.build("sqlite-provider"))
+            })
+            .collect::<Vec<_>>();
+        for (_, metadata) in &thread_ids {
+            runtime
+                .upsert_thread(metadata)
+                .await
+                .expect("state db upsert should succeed");
+        }
+
+        let threads = store
+            .read_threads(crate::ReadThreadsParams {
+                thread_ids: thread_ids.iter().map(|(thread_id, _)| *thread_id).collect(),
+            })
+            .await
+            .expect("batch metadata read should not require rollout files");
+
+        assert_eq!(
+            threads
+                .iter()
+                .map(|thread| thread.thread_id)
+                .collect::<Vec<_>>(),
+            thread_ids
+                .iter()
+                .map(|(thread_id, _)| *thread_id)
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            threads
+                .iter()
+                .all(|thread| thread.model_provider == "sqlite-provider")
         );
     }
 

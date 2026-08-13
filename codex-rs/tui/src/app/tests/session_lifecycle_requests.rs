@@ -3116,6 +3116,7 @@ fn session_lifecycle_avoids_redundant_subagent_metadata_reads() -> Result<()> {
                     .thread_loaded_list(ThreadLoadedListParams {
                         cursor: None,
                         limit: None,
+                        ancestor_thread_id: None,
                     })
                     .await?
                     .data;

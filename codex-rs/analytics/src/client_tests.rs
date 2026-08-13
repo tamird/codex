@@ -604,6 +604,7 @@ fn sample_thread(thread_id: &str) -> Thread {
         updated_at: 2,
         recency_at: Some(2),
         status: AppServerThreadStatus::Idle,
+        agent_status: None,
         path: None,
         cwd: test_path_buf("/tmp").abs(),
         cli_version: "0.0.0".to_string(),

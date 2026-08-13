@@ -1985,9 +1985,71 @@ async fn open_agent_picker_preserves_cached_metadata_for_replay_threads() -> Res
             is_closed: true,
         })
     );
-    let picker = app.agent_picker_selection_view_params(/*selected*/ None);
-    assert_eq!(picker.items.len(), 1);
-    assert_eq!(picker.items[0].name, "Robie [explorer]");
+    Ok(())
+}
+
+#[tokio::test]
+async fn relation_refresh_preserves_cold_ephemeral_agent_identity() -> Result<()> {
+    let mut app = Box::pin(make_test_app()).await;
+    let root_thread_id = ThreadId::new();
+    let child_thread_id = ThreadId::new();
+    app.primary_thread_id = Some(root_thread_id);
+    let request_id = app
+        .agent_navigation
+        .begin_picker_refresh(root_thread_id)
+        .expect("relation refresh should start");
+    let source = codex_app_server_protocol::SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+        parent_thread_id: root_thread_id,
+        depth: 1,
+        agent_path: None,
+        agent_nickname: Some("Robie".to_string()),
+        agent_role: Some("explorer".to_string()),
+    });
+    app.apply_agent_picker_thread_refresh(
+        root_thread_id,
+        request_id,
+        Ok(vec![Thread {
+            id: child_thread_id.to_string(),
+            extra: None,
+            session_id: child_thread_id.to_string(),
+            forked_from_id: None,
+            parent_thread_id: Some(root_thread_id.to_string()),
+            preview: String::new(),
+            ephemeral: true,
+            section: None,
+            section_entered_at: None,
+            project_id: None,
+            history_mode: Default::default(),
+            model_provider: app.config.model_provider_id.clone(),
+            created_at: 0,
+            updated_at: 0,
+            recency_at: Some(0),
+            status: codex_app_server_protocol::ThreadStatus::NotLoaded,
+            agent_status: Some(codex_app_server_protocol::CollabAgentStatus::Completed),
+            path: None,
+            cwd: app.config.cwd.clone(),
+            cli_version: "0.0.0".to_string(),
+            source,
+            can_accept_direct_input: Some(false),
+            thread_source: Some(codex_app_server_protocol::ThreadSource::Subagent),
+            agent_nickname: Some("Robie".to_string()),
+            agent_role: Some("explorer".to_string()),
+            git_info: None,
+            name: None,
+            turns: Vec::new(),
+        }]),
+    );
+
+    assert_eq!(
+        app.agent_navigation.get(&child_thread_id),
+        Some(&AgentPickerThreadEntry {
+            agent_nickname: Some("Robie".to_string()),
+            agent_role: Some("explorer".to_string()),
+            agent_path: None,
+            is_running: false,
+            is_closed: true,
+        })
+    );
     Ok(())
 }
 
@@ -4142,6 +4204,7 @@ async fn inactive_thread_started_notification_initializes_replay_session() -> Re
                 updated_at: 2,
                 recency_at: Some(2),
                 status: codex_app_server_protocol::ThreadStatus::Idle,
+                agent_status: None,
                 path: Some(rollout_path.clone()),
                 cwd: test_path_buf("/tmp/agent").abs(),
                 cli_version: "0.0.0".to_string(),
@@ -4241,6 +4304,7 @@ async fn inactive_thread_started_notification_preserves_primary_model_when_path_
                 updated_at: 2,
                 recency_at: Some(2),
                 status: codex_app_server_protocol::ThreadStatus::Idle,
+                agent_status: None,
                 path: None,
                 cwd: test_path_buf("/tmp/agent").abs(),
                 cli_version: "0.0.0".to_string(),
@@ -4307,6 +4371,7 @@ async fn thread_read_session_state_does_not_reuse_primary_permission_profile() {
         updated_at: 2,
         recency_at: Some(2),
         status: codex_app_server_protocol::ThreadStatus::Idle,
+        agent_status: None,
         path: None,
         cwd: test_path_buf("/tmp/read").abs(),
         cli_version: "0.0.0".to_string(),

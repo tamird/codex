@@ -45,14 +45,23 @@ impl Handler {
             .services
             .agent_control
             .register_session_root(session.thread_id, turn.parent_thread_id);
-        let agents = session
+        let page = session
             .services
             .agent_control
-            .list_agents(&turn.session_source, args.path_prefix.as_deref())
+            .list_agents_page(
+                &turn.session_source,
+                args.path_prefix.as_deref(),
+                args.cursor.as_deref(),
+                args.limit,
+            )
             .await
             .map_err(collab_spawn_error)?;
 
-        Ok(boxed_tool_output(ListAgentsResult { agents }))
+        Ok(boxed_tool_output(ListAgentsResult {
+            agents: page.agents,
+            next_cursor: page.next_cursor,
+            total_count: page.total_count,
+        }))
     }
 }
 
@@ -66,11 +75,15 @@ impl CoreToolRuntime for Handler {
 #[serde(deny_unknown_fields)]
 struct ListAgentsArgs {
     path_prefix: Option<String>,
+    cursor: Option<String>,
+    limit: Option<usize>,
 }
 
 #[derive(Debug, Serialize)]
 pub(crate) struct ListAgentsResult {
     agents: Vec<ListedAgent>,
+    next_cursor: Option<String>,
+    total_count: usize,
 }
 
 impl ToolOutput for ListAgentsResult {

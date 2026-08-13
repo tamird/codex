@@ -58,6 +58,20 @@ use std::collections::HashMap;
 use std::io;
 use std::path::PathBuf;
 
+impl From<CoreAgentStatus> for CollabAgentStatus {
+    fn from(value: CoreAgentStatus) -> Self {
+        match value {
+            CoreAgentStatus::PendingInit => Self::PendingInit,
+            CoreAgentStatus::Running => Self::Running,
+            CoreAgentStatus::Interrupted => Self::Interrupted,
+            CoreAgentStatus::Completed(_) => Self::Completed,
+            CoreAgentStatus::Errored(_) => Self::Errored,
+            CoreAgentStatus::Shutdown => Self::Shutdown,
+            CoreAgentStatus::NotFound => Self::NotFound,
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]

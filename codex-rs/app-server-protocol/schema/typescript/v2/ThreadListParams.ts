@@ -26,8 +26,9 @@ modelProviders?: Array<string> | null, /**
  * are returned. When omitted or empty, defaults to interactive sources.
  */
 sourceKinds?: Array<ThreadSourceKind> | null, /**
- * Optional archived filter; when set to true, only archived threads are returned.
- * If false or null, only non-archived threads are returned.
+ * Optional archived filter. `true` returns archived threads and `false` returns active threads.
+ * When omitted from a current-agent relation request, both archive states are returned;
+ * ordinary thread lists treat omission as `false`.
  */
 archived?: boolean | null, /**
  * Omit to include every section, set to `null` for unsectioned threads,

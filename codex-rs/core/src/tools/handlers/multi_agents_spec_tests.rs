@@ -557,15 +557,25 @@ fn list_agents_tool_includes_path_prefix_and_agent_fields() {
         .as_ref()
         .expect("list_agents should use object params");
     assert!(properties.contains_key("path_prefix"));
+    assert!(properties.contains_key("cursor"));
+    assert!(properties.contains_key("limit"));
     assert_eq!(
         properties
             .get("path_prefix")
             .and_then(|schema| schema.description.as_deref()),
-        Some("Task-path prefix filter without a trailing slash. Omit to list all live agents.")
+        Some(
+            "Task-path prefix filter without a trailing slash. Omit to list all current subagents."
+        )
     );
     assert_eq!(
         output_schema.expect("list_agents output schema")["properties"]["agents"]["items"]["required"],
-        json!(["agent_name", "agent_status"])
+        json!([
+            "agent_id",
+            "parent_agent_id",
+            "agent_name",
+            "agent_status",
+            "last_task_message"
+        ])
     );
 }
 

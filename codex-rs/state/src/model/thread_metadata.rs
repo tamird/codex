@@ -125,6 +125,10 @@ pub struct ExtractionOutcome {
 pub struct ThreadSpawnDescendantIdentity {
     /// Identifier from the open parent-child relationship.
     pub thread_id: ThreadId,
+    /// Immediate persisted owner of this descendant.
+    pub parent_thread_id: ThreadId,
+    /// Number of ownership edges from the queried root to this descendant.
+    pub depth: u32,
     /// Serialized session source, or `None` when the thread metadata row is missing.
     pub source: Option<String>,
     /// Canonical agent path recorded on the persisted thread.

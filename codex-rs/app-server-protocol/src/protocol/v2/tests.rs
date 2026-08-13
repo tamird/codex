@@ -295,6 +295,7 @@ fn thread_resume_response_round_trips_initial_turns_page() {
             updated_at: 1,
             recency_at: Some(1),
             status: ThreadStatus::Idle,
+            agent_status: None,
             path: None,
             cwd: absolute_path("tmp"),
             cli_version: "0.0.0".to_string(),

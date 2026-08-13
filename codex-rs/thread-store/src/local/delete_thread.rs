@@ -21,6 +21,8 @@ use super::LocalThreadStore;
 use super::helpers::matching_rollout_file_name;
 use super::helpers::scoped_rollout_path;
 use crate::DeleteThreadParams;
+use crate::DeleteThreadsFailure;
+use crate::DeleteThreadsOutcome;
 use crate::DeleteThreadsParams;
 use crate::ThreadStoreError;
 use crate::ThreadStoreResult;
@@ -52,16 +54,43 @@ pub(super) async fn delete_thread(
     {
         return Err(referenced_thread_error(thread_id));
     }
-    delete_thread_after_reference_check(store, thread_id, owned_rollouts, &mut writer_guards).await
+    delete_thread_after_reference_check(store, thread_id, owned_rollouts, &mut writer_guards)
+        .await
+        .map_err(|failure| failure.error)
 }
 
 pub(super) async fn delete_threads(
     store: &LocalThreadStore,
     params: DeleteThreadsParams,
 ) -> ThreadStoreResult<()> {
+    let outcome = delete_threads_with_outcome(store, params).await?;
+    match outcome.failure {
+        Some(failure) => Err(failure.error),
+        None => Ok(()),
+    }
+}
+
+pub(super) async fn delete_threads_with_outcome(
+    store: &LocalThreadStore,
+    params: DeleteThreadsParams,
+) -> ThreadStoreResult<DeleteThreadsOutcome> {
+    delete_threads_with_pre_delete(store, params, |_| Ok(())).await
+}
+
+async fn delete_threads_with_pre_delete<F>(
+    store: &LocalThreadStore,
+    params: DeleteThreadsParams,
+    mut pre_delete: F,
+) -> ThreadStoreResult<DeleteThreadsOutcome>
+where
+    F: FnMut(ThreadId) -> ThreadStoreResult<()>,
+{
     let thread_ids = params.thread_ids;
     if thread_ids.is_empty() {
-        return Ok(());
+        return Ok(DeleteThreadsOutcome {
+            deleted_thread_ids: Vec::new(),
+            failure: None,
+        });
     }
 
     let deletion_set: HashSet<_> = thread_ids.iter().copied().collect();
@@ -89,11 +118,11 @@ pub(super) async fn delete_threads(
     // references from children outside the set should block it.
     let mut internal_reference_counts = HashMap::new();
     for child_rollouts in owned_rollouts_by_thread.values() {
-        for child_rollout_id in child_rollouts
+        let child_rollout_ids = child_rollouts
             .iter()
             .map(|rollout| rollout.rollout_id)
-            .collect::<HashSet<_>>()
-        {
+            .collect::<HashSet<_>>();
+        for child_rollout_id in child_rollout_ids {
             if let Some(direct_references) = reference_index.direct_references(child_rollout_id) {
                 for referenced_rollout_id in direct_references {
                     if *referenced_rollout_id != child_rollout_id
@@ -108,13 +137,13 @@ pub(super) async fn delete_threads(
         }
     }
     for thread_id in &thread_ids {
-        for rollout_id in owned_rollouts_by_thread
+        let rollout_ids = owned_rollouts_by_thread
             .get(thread_id)
             .into_iter()
             .flatten()
             .map(|rollout| rollout.rollout_id)
-            .collect::<HashSet<_>>()
-        {
+            .collect::<HashSet<_>>();
+        for rollout_id in rollout_ids {
             let internal_reference_count = internal_reference_counts
                 .get(&rollout_id)
                 .copied()
@@ -125,7 +154,14 @@ pub(super) async fn delete_threads(
         }
     }
 
+    let mut deleted_thread_ids = Vec::new();
     for thread_id in thread_ids {
+        if let Err(error) = pre_delete(thread_id) {
+            return Ok(DeleteThreadsOutcome {
+                deleted_thread_ids,
+                failure: Some(DeleteThreadsFailure { thread_id, error }),
+            });
+        }
         let owned_rollouts = owned_rollouts_by_thread
             .remove(&thread_id)
             .unwrap_or_default();
@@ -137,11 +173,28 @@ pub(super) async fn delete_threads(
         )
         .await
         {
-            Ok(()) | Err(ThreadStoreError::ThreadNotFound { .. }) => {}
-            Err(err) => return Err(err),
+            Ok(()) => deleted_thread_ids.push(thread_id),
+            Err(failure) if matches!(failure.error, ThreadStoreError::ThreadNotFound { .. }) => {
+                deleted_thread_ids.push(thread_id);
+            }
+            Err(failure) => {
+                if failure.thread_unavailable {
+                    deleted_thread_ids.push(thread_id);
+                }
+                return Ok(DeleteThreadsOutcome {
+                    deleted_thread_ids,
+                    failure: Some(DeleteThreadsFailure {
+                        thread_id,
+                        error: failure.error,
+                    }),
+                });
+            }
         }
     }
-    Ok(())
+    Ok(DeleteThreadsOutcome {
+        deleted_thread_ids,
+        failure: None,
+    })
 }
 
 async fn scan_reference_index(
@@ -288,7 +341,7 @@ async fn delete_thread_after_reference_check(
     thread_id: codex_protocol::ThreadId,
     owned_rollouts: Vec<OwnedRollout>,
     writer_guards: &mut Vec<super::writer_lock::WriterLockGuard>,
-) -> ThreadStoreResult<()> {
+) -> Result<(), DeleteThreadFailure> {
     let mut rollout_ids = owned_rollouts
         .iter()
         .map(|rollout| rollout.rollout_id)
@@ -296,27 +349,68 @@ async fn delete_thread_after_reference_check(
     // Remove rows created before rollout replacement used the physical rollout ID as its key.
     rollout_ids.insert(thread_id);
     super::thread_history::delete_threads(store, &rollout_ids.into_iter().collect::<Vec<_>>())
-        .await?;
+        .await
+        .map_err(DeleteThreadFailure::before_rollout_removal)?;
 
     // Drop the recorder before removing files, but retain its writer lock until cleanup finishes.
     if let Some(entry) = store.live_recorders.lock().await.remove(&thread_id) {
         writer_guards.push(entry.writer_lock);
     }
     let found_rollout_path = !owned_rollouts.is_empty();
-    for rollout in owned_rollouts {
-        delete_rollout_file(store, &rollout, thread_id)?;
+    for rollout in &owned_rollouts {
+        if let Err(error) = delete_rollout_file(store, rollout, thread_id) {
+            return Err(DeleteThreadFailure {
+                error,
+                thread_unavailable: !owned_rollouts_have_readable_representation(&owned_rollouts)
+                    .await,
+            });
+        }
     }
     remove_thread_name_entries(store.config.codex_home.as_path(), thread_id)
         .await
-        .map_err(|err| ThreadStoreError::Internal {
-            message: format!("failed to delete thread name index entries for {thread_id}: {err}"),
+        .map_err(|err| DeleteThreadFailure {
+            error: ThreadStoreError::Internal {
+                message: format!(
+                    "failed to delete thread name index entries for {thread_id}: {err}"
+                ),
+            },
+            thread_unavailable: true,
         })?;
 
     if !found_rollout_path {
-        return Err(ThreadStoreError::ThreadNotFound { thread_id });
+        return Err(DeleteThreadFailure {
+            error: ThreadStoreError::ThreadNotFound { thread_id },
+            thread_unavailable: true,
+        });
     }
 
     Ok(())
+}
+
+struct DeleteThreadFailure {
+    error: ThreadStoreError,
+    thread_unavailable: bool,
+}
+
+impl DeleteThreadFailure {
+    fn before_rollout_removal(error: ThreadStoreError) -> Self {
+        Self {
+            error,
+            thread_unavailable: false,
+        }
+    }
+}
+
+async fn owned_rollouts_have_readable_representation(owned_rollouts: &[OwnedRollout]) -> bool {
+    for rollout in owned_rollouts {
+        if codex_rollout::existing_rollout_path(rollout.path.as_path())
+            .await
+            .is_some()
+        {
+            return true;
+        }
+    }
+    false
 }
 
 fn delete_rollout_file(
@@ -443,6 +537,52 @@ mod tests {
             assert!(!path.exists());
         }
         assert!(!compressed_path.exists());
+    }
+
+    #[tokio::test]
+    async fn delete_threads_reports_exact_prefix_before_member_failure() {
+        let home = TempDir::new().expect("temp dir");
+        let store = LocalThreadStore::new(test_config(home.path()), /*state_db*/ None);
+        let first_uuid = Uuid::from_u128(320);
+        let first_thread_id =
+            ThreadId::from_string(&first_uuid.to_string()).expect("valid first thread id");
+        let first_path = write_session_file(home.path(), "2025-01-03T12-00-00", first_uuid)
+            .expect("first session file");
+        let failed_uuid = Uuid::from_u128(321);
+        let failed_thread_id =
+            ThreadId::from_string(&failed_uuid.to_string()).expect("valid failed thread id");
+        let failed_path = write_session_file(home.path(), "2025-01-03T12-00-01", failed_uuid)
+            .expect("failed session file");
+        let suffix_uuid = Uuid::from_u128(322);
+        let suffix_thread_id =
+            ThreadId::from_string(&suffix_uuid.to_string()).expect("valid suffix thread id");
+        let suffix_path = write_session_file(home.path(), "2025-01-03T12-00-02", suffix_uuid)
+            .expect("suffix session file");
+
+        let outcome = delete_threads_with_pre_delete(
+            &store,
+            DeleteThreadsParams {
+                thread_ids: vec![first_thread_id, failed_thread_id, suffix_thread_id],
+            },
+            |thread_id| {
+                if thread_id == failed_thread_id {
+                    return Err(ThreadStoreError::Internal {
+                        message: "injected second-member failure".to_string(),
+                    });
+                }
+                Ok(())
+            },
+        )
+        .await
+        .expect("batch outcome");
+
+        assert_eq!(outcome.deleted_thread_ids, vec![first_thread_id]);
+        let failure = outcome.failure.expect("injected failure");
+        assert_eq!(failure.thread_id, failed_thread_id);
+        assert!(matches!(failure.error, ThreadStoreError::Internal { .. }));
+        assert!(!first_path.exists());
+        assert!(failed_path.exists());
+        assert!(suffix_path.exists());
     }
 
     #[tokio::test]

@@ -47,6 +47,7 @@ pub use model::Anchor;
 pub use model::BackfillState;
 pub use model::BackfillStats;
 pub use model::BackfillStatus;
+pub use model::DirectionalThreadSpawnEdge;
 pub use model::DirectionalThreadSpawnEdgeStatus;
 pub use model::ExtractionOutcome;
 pub use model::SortDirection;

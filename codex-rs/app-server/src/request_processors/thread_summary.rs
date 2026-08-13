@@ -275,6 +275,7 @@ pub(crate) fn summary_to_thread(
         updated_at: updated_at.map(|dt| dt.timestamp()).unwrap_or(0),
         recency_at: updated_at.map(|dt| dt.timestamp()),
         status: ThreadStatus::NotLoaded,
+        agent_status: None,
         path: (!path.as_os_str().is_empty()).then_some(path),
         cwd,
         cli_version,
