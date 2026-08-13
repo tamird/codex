@@ -3,6 +3,7 @@
 //! Callers choose an explicit reduced-motion fallback here instead of reaching
 //! directly for time-varying spinner or shimmer helpers.
 
+use std::time::Duration;
 use std::time::Instant;
 
 use ratatui::style::Stylize;
@@ -11,6 +12,7 @@ use ratatui::text::Span;
 #[path = "shimmer.rs"]
 mod shimmer;
 
+use shimmer::next_shimmer_change_in;
 use shimmer::shimmer_spans;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -62,6 +64,31 @@ pub(crate) fn shimmer_text(text: &str, motion_mode: MotionMode) -> Vec<Span<'sta
     }
 }
 
+pub(crate) fn next_status_motion_change_in(
+    header: &str,
+    indicator_start_time: Instant,
+) -> Option<Duration> {
+    let indicator_delay = if supports_color::on_cached(supports_color::Stream::Stdout)
+        .map(|level| level.has_16m)
+        .unwrap_or(false)
+    {
+        next_shimmer_change_in("•")
+    } else {
+        let blink_interval = Duration::from_millis(600);
+        let elapsed_nanos = indicator_start_time.elapsed().as_nanos();
+        let remainder = elapsed_nanos % blink_interval.as_nanos();
+        Some(Duration::from_nanos(
+            (blink_interval.as_nanos() - remainder) as u64,
+        ))
+    };
+
+    match (next_shimmer_change_in(header), indicator_delay) {
+        (Some(header_delay), Some(indicator_delay)) => Some(header_delay.min(indicator_delay)),
+        (Some(delay), None) | (None, Some(delay)) => Some(delay),
+        (None, None) => None,
+    }
+}
+
 fn animated_activity_indicator(start_time: Option<Instant>) -> Span<'static> {
     let elapsed = start_time.map(|st| st.elapsed()).unwrap_or_default();
     if supports_color::on_cached(supports_color::Stream::Stdout)
@@ -105,7 +132,7 @@ mod tests {
     }
 
     #[test]
-    fn reduced_motion_shimmer_text_is_plain_text() {
+    fn shimmer_text_and_timing_respect_motion_mode() {
         assert_eq!(
             shimmer_text("Loading", MotionMode::Reduced),
             vec!["Loading".into()]
@@ -113,6 +140,28 @@ mod tests {
         assert_eq!(
             shimmer_text("", MotionMode::Reduced),
             Vec::<Span<'static>>::new()
+        );
+        assert_eq!(
+            [
+                shimmer::next_shimmer_change_after(Duration::ZERO, /*char_count*/ 7),
+                shimmer::next_shimmer_change_after(
+                    Duration::from_millis(500),
+                    /*char_count*/ 7,
+                ),
+                shimmer::next_shimmer_change_after(
+                    Duration::from_millis(1_556),
+                    /*char_count*/ 7,
+                ),
+                shimmer::next_shimmer_change_after(Duration::ZERO, /*char_count*/ 1),
+                shimmer::next_shimmer_change_after(Duration::ZERO, /*char_count*/ 0),
+            ],
+            [
+                Some(Duration::from_nanos(444_444_445)),
+                Some(Duration::from_nanos(18_518_519)),
+                Some(Duration::from_nanos(888_444_445)),
+                Some(Duration::from_nanos(571_428_572)),
+                None,
+            ]
         );
     }
 }

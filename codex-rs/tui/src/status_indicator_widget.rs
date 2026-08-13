@@ -25,6 +25,7 @@ use crate::line_truncation::truncate_line_with_ellipsis_if_overflow;
 use crate::motion::MotionMode;
 use crate::motion::ReducedMotionIndicator;
 use crate::motion::activity_indicator;
+use crate::motion::next_status_motion_change_in;
 use crate::motion::shimmer_text;
 use crate::render::renderable::Renderable;
 use crate::text_formatting::capitalize_first;
@@ -34,6 +35,7 @@ use crate::wrapping::word_wrap_lines;
 
 pub(crate) const STATUS_DETAILS_DEFAULT_MAX_LINES: usize = 3;
 const DETAILS_PREFIX: &str = "  └ ";
+const MIN_STATUS_ANIMATION_FRAME_INTERVAL: Duration = Duration::from_millis(32);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum StatusDetailsCapitalization {
@@ -240,11 +242,6 @@ impl Renderable for StatusIndicatorWidget {
             return;
         }
 
-        if self.animations_enabled {
-            // Schedule next animation frame.
-            self.frame_requester
-                .schedule_frame_in(Duration::from_millis(32));
-        }
         let now = Instant::now();
         let elapsed_duration = self.elapsed_duration_at(now);
         let pretty_elapsed = fmt_elapsed_compact(elapsed_duration.as_secs());
@@ -279,6 +276,28 @@ impl Renderable for StatusIndicatorWidget {
             // interrupt affordances stay in a fixed visual location.
             spans.push(" · ".dim());
             spans.push(message.clone().dim());
+        }
+
+        if self.animations_enabled {
+            let next_elapsed_change = if self.is_paused {
+                None
+            } else {
+                Some(
+                    Duration::from_secs(1)
+                        - Duration::from_nanos(u64::from(elapsed_duration.subsec_nanos())),
+                )
+            };
+            let next_motion_change =
+                next_status_motion_change_in(&self.header, self.last_resume_at);
+            let next_change = match (next_motion_change, next_elapsed_change) {
+                (Some(motion), Some(elapsed)) => Some(motion.min(elapsed)),
+                (Some(change), None) | (None, Some(change)) => Some(change),
+                (None, None) => None,
+            };
+            if let Some(delay) = next_change {
+                self.frame_requester
+                    .schedule_frame_in(delay.max(MIN_STATUS_ANIMATION_FRAME_INTERVAL));
+            }
         }
 
         let mut lines = Vec::new();
@@ -340,6 +359,53 @@ mod tests {
             .draw(|f| w.render(f.area(), f.buffer_mut()))
             .expect("draw");
         insta::assert_snapshot!(terminal.backend());
+    }
+
+    #[test]
+    fn working_status_schedules_next_visible_animation_change() {
+        let (tx_raw, _rx) = unbounded_channel::<AppEvent>();
+        let tx = AppEventSender::new(tx_raw);
+        let (frame_requester, mut frame_rx) = crate::tui::FrameRequester::test_channel();
+        let mut widget =
+            StatusIndicatorWidget::new(tx, frame_requester, /*animations_enabled*/ true);
+        let expected_motion_change =
+            next_status_motion_change_in(widget.header(), widget.last_resume_at)
+                .expect("animated status has a future visible change");
+        let expected_elapsed_change = Duration::from_secs(1)
+            - Duration::from_nanos(u64::from(
+                widget.elapsed_duration_at(Instant::now()).subsec_nanos(),
+            ));
+        let expected_change = expected_motion_change
+            .min(expected_elapsed_change)
+            .max(MIN_STATUS_ANIMATION_FRAME_INTERVAL);
+        let before_render = Instant::now();
+        let area = Rect::new(
+            /*x*/ 0, /*y*/ 0, /*width*/ 80, /*height*/ 1,
+        );
+        let mut buffer = Buffer::empty(area);
+        widget.render(area, &mut buffer);
+        let after_render = Instant::now();
+
+        let scheduled = frame_rx.try_recv().expect("next visible frame scheduled");
+        let timing_tolerance = Duration::from_millis(2);
+        let earliest = before_render + expected_change.saturating_sub(timing_tolerance);
+        let latest = after_render + expected_change + timing_tolerance;
+        assert!(
+            (earliest..=latest).contains(&scheduled),
+            "expected the next visible status change after {expected_change:?}, scheduled after {:?}",
+            scheduled.saturating_duration_since(before_render)
+        );
+
+        widget.update_header("x".repeat(500));
+        let before_long_header_render = Instant::now();
+        widget.render(area, &mut buffer);
+        let long_header_deadline = frame_rx
+            .try_recv()
+            .expect("long status header schedules its next visible frame");
+        assert!(
+            long_header_deadline >= before_long_header_render + MIN_STATUS_ANIMATION_FRAME_INTERVAL,
+            "long status headers must not exceed the original animation frame rate"
+        );
     }
 
     #[test]
