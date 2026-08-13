@@ -1,0 +1,225 @@
+name: frodex-release
+
+on:
+  push:
+    tags:
+      - "frodex-v*"
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build - ${{ matrix.runner }} - ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 360
+    permissions:
+      contents: read
+    defaults:
+      run:
+        working-directory: codex-rs
+    env:
+      CARGO_PROFILE_RELEASE_LTO: "off"
+      CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            target: aarch64-apple-darwin
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Install Linux build dependencies
+        if: ${{ runner.os == 'Linux' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -y
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends pkg-config libcap-dev
+
+      - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install Rust target
+        shell: bash
+        run: rustup target add ${{ matrix.target }}
+
+      - name: Validate Frodex tag
+        if: ${{ startsWith(github.ref_name, 'frodex-v') }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#frodex-v}"
+          if [[ ! "${version}" =~ ^(.+)\+frodex\.([0-9]+)$ ]]; then
+            echo "Frodex tags must have the form frodex-v<upstream-tag>+frodex.<release-number>." >&2
+            exit 1
+          fi
+
+          upstream_version="${BASH_REMATCH[1]}"
+          if ! git ls-remote --exit-code --tags https://github.com/openai/codex.git \
+            "refs/tags/rust-v${upstream_version}" >/dev/null
+          then
+            echo "Frodex tags must reuse an existing upstream Codex release version exactly: rust-v${upstream_version} was not found." >&2
+            exit 1
+          fi
+
+      - name: Set package version from tag
+        if: ${{ startsWith(github.ref_name, 'frodex-v') }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#frodex-v}"
+          perl -0pi -e 's#^version = "[^"]+"#version = "'"${version}"'"#m' Cargo.toml
+          python3 - "$version" <<'PY'
+          import re
+          import sys
+          from pathlib import Path
+
+          version = sys.argv[1]
+          path = Path("Cargo.lock")
+          text = path.read_text()
+
+          def replace_workspace_package_version(match: re.Match[str]) -> str:
+              block = match.group(0)
+              name_match = re.search(r'^name = "([^"]+)"$', block, flags=re.MULTILINE)
+              if name_match is None:
+                  return block
+              name = name_match.group(1)
+              if not (
+                  name.startswith("codex-")
+                  or name in {"app_test_support", "core_test_support"}
+              ):
+                  return block
+              return re.sub(
+                  r'^version = "[^"]+"$',
+                  f'version = "{version}"',
+                  block,
+                  count=1,
+                  flags=re.MULTILINE,
+              )
+
+          text = re.sub(
+              r'(?ms)^\[\[package\]\]\n.*?(?=^\[\[package\]\]\n|\Z)',
+              replace_workspace_package_version,
+              text,
+          )
+          path.write_text(text)
+          PY
+          grep -n '^version = "'"${version}"'"' Cargo.toml
+
+      - name: Configure rusty_v8 artifact overrides and verify checksums
+        uses: ./.github/actions/setup-rusty-v8
+        with:
+          target: ${{ matrix.target }}
+
+      - name: Cargo build
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${{ runner.os }}" == "Linux" ]]; then
+            cargo build --jobs 2 --target ${{ matrix.target }} --release \
+              --bin codex --bin codex-code-mode-host
+          else
+            cargo build --target ${{ matrix.target }} --release \
+              --bin codex --bin codex-code-mode-host
+          fi
+
+      - name: Build code-mode host JavaScript test
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --target ${{ matrix.target }} --release \
+            -p codex-code-mode-host --test stdio --no-run
+
+      - name: Sign and verify macOS code-mode host
+        if: ${{ runner.os == 'macOS' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          host="target/${{ matrix.target }}/release/codex-code-mode-host"
+          entitlements="${GITHUB_WORKSPACE}/.github/scripts/macos-signing/codex-code-mode-host.entitlements.plist"
+          actual="$(mktemp)"
+          normalized_actual="$(mktemp)"
+          normalized_expected="$(mktemp)"
+          trap 'rm -f "$actual" "$normalized_actual" "$normalized_expected"' EXIT
+
+          codesign --force --sign - --identifier codex-code-mode-host \
+            --options runtime --timestamp=none --entitlements "$entitlements" "$host"
+          codesign --verify --strict --verbose=2 "$host"
+          codesign -d --entitlements :- "$host" >"$actual"
+          plutil -convert xml1 -o "$normalized_actual" "$actual"
+          plutil -convert xml1 -o "$normalized_expected" "$entitlements"
+          cmp "$normalized_actual" "$normalized_expected"
+
+      - name: Verify code-mode host executes JavaScript
+        shell: bash
+        run: |
+          set -euo pipefail
+          test_binary=""
+          for candidate in target/${{ matrix.target }}/release/deps/stdio-*; do
+            if [[ -f "$candidate" && -x "$candidate" ]]; then
+              test_binary="$candidate"
+              break
+            fi
+          done
+          [[ -n "$test_binary" ]] || {
+            echo "code-mode host integration test executable not found" >&2
+            exit 1
+          }
+          "$test_binary" \
+            remote_session_persists_values_forwards_delegates_and_controls_cells --exact
+
+      - name: Stage archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          dest="${GITHUB_WORKSPACE}/dist/${{ matrix.target }}"
+          mkdir -p "${dest}"
+          tar -C "target/${{ matrix.target }}/release" \
+            -czf "${dest}/frodex-${{ matrix.target }}.tar.gz" \
+            codex codex-code-mode-host
+
+          entries="$(tar -tzf "${dest}/frodex-${{ matrix.target }}.tar.gz")"
+          [[ "$entries" == $'codex\ncodex-code-mode-host' ]]
+
+      - uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: frodex-${{ matrix.target }}
+          path: dist/${{ matrix.target }}/*
+
+  release:
+    needs: build
+    name: Release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: List staged artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+          find dist -type f | sort
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@153bb8e04406b158c6c84fc1615b65b24149a1fe # v2.6.1
+        with:
+          files: dist/**
+          prerelease: true

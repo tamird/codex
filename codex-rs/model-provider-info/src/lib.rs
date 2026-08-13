@@ -58,6 +58,18 @@ const CHAT_WIRE_API_REMOVED_ERROR: &str = "`wire_api = \"chat\"` is no longer su
 pub const LEGACY_OLLAMA_CHAT_PROVIDER_ID: &str = "ollama-chat";
 pub const OLLAMA_CHAT_PROVIDER_REMOVED_ERROR: &str = "`ollama-chat` is no longer supported.\nHow to fix: replace `ollama-chat` with `ollama` in `model_provider`, `oss_provider`, or `--local-provider`.\nMore info: https://github.com/openai/codex/discussions/7782";
 
+/// Returns the upstream Codex version used for ChatGPT model eligibility.
+///
+/// Frodex release versions use SemVer build metadata, but the ChatGPT model
+/// catalog does not accept build metadata in the `version` header. The
+/// prerelease component must remain because model eligibility can depend on
+/// the upstream alpha version.
+fn openai_client_version_header(version: &str) -> &str {
+    version
+        .split_once('+')
+        .map_or(version, |(upstream_version, _)| upstream_version)
+}
+
 /// Wire protocol that the provider speaks.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
@@ -394,9 +406,12 @@ impl ModelProviderInfo {
             wire_api: WireApi::Responses,
             query_params: None,
             http_headers: Some(
-                [("version".to_string(), env!("CARGO_PKG_VERSION").into())]
-                    .into_iter()
-                    .collect(),
+                [(
+                    "version".to_string(),
+                    openai_client_version_header(env!("CARGO_PKG_VERSION")).into(),
+                )]
+                .into_iter()
+                .collect(),
             ),
             env_http_headers: Some(
                 [

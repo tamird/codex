@@ -168,6 +168,36 @@ fn codex_backend_routes_require_codex_base_url() {
 }
 
 #[test]
+fn openai_client_version_header_preserves_prerelease_and_strips_build_metadata() {
+    assert_eq!(
+        openai_client_version_header("0.148.0-alpha.20+frodex.0"),
+        "0.148.0-alpha.20"
+    );
+    assert_eq!(
+        openai_client_version_header("0.148.0-alpha.20"),
+        "0.148.0-alpha.20"
+    );
+    assert_eq!(
+        openai_client_version_header("not-a-version"),
+        "not-a-version"
+    );
+}
+
+#[test]
+fn openai_provider_uses_upstream_client_version_header() {
+    let api_provider = ModelProviderInfo::create_openai_provider(/*base_url*/ None)
+        .to_api_provider(Some(AuthMode::Chatgpt))
+        .expect("OpenAI provider should build API provider");
+
+    assert_eq!(
+        api_provider.headers.get("version"),
+        Some(&HeaderValue::from_static(openai_client_version_header(
+            env!("CARGO_PKG_VERSION")
+        )))
+    );
+}
+
+#[test]
 fn test_uses_openai_actor_authorization() {
     let mut provider = ModelProviderInfo {
         http_headers: Some(maplit::hashmap! {

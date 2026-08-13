@@ -182,6 +182,7 @@ impl TestAppServer {
             codex_home: None,
             environment: TestAppServerEnvironment::Auto,
             program: None,
+            program_prefix_args: Vec::new(),
             env_overrides: Vec::new(),
             args: vec![DISABLE_PLUGIN_STARTUP_TASKS_ARG.to_string()],
             exec_server_delay: None,
@@ -1845,9 +1846,18 @@ pub struct TestAppServerBuilder {
     codex_home: Option<PathBuf>,
     environment: TestAppServerEnvironment,
     program: Option<PathBuf>,
+    program_prefix_args: Vec<String>,
     env_overrides: Vec<(String, Option<String>)>,
     args: Vec<String>,
     exec_server_delay: Option<Duration>,
+}
+
+fn command_arguments<'a>(prefix_args: &'a [String], args: &'a [String]) -> Vec<&'a str> {
+    prefix_args
+        .iter()
+        .chain(args.iter())
+        .map(String::as_str)
+        .collect()
 }
 
 enum TestAppServerEnvironment {
@@ -1871,6 +1881,20 @@ impl TestAppServerBuilder {
     /// Uses this app-server binary instead of the standard test binary.
     pub fn with_program(mut self, program: &Path) -> Self {
         self.program = Some(program.to_path_buf());
+        self.program_prefix_args.clear();
+        self
+    }
+
+    /// Uses this program with arguments placed before the standard app-server test arguments.
+    ///
+    /// Installed `codex` binaries expose app-server as the `app-server` subcommand, while Cargo
+    /// tests normally execute the standalone `codex-app-server` binary.
+    pub fn with_program_and_prefix_args(mut self, program: &Path, prefix_args: &[&str]) -> Self {
+        self.program = Some(program.to_path_buf());
+        self.program_prefix_args = prefix_args
+            .iter()
+            .map(|argument| (*argument).to_string())
+            .collect();
         self
     }
 
@@ -1947,6 +1971,7 @@ impl TestAppServerBuilder {
             codex_home,
             environment,
             program,
+            program_prefix_args,
             mut env_overrides,
             args,
             exec_server_delay,
@@ -2107,7 +2132,7 @@ impl TestAppServerBuilder {
             .iter()
             .map(|(key, value)| (key.as_str(), value.as_deref()))
             .collect::<Vec<_>>();
-        let args = args.iter().map(String::as_str).collect::<Vec<_>>();
+        let args = command_arguments(&program_prefix_args, &args);
         let mut app_server = TestAppServer::new_with_program_env_and_args(
             &codex_home,
             &program,
@@ -2123,6 +2148,10 @@ impl TestAppServerBuilder {
         Ok(app_server)
     }
 }
+
+#[cfg(test)]
+#[path = "test_app_server_tests.rs"]
+mod tests;
 
 impl Drop for TestAppServer {
     fn drop(&mut self) {
