@@ -6,29 +6,30 @@
 )]
 
 use crate::DbTelemetry;
+use crate::migrations::repair_frodex_agent_path_migration_collision;
 use crate::migrations::repair_frodex_goal_supervisor_state_migration;
 use crate::migrations::repair_legacy_recency_migration_version;
 use crate::runtime::RuntimeDbInitError;
 use crate::telemetry;
 use crate::telemetry::DbKind;
-use anyhow::Context;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use log::LevelFilter;
 use sqlx::ConnectOptions;
 use sqlx::Error;
+use sqlx::Sqlite;
 use sqlx::SqlitePool;
+use sqlx::Transaction;
 use sqlx::migrate::Migrator;
 use sqlx::sqlite::SqliteAutoVacuum;
 use sqlx::sqlite::SqliteConnectOptions;
 use sqlx::sqlite::SqliteJournalMode;
 use sqlx::sqlite::SqlitePoolOptions;
 use sqlx::sqlite::SqliteSynchronous;
-use std::fs::File;
-use std::fs::OpenOptions;
 use std::path::Path;
 use std::path::PathBuf;
 use std::time::Duration;
 use std::time::Instant;
+use tracing::warn;
 
 const LOGS_DB_FILENAME: &str = "logs_2.sqlite";
 const GOALS_DB_FILENAME: &str = "goals_1.sqlite";
@@ -36,35 +37,140 @@ const MEMORIES_DB_FILENAME: &str = "memories_1.sqlite";
 const QUEUE_DB_FILENAME: &str = "queue_1.sqlite";
 const STATE_DB_FILENAME: &str = "state_5.sqlite";
 const THREAD_HISTORY_DB_FILENAME: &str = "thread_history_1.sqlite";
-const STATE_MIGRATION_LOCK_FILENAME: &str = ".state_5.sqlite.migration.lock";
 
-/// Holds cross-process ownership of state migration and compatibility repair.
-struct StateMigrationGuard {
-    _file: File,
+/// State migration boundaries used by rollback fault-injection tests.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum StateMigrationStep {
+    GoalSupervisorCompatibility,
+    AgentPathCompatibility,
+    RecencyCompatibility,
+    OfficialMigrations,
 }
 
-async fn acquire_state_migration_lock(sqlite_home: &Path) -> anyhow::Result<StateMigrationGuard> {
-    let path = sqlite_home.join(STATE_MIGRATION_LOCK_FILENAME);
-    let file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(&path)
-        .with_context(|| format!("failed to open state migration lock {}", path.display()))?;
+fn ensure_transactional_migrations(migrator: &Migrator) -> anyhow::Result<()> {
+    if migrator.no_tx || migrator.migrations.iter().any(|migration| migration.no_tx) {
+        anyhow::bail!("state migrations must all support the startup transaction");
+    }
+    Ok(())
+}
+
+fn is_sqlite_writer_contention(error: &sqlx::Error) -> bool {
+    let sqlx::Error::Database(database_error) = error else {
+        return false;
+    };
+    database_error
+        .code()
+        .and_then(|code| code.parse::<i32>().ok())
+        .is_some_and(|code| matches!(code & 0xff, 5 | 6))
+}
+
+async fn begin_state_migration_transaction<F>(
+    pool: &SqlitePool,
+    mut on_contention: F,
+) -> anyhow::Result<Transaction<'static, Sqlite>>
+where
+    F: FnMut(),
+{
     loop {
-        match file.try_lock() {
-            Ok(()) => return Ok(StateMigrationGuard { _file: file }),
-            Err(std::fs::TryLockError::WouldBlock) => {
+        match pool.begin_with("BEGIN IMMEDIATE").await {
+            Ok(transaction) => return Ok(transaction),
+            Err(error) if is_sqlite_writer_contention(&error) => {
+                on_contention();
                 tokio::time::sleep(Duration::from_millis(25)).await;
             }
-            Err(std::fs::TryLockError::Error(error)) => {
-                return Err(error).with_context(|| {
-                    format!("failed to acquire state migration lock {}", path.display())
-                });
-            }
+            Err(error) => return Err(error.into()),
         }
     }
+}
+
+async fn migrate_state_database_with_hooks<F, G>(
+    pool: &SqlitePool,
+    migrator: &Migrator,
+    mut after_step: F,
+    on_contention: G,
+) -> anyhow::Result<()>
+where
+    F: FnMut(StateMigrationStep) -> anyhow::Result<()>,
+    G: FnMut(),
+{
+    ensure_transactional_migrations(migrator)?;
+
+    let mut transaction = begin_state_migration_transaction(pool, on_contention).await?;
+    let migration_result = async {
+        repair_frodex_goal_supervisor_state_migration(&mut transaction).await?;
+        after_step(StateMigrationStep::GoalSupervisorCompatibility)?;
+        let repaired_agent_path =
+            repair_frodex_agent_path_migration_collision(&mut transaction, migrator).await?;
+        after_step(StateMigrationStep::AgentPathCompatibility)?;
+        repair_legacy_recency_migration_version(&mut transaction, migrator).await?;
+        after_step(StateMigrationStep::RecencyCompatibility)?;
+        migrator
+            .run_direct(None, &mut *transaction, false)
+            .await
+            .map_err(anyhow::Error::from)?;
+        after_step(StateMigrationStep::OfficialMigrations)?;
+        Ok::<_, anyhow::Error>(repaired_agent_path)
+    }
+    .await;
+
+    let repaired_agent_path = match migration_result {
+        Ok(repaired_agent_path) => {
+            transaction.commit().await?;
+            repaired_agent_path
+        }
+        Err(error) => {
+            if let Err(rollback_error) = transaction.rollback().await {
+                return Err(error.context(format!(
+                    "state migration failed and its rollback also failed: {rollback_error}"
+                )));
+            }
+            return Err(error);
+        }
+    };
+
+    if repaired_agent_path {
+        warn!(
+            migration_version = 48,
+            "repaired released Frodex state migration collision"
+        );
+    }
+    Ok(())
+}
+
+async fn migrate_state_database(pool: &SqlitePool, migrator: &Migrator) -> anyhow::Result<()> {
+    migrate_state_database_with_hooks(pool, migrator, |_| Ok(()), || {}).await
+}
+
+#[cfg(test)]
+pub(crate) async fn migrate_state_database_with_fault(
+    pool: &SqlitePool,
+    migrator: &Migrator,
+    fault: StateMigrationStep,
+) -> anyhow::Result<()> {
+    migrate_state_database_with_hooks(
+        pool,
+        migrator,
+        |completed| {
+            if completed == fault {
+                anyhow::bail!("injected state migration failure after {completed:?}");
+            }
+            Ok(())
+        },
+        || {},
+    )
+    .await
+}
+
+#[cfg(test)]
+pub(crate) async fn migrate_state_database_with_contention_hook<F>(
+    pool: &SqlitePool,
+    migrator: &Migrator,
+    on_contention: F,
+) -> anyhow::Result<()>
+where
+    F: FnMut(),
+{
+    migrate_state_database_with_hooks(pool, migrator, |_| Ok(()), on_contention).await
 }
 
 #[derive(Clone, Copy)]
@@ -270,10 +376,17 @@ impl SqliteConfig {
     ) -> anyhow::Result<SqlitePool> {
         let path = spec.path(self.home());
         let started = Instant::now();
-        let pool_result = self
-            .open_read_write_pool(&path)
-            .await
-            .map_err(anyhow::Error::from);
+        let pool_result = loop {
+            match self.open_read_write_pool(&path).await {
+                Err(error)
+                    if matches!(spec.kind, DbKind::State)
+                        && is_sqlite_writer_contention(&error) =>
+                {
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                }
+                result => break result.map_err(anyhow::Error::from),
+            }
+        };
         telemetry::record_init_result(
             telemetry_override,
             spec.kind,
@@ -286,18 +399,11 @@ impl SqliteConfig {
         })?;
         let started = Instant::now();
         let migrate_result = async {
-            // SQLite's SQLx migration lock is a no-op. Keep deletion of a released Frodex
-            // collision row and the official migration run inside one cross-process exclusion.
-            let _state_migration_guard = if matches!(spec.kind, DbKind::State) {
-                Some(acquire_state_migration_lock(self.home()).await?)
-            } else {
-                None
-            };
             if matches!(spec.kind, DbKind::State) {
-                repair_frodex_goal_supervisor_state_migration(&pool).await?;
-                repair_legacy_recency_migration_version(&pool, migrator).await?;
+                migrate_state_database(&pool, migrator).await
+            } else {
+                migrator.run(&pool).await.map_err(anyhow::Error::from)
             }
-            migrator.run(&pool).await.map_err(anyhow::Error::from)
         }
         .await;
         telemetry::record_init_result(

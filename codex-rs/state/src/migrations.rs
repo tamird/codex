@@ -2,11 +2,21 @@ use std::borrow::Cow;
 
 use anyhow::Context;
 use anyhow::bail;
-use sqlx::Connection;
 use sqlx::Row;
 use sqlx::SqliteConnection;
-use sqlx::SqlitePool;
 use sqlx::migrate::Migrator;
+
+const LEGACY_FRODEX_AGENT_PATH_MIGRATION_VERSION: i64 = 48;
+const LEGACY_FRODEX_AGENT_PATH_MIGRATION_DESCRIPTION: &str = "threads agent path index";
+const LEGACY_FRODEX_AGENT_PATH_MIGRATION_CHECKSUM_HEX: &str = "6e2da6fd82ca71d665d712527262760e81a468eed448e940173e94d330286527508503b739159ed4424e8e0a8f9036d5";
+const LEGACY_FRODEX_AGENT_PATH_INDEX: &str = "idx_threads_agent_path";
+const LEGACY_FRODEX_AGENT_PATH_INDEX_SQL: &str = r#"
+CREATE INDEX idx_threads_agent_path
+    ON threads(agent_path)
+    WHERE agent_path IS NOT NULL
+"#;
+const UPSTREAM_THREAD_SECTION_APPEARANCE_SQL: &str =
+    "ALTER TABLE thread_sections ADD COLUMN appearance TEXT;\n";
 
 const FRODEX_GOAL_SUPERVISOR_MIGRATION_DESCRIPTION: &str = "thread goal supervisor state";
 const FRODEX_GOAL_SUPERVISOR_MIGRATION_CHECKSUM: [u8; 48] = [
@@ -77,12 +87,12 @@ pub(crate) fn runtime_thread_history_migrator() -> Migrator {
 /// migrator can apply those versions. The legacy table remains until its rows are durably copied
 /// to the goals database.
 pub(crate) async fn repair_frodex_goal_supervisor_state_migration(
-    pool: &SqlitePool,
+    connection: &mut SqliteConnection,
 ) -> anyhow::Result<()> {
     let migrations_table_exists = sqlx::query_scalar::<_, i64>(
         "SELECT COUNT(*) FROM sqlite_schema WHERE type = 'table' AND name = '_sqlx_migrations'",
     )
-    .fetch_one(pool)
+    .fetch_one(&mut *connection)
     .await?
         != 0;
     if !migrations_table_exists {
@@ -92,23 +102,10 @@ pub(crate) async fn repair_frodex_goal_supervisor_state_migration(
         "SELECT COUNT(*) FROM _sqlx_migrations WHERE version IN (33, 34) AND description = ?",
     )
     .bind(FRODEX_GOAL_SUPERVISOR_MIGRATION_DESCRIPTION)
-    .fetch_one(pool)
+    .fetch_one(&mut *connection)
     .await?
         != 0;
     if !candidate_exists {
-        return Ok(());
-    }
-
-    let mut connection = pool.acquire().await?;
-    let mut transaction = connection.begin_with("BEGIN IMMEDIATE").await?;
-    let migrations_table_exists = sqlx::query_scalar::<_, i64>(
-        "SELECT COUNT(*) FROM sqlite_schema WHERE type = 'table' AND name = '_sqlx_migrations'",
-    )
-    .fetch_one(&mut *transaction)
-    .await?
-        != 0;
-    if !migrations_table_exists {
-        transaction.commit().await?;
         return Ok(());
     }
 
@@ -122,10 +119,9 @@ ORDER BY version
         "#,
     )
     .bind(FRODEX_GOAL_SUPERVISOR_MIGRATION_DESCRIPTION)
-    .fetch_all(&mut *transaction)
+    .fetch_all(&mut *connection)
     .await?;
     if candidate_rows.is_empty() {
-        transaction.commit().await?;
         return Ok(());
     }
     if candidate_rows.len() != 1 {
@@ -142,8 +138,8 @@ ORDER BY version
         );
     }
 
-    validate_frodex_goal_supervisor_state_table_on(&mut transaction).await?;
-    validate_frodex_goal_supervisor_ledger_on(&mut transaction, version).await?;
+    validate_frodex_goal_supervisor_state_table_on(connection).await?;
+    validate_frodex_goal_supervisor_ledger_on(connection, version).await?;
 
     let result = sqlx::query(
         r#"
@@ -157,13 +153,232 @@ WHERE version = ?
     .bind(version)
     .bind(FRODEX_GOAL_SUPERVISOR_MIGRATION_DESCRIPTION)
     .bind(FRODEX_GOAL_SUPERVISOR_MIGRATION_CHECKSUM.as_slice())
-    .execute(&mut *transaction)
+    .execute(&mut *connection)
     .await
     .context("removing authenticated Frodex goal supervisor migration row")?;
     if result.rows_affected() != 1 {
         bail!("authenticated Frodex goal supervisor migration row changed during repair");
     }
-    transaction.commit().await?;
+    Ok(())
+}
+
+async fn validate_agent_path_index(
+    connection: &mut SqliteConnection,
+    index_name: &str,
+    forced_query: &'static str,
+) -> anyhow::Result<()> {
+    let index_shape = sqlx::query_as::<_, (i64, i64, i64)>(
+        r#"
+SELECT
+    (SELECT COUNT(*) FROM pragma_index_info(?)),
+    (SELECT COUNT(*)
+     FROM pragma_index_list('threads')
+     WHERE name = ? AND partial = 1),
+    (SELECT COUNT(*)
+     FROM pragma_index_list('threads')
+     WHERE name = ? AND "unique" = 1)
+        "#,
+    )
+    .bind(index_name)
+    .bind(index_name)
+    .bind(index_name)
+    .fetch_one(&mut *connection)
+    .await?;
+    let index_column = sqlx::query_scalar::<_, String>("SELECT name FROM pragma_index_info(?)")
+        .bind(index_name)
+        .fetch_optional(&mut *connection)
+        .await?;
+    if index_shape != (1, 1, 0) || index_column.as_deref() != Some("agent_path") {
+        anyhow::bail!("index {index_name} does not match the Frodex agent-path index schema");
+    }
+    let index_sql = sqlx::query_scalar::<_, String>(
+        "SELECT sql FROM sqlite_schema WHERE type = 'index' AND name = ?",
+    )
+    .bind(index_name)
+    .fetch_optional(&mut *connection)
+    .await?
+    .context("released Frodex agent-path index is missing its SQL definition")?;
+    if normalize_schema_sql(&index_sql) != normalize_schema_sql(LEGACY_FRODEX_AGENT_PATH_INDEX_SQL)
+    {
+        anyhow::bail!("index {index_name} does not match the released Frodex index SQL");
+    }
+    sqlx::query(forced_query)
+        .bind("__frodex_index_validation__")
+        .fetch_all(&mut *connection)
+        .await
+        .with_context(|| format!("index {index_name} cannot satisfy the agent-path query"))?;
+    Ok(())
+}
+
+/// Convert the released Frodex migration-48 ledger entry to upstream migration 48.
+///
+/// Frodex alpha.6 and official Codex alpha.7 assigned version 48 to different SQL while sharing
+/// `state_5.sqlite`. This repair recognizes only the exact released Frodex checksum and schema,
+/// applies upstream's migration in the same writer transaction, and restores the upstream ledger
+/// entry. Every other checksum mismatch remains SQLx's responsibility and fails closed.
+pub(crate) async fn repair_frodex_agent_path_migration_collision(
+    connection: &mut SqliteConnection,
+    migrator: &Migrator,
+) -> anyhow::Result<bool> {
+    let Some(upstream_migration) = migrator
+        .migrations
+        .iter()
+        .find(|migration| migration.version == LEGACY_FRODEX_AGENT_PATH_MIGRATION_VERSION)
+    else {
+        return Ok(false);
+    };
+    if upstream_migration.description != "thread section appearance"
+        || upstream_migration.sql.as_str() != UPSTREAM_THREAD_SECTION_APPEARANCE_SQL
+    {
+        anyhow::bail!("embedded state migration 48 does not match upstream appearance migration");
+    }
+    let migrations_table_exists = sqlx::query_scalar::<_, i64>(
+        "SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = '_sqlx_migrations'",
+    )
+    .fetch_optional(&mut *connection)
+    .await?
+    .is_some();
+    if !migrations_table_exists {
+        return Ok(false);
+    }
+    let legacy_row_exists = sqlx::query_scalar::<_, i64>(
+        r#"
+SELECT 1
+FROM _sqlx_migrations
+WHERE version = ?
+  AND success = 1
+  AND description = ?
+  AND lower(hex(checksum)) = ?
+        "#,
+    )
+    .bind(LEGACY_FRODEX_AGENT_PATH_MIGRATION_VERSION)
+    .bind(LEGACY_FRODEX_AGENT_PATH_MIGRATION_DESCRIPTION)
+    .bind(LEGACY_FRODEX_AGENT_PATH_MIGRATION_CHECKSUM_HEX)
+    .fetch_optional(&mut *connection)
+    .await?
+    .is_some();
+    if !legacy_row_exists {
+        return Ok(false);
+    }
+
+    validate_frodex_agent_path_predecessor_ledger(connection, migrator).await?;
+    validate_agent_path_index(
+        connection,
+        LEGACY_FRODEX_AGENT_PATH_INDEX,
+        "EXPLAIN QUERY PLAN SELECT id FROM threads INDEXED BY idx_threads_agent_path WHERE agent_path = ?",
+    )
+    .await
+    .context("refusing to repair Frodex migration 48")?;
+
+    let appearance_shape = sqlx::query_as::<_, (String, i64, Option<String>, i64)>(
+        r#"
+SELECT type, "notnull", dflt_value, pk
+FROM pragma_table_info('thread_sections')
+WHERE name = 'appearance'
+        "#,
+    )
+    .fetch_optional(&mut *connection)
+    .await?;
+    match appearance_shape {
+        None => {
+            sqlx::query(UPSTREAM_THREAD_SECTION_APPEARANCE_SQL)
+                .execute(&mut *connection)
+                .await
+                .context("applying upstream state migration 48 during Frodex repair")?;
+        }
+        Some((column_type, not_null, default_value, primary_key))
+            if column_type.eq_ignore_ascii_case("TEXT")
+                && not_null == 0
+                && default_value.is_none()
+                && primary_key == 0 => {}
+        Some(_) => anyhow::bail!(
+            "refusing to repair Frodex migration 48 because thread_sections.appearance does not match upstream"
+        ),
+    }
+
+    sqlx::query("DROP INDEX idx_threads_agent_path")
+        .execute(&mut *connection)
+        .await?;
+
+    let updated = sqlx::query(
+        r#"
+UPDATE _sqlx_migrations
+SET description = ?, checksum = ?
+WHERE version = ?
+  AND success = 1
+  AND description = ?
+  AND lower(hex(checksum)) = ?
+        "#,
+    )
+    .bind(upstream_migration.description.as_ref())
+    .bind(upstream_migration.checksum.as_ref())
+    .bind(LEGACY_FRODEX_AGENT_PATH_MIGRATION_VERSION)
+    .bind(LEGACY_FRODEX_AGENT_PATH_MIGRATION_DESCRIPTION)
+    .bind(LEGACY_FRODEX_AGENT_PATH_MIGRATION_CHECKSUM_HEX)
+    .execute(&mut *connection)
+    .await?;
+    if updated.rows_affected() != 1 {
+        anyhow::bail!("Frodex migration 48 repair did not update exactly one ledger row");
+    }
+    Ok(true)
+}
+
+async fn validate_frodex_agent_path_predecessor_ledger(
+    connection: &mut SqliteConnection,
+    migrator: &Migrator,
+) -> anyhow::Result<()> {
+    let rows = sqlx::query(
+        "SELECT version, description, success, checksum FROM _sqlx_migrations WHERE version < 48 ORDER BY version",
+    )
+    .fetch_all(&mut *connection)
+    .await?;
+    let expected_predecessors = migrator
+        .migrations
+        .iter()
+        .filter(|migration| migration.version < LEGACY_FRODEX_AGENT_PATH_MIGRATION_VERSION)
+        .collect::<Vec<_>>();
+    let mut row_index = 0;
+    let mut missing_goal_supervisor_version = None;
+    for expected in expected_predecessors {
+        let row = rows.get(row_index);
+        let row_version = row
+            .map(|row| row.try_get::<i64, _>("version"))
+            .transpose()?;
+        if row_version == Some(expected.version) {
+            let row = row.context("migration predecessor row disappeared")?;
+            let description: String = row.try_get("description")?;
+            let success: bool = row.try_get("success")?;
+            let checksum: Vec<u8> = row.try_get("checksum")?;
+            if !success
+                || description != expected.description
+                || checksum.as_slice() != expected.checksum.as_ref()
+            {
+                bail!(
+                    "refusing to repair Frodex migration 48 because predecessor migration {} is not official",
+                    expected.version
+                );
+            }
+            row_index += 1;
+            continue;
+        }
+        if !matches!(expected.version, 33 | 34) || missing_goal_supervisor_version.is_some() {
+            bail!(
+                "refusing to repair Frodex migration 48 because predecessor migration {} is missing",
+                expected.version
+            );
+        }
+        missing_goal_supervisor_version = Some(expected.version);
+    }
+    if row_index != rows.len() {
+        bail!("refusing to repair Frodex migration 48 because its predecessor ledger is unknown");
+    }
+    if missing_goal_supervisor_version.is_some() {
+        validate_frodex_goal_supervisor_state_table_on(connection)
+            .await
+            .context(
+                "refusing to repair Frodex migration 48 with an unauthenticated goal supervisor predecessor",
+            )?;
+    }
     Ok(())
 }
 
@@ -318,7 +533,7 @@ WHERE tbl_name = 'thread_goal_supervisor_state'
 }
 
 pub(crate) async fn repair_legacy_recency_migration_version(
-    pool: &SqlitePool,
+    connection: &mut SqliteConnection,
     migrator: &Migrator,
 ) -> anyhow::Result<()> {
     let Some(recency_migration) = migrator
@@ -331,7 +546,7 @@ pub(crate) async fn repair_legacy_recency_migration_version(
     let migrations_table_exists = sqlx::query_scalar::<_, i64>(
         "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = '_sqlx_migrations'",
     )
-    .fetch_optional(pool)
+    .fetch_optional(&mut *connection)
     .await?
     .is_some();
     if !migrations_table_exists {
@@ -352,7 +567,7 @@ WHERE version = ?
     .bind(38_i64)
     .bind(recency_migration.checksum.as_ref())
     .bind(recency_migration.version)
-    .fetch_optional(pool)
+    .fetch_optional(&mut *connection)
     .await?
     .is_some();
     if !legacy_recency_needs_repair {
@@ -375,7 +590,7 @@ WHERE version = ?
     .bind(38_i64)
     .bind(recency_migration.checksum.as_ref())
     .bind(recency_migration.version)
-    .execute(pool)
+    .execute(&mut *connection)
     .await?;
     Ok(())
 }
