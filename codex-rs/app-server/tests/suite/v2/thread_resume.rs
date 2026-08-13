@@ -2619,6 +2619,323 @@ async fn thread_resume_keeps_paused_goal_paused() -> Result<()> {
 }
 
 #[tokio::test]
+async fn app_server_restart_recovers_overdue_goal_without_thread_resume() -> Result<()> {
+    let server = create_mock_responses_server_repeating_assistant("Done").await;
+    let codex_home = TempDir::new()?;
+    mock_responses_config(&server.uri()).write(codex_home.path())?;
+    let config_path = codex_home.path().join("config.toml");
+    let config = std::fs::read_to_string(&config_path)?;
+    std::fs::write(
+        &config_path,
+        config.replace(
+            "personality = true\n",
+            "personality = true\ngoals = true\ngoal_supervisor = true\n",
+        ),
+    )?;
+    let thread_id = create_fake_rollout(
+        codex_home.path(),
+        "2025-01-05T12-00-00",
+        "2025-01-05T12:00:00Z",
+        "continue without a client resume",
+        Some("mock_provider"),
+        /*git_info*/ None,
+    )?;
+    let thread_id = ThreadId::from_string(thread_id.as_str())?;
+    let state_db = StateRuntime::init(
+        codex_state::SqliteConfig::new_for_testing(codex_home.path().abs()),
+        "mock_provider".into(),
+    )
+    .await?;
+    let goal = state_db
+        .thread_goals()
+        .replace_thread_goal(
+            thread_id,
+            "continue after app-server restart",
+            codex_state::ThreadGoalStatus::Active,
+            /*token_budget*/ None,
+        )
+        .await?;
+    state_db
+        .thread_goals()
+        .set_thread_goal_supervisor_snoozed_until_ms(
+            thread_id,
+            &goal.goal_id,
+            Some(Utc::now().timestamp_millis() + 60_000),
+        )
+        .await?;
+
+    let mut first = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .without_managed_config()
+        .build()
+        .await?;
+    timeout(DEFAULT_READ_TIMEOUT, first.initialize()).await??;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(
+        server
+            .received_requests()
+            .await
+            .is_some_and(|requests| requests.is_empty()),
+        "the future deadline must not run before restart"
+    );
+    first.shutdown_gracefully().await?;
+    state_db
+        .thread_goals()
+        .set_thread_goal_supervisor_snoozed_until_ms(
+            thread_id,
+            &goal.goal_id,
+            Some(Utc::now().timestamp_millis() - 1),
+        )
+        .await?;
+
+    let mut second = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .without_managed_config()
+        .build()
+        .await?;
+    timeout(DEFAULT_READ_TIMEOUT, second.initialize()).await??;
+    wait_for_responses_request_count(&server, /*expected_count*/ 1).await?;
+    let requests = server
+        .received_requests()
+        .await
+        .expect("wiremock should record requests");
+    let request = requests
+        .iter()
+        .find(|request| request.url.path().ends_with("/responses"))
+        .expect("goal supervisor should make a Responses request");
+    let body: serde_json::Value = serde_json::from_slice(request.body.as_slice())?;
+    let input = body
+        .get("input")
+        .expect("Responses request should contain input")
+        .to_string();
+    assert!(input.contains("# Goal Supervisor Assignment"));
+    assert!(input.contains("continue after app-server restart"));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn scheduler_materialized_thread_unloads_after_supervisor_snoozes() -> Result<()> {
+    let server = MockServer::start().await;
+    let _response_mock = responses::mount_sse_once(
+        &server,
+        responses::sse(vec![
+            responses::ev_response_created("supervisor-response"),
+            responses::ev_function_call_with_namespace(
+                "snooze-call",
+                "supervisor",
+                "snooze",
+                &json!({"delay_seconds": 3_600}).to_string(),
+            ),
+            responses::ev_completed("supervisor-response"),
+        ]),
+    )
+    .await;
+    let codex_home = TempDir::new()?;
+    mock_responses_config(&server.uri()).write(codex_home.path())?;
+    let config_path = codex_home.path().join("config.toml");
+    let config = std::fs::read_to_string(&config_path)?;
+    std::fs::write(
+        &config_path,
+        config.replace(
+            "personality = true\n",
+            "personality = true\ngoals = true\ngoal_supervisor = true\n",
+        ),
+    )?;
+    let thread_id = create_fake_rollout(
+        codex_home.path(),
+        "2025-01-05T12-00-00",
+        "2025-01-05T12:00:00Z",
+        "snooze and unload",
+        Some("mock_provider"),
+        /*git_info*/ None,
+    )?;
+    let thread_id = ThreadId::from_string(thread_id.as_str())?;
+    let state_db = StateRuntime::init(
+        codex_state::SqliteConfig::new_for_testing(codex_home.path().abs()),
+        "mock_provider".into(),
+    )
+    .await?;
+    let goal = state_db
+        .thread_goals()
+        .replace_thread_goal(
+            thread_id,
+            "snooze after checking",
+            codex_state::ThreadGoalStatus::Active,
+            /*token_budget*/ None,
+        )
+        .await?;
+    // Do not initialize the protocol connection until the process-owned scheduler has run. This
+    // leaves the cold-resumed thread without a subscriber, as it would be after Desktop disconnects.
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .without_managed_config()
+        .build()
+        .await?;
+    wait_for_responses_request_count(&server, /*expected_count*/ 1).await?;
+    timeout(DEFAULT_READ_TIMEOUT, async {
+        loop {
+            let snoozed_until_ms = state_db
+                .thread_goals()
+                .get_thread_goal_supervisor_snoozed_until_ms(thread_id, &goal.goal_id)
+                .await?;
+            if snoozed_until_ms.is_some_and(|deadline| deadline > Utc::now().timestamp_millis()) {
+                return Ok::<(), anyhow::Error>(());
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await??;
+
+    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+    timeout(DEFAULT_READ_TIMEOUT, async {
+        loop {
+            let request_id = mcp
+                .send_thread_loaded_list_request(ThreadLoadedListParams::default())
+                .await?;
+            let response = mcp
+                .read_stream_until_response_message(RequestId::Integer(request_id))
+                .await?;
+            let ThreadLoadedListResponse { data, .. } = to_response(response)?;
+            if data
+                .iter()
+                .all(|loaded_id| loaded_id != &thread_id.to_string())
+            {
+                return Ok::<(), anyhow::Error>(());
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await??;
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn scheduler_materialized_thread_unloads_and_retries_after_supervisor_failure() -> Result<()>
+{
+    let server = MockServer::start().await;
+    let _response_mock = responses::mount_sse_sequence(
+        &server,
+        vec![
+            responses::sse_failed(
+                "supervisor-failure-1",
+                "model_not_found",
+                "saved model unavailable",
+            ),
+            responses::sse_failed(
+                "supervisor-failure-2",
+                "model_not_found",
+                "saved model unavailable",
+            ),
+        ],
+    )
+    .await;
+    let codex_home = TempDir::new()?;
+    mock_responses_config(&server.uri()).write(codex_home.path())?;
+    let config_path = codex_home.path().join("config.toml");
+    let config = std::fs::read_to_string(&config_path)?;
+    std::fs::write(
+        &config_path,
+        config.replace(
+            "personality = true\n",
+            "personality = true\ngoals = true\ngoal_supervisor = true\n",
+        ),
+    )?;
+    let thread_id = create_fake_rollout(
+        codex_home.path(),
+        "2025-01-05T12-00-00",
+        "2025-01-05T12:00:00Z",
+        "retry a failed goal supervisor",
+        Some("mock_provider"),
+        /*git_info*/ None,
+    )?;
+    let thread_id = ThreadId::from_string(thread_id.as_str())?;
+    let state_db = StateRuntime::init(
+        codex_state::SqliteConfig::new_for_testing(codex_home.path().abs()),
+        "mock_provider".into(),
+    )
+    .await?;
+    let goal = state_db
+        .thread_goals()
+        .replace_thread_goal(
+            thread_id,
+            "continue after a transient supervisor failure",
+            codex_state::ThreadGoalStatus::Active,
+            /*token_budget*/ None,
+        )
+        .await?;
+
+    let mut first = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .without_managed_config()
+        .build()
+        .await?;
+    wait_for_responses_request_count(&server, /*expected_count*/ 1).await?;
+    let first_deadline_ms = timeout(DEFAULT_READ_TIMEOUT, async {
+        loop {
+            if let Some(deadline_ms) = state_db
+                .thread_goals()
+                .get_thread_goal_supervisor_snoozed_until_ms(thread_id, &goal.goal_id)
+                .await?
+                && deadline_ms > Utc::now().timestamp_millis()
+            {
+                return Ok::<i64, anyhow::Error>(deadline_ms);
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await??;
+    assert!(
+        first_deadline_ms - Utc::now().timestamp_millis() <= 60_000,
+        "the first automatic failure retry should use the one-minute tier"
+    );
+
+    timeout(DEFAULT_READ_TIMEOUT, first.initialize()).await??;
+    timeout(DEFAULT_READ_TIMEOUT, async {
+        loop {
+            let request_id = first
+                .send_thread_loaded_list_request(ThreadLoadedListParams::default())
+                .await?;
+            let response = first
+                .read_stream_until_response_message(RequestId::Integer(request_id))
+                .await?;
+            let ThreadLoadedListResponse { data, .. } = to_response(response)?;
+            if data
+                .iter()
+                .all(|loaded_id| loaded_id != &thread_id.to_string())
+            {
+                return Ok::<(), anyhow::Error>(());
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await??;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    wait_for_responses_request_count(&server, /*expected_count*/ 1).await?;
+
+    drop(first);
+    state_db
+        .thread_goals()
+        .set_thread_goal_supervisor_snoozed_until_ms(
+            thread_id,
+            &goal.goal_id,
+            Some(Utc::now().timestamp_millis() - 1),
+        )
+        .await?;
+    let _second = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .without_managed_config()
+        .build()
+        .await?;
+    wait_for_responses_request_count(&server, /*expected_count*/ 2).await?;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    wait_for_responses_request_count(&server, /*expected_count*/ 2).await?;
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn thread_goal_set_enforces_configured_maximum_token_budget() -> Result<()> {
     let server = create_mock_responses_server_repeating_assistant("Done").await;
     let codex_home = TempDir::new()?;

@@ -41,6 +41,12 @@ pub(crate) enum ActiveGoalStopReason {
     UsageLimit,
 }
 
+#[derive(Clone, Copy)]
+enum GoalContinuationTrigger {
+    ThreadIdle,
+    GoalResumed,
+}
+
 struct GoalRuntimeInner {
     thread_id: ThreadId,
     state_dbs: Arc<codex_state::StateRuntime>,
@@ -188,6 +194,10 @@ impl GoalRuntimeHandle {
         let previous_status = previous_goal
             .as_ref()
             .and_then(|previous_goal| (!replaced_existing_goal).then_some(previous_goal.status));
+        let resumed_goal = previous_status.is_some_and(|status| {
+            status != codex_state::ThreadGoalStatus::Active
+                && goal.status == codex_state::ThreadGoalStatus::Active
+        });
         self.inner
             .metrics
             .record_resumed_if_status_changed(previous_status, goal.status);
@@ -216,7 +226,11 @@ impl GoalRuntimeHandle {
                     let item = objective_updated_steering_item(&protocol_goal_from_state(goal));
                     self.inject_active_turn_steering(item).await;
                 }
-                self.continue_if_idle().await?;
+                if resumed_goal {
+                    self.continue_if_idle_after_goal_resume().await?;
+                } else {
+                    self.continue_if_idle().await?;
+                }
             }
             codex_state::ThreadGoalStatus::BudgetLimited => {
                 if self.inner.accounting_state.current_turn_id().is_none() {
@@ -368,6 +382,19 @@ impl GoalRuntimeHandle {
     }
 
     pub(crate) async fn continue_if_idle(&self) -> Result<(), String> {
+        self.continue_if_idle_for_trigger(GoalContinuationTrigger::ThreadIdle)
+            .await
+    }
+
+    async fn continue_if_idle_after_goal_resume(&self) -> Result<(), String> {
+        self.continue_if_idle_for_trigger(GoalContinuationTrigger::GoalResumed)
+            .await
+    }
+
+    async fn continue_if_idle_for_trigger(
+        &self,
+        trigger: GoalContinuationTrigger,
+    ) -> Result<(), String> {
         if !self.tools_visible() {
             self.inner.accounting_state.clear_active_goal();
             return Ok(());
@@ -411,7 +438,25 @@ impl GoalRuntimeHandle {
             self.inner.accounting_state.clear_active_goal();
             return Ok(());
         }
-        let item = continuation_steering_item(&protocol_goal_from_state(goal));
+        let goal_id = goal.goal_id.clone();
+        let goal = protocol_goal_from_state(goal);
+        let supervisor_started = match trigger {
+            GoalContinuationTrigger::ThreadIdle => {
+                thread
+                    .maybe_start_goal_supervisor_checkin(goal_id.as_str(), &goal)
+                    .await
+            }
+            GoalContinuationTrigger::GoalResumed => {
+                thread
+                    .maybe_start_goal_supervisor_checkin_after_goal_resume(goal_id.as_str(), &goal)
+                    .await
+            }
+        }
+        .map_err(|err| err.to_string())?;
+        if supervisor_started {
+            return Ok(());
+        }
+        let item = continuation_steering_item(&goal);
 
         match thread
             .start_turn_if_idle(

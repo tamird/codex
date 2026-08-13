@@ -15,6 +15,7 @@ workspace = true
 
 [dependencies]
 codex-analytics = { workspace = true }
+chrono = { workspace = true }
 codex-core = { workspace = true }
 codex-extension-api = { workspace = true }
 codex-otel = { workspace = true }
