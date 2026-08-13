@@ -26,7 +26,7 @@ use serde_json::Value;
 use serde_json::json;
 use test_case::test_case;
 
-const NO_SPAWN_TEXT: &str = "Any earlier instruction enabling proactive multi-agent delegation no longer applies. Do not spawn sub-agents unless the user or applicable AGENTS.md/skill instructions explicitly ask for sub-agents, delegation, or parallel agent work.";
+const NO_SPAWN_TEXT: &str = "Multi-agent delegation mode instructions are inactive. Any earlier multi-agent mode developer message no longer applies.";
 const PROACTIVE_TEXT: &str = "Proactive multi-agent delegation is active.";
 const CUSTOM_MODE_HINT_TEXT: &str = "Use the configured delegation policy.";
 const CATALOG_MODE_HINT_TEXT: &str = "Use the model catalog delegation policy.";
@@ -400,7 +400,7 @@ async fn changing_configured_mode_hint_to_empty_emits_no_update() -> Result<()> 
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn live_mode_change_appends_mode_without_reappending_usage_hint() -> Result<()> {
+async fn live_effort_change_keeps_proactive_mode_without_reappending_usage_hint() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
     let server = start_mock_server().await;
@@ -455,7 +455,7 @@ async fn live_mode_change_appends_mode_without_reappending_usage_hint() -> Resul
             count_containing(&second_texts, PROACTIVE_TEXT),
             count_containing(&second_texts, NO_SPAWN_TEXT),
         ),
-        (1, 1, 1),
+        (1, 1, 0),
     );
     test.codex.ensure_rollout_materialized().await;
     test.codex.flush_rollout().await?;
@@ -472,16 +472,13 @@ async fn live_mode_change_appends_mode_without_reappending_usage_hint() -> Resul
                 .cloned()
         })
         .collect::<Vec<_>>();
-    assert_eq!(
-        recorded_modes,
-        [json!("proactive"), json!("explicitRequestOnly")]
-    );
+    assert_eq!(recorded_modes, [json!("proactive")]);
 
     Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn leaving_ultra_after_cold_resume_emits_explicit_mode() -> Result<()> {
+async fn leaving_ultra_after_cold_resume_keeps_proactive_mode() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
     let server = start_mock_server().await;
@@ -532,7 +529,7 @@ async fn leaving_ultra_after_cold_resume_emits_explicit_mode() -> Result<()> {
             count_containing(&texts, NO_SPAWN_TEXT),
             count_containing(&texts, PROACTIVE_TEXT),
         ),
-        (2, 1, 1)
+        (1, 0, 1)
     );
 
     Ok(())
@@ -551,6 +548,10 @@ async fn ultra_on_multi_agent_v1_uses_highest_non_ultra_without_mode_instruction
     let test = test_codex()
         .with_model_info_override("gpt-5.4", add_ultra_reasoning)
         .with_config(|config| {
+            config
+                .features
+                .disable(Feature::MultiAgentV2)
+                .expect("multi-agent V1 scenario should disable V2");
             config.model_reasoning_effort = Some(ReasoningEffort::Ultra);
         })
         .build(&server)

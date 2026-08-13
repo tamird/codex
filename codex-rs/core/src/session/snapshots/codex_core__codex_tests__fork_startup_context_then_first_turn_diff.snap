@@ -5,10 +5,14 @@ expression: snapshot
 Scenario: First request after fork when startup preserves the parent baseline, the fork changes approval policy, and the first forked turn enters plan mode.
 
 ## First Forked Turn Request
-00:message/developer:<PERMISSIONS_INSTRUCTIONS>
-01:message/user:<ENVIRONMENT_CONTEXT:cwd=<CWD>>
-02:message/user:fork seed
-03:message/developer[2]:
+00:message/developer[2]:
+    [01] # You are the Root Agent\n\nYou are the **root agent** in a multi-agent Codex session. Until you...
+    [02] <PERMISSIONS_INSTRUCTIONS>
+01:message/developer:You are `/root`, the primary agent in a team of agents collaborating to fulfill the user's goals...
+02:message/developer:<multi_agent_mode>Proactive multi-agent delegation is active. Any earlier instruction requiring ...
+03:message/user:<ENVIRONMENT_CONTEXT:cwd=<CWD>>
+04:message/user:fork seed
+05:message/developer[2]:
     [01] <PERMISSIONS_INSTRUCTIONS>
     [02] <collaboration_mode>Fork turn collaboration instructions.</collaboration_mode>
-04:message/user:after fork
+06:message/user:after fork

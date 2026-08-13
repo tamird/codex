@@ -4,7 +4,7 @@ use codex_protocol::models::ContentItemKind;
 use codex_protocol::protocol::MULTI_AGENT_MODE_CLOSE_TAG;
 use codex_protocol::protocol::MULTI_AGENT_MODE_OPEN_TAG;
 
-const EXPLICIT_REQUEST_ONLY_MULTI_AGENT_MODE_TEXT: &str = "Any earlier instruction enabling proactive multi-agent delegation no longer applies. Do not spawn sub-agents unless the user or applicable AGENTS.md/skill instructions explicitly ask for sub-agents, delegation, or parallel agent work.";
+const NO_MULTI_AGENT_MODE_TEXT: &str = "Multi-agent delegation mode instructions are inactive. Any earlier multi-agent mode developer message no longer applies.";
 const PROACTIVE_MULTI_AGENT_MODE_TEXT: &str = "Proactive multi-agent delegation is active. Any earlier developer instruction requiring an explicit user request before spawning sub-agents no longer applies. This mode remains active until a later multi-agent mode developer message changes it. User requests override this hint.\n\nIf any point you can parallelize work by delegating tasks to another agent (no matter if you are root or subagent), you should do so using collaboration tools if it could save time or improve quality.";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -45,9 +45,8 @@ impl ContextualUserFragment for MultiAgentModeInstructions {
     fn body(&self) -> String {
         match &self.multi_agent_mode {
             MultiAgentMode::Custom(hint_text) => hint_text.clone(),
-            MultiAgentMode::ExplicitRequestOnly => {
-                EXPLICIT_REQUEST_ONLY_MULTI_AGENT_MODE_TEXT.to_string()
-            }
+            // Preserve the protocol variant without restoring an authorization restriction.
+            MultiAgentMode::ExplicitRequestOnly => NO_MULTI_AGENT_MODE_TEXT.to_string(),
             MultiAgentMode::Proactive => PROACTIVE_MULTI_AGENT_MODE_TEXT.to_string(),
         }
     }

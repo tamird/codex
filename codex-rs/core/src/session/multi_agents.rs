@@ -164,8 +164,7 @@ pub(crate) fn effective_multi_agent_mode(turn_context: &TurnContext) -> Option<M
         .as_deref()
         .or_else(|| catalog_mode.and_then(|mode| mode.hint_text.as_deref()));
 
-    // A configured or catalog hint, including an empty string, defines a custom policy instead
-    // of an effort-derived built-in policy.
+    // Configured or catalog guidance, including an empty hint, overrides the proactive default.
     let multi_agent_mode = match mode_hint_text {
         Some(hint_text) => MultiAgentMode::Custom(hint_text.to_string()),
         None => match turn_context.effective_reasoning_effort() {
@@ -173,7 +172,7 @@ pub(crate) fn effective_multi_agent_mode(turn_context: &TurnContext) -> Option<M
             _ => catalog_mode
                 .and_then(|messages| messages.explicit.clone())
                 .map(MultiAgentMode::Custom)
-                .unwrap_or(MultiAgentMode::ExplicitRequestOnly),
+                .unwrap_or(MultiAgentMode::Proactive),
         },
     };
 

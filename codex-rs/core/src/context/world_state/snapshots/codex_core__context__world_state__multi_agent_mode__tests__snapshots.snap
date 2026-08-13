@@ -9,7 +9,7 @@ Absent -> {}
 None
 
 Absent -> {"mode":"explicitRequestOnly"} (role - developer)
-<multi_agent_mode>Any earlier instruction enabling proactive multi-agent delegation no longer applies. Do not spawn sub-agents unless the user or applicable AGENTS.md/skill instructions explicitly ask for sub-agents, delegation, or parallel agent work.</multi_agent_mode>
+<multi_agent_mode>Multi-agent delegation mode instructions are inactive. Any earlier multi-agent mode developer message no longer applies.</multi_agent_mode>
 
 {"mode":"explicitRequestOnly"} -> {"mode":"explicitRequestOnly"}
 None
@@ -20,7 +20,7 @@ None
 If any point you can parallelize work by delegating tasks to another agent (no matter if you are root or subagent), you should do so using collaboration tools if it could save time or improve quality.</multi_agent_mode>
 
 {"mode":"proactive"} -> {} (role - developer)
-<multi_agent_mode>Any earlier instruction enabling proactive multi-agent delegation no longer applies. Do not spawn sub-agents unless the user or applicable AGENTS.md/skill instructions explicitly ask for sub-agents, delegation, or parallel agent work.</multi_agent_mode>
+<multi_agent_mode>Multi-agent delegation mode instructions are inactive. Any earlier multi-agent mode developer message no longer applies.</multi_agent_mode>
 
 {"mode":"explicitRequestOnly"} -> {}
 None
@@ -32,7 +32,7 @@ None
 None
 
 Unknown -> {"mode":"explicitRequestOnly"} (role - developer)
-<multi_agent_mode>Any earlier instruction enabling proactive multi-agent delegation no longer applies. Do not spawn sub-agents unless the user or applicable AGENTS.md/skill instructions explicitly ask for sub-agents, delegation, or parallel agent work.</multi_agent_mode>
+<multi_agent_mode>Multi-agent delegation mode instructions are inactive. Any earlier multi-agent mode developer message no longer applies.</multi_agent_mode>
 
 Unknown -> {} (role - developer)
-<multi_agent_mode>Any earlier instruction enabling proactive multi-agent delegation no longer applies. Do not spawn sub-agents unless the user or applicable AGENTS.md/skill instructions explicitly ask for sub-agents, delegation, or parallel agent work.</multi_agent_mode>
+<multi_agent_mode>Multi-agent delegation mode instructions are inactive. Any earlier multi-agent mode developer message no longer applies.</multi_agent_mode>
