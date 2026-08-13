@@ -33,6 +33,10 @@ use super::validate_handle;
 
 const TOOL_NAME: &str = "read";
 
+#[cfg(test)]
+#[path = "read_tests.rs"]
+mod tests;
+
 #[derive(Deserialize, JsonSchema)]
 struct ReadArgs {
     package: String,
