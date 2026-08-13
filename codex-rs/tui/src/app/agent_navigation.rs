@@ -99,10 +99,7 @@ impl AgentNavigationState {
         self.parent_owned_threads.insert(thread_id);
     }
 
-    /// Returns whether the picker cache currently knows about any threads.
-    ///
-    /// This is the cheapest way for `App` to decide whether opening the picker should show "No
-    /// agents available yet." rather than constructing picker rows from an empty state.
+    #[cfg(test)]
     pub(crate) fn is_empty(&self) -> bool {
         self.threads.is_empty()
     }
@@ -238,17 +235,6 @@ impl AgentNavigationState {
         self.parent_owned_threads.remove(&thread_id);
     }
 
-    /// Returns whether there is at least one tracked thread other than the primary one.
-    ///
-    /// `App` uses this to decide whether the picker should be available even when the collaboration
-    /// feature flag is currently disabled, because already-existing sub-agent threads should remain
-    /// inspectable.
-    pub(crate) fn has_non_primary_thread(&self, primary_thread_id: Option<ThreadId>) -> bool {
-        self.threads
-            .keys()
-            .any(|thread_id| Some(*thread_id) != primary_thread_id)
-    }
-
     /// Returns live picker rows in the same order users cycle through them.
     ///
     /// The `order` vector is intentionally historical and may briefly contain thread ids that no
@@ -269,6 +255,7 @@ impl AgentNavigationState {
             .into_iter()
             .filter(|(thread_id, entry)| {
                 Some(*thread_id) != primary_thread_id
+                    && !entry.is_goal_supervisor()
                     && entry
                         .agent_path
                         .as_deref()
@@ -285,6 +272,13 @@ impl AgentNavigationState {
             .collect()
     }
 
+    fn ordered_user_visible_threads(&self) -> Vec<(ThreadId, &AgentPickerThreadEntry)> {
+        self.ordered_threads()
+            .into_iter()
+            .filter(|(_, entry)| !entry.is_goal_supervisor())
+            .collect()
+    }
+
     /// Returns the adjacent thread id for keyboard navigation in stable spawn order.
     ///
     /// The caller must pass the thread whose transcript is actually being shown to the user, not
@@ -296,15 +290,22 @@ impl AgentNavigationState {
         current_displayed_thread_id: Option<ThreadId>,
         direction: AgentNavigationDirection,
     ) -> Option<ThreadId> {
-        let ordered_threads = self.ordered_threads();
+        let ordered_threads = self.ordered_user_visible_threads();
         if ordered_threads.len() < 2 {
             return None;
         }
 
         let current_thread_id = current_displayed_thread_id?;
-        let current_idx = ordered_threads
+        let Some(current_idx) = ordered_threads
             .iter()
-            .position(|(thread_id, _)| *thread_id == current_thread_id)?;
+            .position(|(thread_id, _)| *thread_id == current_thread_id)
+        else {
+            return match direction {
+                AgentNavigationDirection::Next => ordered_threads.first(),
+                AgentNavigationDirection::Previous => ordered_threads.last(),
+            }
+            .map(|(thread_id, _)| *thread_id);
+        };
         let next_idx = match direction {
             AgentNavigationDirection::Next => (current_idx + 1) % ordered_threads.len(),
             AgentNavigationDirection::Previous => {
@@ -329,11 +330,18 @@ impl AgentNavigationState {
         current_displayed_thread_id: Option<ThreadId>,
         primary_thread_id: Option<ThreadId>,
     ) -> Option<String> {
-        if self.threads.len() <= 1 {
+        let ordered_threads = self.ordered_user_visible_threads();
+        if ordered_threads.len() <= 1 {
             return None;
         }
 
         let thread_id = current_displayed_thread_id?;
+        if !ordered_threads
+            .iter()
+            .any(|(candidate, _)| *candidate == thread_id)
+        {
+            return None;
+        }
         let is_primary = primary_thread_id == Some(thread_id);
         Some(
             self.threads
@@ -491,6 +499,54 @@ mod tests {
     }
 
     #[test]
+    fn adjacent_thread_id_skips_goal_supervisors() {
+        let (mut state, main_thread_id, worker_id, supervisor_id) = populated_state();
+        state.upsert(
+            supervisor_id,
+            Some("Goal supervisor".to_string()),
+            Some("goal_supervisor".to_string()),
+            /*is_closed*/ false,
+        );
+
+        assert_eq!(
+            state.adjacent_thread_id(Some(main_thread_id), AgentNavigationDirection::Next),
+            Some(worker_id)
+        );
+        assert_eq!(
+            state.adjacent_thread_id(Some(worker_id), AgentNavigationDirection::Next),
+            Some(main_thread_id)
+        );
+        assert_eq!(
+            state.adjacent_thread_id(Some(main_thread_id), AgentNavigationDirection::Previous),
+            Some(worker_id)
+        );
+    }
+
+    #[test]
+    fn adjacent_thread_id_escapes_thread_hidden_by_late_supervisor_metadata() {
+        let (mut state, main_thread_id, worker_id, supervisor_id) = populated_state();
+        state.upsert(
+            supervisor_id,
+            Some("Goal supervisor".to_string()),
+            Some("goal_supervisor".to_string()),
+            /*is_closed*/ false,
+        );
+
+        assert_eq!(
+            state.adjacent_thread_id(Some(supervisor_id), AgentNavigationDirection::Next),
+            Some(main_thread_id)
+        );
+        assert_eq!(
+            state.adjacent_thread_id(Some(supervisor_id), AgentNavigationDirection::Previous),
+            Some(worker_id)
+        );
+        assert_eq!(
+            state.active_agent_label(Some(supervisor_id), Some(main_thread_id)),
+            None
+        );
+    }
+
+    #[test]
     fn picker_subtitle_mentions_shortcuts() {
         let previous: Span<'static> = previous_agent_shortcut().into();
         let next: Span<'static> = next_agent_shortcut().into();
@@ -511,6 +567,30 @@ mod tests {
         assert_eq!(
             state.active_agent_label(Some(main_thread_id), Some(main_thread_id)),
             Some("Main [default]".to_string())
+        );
+    }
+
+    #[test]
+    fn active_agent_label_ignores_hidden_goal_supervisor_cardinality() {
+        let mut state = AgentNavigationState::default();
+        let main_thread_id = ThreadId::new();
+        let supervisor_id = ThreadId::new();
+        state.upsert(
+            main_thread_id,
+            /*agent_nickname*/ None,
+            /*agent_role*/ None,
+            /*is_closed*/ false,
+        );
+        state.upsert(
+            supervisor_id,
+            Some("Goal supervisor".to_string()),
+            Some("goal_supervisor".to_string()),
+            /*is_closed*/ false,
+        );
+
+        assert_eq!(
+            state.active_agent_label(Some(main_thread_id), Some(main_thread_id)),
+            None
         );
     }
 }

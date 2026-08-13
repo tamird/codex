@@ -21,18 +21,38 @@ pub(super) async fn update(
     submission_id: String,
     overrides: ThreadSettingsOverrides,
 ) {
+    let previous = session.thread_config_snapshot().await;
     let updates = prepare_update(overrides);
-    if let Err(error) = apply_update(session, submission_id.clone(), updates).await {
-        session
-            .send_event_raw(Event {
-                id: submission_id,
-                msg: EventMsg::Error(ErrorEvent {
-                    misalignment: None,
-                    message: format!("invalid thread settings override: {error}"),
-                    codex_error_info: Some(CodexErrorInfo::BadRequest),
-                }),
-            })
-            .await;
+    match session.update_settings(updates).await {
+        Ok(commit) => {
+            if (
+                commit.snapshot.model.as_str(),
+                commit.snapshot.reasoning_effort.as_ref(),
+                commit.snapshot.service_tier.as_deref(),
+            ) != (
+                previous.model.as_str(),
+                previous.reasoning_effort.as_ref(),
+                previous.service_tier.as_deref(),
+            ) {
+                crate::goal_supervisor::restart_active_helper_for_execution_settings_change(
+                    session,
+                )
+                .await;
+            }
+            emit_applied(session, submission_id, commit.snapshot).await;
+        }
+        Err(error) => {
+            session
+                .send_event_raw(Event {
+                    id: submission_id,
+                    msg: EventMsg::Error(ErrorEvent {
+                        misalignment: None,
+                        message: format!("invalid thread settings override: {error}"),
+                        codex_error_info: Some(CodexErrorInfo::BadRequest),
+                    }),
+                })
+                .await;
+        }
     }
 }
 

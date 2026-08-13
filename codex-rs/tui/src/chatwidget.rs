@@ -116,6 +116,7 @@ use codex_app_server_protocol::TurnCompletedNotification;
 use codex_app_server_protocol::TurnPlanStepStatus;
 use codex_app_server_protocol::TurnStatus;
 use codex_app_server_protocol::UserInput;
+use codex_app_server_protocol::inter_agent_message_display_from_response_item;
 use codex_config::Constrained;
 use codex_config::ConstraintResult;
 use codex_config::types::ApprovalsReviewer;
@@ -204,13 +205,6 @@ const AMBIENT_PET_WRAP_GAP_COLUMNS: u16 = 2;
 const TUI_STUB_MESSAGE: &str = "Not available in TUI yet.";
 const PARENT_OWNED_INPUT_MESSAGE: &str =
     "This sub-agent is controlled by its parent. Direct input is disabled.";
-
-fn inter_agent_communication_from_item(item: &ResponseItem) -> Option<InterAgentCommunication> {
-    let ResponseItem::Message { content, .. } = item else {
-        return None;
-    };
-    InterAgentCommunication::from_message_content(content)
-}
 
 #[derive(Debug, Deserialize)]
 struct SubagentNotificationPayload {
@@ -998,9 +992,8 @@ impl ChatWidget {
     /// Stores or overwrites the cached nickname and role for a collab agent thread.
     ///
     /// Called by `App::upsert_agent_picker_thread` and `App::replace_chat_widget` to keep the
-    /// rendering metadata in sync with the navigation cache. Must be called before any
-    /// notification referencing this thread is processed, otherwise the rendered item will fall
-    /// back to showing the raw thread id.
+    /// rendering metadata in sync with the navigation cache. History cells emitted before this
+    /// metadata arrives keep their original label.
     pub(crate) fn set_collab_agent_metadata(
         &mut self,
         thread_id: ThreadId,

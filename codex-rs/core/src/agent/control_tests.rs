@@ -14,6 +14,7 @@ use crate::context::ManagedDeveloperInstructions;
 use crate::context::MultiAgentRoleInstructions;
 use crate::context::SubagentNotification;
 use crate::init_state_db;
+use crate::state::ActiveTurn;
 use crate::thread_manager::StartThreadOptions;
 use crate::tools::handlers::multi_agents_common::thread_spawn_source;
 use assert_matches::assert_matches;
@@ -34,6 +35,7 @@ use codex_protocol::capabilities::SelectedCapabilityRoot;
 use codex_protocol::config_types::ApprovalsReviewer;
 use codex_protocol::config_types::CollaborationMode;
 use codex_protocol::config_types::ModeKind;
+use codex_protocol::config_types::ServiceTier;
 use codex_protocol::config_types::Settings;
 use codex_protocol::error::CodexErrorDetails;
 use codex_protocol::items::TurnItem;
@@ -48,6 +50,7 @@ use codex_protocol::models::InternalChatMessageMetadataPassthrough;
 use codex_protocol::models::MessagePhase;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::models::ResponseItem;
+use codex_protocol::openai_models::ReasoningEffort;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::EnvironmentConfigState;
 use codex_protocol::protocol::ErrorEvent;
@@ -57,15 +60,19 @@ use codex_protocol::protocol::InterAgentCommunication;
 use codex_protocol::protocol::ItemCompletedEvent;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::SubAgentSource;
+use codex_protocol::protocol::ThreadGoal;
+use codex_protocol::protocol::ThreadGoalStatus;
 use codex_protocol::protocol::ThreadHistoryMode;
 use codex_protocol::protocol::ThreadMemoryMode;
 use codex_protocol::protocol::ThreadSettingsAppliedEvent;
+use codex_protocol::protocol::ThreadSettingsOverrides;
 use codex_protocol::protocol::ThreadSettingsSnapshot;
 use codex_protocol::protocol::TurnAbortReason;
 use codex_protocol::protocol::TurnAbortedEvent;
 use codex_protocol::protocol::TurnCompleteEvent;
 use codex_protocol::protocol::TurnStartedEvent;
 use codex_rollout::RolloutRecorder;
+use codex_state::DirectionalThreadSpawnEdgeStatus;
 use codex_thread_store::AppendThreadItemsParams;
 use codex_thread_store::ArchiveThreadParams;
 use codex_thread_store::CreateThreadParams;
@@ -77,15 +84,25 @@ use codex_thread_store::ThreadPersistenceMetadata;
 use codex_thread_store::ThreadPersistenceMode;
 use codex_thread_store::ThreadStore;
 use codex_utils_path_uri::PathUri;
+use core_test_support::responses::assert_parent_turn;
+use core_test_support::responses::assert_root_turn;
 use core_test_support::responses::ev_completed;
 use core_test_support::responses::ev_response_created;
+use core_test_support::responses::mount_response_sequence;
 use core_test_support::responses::mount_sse_once;
+use core_test_support::responses::mount_sse_sequence;
 use core_test_support::responses::sse;
+use core_test_support::responses::sse_failed;
+use core_test_support::responses::sse_response;
 use core_test_support::responses::start_mock_server;
 use core_test_support::responses::strip_response_item_ids;
 use pretty_assertions::assert_eq;
+use serial_test::serial;
+use std::ffi::OsStr;
+use std::ffi::OsString;
 use tempfile::TempDir;
 use tokio::time::Duration;
+use tokio::time::Instant;
 use tokio::time::sleep;
 use tokio::time::timeout;
 use toml::Value as TomlValue;
@@ -109,6 +126,38 @@ async fn test_config_with_cli_overrides(
 
 async fn test_config() -> (TempDir, Config) {
     test_config_with_cli_overrides(Vec::new()).await
+}
+
+async fn create_active_thread_goal_for_test(
+    state_db: &StateDbHandle,
+    parent_thread_id: ThreadId,
+    parent_session: &std::sync::Arc<crate::session::session::Session>,
+    objective: &str,
+) -> anyhow::Result<(String, ThreadGoal)> {
+    let parent_metadata = codex_state::ThreadMetadataBuilder::new(
+        parent_thread_id,
+        parent_session
+            .get_config()
+            .await
+            .codex_home
+            .join(format!("{parent_thread_id}.jsonl"))
+            .to_path_buf(),
+        chrono::Utc::now(),
+        SessionSource::Exec,
+    )
+    .build("openai");
+    state_db.upsert_thread(&parent_metadata).await?;
+    let state_goal = state_db
+        .thread_goals()
+        .replace_thread_goal(
+            parent_thread_id,
+            objective,
+            codex_state::ThreadGoalStatus::Active,
+            /*token_budget*/ None,
+        )
+        .await?;
+    let protocol_goal = crate::goal_supervisor::protocol_goal_from_state(state_goal.clone());
+    Ok((state_goal.goal_id, protocol_goal))
 }
 
 fn text_input(text: &str) -> Vec<UserInput> {
@@ -165,6 +214,112 @@ fn assistant_message(text: &str, phase: Option<MessagePhase>) -> ResponseItem {
     }
 }
 
+fn run_goal_supervisor_test<F, T>(name: &'static str, future: F) -> T
+where
+    F: std::future::Future<Output = T> + Send + 'static,
+    T: Send + 'static,
+{
+    let test_thread = std::thread::Builder::new()
+        .name(name.to_string())
+        .stack_size(32 * 1024 * 1024)
+        .spawn(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("build goal supervisor test runtime")
+                .block_on(future)
+        })
+        .expect("spawn goal supervisor test thread");
+    match test_thread.join() {
+        Ok(result) => result,
+        Err(err) => std::panic::resume_unwind(err),
+    }
+}
+
+async fn spawned_thread_id_after(
+    manager: &ThreadManager,
+    before_thread_ids: &[ThreadId],
+) -> ThreadId {
+    let mut spawned_thread_ids = manager
+        .list_thread_ids()
+        .await
+        .into_iter()
+        .filter(|thread_id| !before_thread_ids.contains(thread_id))
+        .collect::<Vec<_>>();
+    spawned_thread_ids.sort_by_key(ToString::to_string);
+    assert_eq!(
+        spawned_thread_ids.len(),
+        1,
+        "spawn should add exactly one child thread"
+    );
+    spawned_thread_ids
+        .pop()
+        .expect("spawned thread id should be present")
+}
+
+fn goal_supervisor_continuity_from_history(
+    history: &crate::context_manager::ContextManager,
+) -> serde_json::Value {
+    history
+        .raw_items()
+        .filter_map(|item| match item {
+            ResponseItem::Message { content, .. } => {
+                content.iter().find_map(|content| match content {
+                    ContentItem::InputText { text } => text
+                        .strip_prefix("# Goal Supervisor Continuity\n\n")
+                        .and_then(|json| serde_json::from_str(json).ok()),
+                    _ => None,
+                })
+            }
+            _ => None,
+        })
+        .next_back()
+        .expect("helper history should contain goal supervisor continuity")
+}
+
+async fn wait_for_turn_complete(thread: &CodexThread) {
+    timeout(Duration::from_secs(5), async {
+        loop {
+            let event = thread
+                .next_event()
+                .await
+                .expect("event channel should stay open");
+            if matches!(event.msg, EventMsg::TurnComplete(_)) {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("turn should complete");
+}
+
+fn request_tool_signatures(body: &serde_json::Value) -> std::collections::BTreeSet<String> {
+    let mut signatures = std::collections::BTreeSet::new();
+    let tools = body["tools"].as_array().expect("tools should be an array");
+    for tool in tools {
+        let tool_type = tool.get("type").and_then(serde_json::Value::as_str);
+        let Some(name) = tool.get("name").and_then(serde_json::Value::as_str) else {
+            continue;
+        };
+        if tool_type == Some("namespace") {
+            let child_tools = tool
+                .get("tools")
+                .and_then(serde_json::Value::as_array)
+                .expect("namespace tools should have child tools");
+            for child_tool in child_tools {
+                let child_name = child_tool
+                    .get("name")
+                    .and_then(serde_json::Value::as_str)
+                    .expect("child tool should have a name");
+                signatures.insert(format!("{name}.{child_name}"));
+            }
+        } else {
+            signatures.insert(name.to_string());
+        }
+    }
+    signatures
+}
+
 #[test]
 fn register_session_root_skips_threads_with_explicit_parent() {
     let control = AgentControl::default();
@@ -189,6 +344,123 @@ fn fork_previous_response_id_env_value_parses_truthy_values() {
             "{value} should not enable previous response forking"
         );
     }
+}
+
+#[tokio::test]
+async fn goal_supervisor_helper_uses_full_history_fork_without_spawn_call_id() {
+    let harness = AgentControlHarness::new().await;
+    let mut parent_config = harness.config.clone();
+    let _ = parent_config.features.enable(Feature::AgentPromptInjection);
+    let _ = parent_config.features.enable(Feature::Goals);
+    let _ = parent_config.features.enable(Feature::GoalSupervisor);
+    let _ = parent_config.features.enable(Feature::MultiAgentV2);
+    let parent = harness
+        .manager
+        .start_thread(StartThreadOptions::new(parent_config))
+        .await
+        .expect("start parent thread");
+    parent
+        .thread
+        .session
+        .inject_no_new_turn(
+            vec![user_message("parent seed context")],
+            /*current_turn_context*/ None,
+        )
+        .await;
+    parent.thread.ensure_rollout_materialized().await;
+    parent
+        .thread
+        .flush_rollout()
+        .await
+        .expect("parent rollout should flush");
+    let state_db = harness
+        .state_db
+        .as_ref()
+        .expect("goal supervisor test requires state db");
+    let (_goal_id, goal) = create_active_thread_goal_for_test(
+        state_db,
+        parent.thread_id,
+        &parent.thread.session,
+        "Ship the active user goal.",
+    )
+    .await
+    .expect("active goal should persist");
+
+    let helper_thread_id =
+        crate::goal_supervisor::spawn_supervisor_helper_for_test(&parent.thread.session, &goal)
+            .await
+            .expect("goal supervisor helper should spawn without a parent tool-call id");
+    let helper_thread = harness
+        .manager
+        .get_thread(helper_thread_id)
+        .await
+        .expect("supervisor helper should be registered");
+    assert_eq!(
+        helper_thread.session.prompt_cache_key(),
+        parent.thread.session.prompt_cache_key(),
+        "supervisor helper should retain the parent prompt-cache identity"
+    );
+
+    let helper_history = helper_thread.session.clone_history().await;
+    assert!(
+        history_contains_text(helper_history.raw_items(), "parent seed context"),
+        "supervisor helper should inherit the parent conversation prefix"
+    );
+    let supervisor_prompt =
+        crate::session::load_supervisor_agent_prompt(&harness.config.codex_home).await;
+    assert_eq!(
+        helper_history
+            .raw_items()
+            .filter(|item| {
+                matches!(
+                    item,
+                    ResponseItem::Message { role, content, .. }
+                        if role == "developer"
+                            && content.iter().any(|content_item| matches!(
+                                content_item,
+                                ContentItem::InputText { text } if text == &supervisor_prompt
+                            ))
+                )
+            })
+            .count(),
+        1,
+        "supervisor role prompt should be installed exactly once"
+    );
+    assert!(
+        history_contains_text(helper_history.raw_items(), "# Goal Supervisor Continuity"),
+        "supervisor helper should receive persisted goal continuity"
+    );
+    assert!(helper_history.raw_items().any(|item| matches!(
+        item,
+        ResponseItem::FunctionCall { name, call_id, .. }
+            if name == "list_agents" && call_id == SUPERVISOR_BOOT_LIST_AGENTS_CALL_ID
+    )));
+
+    let captured_assignment = harness
+        .manager
+        .captured_ops()
+        .into_iter()
+        .find_map(|(thread_id, op)| {
+            (thread_id == helper_thread_id)
+                .then_some(op)
+                .and_then(|op| match op {
+                    Op::TurnInput { request, .. } => match request.input {
+                        codex_protocol::turn_input::TurnInput::UserInput { content, .. } => {
+                            content.into_iter().find_map(|item| match item {
+                                UserInput::Text { text, .. } => Some(text),
+                                _ => None,
+                            })
+                        }
+                        codex_protocol::turn_input::TurnInput::ResponseItem(_)
+                        | codex_protocol::turn_input::TurnInput::InterAgentCommunication(_) => None,
+                    },
+                    _ => None,
+                })
+        })
+        .expect("supervisor assignment should be submitted as user input");
+    assert!(captured_assignment.contains("# Goal Supervisor Assignment"));
+    assert!(captured_assignment.contains("Ship the active user goal."));
+    assert!(!captured_assignment.contains("You are also a **goal supervisor**"));
 }
 
 fn spawn_agent_call(call_id: &str) -> ResponseItem {
@@ -307,6 +579,243 @@ impl AgentControlHarness {
     }
 }
 
+struct EnvVarGuard {
+    key: &'static str,
+    original: Option<OsString>,
+}
+
+impl EnvVarGuard {
+    fn set(key: &'static str, value: &OsStr) -> Self {
+        let original = std::env::var_os(key);
+        unsafe {
+            std::env::set_var(key, value);
+        }
+        Self { key, original }
+    }
+}
+
+impl Drop for EnvVarGuard {
+    fn drop(&mut self) {
+        unsafe {
+            match &self.original {
+                Some(value) => std::env::set_var(self.key, value),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
+}
+
+fn assert_goal_supervisor_boot_history<'a>(
+    history: impl Clone + IntoIterator<Item = &'a ResponseItem>,
+    supervisor_prompt: &str,
+    generic_subagent_hint: &str,
+) {
+    assert!(
+        history_contains_text(history.clone(), "parent seed context"),
+        "goal supervisor helper should inherit the parent conversation prefix"
+    );
+    let supervisor_prompt_count = history
+        .clone()
+        .into_iter()
+        .filter(|item| {
+            matches!(
+                item,
+                ResponseItem::Message { role, content, .. }
+                    if role == "developer"
+                        && content.iter().any(|content_item| matches!(
+                            content_item,
+                            ContentItem::InputText { text } if text == supervisor_prompt
+                        ))
+            )
+        })
+        .count();
+    assert_eq!(
+        supervisor_prompt_count, 1,
+        "goal supervisor role prompt should be injected exactly once"
+    );
+    assert!(
+        history_contains_text(history.clone(), "# Goal Supervisor Continuity"),
+        "goal supervisor helper should receive durable continuity context"
+    );
+    assert!(
+        history.clone().into_iter().any(|item| matches!(
+            item,
+            ResponseItem::FunctionCall { name, call_id, .. }
+                if name == "list_agents" && call_id == "synthetic_supervisor_list_agents"
+        )),
+        "goal supervisor helper should receive a synthetic list_agents call"
+    );
+    assert!(
+        history.clone().into_iter().any(|item| matches!(
+            item,
+            ResponseItem::FunctionCallOutput { call_id, .. }
+                if call_id.as_deref() == Some("synthetic_supervisor_list_agents")
+        )),
+        "goal supervisor helper should receive the synthetic list_agents output"
+    );
+    assert!(
+        !history_contains_text(history, generic_subagent_hint),
+        "goal supervisor helper should not receive generic subagent usage guidance"
+    );
+}
+
+#[test]
+#[serial(fork_env)]
+fn goal_supervisor_full_history_bootstrap_survives_cold_resume() {
+    run_goal_supervisor_test(
+        "goal_supervisor_full_history_bootstrap_survives_cold_resume",
+        goal_supervisor_full_history_bootstrap_survives_cold_resume_inner(),
+    );
+}
+
+async fn goal_supervisor_full_history_bootstrap_survives_cold_resume_inner() {
+    const MATERIALIZE_EPHEMERAL_ROLLOUTS: &str = "CODEX_MATERIALIZE_EPHEMERAL_ROLLOUTS";
+    const GENERIC_SUBAGENT_HINT: &str = "generic subagent guidance must not reach the supervisor";
+    let _materialize_ephemeral_rollouts =
+        EnvVarGuard::set(MATERIALIZE_EPHEMERAL_ROLLOUTS, OsStr::new("1"));
+
+    let (home, mut config) = test_config().await;
+    let _ = config.features.enable(Feature::AgentPromptInjection);
+    let _ = config.features.enable(Feature::Goals);
+    let _ = config.features.enable(Feature::GoalSupervisor);
+    config.multi_agent_v2.subagent_usage_hint_text = Some(GENERIC_SUBAGENT_HINT.to_string());
+    let harness = AgentControlHarness::new_with_config(home, config.clone()).await;
+    let (parent_thread_id, parent_thread) = harness.start_thread().await;
+    parent_thread
+        .session
+        .inject_no_new_turn(
+            vec![user_message("parent seed context")],
+            /*current_turn_context*/ None,
+        )
+        .await;
+    parent_thread.ensure_rollout_materialized().await;
+    parent_thread
+        .flush_rollout()
+        .await
+        .expect("parent rollout should flush");
+
+    let state_db = harness
+        .state_db
+        .as_ref()
+        .expect("goal supervisor test requires state db");
+    let (goal_id, goal) = create_active_thread_goal_for_test(
+        state_db,
+        parent_thread_id,
+        &parent_thread.session,
+        "Ship the active user goal.",
+    )
+    .await
+    .expect("active goal should persist");
+    let before_thread_ids = harness.manager.list_thread_ids().await;
+
+    crate::goal_supervisor::maybe_start_supervisor_checkin(
+        &parent_thread.session,
+        goal_id.as_str(),
+        &goal,
+    )
+    .await
+    .expect("active goal should spawn a goal supervisor helper");
+
+    let helper_thread_id = spawned_thread_id_after(&harness.manager, &before_thread_ids).await;
+    let helper_thread = harness
+        .manager
+        .get_thread(helper_thread_id)
+        .await
+        .expect("goal supervisor helper should be registered");
+    let helper_snapshot = helper_thread.config_snapshot().await;
+    let helper_source = helper_snapshot.session_source.clone();
+    let expected_path = AgentPath::root()
+        .join(crate::goal_supervisor::GOAL_SUPERVISOR_ROLE_NAME)
+        .expect("canonical goal supervisor path");
+    assert!(matches!(
+        &helper_source,
+        SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+            parent_thread_id: source_parent_thread_id,
+            agent_path: Some(agent_path),
+            agent_role: Some(agent_role),
+            ..
+        }) if *source_parent_thread_id == parent_thread_id
+            && agent_path == &expected_path
+            && agent_role == crate::goal_supervisor::GOAL_SUPERVISOR_ROLE_NAME
+    ));
+    assert_eq!(
+        helper_thread.session.prompt_cache_key(),
+        parent_thread.session.prompt_cache_key(),
+        "internal goal supervisor helper should reuse the parent prompt cache key"
+    );
+
+    let supervisor_prompt =
+        crate::session::load_supervisor_agent_prompt(&harness.config.codex_home).await;
+    let helper_history = helper_thread.session.clone_history().await;
+    assert_goal_supervisor_boot_history(
+        helper_history.raw_items(),
+        &supervisor_prompt,
+        GENERIC_SUBAGENT_HINT,
+    );
+    let captured_assignment = harness
+        .manager
+        .captured_ops()
+        .into_iter()
+        .find_map(|(thread_id, op)| {
+            (thread_id == helper_thread_id)
+                .then_some(op)
+                .and_then(|op| match op {
+                    Op::TurnInput { request, .. } => match request.input {
+                        codex_protocol::turn_input::TurnInput::UserInput { content, .. } => {
+                            content.into_iter().find_map(|item| match item {
+                                UserInput::Text { text, .. } => Some(text),
+                                _ => None,
+                            })
+                        }
+                        codex_protocol::turn_input::TurnInput::ResponseItem(_)
+                        | codex_protocol::turn_input::TurnInput::InterAgentCommunication(_) => None,
+                    },
+                    _ => None,
+                })
+        })
+        .expect("goal supervisor assignment should be submitted as user input");
+    assert!(captured_assignment.contains("# Goal Supervisor Assignment"));
+    assert!(captured_assignment.contains("Ship the active user goal."));
+    assert!(
+        !captured_assignment.contains(&supervisor_prompt),
+        "role prompt should not be duplicated in the user assignment"
+    );
+
+    helper_thread
+        .flush_rollout()
+        .await
+        .expect("materialized goal supervisor rollout should flush");
+    assert!(
+        helper_thread.rollout_path().is_some(),
+        "debug materialization should give the ephemeral helper a durable rollout"
+    );
+    harness
+        .control
+        .shutdown_live_agent(helper_thread_id)
+        .await
+        .expect("goal supervisor helper should shut down before cold resume");
+
+    let mut helper_config = config;
+    helper_config.ephemeral = true;
+    let resumed_helper_id = harness
+        .control
+        .resume_agent_from_rollout(helper_config, helper_thread_id, helper_source)
+        .await
+        .expect("materialized goal supervisor helper should cold resume");
+    assert_eq!(resumed_helper_id, helper_thread_id);
+    let resumed_helper = harness
+        .manager
+        .get_thread(resumed_helper_id)
+        .await
+        .expect("cold-resumed goal supervisor helper should be registered");
+    let resumed_history = resumed_helper.session.clone_history().await;
+    assert_goal_supervisor_boot_history(
+        resumed_history.raw_items(),
+        &supervisor_prompt,
+        GENERIC_SUBAGENT_HINT,
+    );
+}
+
 async fn persisted_originator(thread: &CodexThread) -> String {
     thread.ensure_rollout_materialized().await;
     thread
@@ -399,6 +908,26 @@ async fn wait_for_recorded_user_message(thread: &CodexThread, needle: &str) {
     .expect("timed out waiting for user message recording");
 }
 
+fn history_text_match_count<'a>(
+    history_items: impl IntoIterator<Item = &'a ResponseItem>,
+    needle: &str,
+) -> usize {
+    history_items
+        .into_iter()
+        .filter(|item| {
+            let ResponseItem::Message { content, .. } = item else {
+                return false;
+            };
+            content.iter().any(|content_item| match content_item {
+                ContentItem::InputText { text } | ContentItem::OutputText { text } => {
+                    text.contains(needle)
+                }
+                ContentItem::InputImage { .. } | ContentItem::InputAudio { .. } => false,
+            })
+        })
+        .count()
+}
+
 fn history_contains_assistant_inter_agent_communication<'a>(
     history_items: impl IntoIterator<Item = &'a ResponseItem>,
     expected: &InterAgentCommunication,
@@ -437,6 +966,88 @@ async fn wait_for_subagent_notification(parent_thread: &Arc<CodexThread>) -> boo
     // CI can take several seconds to schedule the detached completion watcher,
     // especially on slower Windows runners.
     timeout(Duration::from_secs(10), wait).await.is_ok()
+}
+
+async fn wait_for_agent_status(
+    control: &AgentControl,
+    thread_id: ThreadId,
+    predicate: impl Fn(&AgentStatus) -> bool,
+) {
+    timeout(Duration::from_secs(10), async {
+        loop {
+            let status = control.get_status(thread_id).await;
+            if predicate(&status) {
+                break;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("agent should reach the expected status");
+}
+
+async fn make_cold_multi_agent_v1_child(
+    harness: &AgentControlHarness,
+    parent_thread_id: ThreadId,
+) -> ThreadId {
+    let child_thread_id = harness
+        .control
+        .spawn_agent_with_metadata(
+            harness.config.clone(),
+            text_input("initial v1 child task"),
+            Some(SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+                parent_thread_id,
+                depth: 1,
+                agent_path: None,
+                agent_nickname: None,
+                agent_role: Some("explorer".to_string()),
+            })),
+            SpawnAgentOptions {
+                parent_thread_id: Some(parent_thread_id),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("v1 child spawn should succeed")
+        .thread_id;
+    wait_for_agent_status(&harness.control, child_thread_id, |status| {
+        matches!(status, AgentStatus::Completed(_))
+    })
+    .await;
+    let child_thread = harness
+        .manager
+        .get_thread(child_thread_id)
+        .await
+        .expect("v1 child should be loaded before becoming cold");
+    child_thread.ensure_rollout_materialized().await;
+    child_thread
+        .flush_rollout()
+        .await
+        .expect("v1 child rollout should flush");
+    let lifecycle = harness
+        .control
+        .get_agent_metadata(child_thread_id)
+        .expect("v1 child metadata should remain registered")
+        .lifecycle;
+    lifecycle.wait_for_completion_watcher().await;
+    child_thread
+        .shutdown_and_wait()
+        .await
+        .expect("v1 child should shut down before cold reload");
+    assert!(
+        harness
+            .manager
+            .remove_thread(&child_thread_id)
+            .await
+            .is_some(),
+        "v1 child should be removed from the live manager"
+    );
+    drop(child_thread);
+    assert!(matches!(
+        harness.manager.get_thread(child_thread_id).await,
+        Err(err) if matches!(err.details(), CodexErrorDetails::ThreadNotFound(id) if *id == child_thread_id)
+    ));
+    child_thread_id
 }
 
 async fn persist_thread_for_tree_resume(thread: &Arc<CodexThread>, message: &str) {
@@ -498,6 +1109,118 @@ async fn assert_thread_not_loaded(manager: &ThreadManager, thread_id: ThreadId) 
         },
         Ok(_) => panic!("expected thread not to be loaded"),
     }
+}
+
+#[tokio::test]
+async fn restore_v2_agent_metadata_uses_indexed_identity_without_reading_rollout() {
+    let harness = AgentControlHarness::new().await;
+    let (parent_thread_id, _) = harness.start_thread().await;
+    let state_db = harness
+        .state_db
+        .as_ref()
+        .expect("metadata restoration requires state db");
+    let indexed_thread_id = ThreadId::new();
+    let indexed_path = AgentPath::root()
+        .join("indexed_worker")
+        .expect("indexed agent path");
+    let source_path = AgentPath::root()
+        .join("source_worker")
+        .expect("source agent path");
+    let malformed_rollout = harness.config.codex_home.join("malformed-rollout.jsonl");
+    tokio::fs::write(&malformed_rollout, "not a rollout record\n")
+        .await
+        .expect("malformed rollout should exist");
+    let source = SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+        parent_thread_id,
+        depth: 1,
+        agent_path: Some(source_path),
+        agent_nickname: Some("source-name".to_string()),
+        agent_role: Some("source-role".to_string()),
+    });
+    let mut builder = codex_state::ThreadMetadataBuilder::new(
+        indexed_thread_id,
+        malformed_rollout.to_path_buf(),
+        chrono::Utc::now(),
+        source,
+    );
+    builder.agent_path = Some(indexed_path.to_string());
+    builder.agent_nickname = Some("indexed-name".to_string());
+    builder.agent_role = Some("indexed-role".to_string());
+    state_db
+        .upsert_thread(&builder.build("openai"))
+        .await
+        .expect("indexed metadata should persist");
+    state_db
+        .upsert_thread_spawn_edge(
+            parent_thread_id,
+            indexed_thread_id,
+            DirectionalThreadSpawnEdgeStatus::Open,
+        )
+        .await
+        .expect("indexed spawn edge should persist");
+
+    let anonymous_thread_id = ThreadId::new();
+    let anonymous_rollout = harness.config.codex_home.join("anonymous-malformed.jsonl");
+    tokio::fs::write(&anonymous_rollout, "not a rollout record\n")
+        .await
+        .expect("anonymous malformed rollout should exist");
+    let anonymous_source = SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+        parent_thread_id,
+        depth: 1,
+        agent_path: None,
+        agent_nickname: Some("anonymous-name".to_string()),
+        agent_role: None,
+    });
+    let anonymous_metadata = codex_state::ThreadMetadataBuilder::new(
+        anonymous_thread_id,
+        anonymous_rollout.to_path_buf(),
+        chrono::Utc::now(),
+        anonymous_source,
+    )
+    .build("openai");
+    state_db
+        .upsert_thread(&anonymous_metadata)
+        .await
+        .expect("anonymous metadata should persist");
+    state_db
+        .upsert_thread_spawn_edge(
+            parent_thread_id,
+            anonymous_thread_id,
+            DirectionalThreadSpawnEdgeStatus::Open,
+        )
+        .await
+        .expect("anonymous spawn edge should persist");
+
+    harness
+        .control
+        .restore_v2_agent_metadata(&harness.config, parent_thread_id)
+        .await;
+
+    let indexed_metadata = harness
+        .control
+        .state
+        .agent_metadata_for_thread(indexed_thread_id)
+        .expect("indexed agent should be restored without reading its malformed rollout");
+    assert_eq!(indexed_metadata.agent_path, Some(indexed_path));
+    assert_eq!(indexed_metadata.agent_role.as_deref(), Some("indexed-role"));
+    assert_eq!(
+        indexed_metadata.agent_nickname.as_deref(),
+        Some("indexed-name")
+    );
+
+    let anonymous_metadata = harness
+        .control
+        .state
+        .agent_metadata_for_thread(anonymous_thread_id)
+        .expect("missing optional path and role should not require reading the rollout");
+    assert_eq!(anonymous_metadata.agent_path, None);
+    assert_eq!(anonymous_metadata.agent_role, None);
+    assert_eq!(
+        anonymous_metadata.agent_nickname.as_deref(),
+        Some("anonymous-name")
+    );
+    assert_thread_not_loaded(&harness.manager, indexed_thread_id).await;
+    assert_thread_not_loaded(&harness.manager, anonymous_thread_id).await;
 }
 
 #[tokio::test]
@@ -1053,6 +1776,212 @@ async fn check_v2_agent_reload(route: V2ReloadRoute) {
         .into_iter()
         .find(|entry| captured_op_matches(entry, &expected));
     assert!(captured.is_some());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn multi_agent_v1_cold_delivery_reloads_and_preserves_turn_ancestry() -> anyhow::Result<()> {
+    let server = start_mock_server().await;
+    let responses = mount_sse_sequence(
+        &server,
+        vec![
+            sse(vec![
+                ev_response_created("resp-v1-initial"),
+                ev_completed("resp-v1-initial"),
+            ]),
+            sse(vec![
+                ev_response_created("resp-v1-cold"),
+                ev_completed("resp-v1-cold"),
+            ]),
+        ],
+    )
+    .await;
+    let (home, mut config) = test_config().await;
+    config
+        .features
+        .disable(Feature::MultiAgentV2)
+        .expect("test config should allow feature update");
+    config
+        .features
+        .enable(Feature::Sqlite)
+        .expect("test config should allow feature update");
+    config.model_provider.base_url = Some(format!("{}/v1", server.uri()));
+    config.model_provider.supports_websockets = false;
+    config.model_providers.insert(
+        config.model_provider_id.clone(),
+        config.model_provider.clone(),
+    );
+    let harness = AgentControlHarness::new_with_config(home, config).await;
+    let (parent_thread_id, _parent_thread) = harness.start_thread().await;
+    let child_thread_id = make_cold_multi_agent_v1_child(&harness, parent_thread_id).await;
+
+    let parent_turn_id = "parent-turn-v1-cold";
+    let root_turn_id = "root-turn-v1-cold";
+    harness
+        .control
+        .deliver_input_to_agent(
+            harness.config.clone(),
+            child_thread_id,
+            text_input("cold v1 delivery"),
+            AgentInputDelivery::Queue,
+            TurnStartOptions {
+                parent_turn_id: Some(parent_turn_id.to_string()),
+                root_turn_id: Some(root_turn_id.to_string()),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("cold v1 delivery should reload and submit");
+
+    timeout(Duration::from_secs(10), async {
+        loop {
+            if responses.requests().len() == 2 {
+                break;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("cold v1 delivery should reach the model");
+    let requests = responses.requests();
+    assert_eq!(requests.len(), 2);
+    let cold_request = requests[1].body_json();
+    assert_parent_turn(&cold_request, Some(parent_turn_id))?;
+    assert_root_turn(&cold_request, Some(root_turn_id))?;
+    assert!(
+        requests[1].body_contains_text("cold v1 delivery"),
+        "the reloaded v1 agent should receive the submitted input"
+    );
+    assert!(
+        harness.manager.get_thread(child_thread_id).await.is_ok(),
+        "cold v1 delivery should restore the child in the live manager"
+    );
+    wait_for_agent_status(&harness.control, child_thread_id, |status| {
+        matches!(status, AgentStatus::Completed(_))
+    })
+    .await;
+    harness
+        .manager
+        .get_thread(child_thread_id)
+        .await?
+        .shutdown_and_wait()
+        .await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cold_delivery_waits_for_completion_cleanup_before_reloading() -> anyhow::Result<()> {
+    let server = start_mock_server().await;
+    let _initial_response = mount_sse_once(
+        &server,
+        sse(vec![
+            ev_response_created("resp-v1-race-initial"),
+            ev_completed("resp-v1-race-initial"),
+        ]),
+    )
+    .await;
+    let (home, mut config) = test_config().await;
+    config
+        .features
+        .disable(Feature::MultiAgentV2)
+        .expect("test config should allow feature update");
+    config
+        .features
+        .enable(Feature::Sqlite)
+        .expect("test config should allow feature update");
+    config.model_provider.base_url = Some(format!("{}/v1", server.uri()));
+    config.model_provider.supports_websockets = false;
+    config.model_providers.insert(
+        config.model_provider_id.clone(),
+        config.model_provider.clone(),
+    );
+    let harness = AgentControlHarness::new_with_config(home, config).await;
+    let (parent_thread_id, _parent_thread) = harness.start_thread().await;
+    let child_thread_id = make_cold_multi_agent_v1_child(&harness, parent_thread_id).await;
+    let lifecycle = harness
+        .control
+        .get_agent_metadata(child_thread_id)
+        .expect("cold child metadata should remain registered")
+        .lifecycle;
+    let completion_registration = lifecycle
+        .try_start_completion_watcher()
+        .expect("test should own the simulated completion cleanup");
+    let cleanup_transition = lifecycle.lock_transition().await;
+    let communication = InterAgentCommunication::new(
+        AgentPath::root(),
+        AgentPath::try_from("/root/cold_v1_child").expect("test agent path"),
+        Vec::new(),
+        "queue after completion cleanup".to_string(),
+        /*trigger_turn*/ false,
+    );
+    let expected = (
+        child_thread_id,
+        Op::InterAgentCommunication {
+            communication: communication.clone(),
+            start_options: TurnStartOptions::default(),
+        },
+    );
+    let control = harness.control.clone();
+    let delivery_config = harness.config.clone();
+    let mut delivery = tokio::spawn(async move {
+        control
+            .deliver_inter_agent_communication_to_agent(
+                delivery_config,
+                child_thread_id,
+                communication,
+                AgentCommunicationContext::new(AgentCommunicationKind::Message, parent_thread_id),
+                AgentInputDelivery::Queue,
+                TurnStartOptions::default(),
+            )
+            .await
+    });
+
+    assert!(
+        timeout(Duration::from_millis(100), &mut delivery)
+            .await
+            .is_err(),
+        "delivery must wait while completion cleanup owns the transition"
+    );
+    assert!(matches!(
+        harness.manager.get_thread(child_thread_id).await,
+        Err(err) if matches!(err.details(), CodexErrorDetails::ThreadNotFound(id) if *id == child_thread_id)
+    ));
+    drop(cleanup_transition);
+    assert!(
+        timeout(Duration::from_millis(100), &mut delivery)
+            .await
+            .is_err(),
+        "delivery must still wait for the completion watcher to publish cleanup completion"
+    );
+    assert!(matches!(
+        harness.manager.get_thread(child_thread_id).await,
+        Err(err) if matches!(err.details(), CodexErrorDetails::ThreadNotFound(id) if *id == child_thread_id)
+    ));
+
+    drop(completion_registration);
+    timeout(Duration::from_secs(10), delivery)
+        .await
+        .expect("delivery should finish after completion cleanup")
+        .expect("delivery task should not panic")
+        .expect("delivery should reload the child");
+    assert!(
+        harness
+            .manager
+            .captured_ops()
+            .iter()
+            .any(|entry| captured_op_matches(entry, &expected)),
+        "delivery should submit exactly after the cold reload is admitted"
+    );
+    assert!(
+        harness.manager.get_thread(child_thread_id).await.is_ok(),
+        "delivery should reload the child once cleanup is complete"
+    );
+    harness
+        .manager
+        .get_thread(child_thread_id)
+        .await?
+        .shutdown_and_wait()
+        .await?;
+    Ok(())
 }
 
 #[tokio::test]
@@ -2161,21 +3090,23 @@ async fn spawn_agent_can_fork_parent_thread_history_with_sanitized_items() {
         .flush_rollout()
         .await
         .expect("parent rollout should flush");
+    let child_source = SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+        parent_thread_id,
+        depth: 1,
+        agent_path: None,
+        agent_nickname: None,
+        agent_role: None,
+    });
     let child_thread_id = harness
         .control
         .spawn_agent_with_metadata(
             child_config.clone(),
             text_input("child task"),
-            Some(SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
-                parent_thread_id,
-                depth: 1,
-                agent_path: None,
-                agent_nickname: None,
-                agent_role: None,
-            })),
+            Some(child_source.clone()),
             SpawnAgentOptions {
                 fork_parent_spawn_call_id: Some(parent_spawn_call_id.clone()),
                 fork_mode: Some(SpawnAgentForkMode::FullHistory),
+                initial_task_message: Some("child task".to_string()),
                 ..Default::default()
             },
         )
@@ -2281,6 +3212,7 @@ async fn spawn_agent_can_fork_parent_thread_history_with_sanitized_items() {
         ContextualUserFragment::into(MultiAgentRoleInstructions::unmarked(
             "Child subagent guidance.",
         )),
+        subagent_assignment_item(&child_source, "child task".to_string()),
     ];
     assert_eq!(
         strip_response_item_ids(&history_items),
@@ -2390,17 +3322,7 @@ async fn spawn_agent_can_fork_parent_thread_history_with_sanitized_items() {
         .expect("child shutdown should submit");
     let resumed_child_thread_id = harness
         .control
-        .resume_agent_from_rollout(
-            child_config,
-            child_thread_id,
-            SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
-                parent_thread_id,
-                depth: 1,
-                agent_path: None,
-                agent_nickname: None,
-                agent_role: None,
-            }),
-        )
+        .resume_agent_from_rollout(child_config, child_thread_id, child_source)
         .await
         .expect("sanitized child should resume from persisted history");
     let resumed_child_thread = harness
@@ -2414,6 +3336,8 @@ async fn spawn_agent_can_fork_parent_thread_history_with_sanitized_items() {
         "Child developer instructions.",
         "parent final answer",
         "Child subagent guidance.",
+        "# Subagent Assignment",
+        "Your direct assignment from your parent agent is:\n\nchild task",
     ] {
         assert!(
             history_contains_text(resumed_history.raw_items(), retained_text),
@@ -3230,6 +4154,7 @@ async fn spawn_agent_fork_flushes_parent_rollout_before_loading_history() {
             SpawnAgentOptions {
                 fork_parent_spawn_call_id: Some(parent_spawn_call_id.clone()),
                 fork_mode: Some(SpawnAgentForkMode::FullHistory),
+                initial_task_message: Some("child task".to_string()),
                 ..Default::default()
             },
         )
@@ -3247,6 +4172,11 @@ async fn spawn_agent_fork_flushes_parent_rollout_before_loading_history() {
         history_contains_text(history.raw_items(), "unflushed final answer"),
         "forked child history should include unflushed assistant final answers after flushing the parent rollout"
     );
+    assert_eq!(
+        history_text_match_count(history.raw_items(), "# Subagent Assignment"),
+        1,
+        "forked child history should contain one explicit assignment"
+    );
 
     let _ = harness
         .control
@@ -3257,6 +4187,125 @@ async fn spawn_agent_fork_flushes_parent_rollout_before_loading_history() {
         .submit(Op::Shutdown {})
         .await
         .expect("parent shutdown should submit");
+}
+
+#[tokio::test]
+async fn reference_backed_fork_persists_assignment_after_settings_across_resume() {
+    let harness = AgentControlHarness::new_with_multi_agent_v1().await;
+    let (parent_thread_id, parent_thread) = harness.start_thread().await;
+    parent_thread
+        .session
+        .inject_no_new_turn(
+            vec![user_message("parent seed context")],
+            /*current_turn_context*/ None,
+        )
+        .await;
+    parent_thread
+        .session
+        .ensure_rollout_materialized(PersistContext::Standard)
+        .await;
+    parent_thread
+        .session
+        .flush_rollout()
+        .await
+        .expect("parent rollout should flush");
+    let child_source = SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+        parent_thread_id,
+        depth: 1,
+        agent_path: None,
+        agent_nickname: None,
+        agent_role: None,
+    });
+    let child_thread_id = harness
+        .control
+        .spawn_agent_with_metadata(
+            harness.config.clone(),
+            text_input("child task"),
+            Some(child_source.clone()),
+            SpawnAgentOptions {
+                fork_parent_spawn_call_id: Some("synthetic-spawn-call".to_string()),
+                fork_mode: Some(SpawnAgentForkMode::FullHistory),
+                initial_task_message: Some("child task".to_string()),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("reference-backed fork should spawn")
+        .thread_id;
+    let child_thread = harness
+        .manager
+        .get_thread(child_thread_id)
+        .await
+        .expect("child thread should be registered");
+    child_thread.ensure_rollout_materialized().await;
+    child_thread
+        .flush_rollout()
+        .await
+        .expect("child rollout should flush");
+
+    let physical_items = RolloutRecorder::load_rollout_items(
+        child_thread
+            .rollout_path()
+            .expect("child rollout should exist")
+            .as_path(),
+    )
+    .await
+    .expect("load child rollout")
+    .0;
+    let reference_index = physical_items
+        .iter()
+        .position(|item| matches!(item, RolloutItem::RolloutReference(_)))
+        .expect("child should preserve the parent reference");
+    let settings_index = physical_items
+        .iter()
+        .position(|item| {
+            matches!(
+                item,
+                RolloutItem::EventMsg(EventMsg::ThreadSettingsApplied(_))
+            )
+        })
+        .expect("child should persist effective settings");
+    let assignment_index = physical_items
+        .iter()
+        .position(|item| {
+            matches!(
+                item,
+                RolloutItem::ResponseItem(envelope)
+                    if history_contains_text([&envelope.item], "# Subagent Assignment")
+            )
+        })
+        .expect("child should persist its assignment");
+    assert!(reference_index < settings_index && settings_index < assignment_index);
+    let live_history = child_thread.session.clone_history().await;
+    assert_eq!(
+        history_text_match_count(live_history.raw_items(), "# Subagent Assignment"),
+        1
+    );
+
+    harness
+        .control
+        .shutdown_live_agent(child_thread_id)
+        .await
+        .expect("child shutdown should submit");
+    harness
+        .control
+        .resume_agent_from_rollout(harness.config.clone(), child_thread_id, child_source)
+        .await
+        .expect("child should resume");
+    let resumed_child = harness
+        .manager
+        .get_thread(child_thread_id)
+        .await
+        .expect("resumed child should be registered");
+    let resumed_history = resumed_child.session.clone_history().await;
+    assert_eq!(
+        history_text_match_count(resumed_history.raw_items(), "# Subagent Assignment"),
+        1,
+        "cold resume should retain exactly one explicit assignment"
+    );
+
+    let _ = harness.control.shutdown_live_agent(child_thread_id).await;
+    let _ = parent_thread.submit(Op::Shutdown {}).await;
 }
 
 #[tokio::test]
@@ -5045,6 +6094,1443 @@ async fn resume_agent_from_rollout_does_not_reopen_closed_descendants() {
         .shutdown_agent_tree(parent_thread_id)
         .await
         .expect("tree shutdown after resume should succeed");
+}
+
+#[test]
+fn goal_supervisor_spawn_reconciles_stale_persisted_state() {
+    run_goal_supervisor_test(
+        "goal_supervisor_spawn_reconciles_stale_persisted_state",
+        goal_supervisor_spawn_reconciles_stale_persisted_state_inner(),
+    );
+}
+
+async fn goal_supervisor_spawn_reconciles_stale_persisted_state_inner() {
+    let harness = AgentControlHarness::new().await;
+    let (parent_thread_id, parent_thread) = harness.start_thread().await;
+    let state_db = harness
+        .state_db
+        .as_ref()
+        .expect("goal supervisor test requires state db");
+    let goal = ThreadGoal {
+        thread_id: parent_thread_id,
+        objective: "Continue the daily release cycle.".to_string(),
+        status: ThreadGoalStatus::Active,
+        token_budget: None,
+        tokens_used: 0,
+        time_used_seconds: 0,
+        created_at: 1,
+        updated_at: 1,
+    };
+    let supervisor_path = AgentPath::root()
+        .join("goal_supervisor")
+        .expect("supervisor path");
+    let stale_helper_thread_ids = [ThreadId::new(), ThreadId::new()];
+    for stale_helper_thread_id in stale_helper_thread_ids {
+        let stale_source = SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+            parent_thread_id,
+            depth: 1,
+            agent_path: Some(supervisor_path.clone()),
+            agent_nickname: None,
+            agent_role: Some(crate::goal_supervisor::GOAL_SUPERVISOR_ROLE_NAME.to_string()),
+        });
+        let stale_metadata = codex_state::ThreadMetadataBuilder::new(
+            stale_helper_thread_id,
+            harness
+                .config
+                .codex_home
+                .join(format!("{stale_helper_thread_id}.jsonl"))
+                .to_path_buf(),
+            chrono::Utc::now(),
+            stale_source,
+        )
+        .build("openai");
+        state_db
+            .upsert_thread(&stale_metadata)
+            .await
+            .expect("stale supervisor metadata should persist");
+        state_db
+            .upsert_thread_spawn_edge(
+                parent_thread_id,
+                stale_helper_thread_id,
+                DirectionalThreadSpawnEdgeStatus::Open,
+            )
+            .await
+            .expect("stale supervisor edge should persist");
+    }
+    harness
+        .control
+        .restore_v2_agent_metadata(&harness.config, parent_thread_id)
+        .await;
+    assert!(
+        harness
+            .control
+            .state
+            .agent_id_for_path(&supervisor_path)
+            .is_some_and(|thread_id| stale_helper_thread_ids.contains(&thread_id)),
+        "cold restore should reproduce the stale canonical path collision"
+    );
+    for stale_helper_thread_id in stale_helper_thread_ids {
+        assert_eq!(
+            harness.control.get_status(stale_helper_thread_id).await,
+            AgentStatus::NotFound,
+            "restored supervisor metadata must not be mistaken for a live helper"
+        );
+    }
+
+    let replacement_thread_id =
+        crate::goal_supervisor::spawn_supervisor_helper_for_test(&parent_thread.session, &goal)
+            .await
+            .expect("new supervisor spawn should reconcile stale persisted state");
+
+    assert!(!stale_helper_thread_ids.contains(&replacement_thread_id));
+    let open_children = state_db
+        .list_thread_spawn_children_with_status(
+            parent_thread_id,
+            DirectionalThreadSpawnEdgeStatus::Open,
+        )
+        .await
+        .expect("open child query should succeed");
+    let closed_children = state_db
+        .list_thread_spawn_children_with_status(
+            parent_thread_id,
+            DirectionalThreadSpawnEdgeStatus::Closed,
+        )
+        .await
+        .expect("closed child query should succeed");
+    for stale_helper_thread_id in stale_helper_thread_ids {
+        assert!(!open_children.contains(&stale_helper_thread_id));
+        assert!(closed_children.contains(&stale_helper_thread_id));
+    }
+}
+
+#[test]
+fn goal_supervisor_reconciliation_preserves_running_supervisor_and_worker() {
+    run_goal_supervisor_test(
+        "goal_supervisor_reconciliation_preserves_running_supervisor_and_worker",
+        goal_supervisor_reconciliation_preserves_running_supervisor_and_worker_inner(),
+    );
+}
+
+async fn goal_supervisor_reconciliation_preserves_running_supervisor_and_worker_inner() {
+    let harness = AgentControlHarness::new().await;
+    let (parent_thread_id, _) = harness.start_thread().await;
+    let state_db = harness
+        .state_db
+        .as_ref()
+        .expect("goal supervisor test requires state db");
+    let supervisor_path = AgentPath::root()
+        .join("goal_supervisor")
+        .expect("supervisor path");
+    let mut helper_config = harness.config.clone();
+    helper_config.ephemeral = true;
+    let helper_thread_id = harness
+        .control
+        .spawn_agent_with_metadata(
+            helper_config,
+            text_input("supervise"),
+            Some(SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+                parent_thread_id,
+                depth: 1,
+                agent_path: Some(supervisor_path.clone()),
+                agent_nickname: None,
+                agent_role: Some(crate::goal_supervisor::GOAL_SUPERVISOR_ROLE_NAME.to_string()),
+            })),
+            SpawnAgentOptions::default(),
+        )
+        .await
+        .expect("supervisor helper should spawn")
+        .thread_id;
+    let worker_thread_id = harness
+        .control
+        .spawn_agent_with_metadata(
+            harness.config.clone(),
+            text_input("work"),
+            Some(SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+                parent_thread_id,
+                depth: 1,
+                agent_path: Some(AgentPath::root().join("worker").expect("worker path")),
+                agent_nickname: None,
+                agent_role: Some("worker".to_string()),
+            })),
+            SpawnAgentOptions::default(),
+        )
+        .await
+        .expect("worker should spawn")
+        .thread_id;
+    for child_thread_id in [helper_thread_id, worker_thread_id] {
+        state_db
+            .upsert_thread_spawn_edge(
+                parent_thread_id,
+                child_thread_id,
+                DirectionalThreadSpawnEdgeStatus::Open,
+            )
+            .await
+            .expect("child edge should persist");
+    }
+    let foreign_supervisor_thread_id = ThreadId::new();
+    let foreign_supervisor_source = SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+        parent_thread_id: ThreadId::new(),
+        depth: 1,
+        agent_path: Some(
+            AgentPath::root()
+                .join("foreign_goal_supervisor")
+                .expect("foreign supervisor path"),
+        ),
+        agent_nickname: None,
+        agent_role: Some(crate::goal_supervisor::GOAL_SUPERVISOR_ROLE_NAME.to_string()),
+    });
+    let foreign_supervisor_metadata = codex_state::ThreadMetadataBuilder::new(
+        foreign_supervisor_thread_id,
+        harness
+            .config
+            .codex_home
+            .join(format!("{foreign_supervisor_thread_id}.jsonl"))
+            .to_path_buf(),
+        chrono::Utc::now(),
+        foreign_supervisor_source,
+    )
+    .build("openai");
+    state_db
+        .upsert_thread(&foreign_supervisor_metadata)
+        .await
+        .expect("foreign supervisor metadata should persist");
+    state_db
+        .upsert_thread_spawn_edge(
+            parent_thread_id,
+            foreign_supervisor_thread_id,
+            DirectionalThreadSpawnEdgeStatus::Open,
+        )
+        .await
+        .expect("inaccurate foreign supervisor edge should persist");
+
+    let first_result = harness
+        .control
+        .reconcile_goal_supervisor_state(parent_thread_id, &supervisor_path)
+        .await
+        .expect("first reconciliation should succeed");
+    let second_result = harness
+        .control
+        .reconcile_goal_supervisor_state(parent_thread_id, &supervisor_path)
+        .await
+        .expect("second reconciliation should be idempotent");
+
+    assert_eq!(first_result, Some(helper_thread_id));
+    assert_eq!(second_result, Some(helper_thread_id));
+    let open_children = state_db
+        .list_thread_spawn_children_with_status(
+            parent_thread_id,
+            DirectionalThreadSpawnEdgeStatus::Open,
+        )
+        .await
+        .expect("open child query should succeed");
+    assert!(open_children.contains(&helper_thread_id));
+    assert!(open_children.contains(&worker_thread_id));
+    assert!(
+        open_children.contains(&foreign_supervisor_thread_id),
+        "reconciliation must not trust an inaccurate edge over the stored supervisor parent"
+    );
+}
+
+#[test]
+fn goal_supervisor_waits_for_parent_turn_to_finish() {
+    run_goal_supervisor_test(
+        "goal_supervisor_waits_for_parent_turn_to_finish",
+        goal_supervisor_waits_for_parent_turn_to_finish_inner(),
+    );
+}
+
+async fn goal_supervisor_waits_for_parent_turn_to_finish_inner() {
+    let harness = AgentControlHarness::new().await;
+    let (parent_thread_id, parent_thread) = harness.start_thread().await;
+    parent_thread
+        .session
+        .ensure_rollout_materialized(PersistContext::Standard)
+        .await;
+    parent_thread
+        .session
+        .flush_rollout()
+        .await
+        .expect("parent rollout should flush");
+    let goal = ThreadGoal {
+        thread_id: parent_thread_id,
+        objective: "Wait for the parent turn, then continue.".to_string(),
+        status: ThreadGoalStatus::Active,
+        token_budget: None,
+        tokens_used: 0,
+        time_used_seconds: 0,
+        created_at: 1,
+        updated_at: 1,
+    };
+    let parent_only = harness.manager.list_thread_ids().await;
+    *parent_thread.session.active_turn.lock().await = Some(ActiveTurn::default());
+
+    crate::goal_supervisor::maybe_start_supervisor_checkin(
+        &parent_thread.session,
+        "goal-supervisor-busy-parent-test",
+        &goal,
+    )
+    .await
+    .expect("busy parent should defer the supervisor");
+
+    assert_eq!(harness.manager.list_thread_ids().await, parent_only);
+
+    *parent_thread.session.active_turn.lock().await = None;
+    crate::goal_supervisor::maybe_start_supervisor_checkin(
+        &parent_thread.session,
+        "goal-supervisor-busy-parent-test",
+        &goal,
+    )
+    .await
+    .expect("idle parent should start the deferred supervisor");
+
+    let helper_thread_id = spawned_thread_id_after(&harness.manager, &parent_only).await;
+    assert!(harness.manager.get_thread(helper_thread_id).await.is_ok());
+}
+
+#[test]
+fn goal_supervisor_finish_serializes_with_the_next_start() -> anyhow::Result<()> {
+    run_goal_supervisor_test(
+        "goal_supervisor_finish_serializes_with_the_next_start",
+        goal_supervisor_finish_serializes_with_the_next_start_inner(),
+    )
+}
+
+async fn goal_supervisor_finish_serializes_with_the_next_start_inner() -> anyhow::Result<()> {
+    let server = start_mock_server().await;
+    let delayed_response = Duration::from_secs(30);
+    let request_log = mount_response_sequence(
+        &server,
+        vec![
+            sse_response(sse(vec![
+                ev_response_created("first-supervisor"),
+                ev_completed("first-supervisor"),
+            ]))
+            .set_delay(delayed_response),
+            sse_response(sse(vec![
+                ev_response_created("replacement-supervisor"),
+                ev_completed("replacement-supervisor"),
+            ]))
+            .set_delay(delayed_response),
+            sse_response(sse(vec![
+                ev_response_created("post-followup-supervisor"),
+                ev_completed("post-followup-supervisor"),
+            ]))
+            .set_delay(delayed_response),
+        ],
+    )
+    .await;
+    let (home, mut config) = test_config().await;
+    let _ = config.features.enable(Feature::Goals);
+    let _ = config.features.enable(Feature::GoalSupervisor);
+    let _ = config.features.enable(Feature::MultiAgentV2);
+    config.model_provider.base_url = Some(format!("{}/v1", server.uri()));
+    config.model_provider.supports_websockets = false;
+    let harness = AgentControlHarness::new_with_config(home, config).await;
+    let (parent_thread_id, parent_thread) = harness.start_thread().await;
+    parent_thread.ensure_rollout_materialized().await;
+    parent_thread.flush_rollout().await?;
+    let state_db = harness
+        .state_db
+        .as_ref()
+        .expect("goal supervisor test requires state db");
+    let (goal_id, goal) = create_active_thread_goal_for_test(
+        state_db,
+        parent_thread_id,
+        &parent_thread.session,
+        "Serialize supervisor retirement and replacement.",
+    )
+    .await?;
+    let parent_only = harness.manager.list_thread_ids().await;
+    crate::goal_supervisor::maybe_start_supervisor_checkin(
+        &parent_thread.session,
+        goal_id.as_str(),
+        &goal,
+    )
+    .await?;
+    let first_helper_thread_id = spawned_thread_id_after(&harness.manager, &parent_only).await;
+    timeout(Duration::from_secs(5), async {
+        while request_log.requests().is_empty() {
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("first supervisor request should start");
+
+    let transition =
+        crate::goal_supervisor::hold_supervisor_transition_for_test(&parent_thread.session).await;
+    let finish_session = Arc::clone(&parent_thread.session);
+    let finish_task = tokio::spawn(async move {
+        crate::goal_supervisor::finish_supervisor_helper(&finish_session, first_helper_thread_id)
+            .await
+    });
+    tokio::task::yield_now().await;
+    assert!(
+        !finish_task.is_finished(),
+        "supervisor retirement must wait for the lifecycle transition lock"
+    );
+    drop(transition);
+    assert!(
+        finish_task.await.expect("finish task should not panic")?,
+        "the active supervisor should retire"
+    );
+
+    crate::goal_supervisor::maybe_start_supervisor_checkin(
+        &parent_thread.session,
+        goal_id.as_str(),
+        &goal,
+    )
+    .await?;
+    let replacement_thread_id = spawned_thread_id_after(&harness.manager, &parent_only).await;
+    assert_ne!(replacement_thread_id, first_helper_thread_id);
+    timeout(Duration::from_secs(5), async {
+        while request_log.requests().len() < 2 {
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("replacement supervisor request should start");
+
+    crate::goal_supervisor::record_followup_action(
+        &parent_thread.session,
+        &InterAgentCommunication::new(
+            AgentPath::root()
+                .join("goal_supervisor")
+                .expect("supervisor path"),
+            AgentPath::root(),
+            Vec::new(),
+            "continue".to_string(),
+            /*trigger_turn*/ true,
+        ),
+    )
+    .await;
+    assert!(
+        crate::goal_supervisor::finish_supervisor_helper_after_followup(
+            &parent_thread.session,
+            replacement_thread_id,
+        )
+        .await?,
+        "the replacement supervisor should retire after its followup"
+    );
+    timeout(Duration::from_secs(5), async {
+        while request_log.requests().len() < 3 {
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("idle recheck should replace a supervisor after its delivered followup");
+
+    let _ = harness
+        .manager
+        .shutdown_all_threads_bounded(Duration::from_secs(5))
+        .await;
+    Ok(())
+}
+
+#[test]
+fn goal_supervisor_helper_does_not_consume_multi_agent_v2_thread_limit() {
+    run_goal_supervisor_test(
+        "goal_supervisor_helper_does_not_consume_multi_agent_v2_thread_limit",
+        goal_supervisor_helper_does_not_consume_multi_agent_v2_thread_limit_inner(),
+    );
+}
+
+async fn goal_supervisor_helper_does_not_consume_multi_agent_v2_thread_limit_inner() {
+    let (home, mut config) = test_config().await;
+    config
+        .features
+        .enable(Feature::MultiAgentV2)
+        .expect("test config should allow multi-agent v2");
+    config
+        .features
+        .enable(Feature::Goals)
+        .expect("test config should allow goals");
+    config
+        .features
+        .enable(Feature::GoalSupervisor)
+        .expect("test config should allow goal supervisor");
+    config.agent_max_threads = None;
+    config.multi_agent_v2.max_concurrent_threads_per_session = 2;
+    assert_eq!(
+        (
+            config.agent_max_threads,
+            config.multi_agent_v2.max_concurrent_threads_per_session,
+            config.effective_agent_max_threads(MultiAgentVersion::V2),
+        ),
+        (None, 2, Some(1))
+    );
+    let harness = AgentControlHarness::new_with_config(home, config.clone()).await;
+    let (parent_thread_id, parent_thread) = harness.start_thread().await;
+    let worker_thread_id = ThreadId::new();
+    harness
+        .control
+        .state
+        .reserve_spawn_slot(Some(1))
+        .expect("the user-visible worker slot should be available")
+        .commit(AgentMetadata {
+            agent_id: Some(worker_thread_id),
+            ..Default::default()
+        });
+    parent_thread
+        .session
+        .ensure_rollout_materialized(PersistContext::Standard)
+        .await;
+    parent_thread
+        .session
+        .flush_rollout()
+        .await
+        .expect("parent rollout should flush");
+    let before_thread_ids = harness.manager.list_thread_ids().await;
+    let goal = ThreadGoal {
+        thread_id: parent_thread_id,
+        objective: "Verify supervisor thread accounting.".to_string(),
+        status: ThreadGoalStatus::Active,
+        token_budget: None,
+        tokens_used: 0,
+        time_used_seconds: 0,
+        created_at: 1,
+        updated_at: 1,
+    };
+
+    crate::goal_supervisor::maybe_start_supervisor_checkin(
+        &parent_thread.session,
+        "goal-supervisor-limit-test",
+        &goal,
+    )
+    .await
+    .expect("goal supervisor should bypass the user-visible agent limit");
+    let helper_thread_id = spawned_thread_id_after(&harness.manager, &before_thread_ids).await;
+
+    let err = match harness
+        .control
+        .state
+        .reserve_spawn_slot(config.effective_agent_max_threads(MultiAgentVersion::V2))
+    {
+        Ok(_) => panic!("the goal supervisor must not free the counted worker slot"),
+        Err(err) => err,
+    };
+    let CodexErrorDetails::AgentLimitReached { max_threads } = err.details() else {
+        panic!("expected AgentLimitReached");
+    };
+    assert_eq!(*max_threads, 1);
+    assert!(harness.manager.get_thread(helper_thread_id).await.is_ok());
+
+    harness
+        .control
+        .state
+        .release_spawned_thread(worker_thread_id);
+    let _ = harness.control.shutdown_live_agent(helper_thread_id).await;
+    let _ = parent_thread.submit(Op::Shutdown {}).await;
+}
+
+#[test]
+fn goal_supervisor_goal_resume_clears_snooze_and_spawns_helper() -> anyhow::Result<()> {
+    run_goal_supervisor_test(
+        "goal_supervisor_goal_resume_clears_snooze_and_spawns_helper",
+        goal_supervisor_goal_resume_clears_snooze_and_spawns_helper_inner(),
+    )
+}
+
+async fn goal_supervisor_goal_resume_clears_snooze_and_spawns_helper_inner() -> anyhow::Result<()> {
+    let (home, mut config) = test_config().await;
+    let _ = config.features.enable(Feature::Goals);
+    let _ = config.features.enable(Feature::GoalSupervisor);
+    let _ = config.features.enable(Feature::Sqlite);
+    let harness = AgentControlHarness::new_with_config(home, config).await;
+    let state_db = harness
+        .state_db
+        .as_ref()
+        .expect("sqlite state db should be available");
+    let (parent_thread_id, parent_thread) = harness.start_thread().await;
+    parent_thread
+        .session
+        .ensure_rollout_materialized(PersistContext::Standard)
+        .await;
+    parent_thread.session.flush_rollout().await?;
+    let (goal_id, goal) = create_active_thread_goal_for_test(
+        state_db,
+        parent_thread_id,
+        &parent_thread.session,
+        "Resume the paused goal now.",
+    )
+    .await?;
+    state_db
+        .thread_goals()
+        .set_thread_goal_supervisor_snoozed_until_ms(
+            parent_thread_id,
+            goal_id.as_str(),
+            Some(chrono::Utc::now().timestamp_millis() + 60_000),
+        )
+        .await?;
+
+    crate::goal_supervisor::maybe_start_supervisor_checkin(
+        &parent_thread.session,
+        goal_id.as_str(),
+        &goal,
+    )
+    .await?;
+    let before_resume_thread_ids = harness.manager.list_thread_ids().await;
+    assert_eq!(
+        vec![parent_thread_id],
+        before_resume_thread_ids,
+        "plain idle continuation should honor the supervisor snooze"
+    );
+
+    parent_thread
+        .maybe_start_goal_supervisor_checkin_after_goal_resume(goal_id.as_str(), &goal)
+        .await?;
+
+    let child_thread_id =
+        spawned_thread_id_after(&harness.manager, &before_resume_thread_ids).await;
+    let child_thread = harness
+        .manager
+        .get_thread(child_thread_id)
+        .await
+        .expect("supervisor helper thread should be registered");
+    let child_config = child_thread.config_snapshot().await;
+    assert_matches!(
+        child_config.session_source,
+        SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+            agent_role: Some(agent_role),
+            ..
+        }) if agent_role == crate::goal_supervisor::GOAL_SUPERVISOR_ROLE_NAME
+    );
+    assert_eq!(
+        None,
+        state_db
+            .thread_goals()
+            .get_thread_goal_supervisor_snoozed_until_ms(parent_thread_id, goal_id.as_str())
+            .await?,
+        "manual goal resume should clear the persisted supervisor snooze"
+    );
+    let _ = parent_thread.submit(Op::Shutdown {}).await;
+    Ok(())
+}
+
+#[test]
+fn goal_supervisor_snooze_persists_wakes_and_invalidates_stale_generation() -> anyhow::Result<()> {
+    run_goal_supervisor_test(
+        "goal_supervisor_snooze_persists_wakes_and_invalidates_stale_generation",
+        goal_supervisor_snooze_persists_wakes_and_invalidates_stale_generation_inner(),
+    )
+}
+
+async fn goal_supervisor_snooze_persists_wakes_and_invalidates_stale_generation_inner()
+-> anyhow::Result<()> {
+    let server = start_mock_server().await;
+    let delayed_response = Duration::from_secs(30);
+    let request_log = mount_response_sequence(
+        &server,
+        (0..3)
+            .map(|index| {
+                let response_id = format!("goal-supervisor-snooze-{index}");
+                sse_response(sse(vec![
+                    ev_response_created(&response_id),
+                    ev_completed(&response_id),
+                ]))
+                .set_delay(delayed_response)
+            })
+            .collect(),
+    )
+    .await;
+    let (home, mut config) = test_config().await;
+    let _ = config.features.enable(Feature::Goals);
+    let _ = config.features.enable(Feature::GoalSupervisor);
+    let _ = config.features.enable(Feature::MultiAgentV2);
+    let _ = config.features.enable(Feature::Sqlite);
+    config.model_provider.base_url = Some(format!("{}/v1", server.uri()));
+    config.model_provider.supports_websockets = false;
+    let harness = AgentControlHarness::new_with_config(home, config).await;
+    let state_db = harness
+        .state_db
+        .as_ref()
+        .expect("goal supervisor test requires a state db");
+    let (parent_thread_id, parent_thread) = harness.start_thread().await;
+    parent_thread
+        .session
+        .ensure_rollout_materialized(PersistContext::Standard)
+        .await;
+    parent_thread.session.flush_rollout().await?;
+    let (goal_id, goal) = create_active_thread_goal_for_test(
+        state_db,
+        parent_thread_id,
+        &parent_thread.session,
+        "Resume the scheduled goal after each snooze.",
+    )
+    .await?;
+    let before_thread_ids = harness.manager.list_thread_ids().await;
+
+    crate::goal_supervisor::maybe_start_supervisor_checkin(
+        &parent_thread.session,
+        goal_id.as_str(),
+        &goal,
+    )
+    .await?;
+    let first_helper_id = spawned_thread_id_after(&harness.manager, &before_thread_ids).await;
+    timeout(Duration::from_secs(5), async {
+        while request_log.requests().is_empty() {
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("first supervisor request should start");
+    assert_eq!(
+        harness
+            .control
+            .snooze_goal_supervisor_helper(
+                first_helper_id,
+                /*delay_seconds*/ 60,
+                Some("external work is not ready"),
+            )
+            .await,
+        Some(60)
+    );
+
+    let snoozed_until_ms = state_db
+        .thread_goals()
+        .get_thread_goal_supervisor_snoozed_until_ms(parent_thread_id, goal_id.as_str())
+        .await?
+        .expect("snooze deadline should be persisted");
+    assert!(snoozed_until_ms > chrono::Utc::now().timestamp_millis());
+    let first_generation = crate::goal_supervisor::scheduled_supervisor_wakeup_generation_for_test(
+        &parent_thread.session,
+    )
+    .await
+    .expect("snooze should schedule a wakeup");
+
+    state_db
+        .thread_goals()
+        .set_thread_goal_supervisor_snoozed_until_ms(
+            parent_thread_id,
+            goal_id.as_str(),
+            /*snoozed_until_ms*/ None,
+        )
+        .await?;
+    crate::goal_supervisor::fire_scheduled_supervisor_wakeup_for_test(&parent_thread.session).await;
+    crate::goal_supervisor::maybe_start_supervisor_checkin(
+        &parent_thread.session,
+        goal_id.as_str(),
+        &goal,
+    )
+    .await?;
+    timeout(Duration::from_secs(5), async {
+        while request_log.requests().len() < 2 {
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("scheduled wakeup should start exactly one replacement helper");
+    let second_helper_id = spawned_thread_id_after(&harness.manager, &[parent_thread_id]).await;
+    assert_ne!(second_helper_id, first_helper_id);
+    assert_eq!(
+        crate::goal_supervisor::scheduled_supervisor_wakeup_generation_for_test(
+            &parent_thread.session,
+        )
+        .await,
+        None
+    );
+
+    assert_eq!(
+        harness
+            .control
+            .snooze_goal_supervisor_helper(
+                second_helper_id,
+                /*delay_seconds*/ 60,
+                Some("still waiting for external work"),
+            )
+            .await,
+        Some(60)
+    );
+    let stale_generation = crate::goal_supervisor::scheduled_supervisor_wakeup_generation_for_test(
+        &parent_thread.session,
+    )
+    .await
+    .expect("second snooze should schedule a wakeup");
+    assert_ne!(stale_generation, first_generation);
+    let before_manual_resume = harness.manager.list_thread_ids().await;
+    parent_thread
+        .maybe_start_goal_supervisor_checkin_after_goal_resume(goal_id.as_str(), &goal)
+        .await?;
+    let third_helper_id = spawned_thread_id_after(&harness.manager, &before_manual_resume).await;
+    timeout(Duration::from_secs(5), async {
+        while request_log.requests().len() < 3 {
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("manual resume should start one replacement helper");
+    assert_ne!(third_helper_id, second_helper_id);
+    assert_eq!(
+        state_db
+            .thread_goals()
+            .get_thread_goal_supervisor_snoozed_until_ms(parent_thread_id, goal_id.as_str())
+            .await?,
+        None
+    );
+    assert_eq!(
+        crate::goal_supervisor::scheduled_supervisor_wakeup_generation_for_test(
+            &parent_thread.session,
+        )
+        .await,
+        None
+    );
+
+    let generation_after_resume =
+        crate::goal_supervisor::supervisor_wakeup_generation_for_test(&parent_thread.session);
+    assert_ne!(generation_after_resume, stale_generation);
+    crate::goal_supervisor::fire_supervisor_wakeup_generation_for_test(
+        &parent_thread.session,
+        stale_generation,
+    )
+    .await;
+    assert_eq!(
+        crate::goal_supervisor::supervisor_wakeup_generation_for_test(&parent_thread.session),
+        generation_after_resume,
+        "an invalidated wakeup must not advance the current generation"
+    );
+    assert_eq!(request_log.requests().len(), 3);
+
+    let third_helper = harness
+        .manager
+        .get_thread(third_helper_id)
+        .await
+        .expect("manual resume helper should remain loaded");
+    let continuity =
+        goal_supervisor_continuity_from_history(&third_helper.session.clone_history().await);
+    assert_eq!(continuity["previous_supervisor_action"]["kind"], "snooze");
+    assert_eq!(
+        continuity["goal_timing"]["snooze_count_since_goal_created"],
+        2
+    );
+
+    let _ = harness
+        .manager
+        .shutdown_all_threads_bounded(Duration::from_secs(5))
+        .await;
+    Ok(())
+}
+
+#[test]
+fn goal_supervisor_execution_settings_change_restarts_running_helper() -> anyhow::Result<()> {
+    run_goal_supervisor_test(
+        "goal_supervisor_execution_settings_change_restarts_running_helper",
+        goal_supervisor_execution_settings_change_restarts_running_helper_inner(),
+    )
+}
+
+async fn goal_supervisor_execution_settings_change_restarts_running_helper_inner()
+-> anyhow::Result<()> {
+    let server = start_mock_server().await;
+    let delayed_response = Duration::from_secs(30);
+    let request_log = mount_response_sequence(
+        &server,
+        vec![
+            sse_response(sse(vec![
+                ev_response_created("resp-before-settings-change"),
+                ev_completed("resp-before-settings-change"),
+            ]))
+            .set_delay(delayed_response),
+            sse_response(sse(vec![
+                ev_response_created("resp-after-settings-change"),
+                ev_completed("resp-after-settings-change"),
+            ]))
+            .set_delay(delayed_response),
+        ],
+    )
+    .await;
+    let (home, mut config) = test_config().await;
+    let _ = config.features.enable(Feature::Goals);
+    let _ = config.features.enable(Feature::GoalSupervisor);
+    let _ = config.features.enable(Feature::MultiAgentV2);
+    config.model_provider.base_url = Some(format!("{}/v1", server.uri()));
+    config.model_provider.supports_websockets = false;
+    let harness = AgentControlHarness::new_with_config(home, config).await;
+    let state_db = harness
+        .state_db
+        .as_ref()
+        .expect("goal supervisor test requires a state db");
+    let (parent_thread_id, parent_thread) = harness.start_thread().await;
+    parent_thread
+        .session
+        .ensure_rollout_materialized(PersistContext::Standard)
+        .await;
+    parent_thread.session.flush_rollout().await?;
+    let (goal_id, goal) = create_active_thread_goal_for_test(
+        state_db,
+        parent_thread_id,
+        &parent_thread.session,
+        "Restart the supervisor when execution settings change.",
+    )
+    .await?;
+    let before_thread_ids = harness.manager.list_thread_ids().await;
+
+    crate::goal_supervisor::maybe_start_supervisor_checkin(
+        &parent_thread.session,
+        goal_id.as_str(),
+        &goal,
+    )
+    .await?;
+    let first_helper_thread_id =
+        spawned_thread_id_after(&harness.manager, &before_thread_ids).await;
+    timeout(Duration::from_secs(5), async {
+        while request_log.requests().is_empty() {
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("first supervisor request should start");
+
+    let original_model = parent_thread.session.thread_config_snapshot().await.model;
+    let next_model = if original_model == "gpt-5.4" {
+        "gpt-5.2"
+    } else {
+        "gpt-5.4"
+    };
+    let settings_changed_at = Instant::now();
+    parent_thread
+        .submit(Op::ThreadSettings {
+            thread_settings: ThreadSettingsOverrides {
+                model: Some(next_model.to_string()),
+                effort: Some(Some(ReasoningEffort::High)),
+                service_tier: Some(Some(ServiceTier::Fast.request_value().to_string())),
+                ..Default::default()
+            },
+        })
+        .await?;
+    timeout(Duration::from_secs(5), async {
+        while !harness
+            .manager
+            .captured_ops()
+            .into_iter()
+            .any(|(thread_id, op)| {
+                thread_id == first_helper_thread_id && matches!(op, Op::Shutdown)
+            })
+        {
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("settings update should stop the running supervisor helper");
+    timeout(Duration::from_secs(5), async {
+        while request_log.requests().len() < 2 {
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("replacement supervisor should start before the old response finishes");
+    assert!(settings_changed_at.elapsed() < delayed_response);
+
+    let requests = request_log.requests();
+    assert_eq!(requests.len(), 2);
+    let replacement_body = requests[1].body_json();
+    assert_eq!(replacement_body["model"].as_str(), Some(next_model));
+    assert_eq!(
+        replacement_body["reasoning"]["effort"].as_str(),
+        Some("high")
+    );
+    assert_eq!(
+        replacement_body["service_tier"].as_str(),
+        Some(ServiceTier::Fast.request_value())
+    );
+
+    let _ = harness
+        .manager
+        .shutdown_all_threads_bounded(Duration::from_secs(5))
+        .await;
+    Ok(())
+}
+
+#[test]
+fn failed_goal_supervisor_waits_for_one_persisted_retry() -> anyhow::Result<()> {
+    run_goal_supervisor_test(
+        "failed_goal_supervisor_waits_for_one_persisted_retry",
+        failed_goal_supervisor_waits_for_one_persisted_retry_inner(),
+    )
+}
+
+async fn failed_goal_supervisor_waits_for_one_persisted_retry_inner() -> anyhow::Result<()> {
+    let server = start_mock_server().await;
+    let request_log = mount_sse_sequence(
+        &server,
+        vec![
+            sse_failed(
+                "supervisor-failure-1",
+                "model_not_found",
+                "saved model unavailable",
+            ),
+            sse_failed(
+                "supervisor-failure-2",
+                "model_not_found",
+                "saved model unavailable",
+            ),
+        ],
+    )
+    .await;
+    let (home, mut config) = test_config().await;
+    let _ = config.features.enable(Feature::MultiAgentV2);
+    let _ = config.features.enable(Feature::Goals);
+    let _ = config.features.enable(Feature::GoalSupervisor);
+    let _ = config.features.enable(Feature::Sqlite);
+    config.model_provider.base_url = Some(format!("{}/v1", server.uri()));
+    config.model_provider.supports_websockets = false;
+    config.model_provider.request_max_retries = Some(0);
+    config.model_provider.stream_max_retries = Some(0);
+    let harness = AgentControlHarness::new_with_config(home, config).await;
+    let state_db = harness
+        .state_db
+        .as_ref()
+        .expect("sqlite state db should be available");
+    let (parent_thread_id, parent_thread) = harness.start_thread().await;
+    parent_thread
+        .session
+        .ensure_rollout_materialized(PersistContext::Standard)
+        .await;
+    parent_thread.session.flush_rollout().await?;
+    let (goal_id, goal) = create_active_thread_goal_for_test(
+        state_db,
+        parent_thread_id,
+        &parent_thread.session,
+        "Keep retrying after transient supervisor failures.",
+    )
+    .await?;
+
+    crate::goal_supervisor::maybe_start_supervisor_checkin(
+        &parent_thread.session,
+        goal_id.as_str(),
+        &goal,
+    )
+    .await?;
+
+    let first_deadline_ms = timeout(Duration::from_secs(5), async {
+        loop {
+            if let Some(deadline_ms) = state_db
+                .thread_goals()
+                .get_thread_goal_supervisor_snoozed_until_ms(parent_thread_id, goal_id.as_str())
+                .await?
+                && deadline_ms > chrono::Utc::now().timestamp_millis()
+                && harness.manager.list_thread_ids().await == vec![parent_thread_id]
+            {
+                break Ok::<_, anyhow::Error>(deadline_ms);
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await??;
+    assert_eq!(request_log.requests().len(), 1);
+    assert_eq!(
+        crate::goal_supervisor::supervisor_failure_count_for_test(&parent_thread.session).await,
+        1
+    );
+    assert!(
+        first_deadline_ms - chrono::Utc::now().timestamp_millis() <= 60_000,
+        "first failure retry should use the one-minute backoff tier"
+    );
+    let persisted_goal = state_db
+        .thread_goals()
+        .get_thread_goal(parent_thread_id)
+        .await?
+        .expect("active goal should remain persisted");
+    assert_eq!(
+        persisted_goal.status,
+        codex_state::ThreadGoalStatus::Active,
+        "supervisor failure must not pause, block, or complete the goal"
+    );
+    let warning = timeout(Duration::from_secs(5), async {
+        loop {
+            let event = parent_thread
+                .next_event()
+                .await
+                .expect("parent event channel should stay open");
+            if let EventMsg::Warning(warning) = event.msg
+                && warning.message.contains("Goal supervisor check-in failed")
+            {
+                break warning.message;
+            }
+        }
+    })
+    .await
+    .expect("failed supervisor should warn the user");
+    assert!(warning.contains("saved model unavailable"));
+    assert!(warning.contains("Retrying in"));
+
+    let scheduled_generation =
+        crate::goal_supervisor::scheduled_supervisor_wakeup_generation_for_test(
+            &parent_thread.session,
+        )
+        .await
+        .expect("failure should schedule one retry wakeup");
+    for _ in 0..3 {
+        crate::goal_supervisor::maybe_start_supervisor_checkin(
+            &parent_thread.session,
+            goal_id.as_str(),
+            &goal,
+        )
+        .await?;
+    }
+    assert_eq!(
+        request_log.requests().len(),
+        1,
+        "idle signals before the deadline must not replace the failed helper"
+    );
+    assert_eq!(
+        crate::goal_supervisor::scheduled_supervisor_wakeup_generation_for_test(
+            &parent_thread.session,
+        )
+        .await,
+        Some(scheduled_generation),
+        "idle signals for the same deadline must reuse the existing sleeping timer"
+    );
+
+    state_db
+        .thread_goals()
+        .set_thread_goal_supervisor_snoozed_until_ms(
+            parent_thread_id,
+            goal_id.as_str(),
+            /*snoozed_until_ms*/ None,
+        )
+        .await?;
+    crate::goal_supervisor::fire_scheduled_supervisor_wakeup_for_test(&parent_thread.session).await;
+    for _ in 0..3 {
+        crate::goal_supervisor::maybe_start_supervisor_checkin(
+            &parent_thread.session,
+            goal_id.as_str(),
+            &goal,
+        )
+        .await?;
+    }
+    timeout(Duration::from_secs(5), async {
+        loop {
+            if request_log.requests().len() == 2
+                && harness.manager.list_thread_ids().await == vec![parent_thread_id]
+                // Removing the helper precedes the parent's persisted retry update.
+                && crate::goal_supervisor::supervisor_failure_count_for_test(&parent_thread.session).await == 2
+            {
+                break;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("second failed supervisor should finish");
+    let requests_after_retry = request_log.requests();
+    assert_eq!(
+        requests_after_retry.len(),
+        2,
+        "one failure retry should run after the in-memory deadline; loaded threads: {:?}; captured ops: {:?}",
+        harness.manager.list_thread_ids().await,
+        harness.manager.captured_ops(),
+    );
+    assert_eq!(
+        request_log.requests().len(),
+        2,
+        "duplicate idle signals must still produce exactly one retry"
+    );
+    assert_eq!(
+        crate::goal_supervisor::supervisor_failure_count_for_test(&parent_thread.session).await,
+        2,
+        "the second implicit failure should advance the backoff tier"
+    );
+    Ok(())
+}
+
+#[test]
+#[serial(fork_env)]
+fn goal_supervisor_helper_request_uses_parent_cache_key_and_mcp_snapshot() -> anyhow::Result<()> {
+    run_goal_supervisor_test(
+        "goal_supervisor_helper_request_uses_parent_cache_key_and_mcp_snapshot",
+        goal_supervisor_helper_request_uses_parent_cache_key_and_mcp_snapshot_inner(),
+    )
+}
+
+async fn goal_supervisor_helper_request_uses_parent_cache_key_and_mcp_snapshot_inner()
+-> anyhow::Result<()> {
+    let server = start_mock_server().await;
+    let request_log = mount_sse_sequence(
+        &server,
+        vec![
+            sse(vec![
+                ev_response_created("resp-parent"),
+                ev_completed("resp-parent"),
+            ]),
+            sse(vec![
+                ev_response_created("resp-child"),
+                ev_completed("resp-child"),
+            ]),
+        ],
+    )
+    .await;
+    let (home, mut config) = test_config().await;
+    let _ = config.features.enable(Feature::AgentPromptInjection);
+    let _ = config.features.enable(Feature::MultiAgentV2);
+    let _ = config.features.enable(Feature::Goals);
+    let _ = config.features.enable(Feature::GoalSupervisor);
+    let _ = config.features.enable(Feature::Sqlite);
+    config.model_provider.base_url = Some(format!("{}/v1", server.uri()));
+    config.model_provider.supports_websockets = false;
+    let mcp_server_path = config.codex_home.join("fake_mcp_server.py");
+    std::fs::write(
+        &mcp_server_path,
+        r#"import json
+import sys
+
+def read_message():
+    line = sys.stdin.buffer.readline()
+    if not line:
+        return None
+    return json.loads(line)
+
+def write_message(message):
+    body = json.dumps(message).encode("utf-8")
+    sys.stdout.buffer.write(body)
+    sys.stdout.buffer.write(b"\n")
+    sys.stdout.buffer.flush()
+
+while True:
+    message = read_message()
+    if message is None:
+        break
+    method = message.get("method")
+    request_id = message.get("id")
+    if request_id is None:
+        continue
+    if method == "initialize":
+        write_message({
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "result": {
+                "protocolVersion": "2025-06-18",
+                "capabilities": {"tools": {"listChanged": False}},
+                "serverInfo": {"name": "fake-mcp", "version": "1.0.0"},
+            },
+        })
+    elif method == "tools/list":
+        write_message({
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "result": {
+                "tools": [{
+                    "name": "echo",
+                    "description": "Echo from fake MCP",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {},
+                        "additionalProperties": False,
+                    },
+                }],
+            },
+        })
+    else:
+        write_message({
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "error": {"code": -32601, "message": "method not found"},
+        })
+"#,
+    )?;
+    config
+        .mcp_servers
+        .set(std::collections::HashMap::from([(
+            "rmcp".to_string(),
+            McpServerConfig {
+                auth: Default::default(),
+                transport: McpServerTransportConfig::Stdio {
+                    command: "python3".to_string(),
+                    args: vec![mcp_server_path.to_string_lossy().to_string()],
+                    env: None,
+                    env_vars: Vec::new(),
+                    cwd: None,
+                },
+                environment_id: codex_config::DEFAULT_MCP_SERVER_ENVIRONMENT_ID.to_string(),
+                enabled: true,
+                required: false,
+                supports_parallel_tool_calls: false,
+                omit_tools_from: None,
+                disabled_reason: None,
+                oauth: None,
+                startup_timeout_sec: Some(Duration::from_secs(5)),
+                tool_timeout_sec: None,
+                default_tools_approval_mode: None,
+                enabled_tools: None,
+                disabled_tools: None,
+                scopes: None,
+                oauth_resource: None,
+                tools: std::collections::HashMap::new(),
+            },
+        )]))
+        .expect("test config should allow MCP servers");
+
+    let harness = AgentControlHarness::new_with_config(home, config).await;
+    let state_db = harness
+        .state_db
+        .as_ref()
+        .expect("sqlite state db should be available");
+    let (parent_thread_id, parent_thread) = harness.start_thread().await;
+    let parent_prompt_cache_key = parent_thread.session.prompt_cache_key();
+    let mcp_runtime = Arc::clone(&parent_thread.session.services.mcp_runtime);
+    assert!(
+        mcp_runtime
+            .latest_wait_for_server_ready("rmcp", Duration::from_secs(5))
+            .await,
+        "parent MCP server should become ready before forking"
+    );
+    let parent_mcp_tools = mcp_runtime.latest_list_all_tools().await;
+    assert!(
+        parent_mcp_tools
+            .iter()
+            .any(|tool| tool.server_name == "rmcp" && tool.tool.name == "echo"),
+        "parent MCP manager should expose live MCP tools before forking: tools={parent_mcp_tools:#?}"
+    );
+    parent_thread
+        .start_or_steer_turn(TurnInputRequest::user_input(text_input("parent seed")))
+        .await?;
+    wait_for_turn_complete(parent_thread.as_ref()).await;
+    parent_thread
+        .session
+        .ensure_rollout_materialized(PersistContext::Standard)
+        .await;
+    parent_thread.session.flush_rollout().await?;
+    let before_thread_ids = harness.manager.list_thread_ids().await;
+    let (goal_id, goal) = create_active_thread_goal_for_test(
+        state_db,
+        parent_thread_id,
+        &parent_thread.session,
+        "Supervise the parent with inherited MCP tools.",
+    )
+    .await?;
+
+    crate::goal_supervisor::maybe_start_supervisor_checkin(&parent_thread.session, &goal_id, &goal)
+        .await?;
+    let child_thread_id = spawned_thread_id_after(&harness.manager, &before_thread_ids).await;
+    let child_thread = harness
+        .manager
+        .get_thread(child_thread_id)
+        .await
+        .expect("child thread should be registered");
+    let child_mcp_tool_snapshot = child_thread
+        .session
+        .services
+        .mcp_tool_snapshot
+        .lock()
+        .await
+        .clone()
+        .expect("goal supervisor helper should inherit the parent MCP tool snapshot");
+    assert!(
+        child_mcp_tool_snapshot
+            .tools
+            .iter()
+            .any(|tool| tool.server_name == "rmcp" && tool.tool.name == "echo"),
+        "goal supervisor helper should inherit the parent MCP tool snapshot"
+    );
+
+    wait_for_turn_complete(child_thread.as_ref()).await;
+    let requests = request_log.requests();
+    assert_eq!(requests.len(), 2);
+    let parent_body = requests[0].body_json();
+    let child_body = requests[1].body_json();
+    let parent_input = parent_body["input"]
+        .as_array()
+        .expect("parent input should be an array");
+    let child_input = child_body["input"]
+        .as_array()
+        .expect("child input should be an array");
+    let expected_prompt_cache_key = parent_prompt_cache_key.to_string();
+    assert_eq!(
+        child_body["prompt_cache_key"].as_str(),
+        Some(expected_prompt_cache_key.as_str())
+    );
+    assert_eq!(
+        &child_input[..parent_input.len()],
+        parent_input,
+        "goal supervisor helpers must preserve the exact parent request prefix through the fork point"
+    );
+    let child_suffix = &child_input[parent_input.len()..];
+    assert!(
+        child_suffix.first().is_some_and(|item| {
+            item["role"] == "developer"
+                && item["content"].as_array().is_some_and(|content| {
+                    content.iter().any(|content_item| {
+                        content_item["text"]
+                            .as_str()
+                            .is_some_and(|text| text.contains("You are also a **goal supervisor**"))
+                    })
+                })
+        }),
+        "goal supervisor helpers should append the supervisor role prompt immediately after the inherited parent request prefix: suffix={child_suffix:#?}"
+    );
+    for unexpected_child_context in [
+        "# AGENTS.md instructions",
+        "<permissions instructions>",
+        "<apps_instructions>",
+        "<skills_instructions>",
+        "<plugins_instructions>",
+    ] {
+        assert!(
+            child_suffix.iter().all(|item| {
+                item["content"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .all(|content_item| {
+                        content_item["text"]
+                            .as_str()
+                            .is_none_or(|text| !text.contains(unexpected_child_context))
+                    })
+            }),
+            "goal supervisor helpers must not append fresh child startup context after forking: found {unexpected_child_context} in suffix={child_suffix:#?}"
+        );
+    }
+    assert_eq!(
+        child_body["parallel_tool_calls"], parent_body["parallel_tool_calls"],
+        "goal supervisor helpers must keep the same parallel tool-call setting as their parent"
+    );
+    let parent_tool_signatures = request_tool_signatures(&parent_body);
+    let child_tool_signatures = request_tool_signatures(&child_body);
+    let supervisor_tool_signatures = std::collections::BTreeSet::from([
+        "supervisor.close_self".to_string(),
+        "supervisor.snooze".to_string(),
+        "supervisor.compact_parent_context".to_string(),
+    ]);
+    assert_eq!(
+        child_tool_signatures
+            .difference(&supervisor_tool_signatures)
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>(),
+        parent_tool_signatures,
+        "goal supervisor helpers must inherit every non-supervisor tool from their parent"
+    );
+    assert!(
+        parent_tool_signatures.is_disjoint(&supervisor_tool_signatures),
+        "supervisor tools must not be exposed to the parent request: tools={parent_tool_signatures:#?}"
+    );
+    assert!(
+        supervisor_tool_signatures.is_subset(&child_tool_signatures),
+        "the exact goal supervisor helper must expose the supervisor tools: tools={child_tool_signatures:#?}"
+    );
+    for expected_tool in [
+        "collaboration.spawn_agent",
+        "collaboration.send_message",
+        "collaboration.followup_task",
+        "collaboration.wait_agent",
+        "collaboration.list_agents",
+        "collaboration.interrupt_agent",
+        "supervisor.close_self",
+        "supervisor.snooze",
+        "supervisor.compact_parent_context",
+    ] {
+        assert!(
+            child_tool_signatures.contains(expected_tool),
+            "expected forked child request to expose `{expected_tool}`; tools={child_tool_signatures:#?}"
+        );
+    }
+    assert!(
+        child_body["tools"].as_array().is_some_and(|tools| {
+            tools
+                .iter()
+                .any(|tool| tool["type"].as_str() == Some("tool_search"))
+        }),
+        "the inherited MCP snapshot should be discoverable through tool_search: {child_body:#}"
+    );
+
+    Ok(())
 }
 
 #[tokio::test]

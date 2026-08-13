@@ -124,9 +124,10 @@ async fn handle_spawn_agent(
             parent_thread_id: Some(session.thread_id),
             parent_turn_id: Some(turn.sub_id.clone()),
             root_turn_id: turn.turn_metadata_state.root_turn_id(),
-            environments: Some(step_context.environments.to_selections()),
+            environments: Some(step_context.environments.to_spawn_selections()),
             multi_agent_v2_usage_hints: None,
             cyber_access_program: turn.cyber_access_program,
+            initial_task_message: Some(prompt.clone()),
         },
     ))
     .await

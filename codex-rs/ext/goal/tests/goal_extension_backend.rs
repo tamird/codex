@@ -335,6 +335,32 @@ async fn goal_tools_hidden_for_review_subagents() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
+async fn goal_tools_hidden_for_spawned_subagents() -> anyhow::Result<()> {
+    let runtime = test_runtime().await?;
+    let thread_id = test_thread_id()?;
+    let tools = installed_tools_with_start(
+        Arc::clone(&runtime),
+        thread_id,
+        SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+            parent_thread_id: thread_id,
+            depth: 1,
+            agent_path: None,
+            agent_nickname: None,
+            agent_role: None,
+        }),
+        /*persistent_thread_state_available*/ true,
+    )
+    .await;
+
+    assert_eq!(Vec::<String>::new(), tool_names(&tools));
+    assert_eq!(
+        None,
+        runtime.thread_goals().get_thread_goal(thread_id).await?
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn installed_goal_tools_only_replace_complete_goal() -> anyhow::Result<()> {
     let runtime = test_runtime().await?;
     let thread_id = test_thread_id()?;

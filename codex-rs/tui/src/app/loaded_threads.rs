@@ -86,17 +86,25 @@ pub(crate) fn find_loaded_subagent_threads_for_primary(
     let mut loaded_threads: Vec<LoadedSubagentThread> = included
         .into_iter()
         .filter_map(|thread_id| {
-            threads_by_id
-                .remove(&thread_id)
-                .map(|thread| LoadedSubagentThread {
+            threads_by_id.remove(&thread_id).map(|thread| {
+                let (source_nickname, source_role) = match &thread.source {
+                    SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+                        agent_nickname,
+                        agent_role,
+                        ..
+                    }) => (agent_nickname.clone(), agent_role.clone()),
+                    _ => (None, None),
+                };
+                LoadedSubagentThread {
                     blocks_direct_input: thread_blocks_direct_input(&thread),
                     is_running: matches!(&thread.status, ThreadStatus::Active { .. }),
                     is_closed: matches!(&thread.status, ThreadStatus::NotLoaded),
                     thread_id,
-                    agent_nickname: thread.agent_nickname,
-                    agent_role: thread.agent_role,
+                    agent_nickname: thread.agent_nickname.or(source_nickname),
+                    agent_role: thread.agent_role.or(source_role),
                     agent_path: thread_spawn_agent_path(&thread.source),
-                })
+                }
+            })
         })
         .collect();
     loaded_threads.sort_by_key(|thread| thread.thread_id.to_string());
@@ -253,6 +261,44 @@ mod tests {
                     is_closed: true,
                 },
             ]
+        );
+    }
+
+    #[test]
+    fn recovers_goal_supervisor_metadata_from_thread_spawn_source() {
+        let primary_thread_id =
+            ThreadId::from_string("00000000-0000-0000-0000-000000000011").expect("valid thread");
+        let supervisor_thread_id =
+            ThreadId::from_string("00000000-0000-0000-0000-000000000012").expect("valid thread");
+        let supervisor = test_thread(
+            supervisor_thread_id,
+            thread_spawn_source(
+                primary_thread_id,
+                /*depth*/ 1,
+                "Goal supervisor",
+                "goal_supervisor",
+            ),
+        );
+
+        let loaded = find_loaded_subagent_threads_for_primary(
+            vec![
+                test_thread(primary_thread_id, SessionSource::Cli),
+                supervisor,
+            ],
+            primary_thread_id,
+        );
+
+        assert_eq!(
+            loaded,
+            vec![LoadedSubagentThread {
+                blocks_direct_input: false,
+                is_running: false,
+                is_closed: false,
+                thread_id: supervisor_thread_id,
+                agent_nickname: Some("Goal supervisor".to_string()),
+                agent_role: Some("goal_supervisor".to_string()),
+                agent_path: None,
+            }]
         );
     }
 }

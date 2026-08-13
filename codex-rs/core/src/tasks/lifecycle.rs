@@ -52,7 +52,7 @@ impl Session {
                 cause
             }
         };
-        if self.input_queue.has_trigger_turn_mailbox_items().await {
+        if self.has_pending_turn_start_work().await {
             return;
         }
 

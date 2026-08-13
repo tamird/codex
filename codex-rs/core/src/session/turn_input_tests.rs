@@ -775,6 +775,47 @@ async fn start_only_rejects_pending_trigger_turn_without_injecting() {
 }
 
 #[tokio::test]
+async fn start_only_rejects_queue_only_mail_that_wakes_durable_sleep() {
+    let (session, _turn_context, _rx) = make_session_and_context_with_rx().await;
+    session
+        .services
+        .thread_extension_data
+        .insert(codex_extension_items::sleep::SleepItem {
+            id: "sleep-1".to_string(),
+            duration_ms: 60_000,
+        });
+    session
+        .input_queue
+        .enqueue_mailbox_communication(
+            InterAgentCommunication::new(
+                AgentPath::root(),
+                AgentPath::root(),
+                Vec::new(),
+                "queued update".to_string(),
+                /*trigger_turn*/ false,
+            ),
+            TurnStartOptions::default(),
+        )
+        .await;
+
+    let submission = submit_start_only(
+        &session,
+        SubmittedTurnInput::ResponseItem(user_message("synthetic idle input")),
+    )
+    .await;
+
+    assert_eq!(
+        TurnInputSubmission::NotSubmitted {
+            reason: NotSubmittedReason::PendingTriggerTurn,
+        },
+        submission
+    );
+    assert!(session.active_turn.lock().await.is_none());
+    assert!(session.input_queue.has_pending_mailbox_items().await);
+    assert!(!session.input_queue.has_trigger_turn_mailbox_items().await);
+}
+
+#[tokio::test]
 async fn steer_only_requires_active_turn() {
     let (session, _turn_context, _rx) = make_session_and_context_with_rx().await;
     let submission = submit_steer_only(

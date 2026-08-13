@@ -3,6 +3,8 @@ use codex_protocol::AgentPath;
 use codex_protocol::error::CodexErrorDetails;
 use pretty_assertions::assert_eq;
 use std::collections::HashSet;
+use std::time::Duration;
+use tokio::time::timeout;
 
 fn agent_path(path: &str) -> AgentPath {
     AgentPath::try_from(path).expect("valid agent path")
@@ -13,6 +15,40 @@ fn agent_metadata(thread_id: ThreadId) -> AgentMetadata {
         agent_id: Some(thread_id),
         ..Default::default()
     }
+}
+
+fn goal_supervisor_agent_metadata(thread_id: ThreadId) -> AgentMetadata {
+    AgentMetadata {
+        agent_id: Some(thread_id),
+        agent_role: Some("goal_supervisor".to_string()),
+        ..Default::default()
+    }
+}
+
+#[tokio::test]
+async fn completion_watcher_finish_wakes_all_waiters() {
+    let lifecycle = Arc::new(AgentLifecycle::default());
+    let registration = lifecycle
+        .try_start_completion_watcher()
+        .expect("completion watcher should register");
+    let first_waiter = tokio::spawn({
+        let lifecycle = Arc::clone(&lifecycle);
+        async move { lifecycle.wait_for_completion_watcher().await }
+    });
+    let second_waiter = tokio::spawn({
+        let lifecycle = Arc::clone(&lifecycle);
+        async move { lifecycle.wait_for_completion_watcher().await }
+    });
+    tokio::task::yield_now().await;
+
+    drop(registration);
+
+    timeout(Duration::from_secs(1), async {
+        first_waiter.await.expect("first waiter should finish");
+        second_waiter.await.expect("second waiter should finish");
+    })
+    .await
+    .expect("completion watcher should wake every waiter");
 }
 
 #[test]
@@ -134,6 +170,69 @@ fn releasing_one_spawned_thread_preserves_sibling_identity() {
             .and_then(|metadata| metadata.agent_id),
         Some(second_id)
     );
+}
+
+#[test]
+fn uncounted_spawn_reservation_does_not_count_against_thread_limit() {
+    let registry = Arc::new(AgentRegistry::default());
+    let reservation = registry.reserve_uncounted_spawn_slot();
+    let supervisor_id = ThreadId::new();
+    reservation.commit(goal_supervisor_agent_metadata(supervisor_id));
+
+    let reservation = registry
+        .reserve_spawn_slot(Some(1))
+        .expect("uncounted reservation should not consume a counted slot");
+    let worker_id = ThreadId::new();
+    reservation.commit(agent_metadata(worker_id));
+
+    let err = match registry.reserve_spawn_slot(Some(1)) {
+        Ok(_) => panic!("worker should consume the counted slot"),
+        Err(err) => err,
+    };
+    let CodexErrorDetails::AgentLimitReached { max_threads } = err.details() else {
+        panic!("expected AgentLimitReached");
+    };
+    assert_eq!(*max_threads, 1);
+
+    registry.release_spawned_thread(supervisor_id);
+    registry.release_spawned_thread(worker_id);
+    let reservation = registry
+        .reserve_spawn_slot(Some(1))
+        .expect("counted slot should be available");
+    drop(reservation);
+}
+
+#[test]
+fn released_goal_supervisor_helper_does_not_decrement_counted_thread_total() {
+    let registry = Arc::new(AgentRegistry::default());
+    let reservation = registry.reserve_uncounted_spawn_slot();
+    let supervisor_id = ThreadId::new();
+    reservation.commit(goal_supervisor_agent_metadata(supervisor_id));
+
+    let reservation = registry
+        .reserve_spawn_slot(Some(1))
+        .expect("uncounted goal supervisor helper should not consume the counted slot");
+    let worker_id = ThreadId::new();
+    reservation.commit(agent_metadata(worker_id));
+
+    registry.release_spawned_thread(supervisor_id);
+
+    let err = match registry.reserve_spawn_slot(Some(1)) {
+        Ok(_) => {
+            panic!("releasing an uncounted goal supervisor helper must not free a counted slot")
+        }
+        Err(err) => err,
+    };
+    let CodexErrorDetails::AgentLimitReached { max_threads } = err.details() else {
+        panic!("expected AgentLimitReached");
+    };
+    assert_eq!(*max_threads, 1);
+
+    registry.release_spawned_thread(worker_id);
+    let reservation = registry
+        .reserve_spawn_slot(Some(1))
+        .expect("counted slot should be available after releasing worker");
+    drop(reservation);
 }
 
 #[test]

@@ -59,6 +59,14 @@ impl AgentControl {
         }
     }
 
+    pub(crate) fn is_execution_limited(
+        &self,
+        multi_agent_version: MultiAgentVersion,
+        session_source: &SessionSource,
+    ) -> bool {
+        is_execution_limited(multi_agent_version, session_source)
+    }
+
     pub(crate) fn execution_guard(
         &self,
         multi_agent_version: MultiAgentVersion,
@@ -94,6 +102,7 @@ fn is_execution_limited(
 ) -> bool {
     multi_agent_version == MultiAgentVersion::V2
         && matches!(session_source, SessionSource::SubAgent(_))
+        && !crate::goal_supervisor::is_goal_supervisor_helper_source(session_source)
 }
 
 #[cfg(test)]

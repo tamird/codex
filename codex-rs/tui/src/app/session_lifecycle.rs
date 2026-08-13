@@ -133,10 +133,23 @@ impl App {
             }
         }
 
-        let has_non_primary_agent_thread = self
+        let collab_enabled = self.config.features.enabled(Feature::Collab);
+        let selectable_threads = self
             .agent_navigation
-            .has_non_primary_thread(self.primary_thread_id);
-        if !self.config.features.enabled(Feature::Collab) && !has_non_primary_agent_thread {
+            .ordered_threads()
+            .into_iter()
+            .filter(|(thread_id, entry)| {
+                let is_primary = Some(*thread_id) == self.primary_thread_id;
+                let is_supervisor = entry.is_goal_supervisor();
+                let is_open_agent = !entry.is_closed && !is_supervisor;
+                let is_existing_replay_thread = self.thread_event_channels.contains_key(thread_id);
+                is_primary || is_open_agent || (is_existing_replay_thread && !is_supervisor)
+            })
+            .collect::<Vec<_>>();
+        let has_non_primary_agent_thread = selectable_threads
+            .iter()
+            .any(|(thread_id, _)| Some(*thread_id) != self.primary_thread_id);
+        if !collab_enabled && !has_non_primary_agent_thread {
             if let Some(primary_thread_id) = self.primary_thread_id {
                 self.refresh_agent_picker_threads(app_server, primary_thread_id);
             }
@@ -144,7 +157,7 @@ impl App {
             return;
         }
 
-        if self.agent_navigation.is_empty() {
+        if selectable_threads.is_empty() {
             self.chat_widget
                 .add_info_message("No agents available yet.".to_string(), /*hint*/ None);
             return;
@@ -175,6 +188,13 @@ impl App {
             .agent_navigation
             .ordered_threads()
             .into_iter()
+            .filter(|(thread_id, entry)| {
+                let is_primary = Some(*thread_id) == self.primary_thread_id;
+                let is_supervisor = entry.is_goal_supervisor();
+                let is_open_agent = !entry.is_closed && !is_supervisor;
+                let is_existing_replay_thread = self.thread_event_channels.contains_key(thread_id);
+                is_primary || is_open_agent || (is_existing_replay_thread && !is_supervisor)
+            })
             .enumerate()
             .map(|(idx, (thread_id, entry))| {
                 if initial_selected_idx.is_none() && self.active_thread_id == Some(thread_id) {

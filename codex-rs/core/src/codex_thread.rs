@@ -41,6 +41,7 @@ use codex_protocol::protocol::SandboxPolicy;
 use codex_protocol::protocol::SessionConfiguredEvent;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::Submission;
+use codex_protocol::protocol::ThreadGoal;
 use codex_protocol::protocol::ThreadHistoryMode;
 use codex_protocol::protocol::ThreadMemoryMode;
 use codex_protocol::protocol::ThreadSettingsSnapshot;
@@ -538,6 +539,41 @@ impl CodexThread {
         items: Vec<ResponseItem>,
     ) -> Result<(), Vec<ResponseItem>> {
         self.session.inject_if_running(items).await
+    }
+
+    pub async fn maybe_start_goal_supervisor_checkin(
+        &self,
+        goal_id: &str,
+        goal: &ThreadGoal,
+    ) -> anyhow::Result<bool> {
+        if !self.enabled(Feature::GoalSupervisor) {
+            return Ok(false);
+        }
+        crate::goal_supervisor::maybe_start_supervisor_checkin(&self.session, goal_id, goal)
+            .await?;
+        Ok(true)
+    }
+
+    pub async fn maybe_start_goal_supervisor_checkin_after_goal_resume(
+        &self,
+        goal_id: &str,
+        goal: &ThreadGoal,
+    ) -> anyhow::Result<bool> {
+        if !self.enabled(Feature::GoalSupervisor) {
+            return Ok(false);
+        }
+        crate::goal_supervisor::maybe_start_supervisor_checkin_after_goal_resume(
+            &self.session,
+            goal_id,
+            goal,
+        )
+        .await?;
+        Ok(true)
+    }
+
+    /// Returns whether this root currently owns a running internal goal supervisor helper.
+    pub async fn has_running_goal_supervisor(&self) -> bool {
+        crate::goal_supervisor::has_running_supervisor_helper(&self.session).await
     }
 
     pub async fn set_app_server_client_info(

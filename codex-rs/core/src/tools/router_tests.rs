@@ -59,6 +59,61 @@ fn tool_log_payload_redacts_plaintext_multi_agent_messages() {
     );
 }
 
+#[test]
+fn ownership_message_tool_uses_plaintext_source() {
+    let call = ToolCall {
+        tool_name: ToolName::namespaced("frodex", "adopt_agent"),
+        call_id: "call-frodex-adopt-agent".to_string(),
+        payload: ToolPayload::Function {
+            arguments: "{}".to_string(),
+        },
+        encrypted_function_args: None,
+    };
+    assert_eq!(call.direct_source(), ToolCallSource::DirectPlaintextMessage);
+
+    let encrypted_call = ToolCall {
+        encrypted_function_args: Some(vec!["message".to_string()]),
+        ..call
+    };
+    assert_eq!(encrypted_call.direct_source(), ToolCallSource::Direct);
+}
+
+#[test]
+fn supervisor_followup_uses_plaintext_source() {
+    for encrypted_function_args in [None, Some(Vec::new())] {
+        let call = ToolCall {
+            tool_name: ToolName::namespaced("supervisor", "followup_parent"),
+            call_id: "call-supervisor-followup-parent".to_string(),
+            payload: ToolPayload::Function {
+                arguments: "{}".to_string(),
+            },
+            encrypted_function_args,
+        };
+        assert_eq!(call.direct_source(), ToolCallSource::DirectPlaintextMessage);
+    }
+}
+
+#[test]
+fn build_tool_call_rejects_encrypted_supervisor_followup() {
+    let error = ToolRouter::build_tool_call(ResponseItem::FunctionCall {
+        id: None,
+        name: "followup_parent".to_string(),
+        namespace: Some("supervisor".to_string()),
+        arguments: r#"{"message":"opaque"}"#.to_string(),
+        encrypted_function_args: Some(vec!["message".to_string()]),
+        call_id: "call-supervisor-followup-parent-encrypted".to_string(),
+        internal_chat_message_metadata_passthrough: None,
+    })
+    .expect_err("encrypted supervisor follow-up must fail before dispatch");
+
+    assert_eq!(
+        error,
+        crate::function_tool::FunctionCallError::RespondToModel(
+            "supervisor.followup_parent does not accept encrypted arguments".to_string()
+        )
+    );
+}
+
 impl codex_extension_api::ToolContributor for ExtensionEchoContributor {
     fn tools(
         &self,

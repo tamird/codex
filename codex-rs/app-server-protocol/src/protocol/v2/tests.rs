@@ -41,6 +41,7 @@ use codex_protocol::permissions::FileSystemSpecialPath as CoreFileSystemSpecialP
 use codex_protocol::protocol::AgentStatus as CoreAgentStatus;
 use codex_protocol::protocol::AskForApproval as CoreAskForApproval;
 use codex_protocol::protocol::CodexErrorInfo as CoreCodexErrorInfo;
+use codex_protocol::protocol::CollabAgentRef;
 use codex_protocol::protocol::ConversationTextRole;
 use codex_protocol::protocol::ExecCommandSource as CoreExecCommandSource;
 use codex_protocol::protocol::GranularApprovalConfig as CoreGranularApprovalConfig;
@@ -3268,7 +3269,11 @@ fn core_turn_item_into_thread_item_converts_supported_variants() {
         status: CoreCollabAgentToolCallStatus::Completed,
         sender_thread_id,
         receiver_thread_ids: vec![receiver_thread_id],
-        receiver_agents: Vec::new(),
+        receiver_agents: vec![CollabAgentRef {
+            thread_id: receiver_thread_id,
+            agent_nickname: Some("worker".to_string()),
+            agent_role: Some("worker".to_string()),
+        }],
         prompt: Some("continue".to_string()),
         model: None,
         reasoning_effort: None,
@@ -3285,6 +3290,8 @@ fn core_turn_item_into_thread_item_converts_supported_variants() {
             status: CollabAgentToolCallStatus::Completed,
             sender_thread_id: sender_thread_id.to_string(),
             receiver_thread_ids: vec![receiver_thread_id.to_string()],
+            receiver_agent_nickname: Some("worker".to_string()),
+            receiver_agent_role: Some("worker".to_string()),
             prompt: Some("continue".to_string()),
             model: None,
             reasoning_effort: None,

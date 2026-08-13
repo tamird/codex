@@ -1,4 +1,6 @@
 use crate::agent::AgentControl;
+use crate::goal_supervisor::GOAL_SUPERVISOR_ROLE_NAME;
+use codex_protocol::ThreadId;
 use codex_protocol::error::CodexErrorDetails;
 use codex_protocol::protocol::MultiAgentVersion;
 use codex_protocol::protocol::SessionSource;
@@ -55,6 +57,27 @@ fn execution_guards_ignore_root_and_v1_turns() {
                 MultiAgentVersion::V1,
                 &SessionSource::SubAgent(SubAgentSource::Other("worker".to_string())),
             )
+            .is_none()
+    );
+}
+
+#[test]
+fn execution_guards_ignore_goal_supervisor_turns() {
+    let control = control_with_limit(/*max_threads*/ 0);
+    let source = SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+        parent_thread_id: ThreadId::new(),
+        depth: 1,
+        agent_path: None,
+        agent_nickname: None,
+        agent_role: Some(GOAL_SUPERVISOR_ROLE_NAME.to_string()),
+    });
+
+    control
+        .ensure_execution_capacity(MultiAgentVersion::V2, &source)
+        .expect("goal supervisor turns do not use user-visible execution capacity");
+    assert!(
+        control
+            .execution_guard(MultiAgentVersion::V2, &source)
             .is_none()
     );
 }

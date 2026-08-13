@@ -2908,6 +2908,28 @@ fn resolve_multi_agent_version_handles_unset_and_legacy_history() {
     );
 }
 
+#[test]
+fn configured_multi_agent_v2_preserves_persisted_v1_history() {
+    let thread_id = ThreadId::default();
+    let history = InitialHistory::Resumed(ResumedHistory {
+        conversation_id: thread_id,
+        history: Arc::new(vec![session_meta_item(
+            thread_id,
+            Some(MultiAgentVersion::V1),
+        )]),
+        rollout_path: None,
+    });
+
+    assert_eq!(
+        configured_or_persisted_multi_agent_version(&history, Some(MultiAgentVersion::V2)),
+        Some(MultiAgentVersion::V1)
+    );
+    assert_eq!(
+        configured_or_persisted_multi_agent_version(&history, Some(MultiAgentVersion::Disabled)),
+        Some(MultiAgentVersion::Disabled)
+    );
+}
+
 #[tokio::test]
 async fn empty_reference_prefix_continues_after_physical_metadata_ordinal() {
     let codex_home = tempfile::tempdir().expect("create Codex home");
@@ -7495,6 +7517,7 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
         async_hook_results,
         input_queue: super::input_queue::InputQueue::new(),
         guardian_review_session: crate::guardian::GuardianReviewSessionManager::default(),
+        goal_supervisor_runtime: crate::goal_supervisor::GoalSupervisorRuntimeState::new(),
         services,
         git_enrichment_policy: GitEnrichmentPolicy::Fresh,
         forked_from_ordinal_exclusive: None,
@@ -9783,6 +9806,7 @@ where
         async_hook_results,
         input_queue: super::input_queue::InputQueue::new(),
         guardian_review_session: crate::guardian::GuardianReviewSessionManager::default(),
+        goal_supervisor_runtime: crate::goal_supervisor::GoalSupervisorRuntimeState::new(),
         services,
         git_enrichment_policy: GitEnrichmentPolicy::Fresh,
         forked_from_ordinal_exclusive: None,
@@ -11211,6 +11235,43 @@ async fn build_initial_context_adds_multi_agent_v2_subagent_usage_hint_as_develo
             .iter()
             .any(|message| message.as_slice() == ["Root guidance."]),
         "did not expect root usage hint for subagent thread, got {developer_messages:?}"
+    );
+}
+
+#[tokio::test]
+async fn build_initial_context_omits_usage_hint_for_goal_supervisor_helper() {
+    let (session, mut turn_context) =
+        make_multi_agent_v2_usage_hint_test_session(/*enable_multi_agent_v2*/ true).await;
+    let session_source = SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+        parent_thread_id: ThreadId::new(),
+        depth: 1,
+        agent_path: Some(
+            AgentPath::try_from("/root/goal_supervisor").expect("supervisor path should parse"),
+        ),
+        agent_nickname: None,
+        agent_role: Some(crate::goal_supervisor::GOAL_SUPERVISOR_ROLE_NAME.to_string()),
+    });
+    session
+        .state
+        .lock()
+        .await
+        .session_configuration
+        .session_source = session_source.clone();
+    Arc::get_mut(&mut turn_context)
+        .expect("thread settings should not be shared")
+        .session_source = session_source;
+
+    let initial_context = build_initial_context(&session, &turn_context).await;
+    let developer_messages = developer_message_texts(&initial_context);
+
+    assert!(
+        !developer_messages.iter().any(|message| {
+            matches!(
+                message.as_slice(),
+                ["Root guidance."] | ["Subagent guidance."]
+            )
+        }),
+        "goal supervisor helpers use dedicated supervisor context, not generic usage hints: {developer_messages:?}"
     );
 }
 

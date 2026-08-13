@@ -116,11 +116,28 @@ impl ChatWidget {
 
     pub(super) fn on_collab_agent_tool_call(&mut self, item: ThreadItem) {
         let ThreadItem::CollabAgentToolCall {
-            id, tool, status, ..
+            id,
+            tool,
+            status,
+            receiver_thread_ids,
+            receiver_agent_nickname,
+            receiver_agent_role,
+            ..
         } = &item
         else {
             return;
         };
+        if let [receiver_thread_id] = receiver_thread_ids.as_slice()
+            && (receiver_agent_nickname.is_some() || receiver_agent_role.is_some())
+            && let Ok(receiver_thread_id) = ThreadId::from_string(receiver_thread_id)
+        {
+            let existing = self.collab_agent_metadata(receiver_thread_id);
+            self.set_collab_agent_metadata(
+                receiver_thread_id,
+                receiver_agent_nickname.clone().or(existing.agent_nickname),
+                receiver_agent_role.clone().or(existing.agent_role),
+            );
+        }
         if matches!(tool, CollabAgentTool::SpawnAgent)
             && let Some(spawn_request) = multi_agents::spawn_request_summary(&item)
         {

@@ -28,7 +28,6 @@ use codex_otel::MetricsClient;
 use codex_protocol::ThreadId;
 use codex_protocol::protocol::CodexErrorInfo;
 use codex_protocol::protocol::SessionSource;
-use codex_protocol::protocol::SubAgentSource;
 use codex_protocol::protocol::ThreadGoalStatus;
 use codex_protocol::protocol::TokenUsageInfo;
 
@@ -99,10 +98,7 @@ where
             let config = (self.goal_config)(input.config);
             let enabled = config.enabled;
             let tools_available_for_thread = input.persistent_thread_state_available
-                && !matches!(
-                    input.session_source,
-                    SessionSource::SubAgent(SubAgentSource::Review)
-                );
+                && !matches!(input.session_source, SessionSource::SubAgent(_));
             input.thread_store.insert(config);
             let accounting_state = input
                 .thread_store

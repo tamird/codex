@@ -89,6 +89,7 @@ use codex_app_server_protocol::TurnStatus;
 use codex_app_server_protocol::WarningNotification;
 use codex_app_server_protocol::build_item_from_guardian_event;
 use codex_app_server_protocol::guardian_auto_approval_review_notification;
+use codex_app_server_protocol::inter_agent_message_display_from_response_item;
 use codex_app_server_protocol::item_event_to_server_notification;
 use codex_core::CodexThread;
 use codex_core::ThreadManager;
@@ -98,6 +99,7 @@ use codex_protocol::ThreadId;
 use codex_protocol::items::CollabAgentTool as CoreCollabAgentTool;
 use codex_protocol::items::TurnItem as CoreTurnItem;
 use codex_protocol::models::AdditionalPermissionProfile as CoreAdditionalPermissionProfile;
+use codex_protocol::models::MessagePhase;
 use codex_protocol::plan_tool::UpdatePlanArgs;
 use codex_protocol::protocol::CodexErrorInfo as CoreCodexErrorInfo;
 use codex_protocol::protocol::Event;
@@ -1137,12 +1139,10 @@ pub(crate) async fn apply_bespoke_event_handling(
                 .await;
         }
         EventMsg::RawResponseItem(raw_response_item_event) => {
-            let mut notification = ServerNotification::RawResponseItemCompleted(
-                RawResponseItemCompletedNotification {
-                    thread_id: conversation_id.to_string(),
-                    turn_id: event_turn_id,
-                    item: raw_response_item_event.item,
-                },
+            let mut notification = raw_response_item_completed_notification(
+                conversation_id,
+                &event_turn_id,
+                raw_response_item_event.item,
             );
             if conversation.enabled(Feature::OmitAppServerNotificationMedia) {
                 notification = without_notification_media(notification);
@@ -1522,6 +1522,45 @@ async fn complete_command_execution_item(
     outgoing
         .send_server_notification(ServerNotification::ItemCompleted(notification))
         .await;
+}
+
+fn raw_response_item_completed_notification(
+    conversation_id: ThreadId,
+    turn_id: &str,
+    item: codex_protocol::models::ResponseItem,
+) -> ServerNotification {
+    if let Some(thread_item) = inter_agent_message_item(&item) {
+        return ServerNotification::ItemCompleted(ItemCompletedNotification {
+            thread_id: conversation_id.to_string(),
+            turn_id: turn_id.to_string(),
+            item: thread_item,
+            completed_at_ms: now_unix_timestamp_ms(),
+        });
+    }
+
+    ServerNotification::RawResponseItemCompleted(RawResponseItemCompletedNotification {
+        thread_id: conversation_id.to_string(),
+        turn_id: turn_id.to_string(),
+        item,
+    })
+}
+
+pub(crate) fn is_inter_agent_message_item(item: &codex_protocol::models::ResponseItem) -> bool {
+    inter_agent_message_display_from_response_item(item).is_some()
+}
+
+fn inter_agent_message_item(item: &codex_protocol::models::ResponseItem) -> Option<ThreadItem> {
+    let display = inter_agent_message_display_from_response_item(item)?;
+    let text = display.text();
+    Some(ThreadItem::AgentMessage {
+        id: display
+            .item_id
+            .unwrap_or_else(|| format!("item-{}", ThreadId::new())),
+        text,
+        phase: Some(MessagePhase::Commentary),
+        delivery: None,
+        memory_citation: None,
+    })
 }
 
 async fn find_and_remove_turn_summary(
@@ -4240,7 +4279,7 @@ mod tests {
         Ok(())
     }
     #[tokio::test]
-    async fn test_inter_agent_raw_response_emits_raw_response_item_completed() -> Result<()> {
+    async fn test_inter_agent_raw_response_emits_agent_message_item_completed() -> Result<()> {
         let (tx, mut rx) = mpsc::channel(CHANNEL_CAPACITY);
         let outgoing = Arc::new(OutgoingMessageSender::new(
             tx,
@@ -4253,23 +4292,86 @@ mod tests {
             conversation_id,
         );
         let communication = InterAgentCommunication::new(
-            AgentPath::try_from("/root/worker").expect("valid agent path"),
+            AgentPath::try_from("/root/goal_supervisor").expect("valid agent path"),
             AgentPath::root(),
             Vec::new(),
             "ready for review".to_string(),
             /*trigger_turn*/ true,
         );
-        let item: codex_protocol::models::ResponseItem =
-            communication.to_response_input_item().into();
+        let item = communication.to_model_input_item();
 
-        maybe_emit_raw_response_item_completed(conversation_id, "turn-1", item.clone(), &outgoing)
+        outgoing
+            .send_server_notification(raw_response_item_completed_notification(
+                conversation_id,
+                "turn-1",
+                item.clone(),
+            ))
+            .await;
+
+        let msg = recv_broadcast_notification(&mut rx).await?;
+        match msg {
+            ServerNotification::ItemCompleted(notification) => {
+                assert_eq!(notification.thread_id, conversation_id.to_string());
+                assert_eq!(notification.turn_id, "turn-1");
+                let ThreadItem::AgentMessage {
+                    id,
+                    text,
+                    phase,
+                    delivery,
+                    memory_citation,
+                } = notification.item
+                else {
+                    bail!("unexpected item");
+                };
+                assert!(!id.is_empty());
+                assert_eq!(
+                    text,
+                    "Agent message: ready for review from /root/goal_supervisor"
+                );
+                assert_eq!(phase, Some(MessagePhase::Commentary));
+                assert_eq!(delivery, None);
+                assert_eq!(memory_citation, None);
+            }
+            other => bail!("unexpected message: {other:?}"),
+        }
+        assert!(rx.try_recv().is_err(), "no extra messages expected");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_encrypted_inter_agent_raw_response_is_not_projected_as_visible_message()
+    -> Result<()> {
+        let (tx, mut rx) = mpsc::channel(CHANNEL_CAPACITY);
+        let outgoing = Arc::new(OutgoingMessageSender::new(
+            tx,
+            codex_analytics::AnalyticsEventsClient::disabled(),
+        ));
+        let conversation_id = ThreadId::new();
+        let outgoing = ThreadScopedOutgoingMessageSender::new(
+            outgoing,
+            vec![ConnectionId(1)],
+            conversation_id,
+        );
+        let communication = InterAgentCommunication::new_encrypted(
+            AgentPath::try_from("/root/goal_supervisor").expect("valid agent path"),
+            AgentPath::root(),
+            Vec::new(),
+            "gAAAAABqKHxROS-9NG4XHnjf7m9iGOunr9TPY4sShZI5WQsBqZ7eLq94".to_string(),
+            /*trigger_turn*/ true,
+        );
+        let item = communication.to_model_input_item();
+
+        outgoing
+            .send_server_notification(raw_response_item_completed_notification(
+                conversation_id,
+                "turn-1",
+                item.clone(),
+            ))
             .await;
 
         let msg = recv_broadcast_notification(&mut rx).await?;
         match msg {
             ServerNotification::RawResponseItemCompleted(notification) => {
-                assert_eq!(notification.thread_id, conversation_id.to_string());
-                assert_eq!(notification.turn_id, "turn-1");
                 assert_eq!(notification.item, item);
             }
             other => bail!("unexpected message: {other:?}"),

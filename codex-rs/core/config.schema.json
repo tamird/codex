@@ -2319,6 +2319,10 @@
           "minimum": 0.0,
           "type": "integer"
         },
+        "enable_thread_adoption": {
+          "description": "Expose same-thread adoption and subagent promotion only when explicitly enabled.",
+          "type": "boolean"
+        },
         "enabled": {
           "type": "boolean"
         },

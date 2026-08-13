@@ -1,4 +1,5 @@
 use super::*;
+use crate::bespoke_event_handling::is_inter_agent_message_item;
 use crate::extensions::send_thread_warning;
 use crate::realtime_event_handling::apply_realtime_event_effects;
 use crate::realtime_event_handling::persist_realtime_items;
@@ -346,11 +347,14 @@ pub(super) async fn ensure_listener_task_running(
                         };
                         (thread_state.experimental_raw_events, realtime_effects)
                     };
-                    if matches!(
-                        &event.msg,
-                        EventMsg::RawResponseItem(_) | EventMsg::RawResponseCompleted(_)
-                    ) && !raw_events_enabled
-                    {
+                    let suppress_raw_event = match &event.msg {
+                        EventMsg::RawResponseItem(event) => {
+                            !is_inter_agent_message_item(&event.item)
+                        }
+                        EventMsg::RawResponseCompleted(_) => true,
+                        _ => false,
+                    };
+                    if suppress_raw_event && !raw_events_enabled {
                         continue;
                     }
                     let subscribed_connection_ids = thread_state_manager

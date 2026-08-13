@@ -1134,14 +1134,26 @@ impl App {
                 continue;
             };
 
-            if self.agent_navigation.get(&thread_id).is_some() {
-                continue;
+            let (agent_nickname, agent_role) =
+                collab_receiver_agent_metadata(notification, receiver_thread_id);
+            if let Some(existing) = self.agent_navigation.get(&thread_id).cloned() {
+                if agent_nickname.is_none() && agent_role.is_none() {
+                    continue;
+                }
+                self.upsert_agent_picker_thread(
+                    thread_id,
+                    agent_nickname.or(existing.agent_nickname),
+                    agent_role.or(existing.agent_role),
+                    existing.is_closed,
+                );
+            } else {
+                self.upsert_agent_picker_thread(
+                    thread_id,
+                    agent_nickname,
+                    agent_role,
+                    /*is_closed*/ false,
+                );
             }
-
-            self.upsert_agent_picker_thread(
-                thread_id, /*agent_nickname*/ None, /*agent_role*/ None,
-                /*is_closed*/ false,
-            );
         }
     }
 

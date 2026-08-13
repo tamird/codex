@@ -53,6 +53,46 @@ use wiremock::MockServer;
 
 const TEST_INSTALLATION_ID: &str = "11111111-1111-4111-8111-111111111111";
 
+#[tokio::test]
+async fn persisted_v1_history_wins_over_configured_v2_for_spawn() {
+    let temp_dir = tempdir().expect("tempdir");
+    let mut config = test_config().await;
+    config.codex_home = temp_dir.path().join("codex-home").abs();
+    config.cwd = config.codex_home.abs();
+    config
+        .features
+        .enable(codex_features::Feature::MultiAgentV2)
+        .expect("enable V2");
+    std::fs::create_dir_all(&config.codex_home).expect("create codex home");
+    let manager = ThreadManager::with_models_provider_and_home_for_tests(
+        CodexAuth::from_api_key("dummy"),
+        config.model_provider.clone(),
+        config.codex_home.to_path_buf(),
+        Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
+    );
+    let thread_id = ThreadId::default();
+    let history = InitialHistory::Forked(vec![RolloutItem::SessionMeta(SessionMetaLine {
+        meta: SessionMeta {
+            id: thread_id,
+            session_id: thread_id.into(),
+            multi_agent_version: Some(MultiAgentVersion::V1),
+            ..SessionMeta::default()
+        },
+        git: None,
+    })]);
+
+    assert_eq!(
+        manager
+            .state
+            .effective_multi_agent_version_for_spawn(
+                &history, /*session_source*/ None, /*parent_thread_id*/ None,
+                /*forked_from_thread_id*/ None, &config,
+            )
+            .await,
+        MultiAgentVersion::V1
+    );
+}
+
 /// Controls without a custom allocation policy still produce distinct thread identifiers.
 #[test]
 fn thread_id_generator_defaults_to_standard_ids() {

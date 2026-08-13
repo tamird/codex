@@ -18,6 +18,7 @@ const SPAWN_AGENT_INHERITED_MODEL_GUIDANCE: &str = "Spawned agents inherit your 
 const SPAWN_AGENT_TYPE_OVERRIDE_DESCRIPTION_V1: &str = "Agent type override for the new agent. Omit to inherit the parent agent type with a full-history fork; otherwise, `default` is used.";
 const SPAWN_AGENT_MODEL_OVERRIDE_DESCRIPTION: &str =
     "Model override for the new agent. Omit unless an explicit override is needed.";
+const ADOPT_AGENT_THREAD_DESCRIPTION: &str = "Existing independent thread ID to adopt as this agent. Preserve its original thread, history, configuration, and descendants; wait for any active turn to finish.";
 const MAX_REASONING_EFFORT_CHARS_IN_SPAWN_AGENT_DESCRIPTION: usize = 64;
 
 #[derive(Debug, Clone)]
@@ -137,6 +138,66 @@ pub fn create_spawn_agent_tool_v2(options: SpawnAgentToolOptions) -> ToolSpec {
         output_schema: Some(spawn_agent_output_schema_v2(
             options.hide_agent_type_model_reasoning,
         )),
+    })
+}
+
+pub fn create_adopt_agent_tool(hide_agent_metadata: bool) -> ToolSpec {
+    let properties = BTreeMap::from([
+        (
+            "existing_thread_id".to_string(),
+            JsonSchema::string(Some(ADOPT_AGENT_THREAD_DESCRIPTION.to_string())),
+        ),
+        (
+            "task_name".to_string(),
+            JsonSchema::string(Some(
+                "Task name for the adopted agent. Use lowercase letters, digits, and underscores."
+                    .to_string(),
+            )),
+        ),
+        (
+            "message".to_string(),
+            JsonSchema::string(Some("Initial task for the adopted agent.".to_string())),
+        ),
+    ]);
+
+    ToolSpec::Function(ResponsesApiTool {
+        name: "adopt_agent".to_string(),
+        description: "Adopt an existing independent thread as a native subagent without copying or forking its history. Preserve its thread ID, conversation history, configuration, and descendants; wait for any active turn to finish. Use collaboration.spawn_agent instead to create a new or forked agent.".to_string(),
+        strict: false,
+        defer_loading: None,
+        parameters: JsonSchema::object(
+            properties,
+            Some(vec![
+                "existing_thread_id".to_string(),
+                "task_name".to_string(),
+                "message".to_string(),
+            ]),
+            Some(false.into()),
+        ),
+        output_schema: Some(spawn_agent_output_schema_v2(hide_agent_metadata)),
+    })
+}
+
+pub fn create_promote_agent_tool() -> ToolSpec {
+    let properties = BTreeMap::from([(
+        "target".to_string(),
+        JsonSchema::string(Some(
+            "Canonical task name or thread ID of the subagent to promote into an independent root."
+                .to_string(),
+        )),
+    )]);
+
+    ToolSpec::Function(ResponsesApiTool {
+        name: "promote_agent".to_string(),
+        description: "Promote an existing subagent and its descendants into an independent root thread. Preserve their thread IDs, conversation history, and configuration; wait for any active turn to finish.".to_string(),
+        strict: false,
+        defer_loading: None,
+        parameters: JsonSchema::object(
+            properties,
+            Some(vec!["target".to_string()]),
+            Some(false.into()),
+        ),
+        output_schema: None,
     })
 }
 
@@ -329,6 +390,145 @@ pub fn create_close_agent_tool_v1() -> ToolSpec {
                 "The agent status observed before shutdown was requested.",
             )),
         })],
+    })
+}
+
+pub fn create_close_agent_tool_v2() -> ToolSpec {
+    let properties = BTreeMap::from([(
+        "target".to_string(),
+        JsonSchema::string(Some(
+            "Canonical task name or thread ID of an owned descendant agent to close.".to_string(),
+        )),
+    )]);
+
+    ToolSpec::Function(ResponsesApiTool {
+        name: "close_agent".to_string(),
+        description: "Close an owned descendant agent and its live descendants, then return its previous status.".to_string(),
+        strict: false,
+        defer_loading: None,
+        parameters: JsonSchema::object(
+            properties,
+            Some(vec!["target".to_string()]),
+            Some(false.into()),
+        ),
+        output_schema: Some(agent_previous_status_output_schema(
+            "The agent status observed before shutdown was requested.",
+        )),
+    })
+}
+
+pub fn create_supervisor_close_self_tool() -> ToolSpec {
+    let properties = BTreeMap::from([(
+        "message".to_string(),
+        JsonSchema::string(Some(
+            "Optional final message sent to the parent agent before marking the goal complete."
+                .to_string(),
+        )),
+    )]);
+
+    ToolSpec::Function(ResponsesApiTool {
+        name: "close_self".to_string(),
+        description: "Supervisor-only: mark the active goal complete, optionally send a final message to the parent agent, and end this supervisor check-in immediately."
+            .to_string(),
+        strict: false,
+        defer_loading: None,
+        parameters: JsonSchema::object(properties, /*required*/ None, Some(false.into())),
+        output_schema: Some(json!({
+            "type": "object",
+            "properties": {
+                "completed": {
+                    "type": "boolean",
+                    "description": "Whether the active goal was marked complete."
+                }
+            },
+            "required": ["completed"],
+            "additionalProperties": false
+        })),
+    })
+}
+
+pub fn create_supervisor_compact_parent_context_tool() -> ToolSpec {
+    let properties = BTreeMap::from([
+        (
+            "reason".to_string(),
+            JsonSchema::string(Some(
+                "Short reason why the parent thread should be compacted.".to_string(),
+            )),
+        ),
+        (
+            "evidence".to_string(),
+            JsonSchema::string(Some(
+                "Specific observation that the parent thread is idle or stuck.".to_string(),
+            )),
+        ),
+    ]);
+
+    ToolSpec::Function(ResponsesApiTool {
+        name: "compact_parent_context".to_string(),
+        description: "Supervisor-only: request compaction for this supervisor helper's parent thread when it is idle and stuck."
+            .to_string(),
+        strict: false,
+        defer_loading: None,
+        parameters: JsonSchema::object(properties, /*required*/ None, Some(false.into())),
+        output_schema: None,
+    })
+}
+
+pub fn create_supervisor_snooze_tool() -> ToolSpec {
+    let properties = BTreeMap::from([
+        (
+            "delay_seconds".to_string(),
+            JsonSchema::number(Some("Snooze delay in seconds.".to_string())),
+        ),
+        (
+            "reason".to_string(),
+            JsonSchema::string(Some(
+                "Optional short reason for snoozing this check-in.".to_string(),
+            )),
+        ),
+    ]);
+
+    ToolSpec::Function(ResponsesApiTool {
+        name: "snooze".to_string(),
+        description: "Supervisor-only: keep the active goal supervised, send no message for the current check-in, and wait before the next check-in."
+            .to_string(),
+        strict: false,
+        defer_loading: None,
+        parameters: JsonSchema::object(
+            properties,
+            /*required*/ Some(vec!["delay_seconds".to_string()]),
+            Some(false.into()),
+        ),
+        output_schema: Some(json!({
+            "type": "object",
+            "properties": {
+                "delay_seconds": {
+                    "type": "number",
+                    "description": "Effective snooze delay in seconds."
+                }
+            },
+            "required": ["delay_seconds"],
+            "additionalProperties": false
+        })),
+    })
+}
+
+pub fn create_supervisor_tools_namespace(tools: Vec<ToolSpec>) -> ToolSpec {
+    let tools = tools
+        .into_iter()
+        .filter_map(|tool| match tool {
+            ToolSpec::Function(tool) => Some(ResponsesApiNamespaceTool::Function(tool)),
+            ToolSpec::Freeform(_)
+            | ToolSpec::Namespace(_)
+            | ToolSpec::ToolSearch { .. }
+            | ToolSpec::WebSearch { .. } => None,
+        })
+        .collect();
+
+    ToolSpec::Namespace(ResponsesApiNamespace {
+        name: "supervisor".to_string(),
+        description: "Supervisor-only tools for active-goal lifecycle control.".to_string(),
+        tools,
     })
 }
 

@@ -887,6 +887,19 @@ impl TurnEnvironmentSnapshot {
             .collect()
     }
 
+    /// Returns Ready and Starting selections so a child keeps each Starting environment.
+    pub(crate) fn to_spawn_selections(&self) -> Vec<TurnEnvironmentSelection> {
+        self.environments
+            .iter()
+            .map(|environment| match environment {
+                TurnEnvironmentState::Ready(environment) => environment.selection(),
+                TurnEnvironmentState::Starting(environment) => environment
+                    .config_origin
+                    .into_input_selection(environment.selection.clone()),
+            })
+            .collect()
+    }
+
     pub(crate) fn primary_filesystem(&self) -> Option<Arc<dyn ExecutorFileSystem>> {
         self.primary()
             .map(|environment| environment.environment.get_filesystem())
@@ -1456,6 +1469,10 @@ url = "ws://127.0.0.1:8765"
             vec![resolved_remote.clone()]
         );
         assert_eq!(starting.to_selections(), vec![local.clone()]);
+        assert_eq!(
+            starting.to_spawn_selections(),
+            vec![remote.clone(), local.clone()]
+        );
         assert!(starting.single_local_environment().is_none());
 
         let next_config = test_environment_config();
@@ -1516,6 +1533,7 @@ url = "ws://127.0.0.1:8765"
                 temporary_directories: Some(expected_temporary_directories.as_slice()),
             }
         );
+        assert_eq!(attached.to_spawn_selections(), attached.to_selections());
         assert_eq!(
             next_starting
                 .refresh_readiness()

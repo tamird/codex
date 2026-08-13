@@ -1328,6 +1328,20 @@
               ],
               "description": "Reasoning effort requested for the spawned agent, when applicable."
             },
+            "receiverAgentNickname": {
+              "description": "Nickname for the single receiver agent when the source event reports one.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "receiverAgentRole": {
+              "description": "Role for the single receiver agent when the source event reports one.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "receiverThreadIds": {
               "description": "Thread ID of the receiving agent, when applicable. In case of spawn operation, this corresponds to the newly spawned agent.",
               "items": {

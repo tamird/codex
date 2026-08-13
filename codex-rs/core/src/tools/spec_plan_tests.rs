@@ -66,6 +66,7 @@ use crate::tools::spec_plan::append_source_tools;
 use crate::tools::spec_plan::build_core_tool_registry;
 
 const MULTI_AGENT_V2_NAMESPACE: &str = "collaboration";
+const FRODEX_AGENT_OWNERSHIP_NAMESPACE: &str = "frodex";
 
 #[derive(Default)]
 struct ToolPlanInputs {
@@ -255,6 +256,61 @@ fn plan_with_model(
 
 async fn probe(configure_turn: impl FnOnce(&mut TurnContext)) -> ToolPlanProbe {
     probe_with(configure_turn, ToolPlanInputs::default()).await
+}
+
+#[tokio::test]
+async fn supervisor_tools_are_visible_only_to_goal_supervisor_helpers() {
+    let source = |path: &str, role: &str| {
+        SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+            parent_thread_id: ThreadId::new(),
+            depth: 1,
+            agent_path: Some(AgentPath::try_from(path).expect("valid agent path")),
+            agent_nickname: None,
+            agent_role: Some(role.to_string()),
+        })
+    };
+
+    let supervisor = probe(|turn| {
+        turn.session_source = source(
+            "/root/goal_supervisor",
+            crate::goal_supervisor::GOAL_SUPERVISOR_ROLE_NAME,
+        );
+    })
+    .await;
+    assert_eq!(
+        supervisor.namespace_function_names("supervisor"),
+        ["close_self", "compact_parent_context", "snooze"]
+    );
+
+    let supervisor_path_without_role = probe(|turn| {
+        turn.session_source = source("/root/goal_supervisor", "worker");
+    })
+    .await;
+    assert!(
+        supervisor_path_without_role
+            .namespace_function_names("supervisor")
+            .is_empty()
+    );
+    supervisor_path_without_role.assert_registered_lacks(&[
+        "supervisor.close_self",
+        "supervisor.snooze",
+        "supervisor.compact_parent_context",
+    ]);
+
+    let supervisor_role_on_custom_path = probe(|turn| {
+        turn.session_source = source(
+            "/root/checker",
+            crate::goal_supervisor::GOAL_SUPERVISOR_ROLE_NAME,
+        );
+    })
+    .await;
+    assert_eq!(
+        supervisor_role_on_custom_path.namespace_function_names("supervisor"),
+        ["close_self", "compact_parent_context", "snooze"]
+    );
+
+    let root = probe(|turn| turn.session_source = SessionSource::Exec).await;
+    assert!(root.namespace_function_names("supervisor").is_empty());
 }
 
 fn set_feature(turn: &mut TurnContext, feature: Feature, enabled: bool) {
@@ -2828,6 +2884,71 @@ async fn multi_agent_feature_selects_one_agent_tool_family() {
 }
 
 #[tokio::test]
+async fn multi_agent_v2_ownership_tools_use_separate_opt_in_namespace() {
+    let disabled = probe(|turn| {
+        set_feature(turn, Feature::MultiAgentV2, /*enabled*/ true);
+    })
+    .await;
+
+    disabled.assert_visible_contains(&[MULTI_AGENT_V2_NAMESPACE, FRODEX_AGENT_OWNERSHIP_NAMESPACE]);
+    assert_eq!(
+        disabled.namespace_function_names(FRODEX_AGENT_OWNERSHIP_NAMESPACE),
+        &["close_agent".to_string()]
+    );
+    assert!(
+        !disabled
+            .namespace_function_names(MULTI_AGENT_V2_NAMESPACE)
+            .iter()
+            .any(|name| matches!(
+                name.as_str(),
+                "close_agent" | "adopt_agent" | "promote_agent"
+            ))
+    );
+
+    let enabled = probe(|turn| {
+        set_feature(turn, Feature::MultiAgentV2, /*enabled*/ true);
+        update_config(turn, |config| {
+            config.multi_agent_v2.enable_thread_adoption = true;
+        });
+    })
+    .await;
+    assert_eq!(
+        enabled.namespace_function_names(FRODEX_AGENT_OWNERSHIP_NAMESPACE),
+        &[
+            "adopt_agent".to_string(),
+            "close_agent".to_string(),
+            "promote_agent".to_string(),
+        ]
+    );
+    assert_eq!(
+        enabled.namespace_function_names(MULTI_AGENT_V2_NAMESPACE),
+        disabled.namespace_function_names(MULTI_AGENT_V2_NAMESPACE)
+    );
+
+    let ToolSpec::Namespace(namespace) = enabled.visible_spec(FRODEX_AGENT_OWNERSHIP_NAMESPACE)
+    else {
+        panic!("expected the Frodex ownership namespace");
+    };
+    let Some(ResponsesApiNamespaceTool::Function(adopt_agent)) =
+        namespace.tools.iter().find(|tool| {
+            matches!(
+                tool,
+                ResponsesApiNamespaceTool::Function(tool) if tool.name == "adopt_agent"
+            )
+        })
+    else {
+        panic!("explicit thread adoption must expose adopt_agent");
+    };
+    let properties = adopt_agent
+        .parameters
+        .properties
+        .as_ref()
+        .expect("adopt_agent should use object params");
+    assert!(properties.contains_key("existing_thread_id"));
+    assert_eq!(properties["message"].encrypted, None);
+}
+
+#[tokio::test]
 async fn multi_agent_v2_message_schemas_are_encrypted() {
     let plan = probe(|turn| {
         set_feature(turn, Feature::MultiAgentV2, /*enabled*/ true);
@@ -3076,6 +3197,33 @@ async fn multi_agent_v2_bedrock_workers_only_delegate_when_model_supports_v2() {
 }
 
 #[tokio::test]
+async fn goal_supervisor_keeps_collaboration_tools_when_model_does_not_advertise_v2() {
+    let plan = probe(|turn| {
+        set_feature(turn, Feature::MultiAgentV2, /*enabled*/ true);
+        update_turn_settings_for_test(turn, |settings| {
+            Arc::make_mut(&mut settings.model_info).multi_agent_version =
+                Some(MultiAgentVersion::V1);
+        });
+        turn.session_source = SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+            parent_thread_id: ThreadId::new(),
+            depth: 1,
+            agent_path: Some(
+                AgentPath::try_from("/root/goal_supervisor").expect("supervisor path should parse"),
+            ),
+            agent_nickname: None,
+            agent_role: Some(crate::goal_supervisor::GOAL_SUPERVISOR_ROLE_NAME.to_string()),
+        });
+    })
+    .await;
+
+    plan.assert_visible_contains(&[MULTI_AGENT_V2_NAMESPACE]);
+    plan.assert_registered_contains(&[
+        &ToolName::namespaced(MULTI_AGENT_V2_NAMESPACE, "followup_task").to_string(),
+        &ToolName::namespaced(MULTI_AGENT_V2_NAMESPACE, "list_agents").to_string(),
+    ]);
+}
+
+#[tokio::test]
 async fn code_mode_only_can_expose_namespaced_multi_agent_v2_as_normal_tools() {
     let plan = probe(|turn| {
         set_features(
@@ -3100,6 +3248,7 @@ async fn code_mode_only_can_expose_namespaced_multi_agent_v2_as_normal_tools() {
             "wait",
             "request_user_input",
             "agents",
+            FRODEX_AGENT_OWNERSHIP_NAMESPACE,
             // Hosted Responses tool.
             "web_search",
         ]
@@ -3266,6 +3415,7 @@ async fn hosted_web_search_and_standalone_image_generation_follow_runtime_gates(
             "request_user_input",
             // Multi-agent v2 tools.
             MULTI_AGENT_V2_NAMESPACE,
+            FRODEX_AGENT_OWNERSHIP_NAMESPACE,
             // Hosted Responses tools.
             "web_search",
         ]

@@ -44,6 +44,20 @@ pub(crate) struct AgentPickerThreadEntry {
     pub(crate) is_closed: bool,
 }
 
+impl AgentPickerThreadEntry {
+    /// Returns whether this entry represents the internal goal-supervisor helper.
+    ///
+    /// Goal supervisors remain in history but are not user-selectable agents. Older persisted
+    /// records may identify them by path before nickname and role metadata is restored.
+    pub(crate) fn is_goal_supervisor(&self) -> bool {
+        self.agent_role.as_deref() == Some("goal_supervisor")
+            || self
+                .agent_path
+                .as_deref()
+                .is_some_and(|agent_path| agent_path.ends_with("/goal_supervisor"))
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SubAgentActivityDisplay {
     pub(crate) thread_id: ThreadId,
@@ -209,6 +223,8 @@ pub(crate) fn tool_call_history_cell(
         tool,
         status,
         receiver_thread_ids,
+        receiver_agent_nickname,
+        receiver_agent_role,
         prompt,
         agents_states,
         ..
@@ -234,11 +250,24 @@ pub(crate) fn tool_call_history_cell(
             }
             let fallback_spawn_request = spawn_request_summary(item);
             let spawn_request = cached_spawn_request.or(fallback_spawn_request.as_ref());
+            let receiver_metadata = AgentMetadata {
+                agent_nickname: receiver_agent_nickname.clone(),
+                agent_role: receiver_agent_role.clone(),
+            };
             Some(spawn_end(
                 first_receiver,
                 prompt,
                 spawn_request,
-                &mut agent_metadata,
+                &mut |thread_id| {
+                    if Some(thread_id) == first_receiver
+                        && (receiver_metadata.agent_nickname.is_some()
+                            || receiver_metadata.agent_role.is_some())
+                    {
+                        receiver_metadata.clone()
+                    } else {
+                        agent_metadata(thread_id)
+                    }
+                },
             ))
         }
         CollabAgentTool::SendInput => {
@@ -734,6 +763,8 @@ mod tests {
                 status: CollabAgentToolCallStatus::Completed,
                 sender_thread_id: sender_thread_id.to_string(),
                 receiver_thread_ids: vec![robie_id.to_string()],
+                receiver_agent_nickname: None,
+                receiver_agent_role: None,
                 prompt: Some("Compute 11! and reply with just the integer result.".to_string()),
                 model: Some("gpt-5".to_string()),
                 reasoning_effort: Some(ReasoningEffortConfig::High),
@@ -754,6 +785,8 @@ mod tests {
                 status: CollabAgentToolCallStatus::Completed,
                 sender_thread_id: sender_thread_id.to_string(),
                 receiver_thread_ids: vec![robie_id.to_string()],
+                receiver_agent_nickname: None,
+                receiver_agent_role: None,
                 prompt: Some("Please continue and return the answer only.".to_string()),
                 model: None,
                 reasoning_effort: None,
@@ -774,6 +807,8 @@ mod tests {
                 status: CollabAgentToolCallStatus::InProgress,
                 sender_thread_id: sender_thread_id.to_string(),
                 receiver_thread_ids: vec![robie_id.to_string()],
+                receiver_agent_nickname: None,
+                receiver_agent_role: None,
                 prompt: None,
                 model: None,
                 reasoning_effort: None,
@@ -791,6 +826,8 @@ mod tests {
                 status: CollabAgentToolCallStatus::Completed,
                 sender_thread_id: sender_thread_id.to_string(),
                 receiver_thread_ids: vec![robie_id.to_string(), bob_id.to_string()],
+                receiver_agent_nickname: None,
+                receiver_agent_role: None,
                 prompt: None,
                 model: None,
                 reasoning_effort: None,
@@ -817,6 +854,8 @@ mod tests {
                 status: CollabAgentToolCallStatus::Completed,
                 sender_thread_id: sender_thread_id.to_string(),
                 receiver_thread_ids: vec![robie_id.to_string()],
+                receiver_agent_nickname: None,
+                receiver_agent_role: None,
                 prompt: None,
                 model: None,
                 reasoning_effort: None,
@@ -901,6 +940,8 @@ mod tests {
                 status: CollabAgentToolCallStatus::Completed,
                 sender_thread_id: sender_thread_id.to_string(),
                 receiver_thread_ids: vec![robie_id.to_string()],
+                receiver_agent_nickname: None,
+                receiver_agent_role: None,
                 prompt: Some(String::new()),
                 model: Some("gpt-5".to_string()),
                 reasoning_effort: Some(ReasoningEffortConfig::High),
@@ -940,6 +981,8 @@ mod tests {
                 status: CollabAgentToolCallStatus::Completed,
                 sender_thread_id: sender_thread_id.to_string(),
                 receiver_thread_ids: vec![robie_id.to_string()],
+                receiver_agent_nickname: None,
+                receiver_agent_role: None,
                 prompt: None,
                 model: None,
                 reasoning_effort: None,

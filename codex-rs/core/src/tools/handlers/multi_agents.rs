@@ -75,12 +75,18 @@ pub(crate) use close_agent::Handler as CloseAgentHandler;
 pub(crate) use resume_agent::Handler as ResumeAgentHandler;
 pub(crate) use send_input::Handler as SendInputHandler;
 pub(crate) use spawn::Handler as SpawnAgentHandler;
+pub(crate) use supervisor_compact_parent_context::Handler as SupervisorCompactParentContextHandler;
+pub(crate) use supervisor_self_close::Handler as SupervisorSelfCloseHandler;
+pub(crate) use supervisor_snooze::Handler as SupervisorSnoozeHandler;
 pub(crate) use wait::Handler as WaitAgentHandler;
 
 pub(crate) mod close_agent;
 mod resume_agent;
 mod send_input;
 mod spawn;
+mod supervisor_compact_parent_context;
+mod supervisor_self_close;
+mod supervisor_snooze;
 pub(crate) mod wait;
 
 pub(crate) fn collab_tool_call_status(

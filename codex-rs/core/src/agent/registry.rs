@@ -12,8 +12,12 @@ use std::collections::HashSet;
 use std::collections::hash_map::Entry;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
+use tokio::sync::Mutex as AsyncMutex;
+use tokio::sync::Notify;
+use tokio::sync::OwnedMutexGuard;
 
 /// This structure is used to add some limits on the multi-agent capabilities for Codex. In
 /// the current implementation, it limits:
@@ -55,6 +59,80 @@ pub(crate) struct AgentMetadata {
     pub(crate) agent_path: Option<AgentPath>,
     pub(crate) agent_nickname: Option<String>,
     pub(crate) agent_role: Option<String>,
+    pub(crate) last_task_message: Option<String>,
+    /// Serializes loaded/cold transitions for this addressable agent. The lock lives with the
+    /// registry entry so unloading the heavy `CodexThread` does not permit concurrent reloads.
+    pub(crate) lifecycle: Arc<AgentLifecycle>,
+}
+
+/// Runtime coordination retained for an addressable agent after its `CodexThread` becomes cold.
+#[derive(Debug, Default)]
+pub(crate) struct AgentLifecycle {
+    /// Guards all loaded/cold transitions and submissions that require a loaded thread.
+    transition: Arc<AsyncMutex<()>>,
+    /// Keeps a transactionally transferred descendant discoverable while its runtime stays cold.
+    visible_when_cold: AtomicBool,
+    /// Prevents duplicate completion watchers for one registered agent.
+    completion_watcher_active: AtomicBool,
+    /// Wakes input delivery after the active completion watcher finishes its transition.
+    completion_watcher_finished: Notify,
+}
+
+/// Clears the active-watcher marker even when the watcher exits through an error path.
+pub(crate) struct CompletionWatcherRegistration {
+    lifecycle: Arc<AgentLifecycle>,
+}
+
+impl AgentLifecycle {
+    pub(crate) async fn lock_transition(self: &Arc<Self>) -> OwnedMutexGuard<()> {
+        Arc::clone(&self.transition).lock_owned().await
+    }
+
+    pub(crate) fn completion_watcher_active(&self) -> bool {
+        self.completion_watcher_active.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn mark_visible_when_cold(&self) {
+        self.visible_when_cold.store(true, Ordering::Release);
+    }
+
+    pub(crate) fn is_visible_when_cold(&self) -> bool {
+        self.visible_when_cold.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn try_start_completion_watcher(
+        self: &Arc<Self>,
+    ) -> Option<CompletionWatcherRegistration> {
+        self.completion_watcher_active
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .ok()
+            .map(|_| CompletionWatcherRegistration {
+                lifecycle: Arc::clone(self),
+            })
+    }
+
+    pub(crate) async fn wait_for_completion_watcher(&self) {
+        while self.completion_watcher_active() {
+            let finished = self.completion_watcher_finished.notified();
+            tokio::pin!(finished);
+            // `notify_waiters` does not store a permit. Register before the atomic recheck so a
+            // watcher cannot finish between the recheck and the first poll of `Notified`.
+            let _ = finished.as_mut().enable();
+            if !self.completion_watcher_active() {
+                return;
+            }
+            finished.await;
+        }
+    }
+}
+
+impl Drop for CompletionWatcherRegistration {
+    fn drop(&mut self) {
+        self.lifecycle
+            .completion_watcher_active
+            .store(false, Ordering::Release);
+        self.lifecycle.completion_watcher_finished.notify_waiters();
+    }
 }
 
 fn format_agent_nickname(name: &str, nickname_reset_count: usize) -> String {
@@ -92,6 +170,10 @@ pub(crate) fn exceeds_thread_spawn_depth_limit(depth: i32, max_depth: i32) -> bo
     depth > max_depth
 }
 
+fn is_uncounted_agent_metadata(agent_metadata: &AgentMetadata) -> bool {
+    agent_metadata.agent_role.as_deref() == Some(crate::goal_supervisor::GOAL_SUPERVISOR_ROLE_NAME)
+}
+
 impl AgentRegistry {
     pub(crate) fn reserve_spawn_slot(
         self: &Arc<Self>,
@@ -111,7 +193,18 @@ impl AgentRegistry {
             active: true,
             reserved_agent_nickname: None,
             reserved_agent_path: None,
+            counted: true,
         })
+    }
+
+    pub(crate) fn reserve_uncounted_spawn_slot(self: &Arc<Self>) -> SpawnReservation {
+        SpawnReservation {
+            state: Arc::clone(self),
+            active: true,
+            reserved_agent_nickname: None,
+            reserved_agent_path: None,
+            counted: false,
+        }
     }
 
     pub(crate) fn release_spawned_thread(&self, thread_id: ThreadId) {
@@ -126,6 +219,7 @@ impl AgentRegistry {
                 .and_then(|agent| active_agents.agent_tree.remove(agent.path.as_str()))
                 .is_some_and(|metadata| {
                     !metadata.agent_path.as_ref().is_some_and(AgentPath::is_root)
+                        && !is_uncounted_agent_metadata(&metadata)
                 })
         };
         if removed_counted_agent {
@@ -226,6 +320,34 @@ impl AgentRegistry {
             })
             .cloned()
             .collect()
+    }
+
+    pub(crate) fn update_last_task_message(&self, thread_id: ThreadId, last_task_message: String) {
+        let mut active_agents = self
+            .active_agents
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(metadata) = active_agents
+            .agent_tree
+            .values_mut()
+            .find(|metadata| metadata.agent_id == Some(thread_id))
+        {
+            metadata.last_task_message = Some(last_task_message);
+        }
+    }
+
+    pub(crate) fn clear_last_task_message(&self, thread_id: ThreadId) {
+        let mut active_agents = self
+            .active_agents
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(metadata) = active_agents
+            .agent_tree
+            .values_mut()
+            .find(|metadata| metadata.agent_id == Some(thread_id))
+        {
+            metadata.last_task_message = None;
+        }
     }
 
     fn register_spawned_thread(&self, agent_metadata: AgentMetadata) {
@@ -358,6 +480,7 @@ pub(crate) struct SpawnReservation {
     active: bool,
     reserved_agent_nickname: Option<String>,
     reserved_agent_path: Option<AgentPath>,
+    counted: bool,
 }
 
 impl SpawnReservation {
@@ -396,7 +519,9 @@ impl Drop for SpawnReservation {
             if let Some(agent_path) = self.reserved_agent_path.take() {
                 self.state.release_reserved_agent_path(&agent_path);
             }
-            self.state.total_count.fetch_sub(1, Ordering::AcqRel);
+            if self.counted {
+                self.state.total_count.fetch_sub(1, Ordering::AcqRel);
+            }
         }
     }
 }

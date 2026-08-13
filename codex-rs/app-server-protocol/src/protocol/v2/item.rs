@@ -387,6 +387,10 @@ pub enum ThreadItem {
         /// Thread ID of the receiving agent, when applicable. In case of spawn operation,
         /// this corresponds to the newly spawned agent.
         receiver_thread_ids: Vec<String>,
+        /// Nickname for the single receiver agent when the source event reports one.
+        receiver_agent_nickname: Option<String>,
+        /// Role for the single receiver agent when the source event reports one.
+        receiver_agent_role: Option<String>,
         /// Prompt text sent as part of the collab tool call, when available.
         prompt: Option<String>,
         /// Model requested for the spawned agent, when applicable.
@@ -961,25 +965,36 @@ impl From<CoreTurnItem> for ThreadItem {
                     .duration
                     .and_then(|duration| i64::try_from(duration.as_millis()).ok()),
             },
-            CoreTurnItem::CollabAgentToolCall(call) => ThreadItem::CollabAgentToolCall {
-                id: call.id,
-                tool: call.tool.into(),
-                status: call.status.into(),
-                sender_thread_id: call.sender_thread_id.to_string(),
-                receiver_thread_ids: call
-                    .receiver_thread_ids
-                    .into_iter()
-                    .map(String::from)
-                    .collect(),
-                prompt: call.prompt,
-                model: call.model,
-                reasoning_effort: call.reasoning_effort,
-                agents_states: call
-                    .agents_states
-                    .into_iter()
-                    .map(|(thread_id, status)| (thread_id.to_string(), status.into()))
-                    .collect(),
-            },
+            CoreTurnItem::CollabAgentToolCall(call) => {
+                let (receiver_agent_nickname, receiver_agent_role) = match call
+                    .receiver_agents
+                    .as_slice()
+                {
+                    [receiver] => (receiver.agent_nickname.clone(), receiver.agent_role.clone()),
+                    _ => (None, None),
+                };
+                ThreadItem::CollabAgentToolCall {
+                    id: call.id,
+                    tool: call.tool.into(),
+                    status: call.status.into(),
+                    sender_thread_id: call.sender_thread_id.to_string(),
+                    receiver_thread_ids: call
+                        .receiver_thread_ids
+                        .into_iter()
+                        .map(String::from)
+                        .collect(),
+                    receiver_agent_nickname,
+                    receiver_agent_role,
+                    prompt: call.prompt,
+                    model: call.model,
+                    reasoning_effort: call.reasoning_effort,
+                    agents_states: call
+                        .agents_states
+                        .into_iter()
+                        .map(|(thread_id, status)| (thread_id.to_string(), status.into()))
+                        .collect(),
+                }
+            }
             CoreTurnItem::SubAgentActivity(activity) => ThreadItem::SubAgentActivity {
                 id: activity.id,
                 kind: activity.kind.into(),

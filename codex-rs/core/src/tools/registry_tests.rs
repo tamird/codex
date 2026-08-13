@@ -691,6 +691,25 @@ fn post_tool_use_feedback_output_keeps_code_mode_result_typed() {
     );
 }
 
+#[test]
+fn post_tool_use_feedback_output_preserves_terminal_no_response() {
+    let output = PostToolUseFeedbackOutput {
+        original: Box::new(
+            crate::tools::context::FunctionToolOutput::from_text(
+                String::new(),
+                /*success*/ Some(true),
+            )
+            .into_terminal_no_response(),
+        ),
+        model_visible: crate::tools::context::FunctionToolOutput::from_text(
+            "hook feedback".to_string(),
+            /*success*/ None,
+        ),
+    };
+
+    assert!(output.terminal_no_response());
+}
+
 #[tokio::test]
 async fn dispatch_uses_canonical_tool_names_for_lifecycle_contributors() -> anyhow::Result<()> {
     let (mut session, turn) = crate::session::tests::make_session_and_context().await;

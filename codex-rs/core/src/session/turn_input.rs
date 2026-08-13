@@ -337,7 +337,7 @@ async fn start_if_idle(
         ..
     } = request;
     let can_start_root_turn = start.parent_turn_id.is_none() && start.root_turn_id.is_none();
-    if session.input_queue.has_trigger_turn_mailbox_items().await {
+    if session.has_pending_turn_start_work().await {
         return Ok(TurnInputSubmission::NotSubmitted {
             reason: NotSubmittedReason::PendingTriggerTurn,
         });
@@ -363,7 +363,7 @@ async fn start_if_idle(
         Arc::clone(&active_turn.turn_state)
     };
 
-    if session.input_queue.has_trigger_turn_mailbox_items().await {
+    if session.has_pending_turn_start_work().await {
         session.clear_reserved_idle_turn(&turn_state).await;
         session.maybe_start_turn_for_pending_work().await;
         return Ok(TurnInputSubmission::NotSubmitted {

@@ -237,6 +237,10 @@ impl ToolOutput for PostToolUseFeedbackOutput {
         self.original.fallback_token_limit_override()
     }
 
+    fn terminal_no_response(&self) -> bool {
+        self.original.terminal_no_response()
+    }
+
     fn to_response_item(&self, call_id: &str, payload: &ToolPayload) -> ResponseInputItem {
         self.model_visible.to_response_item(call_id, payload)
     }

@@ -1,4 +1,4 @@
-use super::residency::is_v2_resident_session_source;
+use super::residency::is_resident_session_source;
 use super::*;
 use crate::agent::role::apply_role_to_config;
 use crate::codex_thread::CodexThread;
@@ -168,51 +168,132 @@ impl AgentControl {
         let Some(agent_graph_store) = state.agent_graph_store() else {
             return;
         };
-        let descendant_ids = match agent_graph_store
-            .list_thread_spawn_descendants(
-                root_thread_id,
-                Some(codex_agent_graph_store::ThreadSpawnEdgeStatus::Open),
-            )
-            .await
-        {
-            Ok(descendant_ids) => descendant_ids,
-            Err(err) => {
-                warn!("failed to restore persisted V2 agent metadata for {root_thread_id}: {err}");
-                return;
-            }
+        let indexed_identities =
+            match agent_graph_store.list_open_thread_spawn_descendant_identities(root_thread_id) {
+                Some(identity_query) => identity_query.await.ok(),
+                None => None,
+            };
+        let descendant_identities: Vec<(
+            ThreadId,
+            Option<codex_state::ThreadSpawnDescendantIdentity>,
+        )> = match indexed_identities {
+            Some(identities) => identities
+                .into_iter()
+                .map(|identity| (identity.thread_id, Some(identity)))
+                .collect(),
+            None => match agent_graph_store
+                .list_thread_spawn_descendants(
+                    root_thread_id,
+                    Some(codex_agent_graph_store::ThreadSpawnEdgeStatus::Open),
+                )
+                .await
+            {
+                Ok(descendant_ids) => descendant_ids
+                    .into_iter()
+                    .map(|thread_id| (thread_id, None))
+                    .collect(),
+                Err(err) => {
+                    warn!(
+                        "failed to restore persisted V2 agent metadata for {root_thread_id}: {err}"
+                    );
+                    return;
+                }
+            },
         };
 
-        for thread_id in descendant_ids {
+        for (thread_id, indexed_identity) in descendant_identities {
             if self.state.agent_metadata_for_thread(thread_id).is_some() {
                 continue;
             }
             let restore_result = async {
-                let stored_thread = state
-                    .read_stored_thread(ReadThreadParams {
-                        thread_id,
-                        include_archived: true,
-                        include_history: false,
-                    })
-                    .await?;
-                let stored_agent_path = stored_thread
-                    .agent_path
-                    .as_deref()
-                    .map(AgentPath::try_from)
-                    .transpose()
-                    .map_err(|err| {
-                        CodexErr::InvalidRequest(format!("invalid stored agent path: {err}"))
-                    })?;
+                let indexed_identity = match indexed_identity {
+                    Some(identity) => identity.source.map(|source| {
+                        (
+                            source,
+                            identity.agent_path,
+                            identity.agent_role,
+                            identity.agent_nickname,
+                        )
+                    }),
+                    None => state
+                        .indexed_thread_metadata(thread_id)
+                        .await
+                        .map(|metadata| {
+                            (
+                                metadata.source,
+                                metadata.agent_path,
+                                metadata.agent_role,
+                                metadata.agent_nickname,
+                            )
+                        }),
+                }
+                .and_then(|(source, agent_path, agent_role, agent_nickname)| {
+                    let source = serde_json::from_str::<SessionSource>(&source)
+                        .or_else(|_| serde_json::from_value(serde_json::Value::String(source)))
+                        .ok()?;
+                    if !matches!(
+                        source,
+                        SessionSource::SubAgent(SubAgentSource::ThreadSpawn { .. })
+                    ) {
+                        return None;
+                    }
+                    let agent_path = agent_path
+                        .as_deref()
+                        .map(AgentPath::try_from)
+                        .transpose()
+                        .ok()?
+                        .or_else(|| source.get_agent_path());
+                    Some((
+                        agent_path,
+                        agent_role.or_else(|| source.get_agent_role()),
+                        agent_nickname.or_else(|| source.get_nickname()),
+                    ))
+                });
+                let (agent_path, agent_role, agent_nickname) = match indexed_identity {
+                    Some(identity) => identity,
+                    None => {
+                        let stored_thread = state
+                            .read_stored_thread(ReadThreadParams {
+                                thread_id,
+                                include_archived: true,
+                                include_history: false,
+                            })
+                            .await?;
+                        let stored_agent_path = match stored_thread
+                            .agent_path
+                            .as_deref()
+                            .map(AgentPath::try_from)
+                            .transpose()
+                        {
+                            Ok(agent_path) => agent_path,
+                            Err(err) => {
+                                stored_thread.source.get_agent_path().map(Some).ok_or_else(
+                                    || {
+                                        CodexErr::InvalidRequest(format!(
+                                            "invalid stored agent path: {err}"
+                                        ))
+                                    },
+                                )?
+                            }
+                        };
+                        (
+                            stored_agent_path.or_else(|| stored_thread.source.get_agent_path()),
+                            stored_thread
+                                .agent_role
+                                .or_else(|| stored_thread.source.get_agent_role()),
+                            stored_thread
+                                .agent_nickname
+                                .or_else(|| stored_thread.source.get_nickname()),
+                        )
+                    }
+                };
                 let mut reservation = self.state.reserve_spawn_slot(/*max_threads*/ None)?;
                 let mut metadata = self.prepare_agent_metadata(
                     &mut reservation,
                     config,
-                    stored_agent_path.or_else(|| stored_thread.source.get_agent_path()),
-                    stored_thread
-                        .agent_role
-                        .or_else(|| stored_thread.source.get_agent_role()),
-                    stored_thread
-                        .agent_nickname
-                        .or_else(|| stored_thread.source.get_nickname()),
+                    agent_path,
+                    agent_role,
+                    agent_nickname,
                 )?;
                 metadata.agent_id = Some(thread_id);
                 reservation.commit(metadata);
@@ -224,7 +305,6 @@ impl AgentControl {
             }
         }
     }
-
     /// Spawn a new agent thread and submit the initial prompt.
     #[cfg(test)]
     pub(crate) async fn spawn_agent(
@@ -302,7 +382,12 @@ impl AgentControl {
         thread_id: ThreadId,
         parent: Option<Arc<CodexThread>>,
     ) -> CodexResult<()> {
+        if parent.is_none() {
+            return self.ensure_agent_loaded(config, thread_id).await;
+        }
         let state = self.upgrade()?;
+        let lifecycle = self.ensure_agent_known(thread_id)?.lifecycle;
+        let _transition = lifecycle.lock_transition().await;
         let parent = if let Some(parent) = parent {
             let parent_thread_id = parent.session.thread_id;
             let turn = parent.session.new_default_turn().await;
@@ -329,7 +414,7 @@ impl AgentControl {
         };
         let owner_thread_id = parent.as_ref().map(|(parent, _)| parent.session.thread_id);
         if owner_thread_id.is_none() && state.get_thread(thread_id).await.is_ok() {
-            self.touch_loaded_v2_residency(&state, thread_id).await;
+            self.touch_loaded_agent_residency(&state, thread_id).await;
             return Ok(());
         }
         if self.state.agent_metadata_for_thread(thread_id).is_none() {
@@ -543,7 +628,7 @@ impl AgentControl {
         };
         // Reserving a slot can evict an idle nested parent. Keep its authority captured above.
         let residency_slot = self
-            .reserve_v2_residency_slot(&state, &config, Some(thread_id))
+            .reserve_agent_residency_slot(&state, &config, MultiAgentVersion::V2, Some(thread_id))
             .await?;
 
         match state
@@ -577,7 +662,7 @@ impl AgentControl {
                     }
                     self.state.clear_evicted_environments(thread_id);
                     drop(residency_slot);
-                    self.touch_loaded_v2_residency(&state, thread_id).await;
+                    self.touch_loaded_agent_residency(&state, thread_id).await;
                     return Ok(());
                 }
                 Err(err)
@@ -602,28 +687,41 @@ impl AgentControl {
                 &config,
             )
             .await;
-        if let Some(session_source) = session_source.as_ref() {
+        let is_goal_supervisor_helper = session_source
+            .as_ref()
+            .is_some_and(crate::goal_supervisor::is_goal_supervisor_helper_source);
+        if let Some(session_source) = session_source.as_ref()
+            && !is_goal_supervisor_helper
+        {
             self.ensure_execution_capacity(multi_agent_version, session_source)?;
         }
         let agent_max_threads = config.effective_agent_max_threads(multi_agent_version);
-        let spawn_uses_v2_residency = multi_agent_version == MultiAgentVersion::V2
-            && session_source
-                .as_ref()
-                .is_some_and(is_v2_resident_session_source);
-        let residency_slot = if spawn_uses_v2_residency {
+        let spawn_uses_residency = session_source
+            .as_ref()
+            .is_some_and(is_resident_session_source);
+        let residency_slot = if spawn_uses_residency {
             Some(
-                self.reserve_v2_residency_slot(&state, &config, /*protected_thread_id*/ None)
-                    .await?,
+                self.reserve_agent_residency_slot(
+                    &state,
+                    &config,
+                    multi_agent_version,
+                    /*protected_thread_id*/ None,
+                )
+                .await?,
             )
         } else {
             None
         };
-        let reservation_max_threads = if spawn_uses_v2_residency {
+        let reservation_max_threads = if spawn_uses_residency {
             None
         } else {
             agent_max_threads
         };
-        let mut reservation = self.state.reserve_spawn_slot(reservation_max_threads)?;
+        let mut reservation = if is_goal_supervisor_helper {
+            self.state.reserve_uncounted_spawn_slot()
+        } else {
+            self.state.reserve_spawn_slot(reservation_max_threads)?
+        };
         let inheritance = SpawnAgentThreadInheritance {
             environments: self
                 .inherited_environments_for_source(&state, session_source.as_ref())
@@ -632,6 +730,13 @@ impl AgentControl {
                 .inherited_exec_policy_for_source(&state, session_source.as_ref(), &config)
                 .await,
         };
+        let mut options = options;
+        if options.environments.is_none() {
+            options.environments = inheritance
+                .environments
+                .as_ref()
+                .map(TurnEnvironmentSnapshot::to_spawn_selections);
+        }
         let (session_source, mut agent_metadata) = match session_source {
             Some(SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
                 parent_thread_id,
@@ -771,7 +876,11 @@ impl AgentControl {
                 .await?;
             }
         }
-        if multi_agent_version != MultiAgentVersion::V2 {
+        let is_goal_supervisor_helper = options.fork_mode.is_some()
+            && notification_source
+                .as_ref()
+                .is_some_and(crate::goal_supervisor::is_goal_supervisor_helper_source);
+        if multi_agent_version != MultiAgentVersion::V2 || is_goal_supervisor_helper {
             let child_reference = agent_metadata
                 .agent_path
                 .as_ref()
@@ -805,7 +914,9 @@ impl AgentControl {
             environments: inherited_environments,
             exec_policy: inherited_exec_policy,
         } = inheritance;
-        if options.fork_parent_spawn_call_id.is_none() {
+        let is_goal_supervisor_helper =
+            crate::goal_supervisor::is_goal_supervisor_helper_source(&session_source);
+        if options.fork_parent_spawn_call_id.is_none() && !is_goal_supervisor_helper {
             return Err(CodexErr::Fatal(
                 "spawn_agent fork requires a parent spawn call id".to_string(),
             ));
@@ -863,6 +974,7 @@ impl AgentControl {
         let destination_history_mode = matches!(parent_history_mode, ThreadHistoryMode::Paginated)
             .then_some(ThreadHistoryMode::Paginated);
 
+        let mut supervisor_continuity_history = None;
         let (
             selected_capability_roots,
             mut forked_rollout_items,
@@ -882,10 +994,19 @@ impl AgentControl {
                         _ => None,
                     })
                     .unwrap_or_default();
+                if is_goal_supervisor_helper {
+                    supervisor_continuity_history = Some(logical_history.clone());
+                }
+                let reference_rollout_items = reference_history.get_rollout_items().to_vec();
                 (
                     selected_capability_roots,
-                    logical_history,
-                    Some(reference_history.get_rollout_items().to_vec()),
+                    if is_goal_supervisor_helper {
+                        reference_rollout_items
+                    } else {
+                        logical_history
+                    },
+                    (!is_goal_supervisor_helper)
+                        .then(|| reference_history.get_rollout_items().to_vec()),
                     Some(source_reservation),
                 )
             }
@@ -913,6 +1034,9 @@ impl AgentControl {
                     .unwrap_or_default();
                 let mut forked_rollout_items =
                     truncate_rollout_to_last_n_fork_turns(parent_history, *last_n_turns);
+                if is_goal_supervisor_helper {
+                    supervisor_continuity_history = Some(forked_rollout_items.clone());
+                }
                 if let Some(source_session_meta) = source_session_meta {
                     forked_rollout_items.insert(0, RolloutItem::SessionMeta(source_session_meta));
                 }
@@ -938,6 +1062,8 @@ impl AgentControl {
             };
         let mut preserve_reference_context_item =
             matches!(fork_mode, SpawnAgentForkMode::FullHistory);
+        let defer_reference_backed_child_suffix = preserve_reference_context_item;
+        let mut deferred_child_tail_items = Vec::new();
         if preserve_reference_context_item {
             for item in forked_rollout_items.iter().rev() {
                 let RolloutItem::Compacted(compacted) = item else {
@@ -1012,66 +1138,67 @@ impl AgentControl {
 
             true
         };
-        forked_rollout_items.retain_mut(|item| {
-            if !keep_forked_rollout_item(item, preserve_reference_context_item)
-                || destination_history_mode == Some(ThreadHistoryMode::Paginated)
-                    && matches!(
-                        &*item,
-                        RolloutItem::EventMsg(
-                            EventMsg::ItemCompleted(_)
-                                | EventMsg::TokenCount(_)
-                                | EventMsg::ThreadGoalUpdated(_)
-                                | EventMsg::ThreadSettingsApplied(_),
-                        )
-                    )
-            {
-                return false;
-            }
-
-            match item {
-                RolloutItem::ResponseItem(response_item) => retain_forked_item(
-                    &mut response_item.item,
-                    &mut replaced_parent_developer_instructions,
-                ),
-                RolloutItem::Compacted(compacted) => {
-                    if let Some(replacement_history) = compacted.replacement_history.as_mut() {
-                        // Matches before this checkpoint cannot survive its replacement history.
-                        replaced_parent_developer_instructions = false;
-                        replacement_history.retain_mut(|response_item| {
-                            retain_forked_item(
-                                &mut response_item.item,
-                                &mut replaced_parent_developer_instructions,
+        if !is_goal_supervisor_helper {
+            forked_rollout_items.retain_mut(|item| {
+                if !keep_forked_rollout_item(item, preserve_reference_context_item)
+                    || destination_history_mode == Some(ThreadHistoryMode::Paginated)
+                        && matches!(
+                            &*item,
+                            RolloutItem::EventMsg(
+                                EventMsg::ItemCompleted(_)
+                                    | EventMsg::TokenCount(_)
+                                    | EventMsg::ThreadGoalUpdated(_)
+                                    | EventMsg::ThreadSettingsApplied(_),
                             )
-                        });
-                    }
-                    true
+                        )
+                {
+                    return false;
                 }
-                RolloutItem::WorldState(world_state) => {
-                    if multi_agent_version == MultiAgentVersion::V2 {
-                        world_state.state.remove("multi_agent_usage_hint");
+                match item {
+                    RolloutItem::ResponseItem(response_item) => retain_forked_item(
+                        &mut response_item.item,
+                        &mut replaced_parent_developer_instructions,
+                    ),
+                    RolloutItem::Compacted(compacted) => {
+                        if let Some(replacement_history) = compacted.replacement_history.as_mut() {
+                            // Matches before this checkpoint cannot survive its replacement history.
+                            replaced_parent_developer_instructions = false;
+                            replacement_history.retain_mut(|response_item| {
+                                retain_forked_item(
+                                    &mut response_item.item,
+                                    &mut replaced_parent_developer_instructions,
+                                )
+                            });
+                        }
+                        true
                     }
-                    true
+                    RolloutItem::WorldState(world_state) => {
+                        if multi_agent_version == MultiAgentVersion::V2 {
+                            world_state.state.remove("multi_agent_usage_hint");
+                        }
+                        true
+                    }
+                    RolloutItem::EventMsg(_)
+                    | RolloutItem::SessionMeta(_)
+                    | RolloutItem::TurnContext(_)
+                    | RolloutItem::InterAgentCommunication(_)
+                    | RolloutItem::InterAgentCommunicationMetadata { .. }
+                    | RolloutItem::RolloutReference(_) => true,
+                    RolloutItem::SecurityRiskScore(_) | RolloutItem::RealtimeItem(_) => false,
                 }
-                RolloutItem::RealtimeItem(_) => false,
-                RolloutItem::EventMsg(_)
-                | RolloutItem::SessionMeta(_)
-                | RolloutItem::TurnContext(_)
-                | RolloutItem::InterAgentCommunication(_)
-                | RolloutItem::InterAgentCommunicationMetadata { .. }
-                | RolloutItem::RolloutReference(_) => true,
-                RolloutItem::SecurityRiskScore(_) => false,
+            });
+            if let (Some(reference_rollout_items), Some(unsanitized_parent_history)) =
+                (reference_rollout_items, unsanitized_parent_history)
+                && serde_json::to_value(&forked_rollout_items)? == unsanitized_parent_history
+            {
+                forked_rollout_items = reference_rollout_items;
             }
-        });
-        if let (Some(reference_rollout_items), Some(unsanitized_parent_history)) =
-            (reference_rollout_items, unsanitized_parent_history)
-            && serde_json::to_value(&forked_rollout_items)? == unsanitized_parent_history
-        {
-            forked_rollout_items = reference_rollout_items;
         }
         // Full forks reuse the parent's reference context instead of rebuilding it. If that
         // context omitted the parent's developer fragment, append the child's override so its
         // instructions still reach the model exactly once.
-        if let Some(subagent_developer_instructions) = subagent_developer_instructions.as_ref()
+        if !is_goal_supervisor_helper
+            && let Some(subagent_developer_instructions) = subagent_developer_instructions.as_ref()
             && preserve_reference_context_item
             && !replaced_parent_developer_instructions
             && !subagent_developer_instructions.is_empty()
@@ -1086,7 +1213,8 @@ impl AgentControl {
             ));
             forked_rollout_items.push(RolloutItem::ResponseItem(developer_message.into()));
         }
-        if preserve_reference_context_item
+        if !is_goal_supervisor_helper
+            && preserve_reference_context_item
             && multi_agent_version == MultiAgentVersion::V2
             && let Some(subagent_usage_hint) = options
                 .multi_agent_v2_usage_hints
@@ -1100,6 +1228,45 @@ impl AgentControl {
             forked_rollout_items.push(RolloutItem::ResponseItem(
                 subagent_usage_hint_message.into(),
             ));
+        }
+        if let Some(initial_task_message) = options.initial_task_message.clone() {
+            let assignment = subagent_assignment_item(&session_source, initial_task_message);
+            if defer_reference_backed_child_suffix {
+                deferred_child_tail_items.push(assignment);
+            } else {
+                forked_rollout_items.push(RolloutItem::ResponseItem(assignment.into()));
+            }
+        }
+        if is_goal_supervisor_helper {
+            if let Some(role_prompt) =
+                crate::session::load_agent_role_prompt(&config, &session_source).await
+            {
+                forked_rollout_items.push(RolloutItem::ResponseItem(
+                    role_prompt_item(role_prompt).into(),
+                ));
+            }
+            if let Some(state_db) = parent_thread.session.services.state_db.as_ref()
+                && let Ok(Some(parent_goal)) = state_db
+                    .thread_goals()
+                    .get_thread_goal(parent_thread_id)
+                    .await
+            {
+                let goal_id = parent_goal.goal_id.clone();
+                let parent_goal = crate::goal_supervisor::protocol_goal_from_state(parent_goal);
+                forked_rollout_items.push(
+                    crate::goal_supervisor::supervisor_continuity_context_item(
+                        &parent_thread.session,
+                        &goal_id,
+                        &parent_goal,
+                        supervisor_continuity_history.as_deref().unwrap_or_default(),
+                    )
+                    .await,
+                );
+            }
+            forked_rollout_items.extend(
+                self.supervisor_boot_context_items(state, parent_thread_id)
+                    .await,
+            );
         }
         let mut thread_extension_init = ExtensionDataInit::new();
         thread_extension_init.insert(selected_capability_roots);
@@ -1120,6 +1287,7 @@ impl AgentControl {
             .fork_thread_with_source(
                 config.clone(),
                 InitialHistory::Forked(forked_rollout_items),
+                crate::session::ForkStartupItems::new(Vec::new(), deferred_child_tail_items),
                 destination_history_mode,
                 self.clone(),
                 session_source,
@@ -1140,190 +1308,27 @@ impl AgentControl {
         result
     }
 
-    /// Resume an existing agent thread from a recorded rollout file.
-    pub(crate) async fn resume_agent_from_rollout(
+    async fn supervisor_boot_context_items(
         &self,
-        config: Config,
-        thread_id: ThreadId,
-        session_source: SessionSource,
-    ) -> CodexResult<ThreadId> {
-        let root_depth = thread_spawn_depth(&session_source).unwrap_or(0);
-        let (resumed_thread_id, resumed_multi_agent_version) = Box::pin(
-            self.resume_single_agent_from_rollout(config.clone(), thread_id, session_source),
-        )
-        .await?;
-        let state = self.upgrade()?;
-        if config.multi_agent_version_from_features() == MultiAgentVersion::V2
-            || resumed_multi_agent_version == MultiAgentVersion::V2
-        {
-            return Ok(resumed_thread_id);
-        }
-        let Some(agent_graph_store) = state.agent_graph_store() else {
-            return Ok(resumed_thread_id);
-        };
-
-        let mut resume_queue = VecDeque::from([(thread_id, root_depth)]);
-        while let Some((parent_thread_id, parent_depth)) = resume_queue.pop_front() {
-            let child_ids = match agent_graph_store
-                .list_thread_spawn_children(
-                    parent_thread_id,
-                    Some(codex_agent_graph_store::ThreadSpawnEdgeStatus::Open),
-                )
-                .await
-            {
-                Ok(child_ids) => child_ids,
-                Err(err) => {
-                    warn!(
-                        "failed to load persisted thread-spawn children for {parent_thread_id}: {err}"
-                    );
-                    continue;
-                }
-            };
-
-            for child_thread_id in child_ids {
-                let child_depth = parent_depth + 1;
-                let child_resumed = if state.get_thread(child_thread_id).await.is_ok() {
-                    true
-                } else {
-                    let child_session_source =
-                        SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
-                            parent_thread_id,
-                            depth: child_depth,
-                            agent_path: None,
-                            agent_nickname: None,
-                            agent_role: None,
-                        });
-                    match Box::pin(self.resume_single_agent_from_rollout(
-                        config.clone(),
-                        child_thread_id,
-                        child_session_source,
-                    ))
+        state: &Arc<ThreadManagerState>,
+        owner_thread_id: ThreadId,
+    ) -> Vec<RolloutItem> {
+        let owner_source = match state.get_thread(owner_thread_id).await {
+            Ok(owner_thread) => {
+                owner_thread
+                    .session
+                    .thread_config_snapshot()
                     .await
-                    {
-                        Ok((_, _)) => true,
-                        Err(err) => {
-                            warn!("failed to resume descendant thread {child_thread_id}: {err}");
-                            false
-                        }
-                    }
-                };
-                if child_resumed {
-                    resume_queue.push_back((child_thread_id, child_depth));
-                }
+                    .session_source
             }
-        }
-
-        Ok(resumed_thread_id)
-    }
-
-    async fn resume_single_agent_from_rollout(
-        &self,
-        config: Config,
-        thread_id: ThreadId,
-        session_source: SessionSource,
-    ) -> CodexResult<(ThreadId, MultiAgentVersion)> {
-        let state = self.upgrade()?;
-        let stored_thread = state
-            .read_stored_thread(ReadThreadParams {
-                thread_id,
-                include_archived: true,
-                include_history: false,
-            })
-            .await?;
-        let resumed_agent_path = stored_thread
-            .agent_path
-            .as_deref()
-            .map(AgentPath::try_from)
-            .transpose()
-            .map_err(|err| CodexErr::InvalidRequest(format!("invalid stored agent path: {err}")))?;
-        let resumed_agent_nickname = stored_thread.agent_nickname.clone();
-        let resumed_agent_role = stored_thread.agent_role.clone();
-        let history = load_agent_model_context(&state, thread_id, stored_thread.history_mode)
-            .await?
-            .ok_or(CodexErr::ThreadNotFound(thread_id))?;
-        let initial_history = InitialHistory::Resumed(ResumedHistory {
-            conversation_id: thread_id,
-            history: Arc::new(history),
-            rollout_path: stored_thread.rollout_path,
-        });
-        let parent_thread_id = stored_thread.parent_thread_id;
-        let multi_agent_version = state
-            .effective_multi_agent_version_for_spawn(
-                &initial_history,
-                Some(&session_source),
-                parent_thread_id,
-                /*forked_from_thread_id*/ None,
-                &config,
-            )
-            .await;
-        let agent_max_threads = config.effective_agent_max_threads(multi_agent_version);
-        let mut reservation = self.state.reserve_spawn_slot(agent_max_threads)?;
-        let (session_source, agent_metadata) = match session_source {
-            SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
-                parent_thread_id,
-                depth,
-                agent_path,
-                agent_role: _,
-                agent_nickname: _,
-            }) => self.prepare_thread_spawn(
-                &mut reservation,
-                &config,
-                parent_thread_id,
-                depth,
-                agent_path.or(resumed_agent_path),
-                resumed_agent_role,
-                resumed_agent_nickname,
-            )?,
-            other => (other, AgentMetadata::default()),
+            Err(_) => SessionSource::Cli,
         };
-        let notification_source = session_source.clone();
-        let inherited_environments = self
-            .inherited_environments_for_source(&state, Some(&session_source))
-            .await;
-        let inherited_exec_policy = self
-            .inherited_exec_policy_for_source(&state, Some(&session_source), &config)
-            .await;
+        self.register_session_root(owner_thread_id, owner_source.parent_thread_id());
+        let agents = self
+            .list_agents(&owner_source, /*path_prefix*/ None)
+            .await
+            .unwrap_or_default();
 
-        let resumed_thread = state
-            .resume_thread_with_history_with_source(ResumeThreadWithHistoryOptions {
-                config: config.clone(),
-                initial_history,
-                agent_control: self.clone(),
-                session_source,
-                parent_thread_id,
-                environment_selections: None,
-                inherited_environments,
-                inherited_exec_policy,
-                client_mcp_extensions: None,
-                inherited_thread_state: Default::default(),
-            })
-            .await?;
-        let mut agent_metadata = agent_metadata;
-        agent_metadata.agent_id = Some(resumed_thread.thread_id);
-        reservation.commit(agent_metadata.clone());
-        // Resumed threads are re-registered in-memory and need the same listener
-        // attachment path as freshly spawned threads.
-        state.notify_thread_created(resumed_thread.thread_id);
-        if multi_agent_version != MultiAgentVersion::V2 {
-            let child_reference = agent_metadata
-                .agent_path
-                .as_ref()
-                .map(ToString::to_string)
-                .unwrap_or_else(|| resumed_thread.thread_id.to_string());
-            self.maybe_start_completion_watcher(
-                resumed_thread.thread_id,
-                Some(notification_source.clone()),
-                child_reference,
-                agent_metadata.agent_path.clone(),
-            );
-        }
-        self.persist_thread_spawn_edge_for_source(
-            resumed_thread.thread.as_ref(),
-            resumed_thread.thread_id,
-            Some(&notification_source),
-        )
-        .await;
-
-        Ok((resumed_thread.thread_id, multi_agent_version))
+        synthetic_supervisor_list_agents_items(owner_thread_id, agents)
     }
 }

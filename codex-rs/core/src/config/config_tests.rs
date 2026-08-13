@@ -12083,6 +12083,27 @@ fn multi_agent_v2_exposes_model_overrides_by_default() {
     }
 }
 
+#[test]
+fn multi_agent_v2_thread_adoption_is_disabled_by_default() {
+    let config = resolve_multi_agent_v2_config(&ConfigToml::default());
+
+    assert!(!config.enable_thread_adoption);
+}
+
+#[test]
+fn multi_agent_v2_thread_adoption_can_be_enabled_from_feature_table() {
+    let config_toml = toml::from_str(
+        r#"[features.multi_agent_v2]
+enable_thread_adoption = true
+"#,
+    )
+    .expect("multi-agent v2 thread adoption config should parse");
+
+    let config = resolve_multi_agent_v2_config(&config_toml);
+
+    assert!(config.enable_thread_adoption);
+}
+
 #[tokio::test]
 async fn multi_agent_v2_allows_disabled_wait_agent_without_sleep_tool() -> std::io::Result<()> {
     for config_toml in [

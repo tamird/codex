@@ -103,6 +103,14 @@ senderThreadId: string,
  */
 receiverThreadIds: Array<string>,
 /**
+ * Nickname for the single receiver agent when the source event reports one.
+ */
+receiverAgentNickname: string | null,
+/**
+ * Role for the single receiver agent when the source event reports one.
+ */
+receiverAgentRole: string | null,
+/**
  * Prompt text sent as part of the collab tool call, when available.
  */
 prompt: string | null,

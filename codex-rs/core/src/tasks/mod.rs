@@ -422,6 +422,33 @@ impl Session {
             .is_some()
     }
 
+    /// Returns whether queued mailbox work is entitled to start the next regular turn.
+    ///
+    /// All automatic idle work uses this predicate so lifecycle contributors cannot race a
+    /// mailbox-backed turn. Queue-only mail wakes a durable sleep unless doing so would bypass
+    /// the active-turn limit for a V2 subagent.
+    pub(crate) async fn has_pending_turn_start_work(&self) -> bool {
+        if !self.input_queue.has_pending_mailbox_items().await {
+            return false;
+        }
+        if self.input_queue.has_trigger_turn_mailbox_items().await {
+            return true;
+        }
+        if !self.has_outstanding_durable_sleep() {
+            return false;
+        }
+
+        let session_source = self.session_source().await;
+        let config = self.get_config().await;
+        let multi_agent_version = self
+            .multi_agent_version()
+            .unwrap_or_else(|| config.multi_agent_version_from_features());
+        !self
+            .services
+            .agent_control
+            .is_execution_limited(multi_agent_version, &session_source)
+    }
+
     /// Starts a regular turn when the session is idle and pending work is waiting.
     ///
     /// Pending work includes mailbox mail marked with `trigger_turn`, or any mailbox mail while
@@ -447,10 +474,7 @@ impl Session {
         self: &Arc<Self>,
         sub_id: String,
     ) {
-        if !self.input_queue.has_pending_mailbox_items().await
-            || (!self.input_queue.has_trigger_turn_mailbox_items().await
-                && !self.has_outstanding_durable_sleep())
-        {
+        if !self.has_pending_turn_start_work().await {
             return;
         }
 

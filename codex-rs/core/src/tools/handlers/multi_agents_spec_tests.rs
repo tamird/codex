@@ -94,6 +94,7 @@ fn spawn_agent_tool_v2_requires_task_name_and_lists_visible_models() {
     assert!(!description.contains("disabled-model"));
     assert!(properties.contains_key("task_name"));
     assert!(properties.contains_key("message"));
+    assert!(!properties.contains_key("existing_thread_id"));
     assert_eq!(
         properties
             .get("message")
@@ -123,6 +124,95 @@ fn spawn_agent_tool_v2_requires_task_name_and_lists_visible_models() {
     assert_eq!(
         output_schema.expect("spawn_agent output schema")["required"],
         json!(["task_name", "nickname"])
+    );
+}
+
+#[test]
+fn adopt_agent_tool_requires_thread_task_and_message() {
+    let tool = create_adopt_agent_tool(/*hide_agent_metadata*/ false);
+
+    let ToolSpec::Function(ResponsesApiTool {
+        name,
+        parameters,
+        output_schema,
+        ..
+    }) = tool
+    else {
+        panic!("adopt_agent should be a function tool");
+    };
+
+    assert_eq!(name, "adopt_agent");
+    assert_eq!(
+        parameters.required,
+        Some(vec![
+            "existing_thread_id".to_string(),
+            "task_name".to_string(),
+            "message".to_string(),
+        ])
+    );
+    let properties = parameters
+        .properties
+        .as_ref()
+        .expect("adopt_agent should use object params");
+    assert_eq!(
+        properties.keys().cloned().collect::<Vec<_>>(),
+        vec![
+            "existing_thread_id".to_string(),
+            "message".to_string(),
+            "task_name".to_string(),
+        ]
+    );
+    assert_eq!(properties["message"].encrypted, None);
+    assert_eq!(
+        output_schema.expect("adopt_agent output schema")["required"],
+        json!(["task_name", "nickname"])
+    );
+}
+
+#[test]
+fn promote_agent_tool_requires_target() {
+    let tool = create_promote_agent_tool();
+
+    let ToolSpec::Function(ResponsesApiTool {
+        name, parameters, ..
+    }) = tool
+    else {
+        panic!("promote_agent should be a function tool");
+    };
+
+    assert_eq!(name, "promote_agent");
+    assert_eq!(
+        parameters.schema_type,
+        Some(JsonSchemaType::Single(JsonSchemaPrimitiveType::Object))
+    );
+    assert_eq!(parameters.required, Some(vec!["target".to_string()]));
+}
+
+#[test]
+fn close_agent_tool_v2_uses_owned_task_targets_and_previous_status_output() {
+    let ToolSpec::Function(ResponsesApiTool {
+        name,
+        description,
+        parameters,
+        output_schema,
+        ..
+    }) = create_close_agent_tool_v2()
+    else {
+        panic!("close_agent should be a function tool");
+    };
+
+    assert_eq!(name, "close_agent");
+    assert_eq!(
+        description,
+        "Close an owned descendant agent and its live descendants, then return its previous status."
+    );
+    assert_eq!(
+        parameters.required.as_ref(),
+        Some(&vec!["target".to_string()])
+    );
+    assert_eq!(
+        output_schema.expect("close_agent output schema")["required"],
+        json!(["previous_status"])
     );
 }
 
@@ -377,6 +467,32 @@ fn followup_task_tool_requires_message_and_has_no_output_schema() {
         Some(&vec!["target".to_string(), "message".to_string()])
     );
     assert_eq!(output_schema, None);
+}
+
+#[test]
+fn supervisor_tools_do_not_mark_parameters_encrypted() {
+    for tool in [
+        create_supervisor_close_self_tool(),
+        create_supervisor_compact_parent_context_tool(),
+        create_supervisor_snooze_tool(),
+    ] {
+        let ToolSpec::Function(ResponsesApiTool {
+            name, parameters, ..
+        }) = tool
+        else {
+            panic!("supervisor tool should be a function tool");
+        };
+        for (property_name, schema) in parameters
+            .properties
+            .as_ref()
+            .expect("supervisor tool should use object params")
+        {
+            assert_eq!(
+                schema.encrypted, None,
+                "{name}.{property_name} should not use encrypted tool parameters"
+            );
+        }
+    }
 }
 
 #[test]
