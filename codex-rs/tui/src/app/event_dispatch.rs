@@ -922,6 +922,20 @@ impl App {
             AppEvent::SubmitThreadOp { thread_id, op } => {
                 self.submit_thread_op(app_server, thread_id, op).await?;
             }
+            AppEvent::ThreadNotification {
+                thread_id,
+                channel_identity,
+                notification,
+            } => {
+                if self
+                    .thread_event_channels
+                    .get(&thread_id)
+                    .is_some_and(|channel| channel_identity.matches(channel))
+                {
+                    self.enqueue_thread_notification(thread_id, notification)
+                        .await?;
+                }
+            }
             AppEvent::ThreadHistoryEntryResponse { thread_id, event } => {
                 self.enqueue_thread_history_entry_response(thread_id, event)
                     .await?;

@@ -282,6 +282,7 @@ impl App {
         self.agent_navigation
             .upsert(thread_id, agent_nickname, agent_role, is_closed);
         self.sync_active_agent_label();
+        self.update_pending_thread_approval_label(thread_id);
     }
 
     /// Persists the app-server's authoritative ownership flag and updates the active composer.
@@ -641,6 +642,7 @@ impl App {
     pub(super) fn reset_thread_event_state(&mut self) {
         self.abort_all_thread_event_listeners();
         self.thread_event_channels.clear();
+        self.pending_thread_approval_labels.clear();
         self.agent_navigation.clear();
         self.side_threads.clear();
         self.active_thread_id = None;

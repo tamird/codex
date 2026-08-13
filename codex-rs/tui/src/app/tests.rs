@@ -2,6 +2,8 @@
 
 #[path = "tests/advanced_reasoning_tests.rs"]
 mod advanced_reasoning_tests;
+#[path = "tests/approval_routing_tests.rs"]
+mod approval_routing;
 #[path = "tests/background_exit_tests.rs"]
 mod background_exit_tests;
 #[path = "tests/connector_policy.rs"]
@@ -5637,6 +5639,7 @@ async fn make_test_app() -> App {
         thread_event_channels: HashMap::new(),
         temporary_structured_requests: HashMap::new(),
         thread_event_listener_tasks: HashMap::new(),
+        pending_thread_approval_labels: HashMap::new(),
         agent_navigation: AgentNavigationState::default(),
         agents_overview: Default::default(),
         side_threads: HashMap::new(),
@@ -5719,6 +5722,7 @@ async fn make_test_app_with_channels() -> (
             thread_event_channels: HashMap::new(),
             temporary_structured_requests: HashMap::new(),
             thread_event_listener_tasks: HashMap::new(),
+            pending_thread_approval_labels: HashMap::new(),
             agent_navigation: AgentNavigationState::default(),
             agents_overview: Default::default(),
             side_threads: HashMap::new(),

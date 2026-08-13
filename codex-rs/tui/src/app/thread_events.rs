@@ -327,6 +327,21 @@ fn file_change_item_changes(
     }
 }
 
+#[derive(Clone)]
+pub(crate) struct ThreadEventChannelIdentity(Arc<Mutex<ThreadEventStore>>);
+
+impl std::fmt::Debug for ThreadEventChannelIdentity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ThreadEventChannelIdentity")
+    }
+}
+
+impl ThreadEventChannelIdentity {
+    pub(super) fn matches(&self, channel: &ThreadEventChannel) -> bool {
+        Arc::ptr_eq(&self.0, &channel.store)
+    }
+}
+
 #[derive(Debug)]
 pub(super) struct ThreadEventChannel {
     pub(super) sender: mpsc::Sender<ThreadBufferedEvent>,
@@ -336,6 +351,10 @@ pub(super) struct ThreadEventChannel {
 }
 
 impl ThreadEventChannel {
+    pub(super) fn identity(&self) -> ThreadEventChannelIdentity {
+        ThreadEventChannelIdentity(Arc::clone(&self.store))
+    }
+
     pub(super) fn new(capacity: usize) -> Self {
         let (sender, receiver) = mpsc::channel(capacity);
         Self {

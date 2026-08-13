@@ -31,6 +31,7 @@ use codex_app_server_protocol::PluginReadParams;
 use codex_app_server_protocol::PluginReadResponse;
 use codex_app_server_protocol::PluginUninstallResponse;
 use codex_app_server_protocol::RequestId as AppServerRequestId;
+use codex_app_server_protocol::ServerNotification;
 use codex_app_server_protocol::SkillsListResponse;
 use codex_app_server_protocol::Thread;
 use codex_app_server_protocol::ThreadGoalStatus;
@@ -46,6 +47,7 @@ use codex_utils_approval_presets::ApprovalPreset;
 use strum_macros::IntoStaticStr;
 use uuid::Uuid;
 
+use crate::app::ThreadEventChannelIdentity;
 use crate::app_command::AppCommand;
 use crate::app_server_session::AppServerStartedThread;
 use crate::bottom_pane::ApprovalRequest;
@@ -305,6 +307,13 @@ pub(crate) enum AppEvent {
         model: String,
         turn: AppCommand,
         prompt: UserMessage,
+    },
+
+    /// Deliver a synthetic server notification through its owning thread.
+    ThreadNotification {
+        thread_id: ThreadId,
+        channel_identity: ThreadEventChannelIdentity,
+        notification: ServerNotification,
     },
 
     /// Deliver a synthetic history lookup response to a specific thread channel.

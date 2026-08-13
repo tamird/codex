@@ -587,9 +587,9 @@ impl App {
                     .active_turn_id_for_thread(thread_id)
                     .await
                     .unwrap_or_default();
-                let (thread_event_tx, thread_event_store) = {
+                let (thread_event_store, channel_identity) = {
                     let channel = self.ensure_thread_channel(thread_id);
-                    (channel.sender.clone(), Arc::clone(&channel.store))
+                    (Arc::clone(&channel.store), channel.identity())
                 };
                 self.reset_backtrack_state();
                 if !turn_id.is_empty() {
@@ -601,6 +601,7 @@ impl App {
                 }
                 let request_handle = app_server.request_handle();
                 let request_ids = [app_server.next_request_id(), app_server.next_request_id()];
+                let app_event_tx = self.app_event_tx.clone();
                 tokio::spawn(async move {
                     for (attempt, request_id) in request_ids.into_iter().enumerate() {
                         let result = request_handle
@@ -631,20 +632,11 @@ impl App {
                                         thread_id: Some(thread_id.to_string()),
                                         message: format!("Failed to interrupt turn: {error}"),
                                     });
-                                let should_send = {
-                                    let mut store = thread_event_store.lock().await;
-                                    store.push_notification_ref(&notification);
-                                    store.active
-                                };
-                                if should_send
-                                    && let Err(error) = thread_event_tx
-                                        .send(ThreadBufferedEvent::Notification(Box::new(
-                                            notification,
-                                        )))
-                                        .await
-                                {
-                                    tracing::warn!(error = %error, "thread event channel closed");
-                                }
+                                app_event_tx.send(AppEvent::ThreadNotification {
+                                    thread_id,
+                                    channel_identity,
+                                    notification,
+                                });
                                 break;
                             }
                         }
@@ -909,37 +901,6 @@ impl App {
         }
     }
 
-    pub(super) async fn refresh_pending_thread_approvals(&mut self) {
-        let side_parent_thread_id = self.active_side_parent_thread_id();
-        let channels: Vec<(ThreadId, Arc<Mutex<ThreadEventStore>>)> = self
-            .thread_event_channels
-            .iter()
-            .map(|(thread_id, channel)| (*thread_id, Arc::clone(&channel.store)))
-            .collect();
-
-        let mut pending_thread_ids = Vec::new();
-        for (thread_id, store) in channels {
-            if Some(thread_id) == self.active_thread_id || Some(thread_id) == side_parent_thread_id
-            {
-                continue;
-            }
-
-            let store = store.lock().await;
-            if store.has_pending_thread_approvals() {
-                pending_thread_ids.push(thread_id);
-            }
-        }
-
-        pending_thread_ids.sort_by_key(ThreadId::to_string);
-
-        let threads = pending_thread_ids
-            .into_iter()
-            .map(|thread_id| self.thread_label(thread_id))
-            .collect();
-
-        self.chat_widget.set_pending_thread_approvals(threads);
-    }
-
     pub(super) async fn refresh_side_parent_status_from_store(&mut self, thread_id: ThreadId) {
         let Some(channel) = self.thread_event_channels.get(&thread_id) else {
             return;
@@ -1037,7 +998,13 @@ impl App {
             let channel = self.ensure_thread_channel(thread_id);
             (channel.sender.clone(), Arc::clone(&channel.store))
         };
-        let (notification, previous_pending_status, pending_status, turn_stopped) = {
+        let (
+            notification,
+            previous_pending_status,
+            pending_status,
+            turn_stopped,
+            has_pending_approvals,
+        ) = {
             let mut guard = store.lock().await;
             if guard.session.is_none()
                 && let Some(session) = inferred_session
@@ -1058,11 +1025,13 @@ impl App {
                 guard.push_notification(notification);
                 None
             };
+            let has_pending_approvals = guard.has_pending_thread_approvals();
             (
                 notification,
                 previous_pending_status,
                 guard.side_parent_pending_status(),
                 turn_stopped,
+                has_pending_approvals,
             )
         };
         if is_turn_started {
@@ -1095,7 +1064,7 @@ impl App {
         } else if previous_pending_status.is_some() {
             self.clear_side_parent_action_status(thread_id);
         }
-        self.refresh_pending_thread_approvals().await;
+        self.update_pending_thread_approval(thread_id, has_pending_approvals);
         Ok(())
     }
 
@@ -1197,10 +1166,14 @@ impl App {
             (channel.sender.clone(), Arc::clone(&channel.store))
         };
 
-        let (should_send, pending_status) = {
+        let (should_send, pending_status, has_pending_approvals) = {
             let mut guard = store.lock().await;
             guard.push_request(request.clone());
-            (guard.active, guard.side_parent_pending_status())
+            (
+                guard.active,
+                guard.side_parent_pending_status(),
+                guard.has_pending_thread_approvals(),
+            )
         };
         let request_status = SideParentStatus::for_request(&request);
 
@@ -1226,7 +1199,7 @@ impl App {
         if let Some(status) = pending_status.or(request_status) {
             self.set_side_parent_status(thread_id, Some(status));
         }
-        self.refresh_pending_thread_approvals().await;
+        self.update_pending_thread_approval(thread_id, has_pending_approvals);
         Ok(())
     }
 
@@ -1240,7 +1213,7 @@ impl App {
             (channel.sender.clone(), Arc::clone(&channel.store))
         };
 
-        let should_send = {
+        let (should_send, has_pending_approvals) = {
             let mut guard = store.lock().await;
             let should_send = guard.active;
             // Active batch responses remain queued in the receiver across a concurrent detach, so
@@ -1249,7 +1222,7 @@ impl App {
             if !should_send || !matches!(&event, HistoryLookupResponse::Batch { .. }) {
                 guard.push_buffered_event(ThreadBufferedEvent::HistoryEntryResponse(event.clone()));
             }
-            should_send
+            (should_send, guard.has_pending_thread_approvals())
         };
 
         if should_send {
@@ -1267,6 +1240,7 @@ impl App {
                 }
             }
         }
+        self.update_pending_thread_approval(thread_id, has_pending_approvals);
         Ok(())
     }
 
