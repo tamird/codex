@@ -6,8 +6,8 @@ use crate::RolloutItem;
 use crate::RolloutLine;
 use crate::config::RolloutConfig;
 use chrono::TimeZone;
-use codex_protocol::SanitizedGitUrl;
 use codex_extension_items::ExtensionItem;
+use codex_protocol::SanitizedGitUrl;
 use codex_protocol::SessionId;
 use codex_protocol::ThreadId;
 use codex_protocol::items::TurnItem;
@@ -1971,6 +1971,258 @@ async fn list_threads_default_filter_returns_filesystem_scan_results() -> std::i
 }
 
 #[tokio::test]
+async fn list_threads_discovers_rollouts_missing_from_a_nonempty_index() -> std::io::Result<()> {
+    for sort_direction in [SortDirection::Asc, SortDirection::Desc] {
+        for (allowed_sources, page_size) in [(Vec::new(), 10), (vec![SessionSource::Cli], 1)] {
+            for start_after_indexed in [false, true] {
+                let home = TempDir::new().expect("temp dir");
+                let config = test_config(home.path());
+                let runtime = codex_state::StateRuntime::init(
+                    config.sqlite.clone(),
+                    config.model_provider_id.clone(),
+                )
+                .await
+                .expect("state db should initialize");
+                runtime
+                    .mark_backfill_complete(/*last_watermark*/ None)
+                    .await
+                    .expect("backfill should be complete");
+
+                let oldest_uuid = Uuid::from_u128(/*v*/ 9020);
+                let indexed_uuid = Uuid::from_u128(/*v*/ 9021);
+                let newest_uuid = Uuid::from_u128(/*v*/ 9022);
+                write_session_file(home.path(), "2025-01-03T09-00-00", oldest_uuid)?;
+                let indexed_path =
+                    write_session_file(home.path(), "2025-01-03T10-00-00", indexed_uuid)?;
+                write_session_file(home.path(), "2025-01-03T11-00-00", newest_uuid)?;
+                let thread_ids = [oldest_uuid, indexed_uuid, newest_uuid]
+                    .map(|uuid| ThreadId::from_string(&uuid.to_string()).expect("thread id"));
+                let created_at = "2025-01-03T10:00:00Z"
+                    .parse::<chrono::DateTime<chrono::Utc>>()
+                    .expect("indexed creation time");
+                let mut builder = codex_state::ThreadMetadataBuilder::new(
+                    thread_ids[1],
+                    indexed_path,
+                    created_at,
+                    SessionSource::Cli,
+                );
+                builder.model_provider = Some(config.model_provider_id.clone());
+                let mut metadata = builder.build(config.model_provider_id.as_str());
+                metadata.first_user_message = Some("Indexed middle rollout".to_string());
+                metadata.preview = metadata.first_user_message.clone();
+                runtime
+                    .upsert_thread(&metadata)
+                    .await
+                    .expect("index only the middle rollout");
+
+                let indexed_page = RolloutRecorder::list_threads_from_state_db(
+                    Some(runtime.clone()),
+                    &config,
+                    /*page_size*/ 10,
+                    /*cursor*/ None,
+                    ThreadSortKey::CreatedAt,
+                    sort_direction,
+                    &allowed_sources,
+                    /*model_providers*/ None,
+                    /*cwd_filters*/ None,
+                    config.model_provider_id.as_str(),
+                    /*search_term*/ None,
+                )
+                .await?;
+                assert_eq!(
+                    indexed_page
+                        .items
+                        .iter()
+                        .map(|item| item.thread_id)
+                        .collect::<Vec<_>>(),
+                    vec![Some(thread_ids[1])],
+                );
+                let indexed_cursor =
+                    cursor_from_thread_item(&indexed_page.items[0], ThreadSortKey::CreatedAt)
+                        .expect("cursor from indexed metadata without a repair scan");
+                let mut cursor = start_after_indexed.then_some(indexed_cursor);
+                let mut actual = Vec::new();
+                // The filtered one-item pages exercise continuation; the unfiltered full page
+                // isolates discovery from the existing ascending scan/DB pagination boundary.
+                for _ in 0..thread_ids.len() {
+                    let page = RolloutRecorder::list_threads(
+                        Some(runtime.clone()),
+                        &config,
+                        page_size,
+                        cursor.as_ref(),
+                        ThreadSortKey::CreatedAt,
+                        sort_direction,
+                        &allowed_sources,
+                        /*model_providers*/ None,
+                        /*cwd_filters*/ None,
+                        config.model_provider_id.as_str(),
+                        /*search_term*/ None,
+                    )
+                    .await?;
+                    actual.extend(page.items.into_iter().map(|item| item.thread_id));
+                    cursor = page.next_cursor;
+                    if cursor.is_none() {
+                        break;
+                    }
+                }
+                let expected = match (sort_direction, start_after_indexed) {
+                    (SortDirection::Asc, false) => thread_ids.to_vec(),
+                    (SortDirection::Desc, false) => thread_ids.into_iter().rev().collect(),
+                    (SortDirection::Asc, true) => vec![thread_ids[2]],
+                    (SortDirection::Desc, true) => vec![thread_ids[0]],
+                };
+                assert_eq!(actual, expected.into_iter().map(Some).collect::<Vec<_>>());
+                assert!(cursor.is_none(), "fixture history must reach its end");
+            }
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn list_threads_repairs_stale_source_and_provider_matches() -> std::io::Result<()> {
+    enum StaleField {
+        Source,
+        ModelProvider,
+    }
+
+    for sort_direction in [SortDirection::Asc, SortDirection::Desc] {
+        for stale_field in [StaleField::Source, StaleField::ModelProvider] {
+            let home = TempDir::new().expect("temp dir");
+            let config = test_config(home.path());
+            let stale_uuid = Uuid::from_u128(/*v*/ 9023);
+            let valid_uuid = Uuid::from_u128(/*v*/ 9024);
+            let stale_id = ThreadId::from_string(&stale_uuid.to_string()).expect("stale id");
+            let valid_id = ThreadId::from_string(&valid_uuid.to_string()).expect("valid id");
+            let stale_path = write_session_file(home.path(), "2025-01-03T12-00-00", stale_uuid)?;
+            let valid_path = write_session_file(home.path(), "2025-01-03T13-00-00", valid_uuid)?;
+            let mut lines = read_rollout_lines(&stale_path)?;
+            let RolloutItem::SessionMeta(metadata) = &mut lines[0].item else {
+                panic!("fixture starts with session metadata");
+            };
+            let (allowed_sources, model_providers) = match stale_field {
+                StaleField::Source => {
+                    metadata.meta.source = SessionSource::Exec;
+                    (vec![SessionSource::Cli], None)
+                }
+                StaleField::ModelProvider => {
+                    metadata.meta.model_provider = Some("other-provider".to_string());
+                    (Vec::new(), Some(vec![config.model_provider_id.clone()]))
+                }
+            };
+            let jsonl = lines
+                .iter()
+                .map(serde_json::to_string)
+                .collect::<Result<Vec<_>, _>>()?
+                .join("\n");
+            fs::write(&stale_path, format!("{jsonl}\n"))?;
+
+            let runtime = codex_state::StateRuntime::init(
+                config.sqlite.clone(),
+                config.model_provider_id.clone(),
+            )
+            .await
+            .expect("state db should initialize");
+            runtime
+                .mark_backfill_complete(/*last_watermark*/ None)
+                .await
+                .expect("backfill should be complete");
+            for (thread_id, path, created_at) in [
+                (stale_id, stale_path, "2025-01-03T12:00:00Z"),
+                (valid_id, valid_path, "2025-01-03T13:00:00Z"),
+            ] {
+                let mut builder = codex_state::ThreadMetadataBuilder::new(
+                    thread_id,
+                    path,
+                    created_at.parse().expect("fixture creation time"),
+                    SessionSource::Cli,
+                );
+                builder.model_provider = Some(config.model_provider_id.clone());
+                let mut metadata = builder.build(config.model_provider_id.as_str());
+                metadata.first_user_message = Some("Indexed preview".to_string());
+                metadata.preview = metadata.first_user_message.clone();
+                runtime
+                    .upsert_thread(&metadata)
+                    .await
+                    .expect("index both rows as filter matches");
+            }
+
+            let indexed_page = RolloutRecorder::list_threads_from_state_db(
+                Some(runtime.clone()),
+                &config,
+                /*page_size*/ 10,
+                /*cursor*/ None,
+                ThreadSortKey::CreatedAt,
+                sort_direction,
+                &allowed_sources,
+                model_providers.as_deref(),
+                /*cwd_filters*/ None,
+                config.model_provider_id.as_str(),
+                /*search_term*/ None,
+            )
+            .await?;
+            let expected_indexed = match sort_direction {
+                SortDirection::Asc => vec![Some(stale_id), Some(valid_id)],
+                SortDirection::Desc => vec![Some(valid_id), Some(stale_id)],
+            };
+            assert_eq!(
+                indexed_page
+                    .items
+                    .iter()
+                    .map(|item| item.thread_id)
+                    .collect::<Vec<_>>(),
+                expected_indexed,
+            );
+            let scanned_page = RolloutRecorder::list_threads(
+                Some(runtime.clone()),
+                &config,
+                /*page_size*/ 10,
+                /*cursor*/ None,
+                ThreadSortKey::CreatedAt,
+                sort_direction,
+                &allowed_sources,
+                model_providers.as_deref(),
+                /*cwd_filters*/ None,
+                config.model_provider_id.as_str(),
+                /*search_term*/ None,
+            )
+            .await?;
+            assert_eq!(
+                scanned_page
+                    .items
+                    .iter()
+                    .map(|item| item.thread_id)
+                    .collect::<Vec<_>>(),
+                vec![Some(valid_id)],
+            );
+            let repaired_page = RolloutRecorder::list_threads_from_state_db(
+                Some(runtime.clone()),
+                &config,
+                /*page_size*/ 10,
+                /*cursor*/ None,
+                ThreadSortKey::CreatedAt,
+                sort_direction,
+                &allowed_sources,
+                model_providers.as_deref(),
+                /*cwd_filters*/ None,
+                config.model_provider_id.as_str(),
+                /*search_term*/ None,
+            )
+            .await?;
+            assert_eq!(
+                repaired_page
+                    .items
+                    .iter()
+                    .map(|item| item.thread_id)
+                    .collect::<Vec<_>>(),
+                vec![Some(valid_id)],
+            );
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
 async fn list_threads_metadata_filter_overlays_state_db_list_metadata() -> std::io::Result<()> {
     let home = TempDir::new().expect("temp dir");
     let config = test_config(home.path());
@@ -2007,22 +2259,23 @@ async fn list_threads_metadata_filter_overlays_state_db_list_metadata() -> std::
         SanitizedGitUrl::try_from("https://example.com/repo.git").expect("valid git remote URL"),
     );
     let mut metadata = builder.build(config.model_provider_id.as_str());
-    metadata.first_user_message = Some("Hello from user".to_string());
+    metadata.first_user_message = Some("SQLite indexed preview".to_string());
     metadata.preview = metadata.first_user_message.clone();
     runtime
         .upsert_thread(&metadata)
         .await
         .expect("state db upsert should succeed");
 
+    let model_providers = [config.model_provider_id.clone()];
     let page = RolloutRecorder::list_threads(
         Some(runtime.clone()),
         &config,
         /*page_size*/ 10,
         /*cursor*/ None,
         ThreadSortKey::CreatedAt,
-        SortDirection::Desc,
+        SortDirection::Asc,
         &[SessionSource::Cli],
-        /*model_providers*/ None,
+        /*model_providers*/ Some(model_providers.as_slice()),
         /*cwd_filters*/ None,
         config.model_provider_id.as_str(),
         /*search_term*/ None,
@@ -2030,11 +2283,52 @@ async fn list_threads_metadata_filter_overlays_state_db_list_metadata() -> std::
     .await?;
 
     assert_eq!(page.items.len(), 1);
+    assert_eq!(
+        page.items[0].first_user_message.as_deref(),
+        Some("Hello from user")
+    );
+    assert_eq!(page.items[0].preview.as_deref(), Some("Hello from user"));
     assert_eq!(page.items[0].git_branch.as_deref(), Some("sqlite-branch"));
     assert_eq!(page.items[0].git_sha.as_deref(), Some("sqlite-sha"));
     assert_eq!(
         page.items[0].git_origin_url.as_deref(),
         Some("https://example.com/repo.git")
+    );
+
+    let indexed_page = RolloutRecorder::list_threads_from_state_db(
+        Some(runtime.clone()),
+        &config,
+        /*page_size*/ 10,
+        /*cursor*/ None,
+        ThreadSortKey::CreatedAt,
+        SortDirection::Asc,
+        &[SessionSource::Cli],
+        Some(model_providers.as_slice()),
+        /*cwd_filters*/ None,
+        config.model_provider_id.as_str(),
+        /*search_term*/ None,
+    )
+    .await?;
+    assert_eq!(indexed_page.items.len(), 1);
+    assert_eq!(
+        indexed_page.items[0].first_user_message.as_deref(),
+        Some("SQLite indexed preview")
+    );
+    assert_eq!(
+        indexed_page.items[0].preview.as_deref(),
+        Some("SQLite indexed preview")
+    );
+    assert_eq!(
+        (
+            &indexed_page.items[0].git_branch,
+            &indexed_page.items[0].git_sha,
+            &indexed_page.items[0].git_origin_url,
+        ),
+        (
+            &page.items[0].git_branch,
+            &page.items[0].git_sha,
+            &page.items[0].git_origin_url,
+        ),
     );
     Ok(())
 }
