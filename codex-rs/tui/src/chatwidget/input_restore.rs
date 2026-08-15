@@ -5,6 +5,7 @@ use std::collections::VecDeque;
 
 use crate::bottom_pane::ComposerDraftSnapshot;
 
+use super::user_messages::TurnLifecycleAuthority;
 use super::user_messages::remap_colliding_paste_placeholders;
 use super::*;
 
@@ -474,6 +475,11 @@ impl ChatWidget {
             active_collaboration_mask: self.active_collaboration_mask.clone(),
             task_running: self.bottom_pane.is_task_running(),
             agent_turn_running: self.turn_lifecycle.agent_turn_running,
+            turn_lifecycle_authority: if self.input_queue.user_turn_pending_start {
+                TurnLifecycleAuthority::PendingStart
+            } else {
+                TurnLifecycleAuthority::Unknown
+            },
         })
     }
 

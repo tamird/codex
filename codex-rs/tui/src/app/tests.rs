@@ -1342,7 +1342,7 @@ async fn replay_only_thread_keeps_restored_queue_visible() {
 }
 
 #[tokio::test]
-async fn replay_thread_snapshot_keeps_queue_when_running_state_only_comes_from_snapshot() {
+async fn replay_thread_snapshot_requires_confirmed_idle_to_submit_queued_input() {
     let (mut app, _app_event_rx, _op_rx) = make_test_app_with_channels().await;
     let thread_id = ThreadId::new();
     let session = test_thread_session(thread_id, test_path_buf("/tmp/project"));
@@ -1364,30 +1364,95 @@ async fn replay_thread_snapshot_keeps_queue_when_running_state_only_comes_from_s
         .capture_thread_input_state()
         .expect("expected queued follow-up state");
 
-    let (chat_widget, _app_event_tx, _rx, mut new_op_rx) =
-        make_chatwidget_manual_with_sender().await;
-    app.chat_widget = chat_widget;
-    app.chat_widget.handle_thread_session(session.clone());
-    while new_op_rx.try_recv().is_ok() {}
+    for refresh_without_terminal_notification in [false, true] {
+        let (chat_widget, _app_event_tx, _rx, mut new_op_rx) =
+            make_chatwidget_manual_with_sender().await;
+        app.chat_widget = chat_widget;
+        app.chat_widget.handle_thread_session(session.clone());
+        while new_op_rx.try_recv().is_ok() {}
 
-    app.replay_thread_snapshot(
-        ThreadEventSnapshot {
-            session: None,
-            turns: Vec::new(),
-            events: vec![],
-            input_state: Some(input_state),
-        },
-        /*resume_restored_queue*/ true,
-    );
+        app.replay_thread_snapshot(
+            ThreadEventSnapshot {
+                session: None,
+                turns: Vec::new(),
+                events: Vec::new(),
+                input_state: Some(input_state.clone()),
+            },
+            /*resume_restored_queue*/ true,
+        );
+        assert_eq!(
+            app.chat_widget.queued_user_message_texts(),
+            vec!["queued follow-up".to_string()]
+        );
+        assert!(
+            new_op_rx.try_recv().is_err(),
+            "unknown turn state must not submit queued input"
+        );
 
-    assert_eq!(
-        app.chat_widget.queued_user_message_texts(),
-        vec!["queued follow-up".to_string()]
-    );
-    assert!(
-        new_op_rx.try_recv().is_err(),
-        "restored queue should stay queued when replay did not prove the turn finished"
-    );
+        let channel =
+            ThreadEventChannel::new_with_session(/*capacity*/ 1, session.clone(), Vec::new());
+        {
+            let mut store = channel.store.lock().await;
+            store.input_state = app.chat_widget.capture_thread_input_state();
+            store.push_notification(turn_started_notification(thread_id, "turn-1"));
+            let running_input_state = store.input_state.clone();
+            store.push_notification(turn_completed_notification(
+                thread_id,
+                "another-turn",
+                TurnStatus::Completed,
+            ));
+            assert_eq!(store.input_state, running_input_state);
+
+            if !refresh_without_terminal_notification {
+                store.push_notification(turn_completed_notification(
+                    thread_id,
+                    "turn-1",
+                    TurnStatus::Completed,
+                ));
+                store.push_notification(token_usage_notification(
+                    thread_id,
+                    "turn-1",
+                    /*model_context_window*/ Some(100),
+                ));
+                store.rebase_buffer_after_session_refresh();
+            }
+        }
+        app.thread_event_channels.insert(thread_id, channel);
+        let (_receiver, mut snapshot) = app
+            .activate_thread_for_replay(thread_id)
+            .await
+            .expect("thread should activate for replay");
+
+        if refresh_without_terminal_notification {
+            app.apply_refreshed_snapshot_thread(
+                thread_id,
+                AppServerStartedThread {
+                    session: session.clone(),
+                    turns: vec![test_turn("turn-1", TurnStatus::Completed, Vec::new())],
+                    blocks_direct_input: false,
+                    task_tools_available: false,
+                },
+                &mut snapshot,
+            )
+            .await;
+        }
+        assert!(snapshot.events.is_empty());
+
+        app.replay_thread_snapshot(snapshot, /*resume_restored_queue*/ true);
+
+        match next_user_turn_op(&mut new_op_rx) {
+            Op::UserTurn { items, .. } => assert_eq!(
+                items,
+                vec![UserInput::Text {
+                    text: "queued follow-up".to_string(),
+                    text_elements: Vec::new(),
+                }]
+            ),
+            other => panic!("expected queued follow-up submission, got {other:?}"),
+        }
+        assert!(app.chat_widget.queued_user_message_texts().is_empty());
+        assert!(new_op_rx.try_recv().is_err());
+    }
 }
 
 #[tokio::test]

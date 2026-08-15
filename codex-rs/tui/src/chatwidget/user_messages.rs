@@ -120,6 +120,15 @@ impl ThreadComposerState {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(super) enum TurnLifecycleAuthority {
+    #[default]
+    Unknown,
+    PendingStart,
+    Running,
+    ConfirmedIdle,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct ThreadInputState {
     pub(super) composer: Option<ThreadComposerState>,
@@ -137,6 +146,46 @@ pub(crate) struct ThreadInputState {
     pub(super) active_collaboration_mask: Option<CollaborationModeMask>,
     pub(super) task_running: bool,
     pub(super) agent_turn_running: bool,
+    pub(super) turn_lifecycle_authority: TurnLifecycleAuthority,
+}
+
+impl ThreadInputState {
+    pub(crate) fn acknowledge_started_turn(&mut self) {
+        self.user_turn_pending_start = false;
+        self.agent_turn_running = true;
+        self.task_running = true;
+        self.turn_lifecycle_authority = TurnLifecycleAuthority::Running;
+    }
+
+    pub(crate) fn note_running_turn(&mut self) {
+        if self.user_turn_pending_start
+            || self.turn_lifecycle_authority == TurnLifecycleAuthority::PendingStart
+        {
+            return;
+        }
+        self.agent_turn_running = true;
+        self.task_running = true;
+        self.turn_lifecycle_authority = TurnLifecycleAuthority::Running;
+    }
+
+    pub(crate) fn finish_running_turn(&mut self) {
+        if self.user_turn_pending_start
+            || self.turn_lifecycle_authority == TurnLifecycleAuthority::PendingStart
+        {
+            return;
+        }
+        if self.agent_turn_running {
+            self.task_running = false;
+        }
+        self.user_turn_pending_start = false;
+        self.submit_pending_steers_after_interrupt = false;
+        self.agent_turn_running = false;
+        self.turn_lifecycle_authority = TurnLifecycleAuthority::ConfirmedIdle;
+    }
+
+    pub(crate) fn is_confirmed_idle(&self) -> bool {
+        self.turn_lifecycle_authority == TurnLifecycleAuthority::ConfirmedIdle
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

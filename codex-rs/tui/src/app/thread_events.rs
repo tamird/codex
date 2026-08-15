@@ -113,6 +113,13 @@ impl ThreadEventStore {
             .rev()
             .find(|turn| matches!(turn.status, TurnStatus::InProgress))
             .map(|turn| turn.id.clone());
+        if let Some(input_state) = self.input_state.as_mut() {
+            if self.active_turn_id.is_some() {
+                input_state.note_running_turn();
+            } else {
+                input_state.finish_running_turn();
+            }
+        }
         self.turns = turns;
     }
 
@@ -130,6 +137,11 @@ impl ThreadEventStore {
         match notification.as_ref() {
             ServerNotification::TurnStarted(turn) => {
                 self.active_turn_id = Some(turn.turn.id.clone());
+                if !self.active
+                    && let Some(input_state) = self.input_state.as_mut()
+                {
+                    input_state.acknowledge_started_turn();
+                }
             }
             ServerNotification::TurnCompleted(turn) => {
                 if matches!(turn.turn.status, TurnStatus::Completed) {
@@ -137,6 +149,11 @@ impl ThreadEventStore {
                 }
                 if self.active_turn_id.as_deref() == Some(turn.turn.id.as_str()) {
                     self.active_turn_id = None;
+                    if !self.active
+                        && let Some(input_state) = self.input_state.as_mut()
+                    {
+                        input_state.finish_running_turn();
+                    }
                 }
                 if self.pending_interrupt_turn_id.as_deref() == Some(turn.turn.id.as_str()) {
                     self.pending_interrupt_turn_id = None;
@@ -145,6 +162,11 @@ impl ThreadEventStore {
             ServerNotification::ThreadClosed(_) => {
                 self.active_turn_id = None;
                 self.pending_interrupt_turn_id = None;
+                if !self.active
+                    && let Some(input_state) = self.input_state.as_mut()
+                {
+                    input_state.finish_running_turn();
+                }
             }
             _ => {}
         }

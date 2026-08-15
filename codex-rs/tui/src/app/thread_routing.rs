@@ -84,6 +84,11 @@ impl App {
             store.active = false;
             store.input_state = input_state;
             store.merge_recap_progress(recap_progress);
+            if store.active_turn_id().is_some()
+                && let Some(input_state) = store.input_state.as_mut()
+            {
+                input_state.note_running_turn();
+            }
             if let Some(receiver) = receiver {
                 channel.receiver = Some(receiver);
             }
@@ -1438,6 +1443,7 @@ impl App {
             let mut store = channel.store.lock().await;
             store.set_session(session.clone(), turns.clone());
             store.rebase_buffer_after_session_refresh();
+            snapshot.input_state = store.input_state.clone();
         }
         snapshot.session = Some(session);
         snapshot.turns = turns;
@@ -1570,10 +1576,15 @@ impl App {
                 self.chat_widget.handle_thread_session(session);
             }
         }
+        let preserve_in_flight_turn = !resume_restored_queue
+            || !snapshot
+                .input_state
+                .as_ref()
+                .is_some_and(ThreadInputState::is_confirmed_idle);
         self.chat_widget.restore_thread_input_state(
             snapshot.input_state,
             ThreadInputStateRestoreMode {
-                preserve_in_flight_turn: true,
+                preserve_in_flight_turn,
             },
         );
         if !snapshot.turns.is_empty() {
