@@ -139,6 +139,9 @@ pub struct RolloutMigrationAdditionalFreeSpace {
     pub filesystem_metadata: &'static str,
     pub dry_run_decompression_temporary: &'static str,
     pub compressed_publication_temporary: &'static str,
+    /// Private replacement needed only when preserving bounded Desktop item IDs.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub generated_id_rewrite_temporary: Option<&'static str>,
 }
 
 /// Ordered durable phases used by apply and restart recovery.
@@ -160,6 +163,7 @@ pub(super) async fn build_lineage_manifest(
     let sources = plan
         .sources
         .iter()
+        .chain(&plan.authentication_sources)
         .map(|source| RolloutMigrationLineageSource {
             thread_id: source.thread_id,
             rollout_id: source.rollout_id,
@@ -272,6 +276,9 @@ pub(super) async fn build_lineage_manifest(
             filesystem_metadata: "filesystem-dependent directory and allocation metadata",
             dry_run_decompression_temporary: "none for segmented lineage inputs",
             compressed_publication_temporary: "exact only after streaming compression",
+            generated_id_rewrite_temporary: (!plan.synthetic_item_id_remap.is_empty()).then_some(
+                "at most one uncompressed staged target during generated item ID rewriting",
+            ),
         },
         publication_phases: vec![
             RolloutMigrationPublicationPhase::Planned,
@@ -341,6 +348,7 @@ pub(super) async fn build_single_manifest(
                 "none"
             },
             compressed_publication_temporary: "exact only after streaming compression",
+            generated_id_rewrite_temporary: None,
         },
         publication_phases: vec![
             RolloutMigrationPublicationPhase::Planned,

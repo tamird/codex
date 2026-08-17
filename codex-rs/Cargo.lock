@@ -4381,6 +4381,7 @@ dependencies = [
  "libc",
  "pretty_assertions",
  "pulldown-cmark",
+ "regex",
  "serde",
  "serde_json",
  "sha2 0.10.9",

@@ -30,15 +30,15 @@ use crate::ThreadStoreResult;
 /// Maximum source bytes an interactive latest-state request may scan for model context.
 ///
 /// Valid segmented histories place a certified checkpoint inside the bounded active segment.
-/// Older one-file histories without a recent compaction require explicit migration instead of
-/// consuming memory and latency proportional to the complete JSONL.
+/// When an older one-file history exceeds this limit, the bounded checkpoint probe yields to the
+/// complete compatibility reader rather than rejecting an otherwise valid rollout.
 pub(super) const MAX_INTERACTIVE_MODEL_CONTEXT_SCAN_BYTES: u64 = 64 * 1024 * 1024;
 // `MAX_USER_INPUT_TEXT_CHARS` permits one mebibyte of characters. Eight mebibytes leaves room
 // for four-byte UTF-8 plus JSON escaping and record metadata without admitting an unbounded line.
 pub(super) const MAX_INTERACTIVE_MODEL_CONTEXT_RECORD_BYTES: usize =
     codex_protocol::user_input::MAX_USER_INPUT_TEXT_CHARS * 8;
-const MODEL_CONTEXT_MIGRATION_REQUIRED: &str =
-    "latest model context exceeds the interactive scan limit; run `codex migrate-rollouts`";
+const MODEL_CONTEXT_SCAN_LIMIT_EXCEEDED: &str =
+    "latest model context exceeds the bounded active scan limit";
 
 #[cfg(test)]
 #[path = "model_context_tests.rs"]
@@ -72,10 +72,11 @@ pub(super) async fn load_latest_model_context(
     let rollout_id = resolved.rollout_id;
 
     let mut history_access =
-        super::goal_supervisor_runtime_repair::repair_active_history_before_access(
+        super::goal_supervisor_runtime_repair::repair_selected_history_before_access(
             store,
             params.thread_id,
             path.as_path(),
+            super::goal_supervisor_runtime_repair::RepairAccess::ActiveOnly,
         )
         .await?;
     path = codex_rollout::existing_rollout_path(path.as_path())
@@ -94,10 +95,11 @@ pub(super) async fn load_latest_model_context(
     } else {
         drop(history_access);
         history_access =
-            super::goal_supervisor_runtime_repair::repair_compatibility_history_before_access(
+            super::goal_supervisor_runtime_repair::repair_selected_history_before_access(
                 store,
                 params.thread_id,
                 path.as_path(),
+                super::goal_supervisor_runtime_repair::RepairAccess::Compatibility,
             )
             .await?;
         path = codex_rollout::existing_rollout_path(path.as_path())
@@ -180,25 +182,25 @@ pub(super) async fn scan_projected_active_model_context(
     let active_scan = if compressed_active {
         let path_for_scan = path.to_path_buf();
         let meta_for_scan = session_meta.clone();
-        tokio::task::spawn_blocking(move || {
+        let result = tokio::task::spawn_blocking(move || {
             scan_compressed_active_model_context_blocking(&path_for_scan, meta_for_scan)
         })
         .await
         .map_err(|err| ThreadStoreError::Internal {
             message: format!("failed to join compressed active model context scan: {err}"),
-        })?
-        .map_err(interactive_model_context_scan_error)?
+        })?;
+        active_model_context_scan_or_fallback(result)?
     } else {
         let path_for_scan = path.to_path_buf();
         let meta_for_scan = session_meta.clone();
-        tokio::task::spawn_blocking(move || {
+        let result = tokio::task::spawn_blocking(move || {
             scan_projected_active_model_context_blocking(&path_for_scan, meta_for_scan)
         })
         .await
         .map_err(|err| ThreadStoreError::Internal {
             message: format!("failed to join active model context scan: {err}"),
-        })?
-        .map_err(interactive_model_context_scan_error)?
+        })?;
+        active_model_context_scan_or_fallback(result)?
     };
     let Some(active_scan) = active_scan else {
         return Ok(None);
@@ -394,14 +396,30 @@ fn scan_compressed_active_model_context_blocking_with_limit(
 fn interactive_model_context_too_large() -> io::Error {
     io::Error::new(
         io::ErrorKind::FileTooLarge,
-        MODEL_CONTEXT_MIGRATION_REQUIRED,
+        MODEL_CONTEXT_SCAN_LIMIT_EXCEEDED,
     )
+}
+
+fn active_model_context_scan_or_fallback(
+    result: io::Result<Option<ActiveModelContextScan>>,
+) -> ThreadStoreResult<Option<ActiveModelContextScan>> {
+    match result {
+        Err(error) if error.kind() == io::ErrorKind::FileTooLarge => {
+            tracing::debug!(
+                outcome = "active_checkpoint_scan_limit",
+                "bounded active model-context scan yielded to complete compatibility reconstruction"
+            );
+            Ok(None)
+        }
+        Ok(scan) => Ok(scan),
+        Err(error) => Err(thread_store_io_error(error)),
+    }
 }
 
 pub(super) fn interactive_model_context_scan_error(error: io::Error) -> ThreadStoreError {
     if error.kind() == io::ErrorKind::FileTooLarge {
         ThreadStoreError::InvalidRequest {
-            message: MODEL_CONTEXT_MIGRATION_REQUIRED.to_string(),
+            message: MODEL_CONTEXT_SCAN_LIMIT_EXCEEDED.to_string(),
         }
     } else {
         thread_store_io_error(error)
@@ -424,7 +442,7 @@ pub(super) async fn scan_plain_active_model_context_snapshot(
     .map_err(|err| ThreadStoreError::Internal {
         message: format!("failed to join active model context scan: {err}"),
     })?;
-    result.map_err(interactive_model_context_scan_error)
+    active_model_context_scan_or_fallback(result)
 }
 
 fn unchanged_active_rollout(before: &Metadata, after: &Metadata) -> io::Result<bool> {
@@ -596,8 +614,11 @@ fn scan_model_context_from_lineage_blocking(
             Some(end_byte_offset) => ReverseJsonlScanner::new_at(file, end_byte_offset)?,
             None => ReverseJsonlScanner::new(file)?,
         };
-        while let Some(outcome) = scanner.scan_next::<RolloutLine>()? {
-            let ScanOutcome::Parsed(line) = outcome else {
+        while let Some(outcome) = scanner.scan_next::<serde_json::Value>()? {
+            let ScanOutcome::Parsed(value) = outcome else {
+                continue;
+            };
+            let Ok(Some(line)) = RolloutRecorder::parse_rollout_line_value(value) else {
                 continue;
             };
             if let Some(ordinal) = line.ordinal

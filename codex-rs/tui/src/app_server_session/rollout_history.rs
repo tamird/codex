@@ -99,9 +99,10 @@ impl AppServerSession {
         } else {
             false
         };
-        if params.exclude_turns {
-            rollout_maintenance_guard = None;
-        }
+        // The embedded thread-store history access reacquires rollout maintenance while it opens
+        // the selected rollout and reserves its writers. Retaining this metadata-check guard across
+        // the request would deadlock when that access also needs Goal Supervisor history repair.
+        drop(rollout_maintenance_guard);
         let request_id = self.next_request_id();
         let resume_response = self
             .client
@@ -110,7 +111,6 @@ impl AppServerSession {
                 params: params.clone(),
             })
             .await;
-        drop(rollout_maintenance_guard);
         let mut response: ThreadResumeResponse = match resume_response {
             Ok(response) => response,
             Err(TypedRequestError::Server { source, .. })

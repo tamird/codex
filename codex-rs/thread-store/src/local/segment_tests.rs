@@ -1281,11 +1281,40 @@ async fn missing_projection_rebuilds_compressed_segmented_paginated_lineage() {
         .await
         .expect("resolve compressed-rebuild lineage");
     assert_eq!(lineage.segments.len(), 3);
-    for segment in &lineage.segments[..2] {
+    for (index, segment) in lineage.segments.iter().take(2).enumerate() {
         let source = codex_rollout::existing_rollout_path(segment.rollout_path())
             .await
             .expect("immutable predecessor path");
-        compress_rollout_for_test(source.as_path());
+        // A fork may select a prefix of a larger immutable ancestor. Neither the plain nor
+        // compressed rebuild may include the records after its saved history_base boundary.
+        let mut ordinal = segment.end_ordinal_exclusive.expect("predecessor cutoff");
+        let mut file = tokio::fs::OpenOptions::new()
+            .append(true)
+            .open(&source)
+            .await
+            .expect("open predecessor for test suffix");
+        for item in turn_items(
+            thread_id,
+            "excluded-turn",
+            "excluded-item",
+            "after the selected boundary",
+        ) {
+            let mut bytes = serde_json::to_vec(&RolloutLine {
+                timestamp: "2025-01-03T12:00:00Z".to_string(),
+                ordinal: Some(ordinal),
+                item,
+            })
+            .expect("serialize excluded record");
+            bytes.push(b'\n');
+            file.write_all(&bytes)
+                .await
+                .expect("append excluded record");
+            ordinal = ordinal.checked_add(1).expect("test ordinal");
+        }
+        drop(file);
+        if index == 1 {
+            compress_rollout_for_test(source.as_path());
+        }
     }
 
     let rollout_id = lineage.root_rollout_id;
@@ -1339,12 +1368,12 @@ async fn missing_projection_rebuilds_compressed_segmented_paginated_lineage() {
             "compressed-turn-2"
         ]
     );
-    for segment in &lineage.segments[..2] {
-        assert!(
+    for (index, segment) in lineage.segments.iter().take(2).enumerate() {
+        assert_eq!(segment.rollout_path().exists(), index == 0);
+        assert_eq!(
             segment.rollout_path().with_extension("jsonl.zst").exists(),
-            "projection rebuild must leave immutable predecessors compressed"
+            index == 1
         );
-        assert!(!segment.rollout_path().exists());
     }
 }
 
@@ -1511,7 +1540,11 @@ async fn projection_rebuild_retries_after_concurrent_append_and_rotation() {
 }
 
 #[tokio::test]
-async fn unprojected_read_reschedules_and_cancels_an_active_background_rebuild() {
+#[expect(
+    clippy::await_holding_invalid_type,
+    reason = "the test holds the rebuild lock while verifying that background rebuild waits"
+)]
+async fn unprojected_read_does_not_cancel_an_active_background_rebuild() {
     let home = TempDir::new().expect("create rescheduled-rebuild Codex home");
     let store = state_backed_store(home.path()).await;
     let thread_id = ThreadId::new();
@@ -1584,7 +1617,18 @@ async fn unprojected_read_reschedules_and_cancels_an_active_background_rebuild()
     }
 
     let first_pause = inject_projection_rebuild_pause(thread_id);
+    let rebuild_gate = store.projection_rebuild_gate.lock().await;
     store.schedule_history_projection_rebuild(thread_id).await;
+    assert!(
+        tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            first_pause.entered.notified(),
+        )
+        .await
+        .is_err(),
+        "background rebuild must wait for the store-wide rebuild gate"
+    );
+    drop(rebuild_gate);
     tokio::time::timeout(
         std::time::Duration::from_secs(5),
         first_pause.entered.notified(),
@@ -1593,6 +1637,7 @@ async fn unprojected_read_reschedules_and_cancels_an_active_background_rebuild()
     .expect("first background rebuild reaches staged boundary");
 
     store.schedule_history_projection_rebuild(thread_id).await;
+    first_pause.release.notify_one();
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
         loop {
             if store
@@ -1606,7 +1651,7 @@ async fn unprojected_read_reschedules_and_cancels_an_active_background_rebuild()
         }
     })
     .await
-    .expect("replacement rebuild publishes after cancelling staged work");
+    .expect("active rebuild publishes after a repeated unprojected read");
 
     let projection_id_count =
         sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM thread_history_projection_state")
@@ -1615,7 +1660,7 @@ async fn unprojected_read_reschedules_and_cancels_an_active_background_rebuild()
             .expect("count rescheduled projection identities");
     assert_eq!(
         projection_id_count, 1,
-        "cancelled staging rows must be removed"
+        "the active rebuild must publish exactly one projection"
     );
 }
 
@@ -3618,6 +3663,34 @@ async fn paginated_freeze_continues_ordinals_and_resets_only_projection_offset()
         vec![Some(1)]
     );
 
+    store
+        .append_items(AppendThreadItemsParams {
+            thread_id,
+            items: vec![
+                turn_items(
+                    thread_id,
+                    "turn-after-freeze",
+                    "item-after-freeze",
+                    "after paginated freeze",
+                )[1]
+                .clone(),
+            ],
+        })
+        .await
+        .expect("append after paginated freeze");
+    store
+        .flush_thread(thread_id)
+        .await
+        .expect("flush append after paginated freeze");
+    let (lines, _, parse_errors) = RolloutRecorder::load_rollout_lines(stable_path.as_path())
+        .await
+        .expect("read appended replacement rollout");
+    assert_eq!(parse_errors, 0);
+    assert_eq!(
+        lines.iter().map(|line| line.ordinal).collect::<Vec<_>>(),
+        vec![Some(1), Some(2)]
+    );
+
     let pool = codex_state::open_thread_history_db(&sqlite)
         .await
         .expect("open history db");
@@ -3639,7 +3712,129 @@ async fn paginated_freeze_continues_ordinals_and_resets_only_projection_offset()
             .len(),
     )
     .expect("replacement length");
-    assert_eq!(projection_state, (replacement_len, 2));
+    assert_eq!(projection_state, (replacement_len, 3));
+}
+
+#[tokio::test]
+async fn paginated_freeze_repairs_repeated_checkpoint_boundary_ordinals() {
+    let home = TempDir::new().expect("temp dir");
+    let store = state_backed_store(home.path()).await;
+    let thread_id = ThreadId::new();
+    store
+        .create_thread(create_params(thread_id, ThreadHistoryMode::Paginated))
+        .await
+        .expect("create thread");
+    store
+        .persist_thread(thread_id, PersistContext::Standard)
+        .await
+        .expect("persist thread");
+    store
+        .append_items(AppendThreadItemsParams {
+            thread_id,
+            items: vec![
+                turn_items(
+                    thread_id,
+                    "turn-before-repair",
+                    "item-before-repair",
+                    "before repair",
+                )[1]
+                .clone(),
+            ],
+        })
+        .await
+        .expect("append before repair");
+    store
+        .flush_thread(thread_id)
+        .await
+        .expect("flush before repair");
+    let stable_path = store
+        .live_rollout_path(thread_id)
+        .await
+        .expect("stable path");
+    let (mut lines, _, parse_errors) = RolloutRecorder::load_rollout_lines(&stable_path)
+        .await
+        .expect("read source rollout");
+    assert_eq!(parse_errors, 0);
+    assert_eq!(lines.len(), 2);
+    lines[1].ordinal = lines[0].ordinal;
+    let mut corrupted = Vec::new();
+    for line in &lines {
+        serde_json::to_writer(&mut corrupted, line).expect("encode corrupted record");
+        corrupted.push(b'\n');
+    }
+    let token_count = br#"{"timestamp":"2026-08-14T00:00:00Z","ordinal":2,"type":"event_msg","payload":{"type":"token_count","info":null,"rate_limits":{"primary":{"used_percent":5.0,"window_minutes":300,"resets_at":1786689000},"secondary":{"used_percent":12.5,"window_minutes":10080,"resets_at":1787292000}}}}"#;
+    corrupted.extend_from_slice(token_count);
+    corrupted.push(b'\n');
+    tokio::fs::write(&stable_path, corrupted)
+        .await
+        .expect("install repeated ordinal fixture");
+
+    let prepared = store
+        .prepare_fork(PrepareForkParams {
+            thread_id,
+            boundary: ForkBoundary::Latest,
+        })
+        .await
+        .expect("persistent fork must repair repeated ordinals before projection");
+    let snapshot = prepared
+        .frozen_segment
+        .as_ref()
+        .expect("persistent fork snapshot");
+    assert_eq!(snapshot.next_rollout_ordinal, Some(3));
+    let (snapshot_lines, _, snapshot_parse_errors) =
+        RolloutRecorder::load_rollout_lines(&snapshot.reference.rollout_path)
+            .await
+            .expect("read repaired snapshot");
+    assert_eq!(snapshot_parse_errors, 0);
+    assert_eq!(
+        snapshot_lines
+            .iter()
+            .map(|line| line.ordinal)
+            .collect::<Vec<_>>(),
+        vec![Some(0), Some(1), Some(2)]
+    );
+    assert!(
+        snapshot_lines
+            .iter()
+            .any(|line| matches!(line.item, RolloutItem::EventMsg(EventMsg::TokenCount(_))))
+    );
+    drop(prepared);
+
+    let rotated = store
+        .freeze_thread_segment(thread_id, FreezeRolloutSegmentParams::rotate(Vec::new()))
+        .await
+        .expect("rotation must replace the corrupted active rollout");
+    assert_eq!(rotated.next_rollout_ordinal, Some(3));
+    store
+        .append_items(AppendThreadItemsParams {
+            thread_id,
+            items: vec![
+                turn_items(
+                    thread_id,
+                    "turn-after-repair",
+                    "item-after-repair",
+                    "after repair",
+                )[1]
+                .clone(),
+            ],
+        })
+        .await
+        .expect("append after repair");
+    store
+        .flush_thread(thread_id)
+        .await
+        .expect("flush after repair");
+    let (active_lines, _, active_parse_errors) = RolloutRecorder::load_rollout_lines(&stable_path)
+        .await
+        .expect("read repaired active rollout");
+    assert_eq!(active_parse_errors, 0);
+    assert_eq!(
+        active_lines
+            .iter()
+            .map(|line| line.ordinal)
+            .collect::<Vec<_>>(),
+        vec![Some(3), Some(4)]
+    );
 }
 
 #[tokio::test]

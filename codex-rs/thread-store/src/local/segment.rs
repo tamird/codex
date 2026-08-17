@@ -982,7 +982,10 @@ async fn freeze_thread_segment_reserved_with_publication(
                 None
             }
         } else {
-            if matches!(history_mode, ThreadHistoryMode::Paginated) && live_entry.is_some() {
+            if matches!(history_mode, ThreadHistoryMode::Paginated)
+                && live_entry.is_some()
+                && !skipped_records
+            {
                 super::thread_history_materialization::materialize_to_sqlite(
                     store,
                     source_rollout_id,
@@ -1670,13 +1673,17 @@ async fn freeze_paginated_prefix_reserved_inner(
     let mut prefix_lines = prefix
         .split(|byte| *byte == b'\n')
         .filter(|line| !line.iter().all(u8::is_ascii_whitespace))
-        .map(|line| {
-            serde_json::from_slice::<RolloutLine>(line).map_err(|err| ThreadStoreError::Internal {
-                message: format!(
-                    "failed to read prepared rollout prefix for {prefix_thread_id}: {err}"
-                ),
-            })
-        })
+        .filter_map(
+            |line| match RolloutRecorder::parse_rollout_line_bytes(line) {
+                Ok(Some(line)) => Some(Ok(line)),
+                Ok(None) => None,
+                Err(err) => Some(Err(ThreadStoreError::Internal {
+                    message: format!(
+                        "failed to read prepared rollout prefix for {prefix_thread_id}: {err}"
+                    ),
+                })),
+            },
+        )
         .collect::<ThreadStoreResult<Vec<_>>>()?;
     match prefix_lines.first().map(|line| &line.item) {
         Some(RolloutItem::SessionMeta(meta)) if meta.meta.id == prefix_thread_id => {}
@@ -2065,7 +2072,7 @@ async fn validate_source_rollout(
     Vec<RolloutLine>,
     bool,
 )> {
-    let (lines, loaded_thread_id, parse_errors) = RolloutRecorder::load_rollout_lines(path)
+    let (mut lines, loaded_thread_id, parse_errors) = RolloutRecorder::load_rollout_lines(path)
         .await
         .map_err(thread_store_io_error)?;
     if loaded_thread_id != Some(thread_id) {
@@ -2095,7 +2102,8 @@ async fn validate_source_rollout(
             ),
         });
     }
-    let next_rollout_ordinal = validate_ordinals(lines.as_slice(), source_meta.meta.history_mode)?;
+    let (next_rollout_ordinal, repaired_ordinals) =
+        repair_source_ordinals(lines.as_mut_slice(), source_meta.meta.history_mode)?;
     let existing_reference = match lines.as_slice() {
         [
             RolloutLine {
@@ -2114,8 +2122,42 @@ async fn validate_source_rollout(
         next_rollout_ordinal,
         existing_reference,
         lines,
-        parse_errors != 0,
+        parse_errors != 0 || repaired_ordinals,
     ))
+}
+
+/// Restores the physical-record ordinal invariant before a segment is frozen.
+///
+/// Older checkpoint publication reopened a recorder at the final checkpoint ordinal, so the
+/// first subsequent record could repeat that ordinal. Segment boundaries are defined by physical
+/// record order; assigning contiguous ordinals from the authenticated first record preserves that
+/// order when the canonical snapshot writer installs the repaired segment.
+fn repair_source_ordinals(
+    lines: &mut [RolloutLine],
+    history_mode: ThreadHistoryMode,
+) -> ThreadStoreResult<(Option<u64>, bool)> {
+    if matches!(history_mode, ThreadHistoryMode::Legacy) {
+        return Ok((validate_ordinals(lines, history_mode)?, false));
+    }
+    let Some(first) = lines.first().and_then(|line| line.ordinal) else {
+        return Err(ThreadStoreError::Internal {
+            message: "paginated rollout is empty or starts without an ordinal".to_string(),
+        });
+    };
+    let mut expected = first;
+    let mut repaired = false;
+    for line in lines {
+        if line.ordinal != Some(expected) {
+            line.ordinal = Some(expected);
+            repaired = true;
+        }
+        expected = expected
+            .checked_add(1)
+            .ok_or_else(|| ThreadStoreError::Internal {
+                message: "paginated rollout ordinal overflow".to_string(),
+            })?;
+    }
+    Ok((Some(expected), repaired))
 }
 
 // Full-history forks freeze the parent's current rollout into an immutable segment and store a

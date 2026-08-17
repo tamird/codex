@@ -73,7 +73,7 @@ async fn active_model_context_scan_stops_at_the_interactive_byte_limit() {
     };
 
     assert_eq!(error.kind(), std::io::ErrorKind::FileTooLarge);
-    assert!(error.to_string().contains("migrate-rollouts"));
+    assert!(error.to_string().contains("bounded active scan limit"));
 }
 
 #[tokio::test]
@@ -106,7 +106,7 @@ async fn compressed_active_model_context_scan_stops_at_the_interactive_byte_limi
     };
 
     assert_eq!(error.kind(), std::io::ErrorKind::FileTooLarge);
-    assert!(error.to_string().contains("migrate-rollouts"));
+    assert!(error.to_string().contains("bounded active scan limit"));
 }
 
 #[tokio::test]
@@ -140,7 +140,71 @@ async fn active_model_context_scan_rejects_an_oversized_record() {
     };
 
     assert_eq!(error.kind(), std::io::ErrorKind::FileTooLarge);
-    assert!(error.to_string().contains("migrate-rollouts"));
+    assert!(error.to_string().contains("bounded active scan limit"));
+}
+
+#[tokio::test]
+async fn active_scan_limit_yields_to_unmarked_paginated_compatibility_reader() {
+    let home = TempDir::new().expect("temp dir");
+    let uuid = Uuid::from_u128(/*v*/ 2041);
+    let thread_id = ThreadId::from_string(&uuid.to_string()).expect("thread id");
+    let path = write_ordinaled_paginated_rollout(
+        home.path(),
+        "2025-01-03T13-41-00",
+        uuid,
+        [
+            turn_started("older-turn"),
+            user_message("older user"),
+            completed_user_message("older-turn", "older user"),
+            turn_context(home.path(), "older-turn"),
+            compacted("ordinary unmarked compaction", Some(Vec::new())),
+            turn_complete("older-turn"),
+            turn_started("latest-turn"),
+            user_message("latest user"),
+            completed_user_message("latest-turn", "latest user"),
+            turn_context(home.path(), "latest-turn"),
+            turn_complete("latest-turn"),
+        ],
+    );
+    let active_len = std::fs::metadata(&path).expect("rollout metadata").len();
+    let store =
+        projected_thread_store(home.path(), thread_id, active_len, /*next_ordinal*/ 32).await;
+    let session_meta = codex_rollout::read_session_meta_line(&path)
+        .await
+        .expect("read active metadata");
+    let bounded_probe = scan_projected_active_model_context_blocking_with_limit(
+        path.as_path(),
+        session_meta.clone(),
+        /*max_scan_bytes*/ 1,
+    );
+
+    assert!(
+        active_model_context_scan_or_fallback(bounded_probe)
+            .expect("yield to compatibility reader")
+            .is_none()
+    );
+    let expected = scan_model_context_from_lineage(
+        store
+            .resolve_rollout_lineage(thread_id)
+            .await
+            .expect("resolve complete lineage"),
+        session_meta,
+    )
+    .await
+    .expect("scan complete compatibility lineage");
+    let actual = store
+        .load_latest_model_context(LoadThreadHistoryParams {
+            thread_id,
+            include_archived: false,
+        })
+        .await
+        .expect("load unmarked Paginated compatibility history")
+        .items;
+
+    assert_eq!(
+        serde_json::to_value(actual).expect("serialize loaded context"),
+        serde_json::to_value(expected).expect("serialize compatibility context")
+    );
 }
 
 #[tokio::test]

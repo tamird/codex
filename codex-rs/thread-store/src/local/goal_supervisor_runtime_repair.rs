@@ -28,8 +28,10 @@ use super::segment::history_repair_publication::HistoryRepairLifecycleLease;
 use super::segment::history_repair_publication::HistoryRepairMaintenanceLease;
 use super::segment::history_repair_publication::HistoryRepairPublication;
 use super::segment::history_repair_publication::HistoryRepairWriterToken;
+use super::segment::history_repair_publication::acquire_history_repair_maintenance;
 use super::segment::history_repair_publication::authorize_history_repair_writer;
 use super::segment::history_repair_publication::clear_history_repair_segment_id;
+use super::segment::history_repair_publication::history_repair_publication_needs_exclusive;
 use super::segment::history_repair_publication::history_repair_segment_id;
 use super::segment::history_repair_publication::install_existing_identity_history_repair_backup;
 use super::segment::history_repair_publication::install_history_repair_segment;
@@ -38,7 +40,6 @@ use super::segment::history_repair_publication::publish_history_repair_replaceme
 use super::segment::history_repair_publication::recover_history_repair_publication;
 use super::segment::history_repair_publication::replace_history_repair_segment_id;
 use super::segment::history_repair_publication::reserve_history_repair_lifecycle;
-use super::segment::history_repair_publication::reserve_history_repair_maintenance;
 use super::segment::history_repair_publication::validate_legacy_initial_repair_path;
 use super::writer_lock::WriterLockGuard;
 use crate::ThreadStoreError;
@@ -77,6 +78,8 @@ pub(super) struct GoalSupervisorHistoryRepairOutcome {
 pub(super) struct GoalSupervisorHistoryAccess {
     lifecycle: Vec<HistoryRepairLifecycleLease>,
     maintenance: Option<HistoryRepairMaintenanceLease>,
+    /// Excludes legacy maintenance and compression without authorizing repair publication.
+    read_maintenance: Option<codex_rollout::RolloutMaintenanceReadGuard>,
     reservation: Option<RolloutWriterReservation>,
     certified_active_snapshot: Option<CertifiedActiveHistorySnapshot>,
 }
@@ -93,7 +96,10 @@ impl std::fmt::Debug for GoalSupervisorHistoryAccess {
         formatter
             .debug_struct("GoalSupervisorHistoryAccess")
             .field("lifecycle_thread_count", &self.lifecycle.len())
-            .field("holds_maintenance", &self.maintenance.is_some())
+            .field(
+                "holds_maintenance",
+                &(self.maintenance.is_some() || self.read_maintenance.is_some()),
+            )
             .field("holds_writer_reservation", &self.reservation.is_some())
             .field(
                 "has_certified_active_snapshot",
@@ -108,6 +114,7 @@ impl GoalSupervisorHistoryAccess {
         Self {
             lifecycle: Vec::new(),
             maintenance: None,
+            read_maintenance: None,
             reservation: None,
             certified_active_snapshot: None,
         }
@@ -257,12 +264,20 @@ pub(super) fn reject_malformed_supplied_history(items: &[RolloutItem]) -> Thread
 }
 
 /// Repairs every mutable root consumed by compatibility replay.
+#[cfg(test)]
 pub(super) async fn repair_compatibility_history_before_access(
     store: &LocalThreadStore,
     thread_id: ThreadId,
     rollout_path: &Path,
 ) -> ThreadStoreResult<GoalSupervisorHistoryAccess> {
-    repair_before_access(store, thread_id, rollout_path, RepairAccess::Compatibility).await
+    repair_before_access(
+        store,
+        thread_id,
+        rollout_path,
+        RepairAccess::Compatibility,
+        HistorySelection::Exact,
+    )
+    .await
 }
 
 /// Repairs only the bounded reference window used by ordinary thread history reads.
@@ -271,23 +286,63 @@ pub(super) async fn repair_recent_history_before_access(
     thread_id: ThreadId,
     rollout_path: &Path,
 ) -> ThreadStoreResult<GoalSupervisorHistoryAccess> {
-    repair_before_access(store, thread_id, rollout_path, RepairAccess::Recent).await
+    repair_before_access(
+        store,
+        thread_id,
+        rollout_path,
+        RepairAccess::Recent,
+        HistorySelection::Exact,
+    )
+    .await
 }
 
 /// Repairs only the active root for an authoritative active checkpoint.
+#[cfg(test)]
 pub(super) async fn repair_active_history_before_access(
     store: &LocalThreadStore,
     thread_id: ThreadId,
     rollout_path: &Path,
 ) -> ThreadStoreResult<GoalSupervisorHistoryAccess> {
-    repair_before_access(store, thread_id, rollout_path, RepairAccess::ActiveOnly).await
+    repair_before_access(
+        store,
+        thread_id,
+        rollout_path,
+        RepairAccess::ActiveOnly,
+        HistorySelection::Exact,
+    )
+    .await
 }
 
+/// Reject a replaced selection instead of reading or repairing an older retained rollout.
+pub(super) async fn repair_selected_history_before_access(
+    store: &LocalThreadStore,
+    thread_id: ThreadId,
+    rollout_path: &Path,
+    access: RepairAccess,
+) -> ThreadStoreResult<GoalSupervisorHistoryAccess> {
+    repair_before_access(
+        store,
+        thread_id,
+        rollout_path,
+        access,
+        HistorySelection::Current,
+    )
+    .await
+}
+
+/// Determines which records the caller will consume after repair.
 #[derive(Clone, Copy)]
-enum RepairAccess {
+pub(super) enum RepairAccess {
     ActiveOnly,
     Compatibility,
     Recent,
+}
+
+/// Explicit historical reads must not follow a thread's newer selected rollout.
+#[derive(Clone, Copy)]
+enum HistorySelection {
+    Current,
+    Exact,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -301,6 +356,7 @@ async fn repair_before_access(
     thread_id: ThreadId,
     rollout_path: &Path,
     access: RepairAccess,
+    selection: HistorySelection,
 ) -> ThreadStoreResult<GoalSupervisorHistoryAccess> {
     let home_key = canonical_home_key(store)?;
     if quarantined_thread(home_key.as_path(), thread_id) {
@@ -333,27 +389,48 @@ async fn repair_before_access(
         }
     }
     let mut lock_ids = vec![thread_id];
+    let mut exclusive = false;
+    let mut scope_changes = 0;
 
     // Lifecycle ownership precedes maintenance. The first discovery runs while the selected
     // thread is stable. A cross-thread lineage expands the lock set and is then rediscovered with
     // every owner stable; a same-thread rotation lineage needs only the one locked scan.
-    for _ in 0..3 {
+    loop {
         let mut lifecycle = Vec::with_capacity(lock_ids.len());
         for &id in &lock_ids {
             lifecycle.push(reserve_history_repair_lifecycle(store, id).await);
         }
-        let maintenance = Some(acquire_maintenance(store).await?);
+        let (maintenance, read_maintenance) = if exclusive {
+            (Some(acquire_maintenance(store).await?), None)
+        } else {
+            (
+                None,
+                Some(
+                    codex_rollout::acquire_rollout_maintenance_read_lock(
+                        store.config.codex_home.as_path(),
+                    )
+                    .await
+                    .map_err(thread_store_io_error)?,
+                ),
+            )
+        };
         let reservation = store.reserve_rollout_writers(lock_ids.as_slice()).await?;
         reject_quarantined_scope(home_key.as_path(), lock_ids.as_slice())?;
         let mut access_token = GoalSupervisorHistoryAccess {
             lifecycle,
             maintenance,
+            read_maintenance,
             reservation: Some(reservation),
             certified_active_snapshot: None,
         };
-        let locked_rollout_path = if codex_rollout::existing_rollout_path(rollout_path)
-            .await
-            .is_some()
+        if matches!(selection, HistorySelection::Current) {
+            super::live_writer::require_selected_rollout_path(store, thread_id, rollout_path)
+                .await?;
+        }
+        let locked_rollout_path = if matches!(selection, HistorySelection::Exact)
+            || codex_rollout::existing_rollout_path(rollout_path)
+                .await
+                .is_some()
         {
             rollout_path.to_path_buf()
         } else {
@@ -367,11 +444,30 @@ async fn repair_before_access(
         let discovered_lock_ids = locked_scope.lock_thread_ids();
         if discovered_lock_ids != lock_ids {
             drop(access_token);
+            scope_changes += 1;
+            if scope_changes >= 3 {
+                return Err(ThreadStoreError::Conflict {
+                    message: format!(
+                        "goal-supervisor history for thread {thread_id} changed while repair locks were acquired"
+                    ),
+                });
+            }
             lock_ids = discovered_lock_ids;
             continue;
         }
         reject_quarantined_scope(home_key.as_path(), lock_ids.as_slice())?;
-        recover_interrupted_publications(store, &locked_scope, &access_token).await?;
+        if !exclusive
+            && (locked_scope.needs_repair()
+                || scope_needs_exclusive_recovery(store, &locked_scope).await?)
+        {
+            // Never upgrade while retaining a writer that another shared reader may await.
+            drop(access_token);
+            exclusive = true;
+            continue;
+        }
+        if exclusive {
+            recover_interrupted_publications(store, &locked_scope, &access_token).await?;
+        }
 
         if !locked_scope.needs_repair() {
             access_token.certified_active_snapshot = locked_scope.certified_active_snapshot;
@@ -393,11 +489,26 @@ async fn repair_before_access(
             message: format!("failed to join goal-supervisor history repair: {error}"),
         })?;
     }
-    Err(ThreadStoreError::Conflict {
-        message: format!(
-            "goal-supervisor history for thread {thread_id} changed while repair locks were acquired"
-        ),
-    })
+}
+
+async fn scope_needs_exclusive_recovery(
+    store: &LocalThreadStore,
+    scope: &RepairScope,
+) -> ThreadStoreResult<bool> {
+    for root in &scope.roots {
+        let physical = codex_rollout::existing_rollout_path(&root.path)
+            .await
+            .ok_or_else(|| ThreadStoreError::Conflict {
+                message: format!("rollout {} changed before repair", root.path.display()),
+            })?;
+        if !is_immutable_segment(store, &physical).await?
+            && history_repair_publication_needs_exclusive(&store.config.codex_home, &physical)
+                .await?
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 async fn clean_unconfined_access_or_error(
@@ -465,22 +576,7 @@ fn indeterminate_repair_error(thread_id: ThreadId) -> ThreadStoreError {
 async fn acquire_maintenance(
     store: &LocalThreadStore,
 ) -> ThreadStoreResult<HistoryRepairMaintenanceLease> {
-    let started = tokio::time::Instant::now();
-    let mut delay = std::time::Duration::from_millis(25);
-    loop {
-        if let Some(guard) = reserve_history_repair_maintenance(store).await? {
-            return Ok(guard);
-        }
-        if started.elapsed() >= std::time::Duration::from_secs(10) {
-            return Err(ThreadStoreError::Conflict {
-                message: "rollout compression or another migration is already running".to_string(),
-            });
-        }
-        tokio::time::sleep(delay).await;
-        delay = delay
-            .saturating_mul(2)
-            .min(std::time::Duration::from_millis(500));
-    }
+    acquire_history_repair_maintenance(store).await
 }
 
 async fn discover_scope(

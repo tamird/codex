@@ -71,6 +71,7 @@ async fn window_id_advances_after_compact_persists_on_resume_and_resets_on_fork(
         )
         .await?;
     submit_user_turn(&resumed.codex, "after resume").await?;
+    let rollout_path = resumed.codex.rollout_path().expect("migrated rollout path");
     shutdown_thread(&resumed.codex).await?;
 
     let forked = resumed
@@ -82,7 +83,8 @@ async fn window_id_advances_after_compact_persists_on_resume_and_resets_on_fork(
             /*thread_source*/ None,
             /*parent_trace*/ None,
         )
-        .await?;
+        .await
+        .expect("fork after migration and resume");
     submit_user_turn(&forked.thread, "after fork").await?;
     shutdown_thread(&forked.thread).await?;
 

@@ -55,6 +55,7 @@ use codex_config::LoaderOverrides;
 use codex_core::ARCHIVED_SESSIONS_SUBDIR;
 use codex_core::config::ConfigBuilder;
 use codex_exec_server::EnvironmentManager;
+use codex_features::Feature;
 use codex_feedback::CodexFeedback;
 use codex_protocol::AgentPath;
 use codex_protocol::SegmentId;
@@ -108,6 +109,8 @@ use codex_thread_store::AppendThreadItemsParams;
 use codex_thread_store::CreateThreadParams;
 use codex_thread_store::FreezeRolloutSegmentParams;
 use codex_thread_store::InMemoryThreadStore;
+use codex_thread_store::ItemSortKey;
+use codex_thread_store::ListItemsParams as StoreListItemsParams;
 use codex_thread_store::ListTurnsParams as StoreListTurnsParams;
 use codex_thread_store::LocalThreadStore;
 use codex_thread_store::LocalThreadStoreConfig;
@@ -136,6 +139,9 @@ use uuid::Uuid;
 const DEFAULT_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(25);
 #[cfg(not(windows))]
 const DEFAULT_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+#[path = "thread_read_warm.rs"]
+mod warm;
 
 fn certified_recent_history_checkpoint(codex_home: &Path) -> CertifiedSegmentStateCheckpoint {
     let window_id = Uuid::now_v7();
@@ -449,7 +455,9 @@ async fn paginated_stored_thread_reads_unprojected_turns_through_read_apis() -> 
 async fn paginated_segmented_history_without_index_returns_latest_five_turns() -> Result<()> {
     let server = create_mock_responses_server_repeating_assistant("Done").await;
     let codex_home = TempDir::new()?;
-    MockResponsesConfig::new(&server.uri()).write(codex_home.path())?;
+    MockResponsesConfig::new(&server.uri())
+        .disable_feature(Feature::BackgroundPaginatedRolloutMigration)
+        .write(codex_home.path())?;
     let thread_id = codex_protocol::ThreadId::new();
     let sqlite = codex_state::SqliteConfig::new_for_testing(codex_home.path().abs());
     let state_db =
@@ -642,7 +650,26 @@ async fn paginated_segmented_history_without_index_returns_latest_five_turns() -
             ("turn-4", "user-4"),
         ]
     );
-    assert!(latest_items_page.next_cursor.is_some());
+    let global_items_cursor = latest_items_page
+        .next_cursor
+        .expect("latest global item page should have a cursor");
+    let filtered_items_page = read_items_page(
+        &mut mcp,
+        thread_id,
+        Some("turn-3"),
+        Some(global_items_cursor),
+        Some(2),
+        SortDirection::Desc,
+    )
+    .await?;
+    assert_eq!(
+        filtered_items_page
+            .data
+            .iter()
+            .map(|entry| (entry.turn_id.as_str(), entry.item.id()))
+            .collect::<Vec<_>>(),
+        vec![("turn-3", "agent-3"), ("turn-3", "user-3")]
+    );
 
     let second_page = read_turns_page(
         &mut mcp,
@@ -744,6 +771,29 @@ async fn paginated_segmented_history_without_index_returns_latest_five_turns() -
         }
     })
     .await?;
+    // A cursor from the rebuilt index must override this process's earlier fallback read.
+    let indexed_items = projection_inspector
+        .list_items(StoreListItemsParams {
+            thread_id,
+            turn_id: Some("turn-7".to_string()),
+            include_archived: true,
+            cursor: None,
+            page_size: 1,
+            sort_direction: StoreSortDirection::Asc,
+            sort_key: ItemSortKey::CreatedAtOrdinal,
+            after_updated_at_ordinal: None,
+        })
+        .await?;
+    let continued_with_indexed_cursor = read_items_page(
+        &mut mcp,
+        thread_id,
+        Some("turn-7"),
+        Some(indexed_items.next_cursor.expect("indexed next-item cursor")),
+        Some(1),
+        SortDirection::Asc,
+    )
+    .await?;
+    assert_eq!(continued_with_indexed_cursor.data, second_items_page.data);
     drop(projection_inspector);
 
     let saved_fallback_cursor = first_page
@@ -965,7 +1015,9 @@ async fn paginated_resume_without_index_does_not_open_obsolete_predecessor() -> 
 async fn thread_turns_list_can_page_backward_and_forward() -> Result<()> {
     let server = create_mock_responses_server_repeating_assistant("Done").await;
     let codex_home = TempDir::new()?;
-    MockResponsesConfig::new(&server.uri()).write(codex_home.path())?;
+    MockResponsesConfig::new(&server.uri())
+        .disable_feature(Feature::BackgroundPaginatedRolloutMigration)
+        .write(codex_home.path())?;
 
     let filename_ts = "2025-01-05T12-00-00";
     let conversation_id = create_fake_rollout_with_text_elements(
@@ -1410,7 +1462,9 @@ async fn rotated_legacy_fork_turns_list_preserves_inherited_parent_turns() -> Re
 async fn frodex_running_legacy_resume_returns_newest_five_segments_only() -> Result<()> {
     let server = create_mock_responses_server_repeating_assistant("Done").await;
     let codex_home = TempDir::new()?;
-    MockResponsesConfig::new(&server.uri()).write(codex_home.path())?;
+    MockResponsesConfig::new(&server.uri())
+        .disable_feature(Feature::BackgroundPaginatedRolloutMigration)
+        .write(codex_home.path())?;
     let thread_id = codex_protocol::ThreadId::new();
     let sqlite = codex_state::SqliteConfig::new_for_testing(codex_home.path().abs());
     let store = LocalThreadStore::new(
@@ -2457,7 +2511,9 @@ async fn segmented_legacy_index_preserves_full_items_cursors_and_restart() -> Re
 async fn thread_turns_list_reuses_legacy_reference_depths_without_changing_history() -> Result<()> {
     let server = create_mock_responses_server_repeating_assistant("Done").await;
     let codex_home = TempDir::new()?;
-    MockResponsesConfig::new(&server.uri()).write(codex_home.path())?;
+    MockResponsesConfig::new(&server.uri())
+        .disable_feature(Feature::BackgroundPaginatedRolloutMigration)
+        .write(codex_home.path())?;
     let thread_id = codex_protocol::ThreadId::new();
     let sqlite = codex_state::SqliteConfig::new_for_testing(codex_home.path().abs());
     let store = LocalThreadStore::new(
@@ -3459,7 +3515,9 @@ async fn thread_resume_initial_turns_page_matches_requested_turns_list_page() ->
 async fn thread_turns_list_rejects_cursor_when_anchor_turn_is_rolled_back() -> Result<()> {
     let server = create_mock_responses_server_repeating_assistant("Done").await;
     let codex_home = TempDir::new()?;
-    MockResponsesConfig::new(&server.uri()).write(codex_home.path())?;
+    MockResponsesConfig::new(&server.uri())
+        .disable_feature(Feature::BackgroundPaginatedRolloutMigration)
+        .write(codex_home.path())?;
 
     let filename_ts = "2025-01-05T12-00-00";
     let conversation_id = create_fake_rollout_with_text_elements(

@@ -1511,6 +1511,133 @@ async fn append_rollout_item_to_path_assigns_next_paginated_ordinal() -> std::io
     Ok(())
 }
 
+#[test]
+fn rate_limit_decimal_spellings_decode_through_tagged_rollout_events() {
+    for spelling in [
+        "12.50",
+        "1.25e1",
+        "125e-1",
+        "12.50000000000000000000000000000001",
+    ] {
+        let window =
+            format!(r#"{{"used_percent":{spelling},"window_minutes":300,"resets_at":1786689000}}"#);
+        let event =
+            format!(r#"{{"type":"token_count","info":null,"rate_limits":{{"primary":{window}}}}}"#);
+        let record = format!(
+            r#"{{"timestamp":"2025-01-03T12:00:00Z","ordinal":274,"type":"event_msg","payload":{event}}}"#
+        );
+        let direct_window: codex_protocol::protocol::RateLimitWindow =
+            serde_json::from_str(&window).expect("decode direct rate-limit number");
+        let direct_event: EventMsg =
+            serde_json::from_str(&event).expect("decode tagged token count");
+        let direct_rollout: RolloutLine =
+            serde_json::from_str(&record).expect("decode nested rollout event");
+        let canonical = RolloutRecorder::parse_rollout_line_bytes(record.as_bytes())
+            .expect("decode canonical rollout")
+            .expect("numeric event retained");
+        let expected_window = codex_protocol::protocol::RateLimitWindow {
+            used_percent: 12.5,
+            window_minutes: Some(300),
+            resets_at: Some(1786689000),
+        };
+        assert_eq!(direct_window, expected_window, "{spelling}");
+        for decoded in [
+            RolloutItem::EventMsg(direct_event),
+            direct_rollout.item,
+            canonical.item,
+        ] {
+            let RolloutItem::EventMsg(EventMsg::TokenCount(event)) = decoded else {
+                panic!("numeric event changed variants");
+            };
+            assert_eq!(
+                event.rate_limits.expect("limits").primary,
+                Some(expected_window.clone()),
+                "{spelling}"
+            );
+        }
+    }
+    for invalid in [r#""12.5""#, "null", "{}", "1e10000"] {
+        let event = format!(
+            r#"{{"type":"token_count","info":null,"rate_limits":{{"primary":{{"used_percent":{invalid}}}}}}}"#
+        );
+        assert!(
+            serde_json::from_str::<EventMsg>(&event).is_err(),
+            "reject {invalid}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn append_rollout_item_uses_ordinal_from_arbitrary_precision_token_count()
+-> std::io::Result<()> {
+    let home = TempDir::new().expect("temp dir");
+    let rollout_path = home.path().join("rollout.jsonl");
+    write_paginated_rollout(&rollout_path, ThreadId::new(), &[4])?;
+    let token_count = serde_json::json!({
+        "timestamp": "2026-08-18T21:03:49.690Z",
+        "ordinal": 5,
+        "type": "event_msg",
+        "payload": {
+            "type": "token_count",
+            "info": {
+                "total_token_usage": {
+                    "input_tokens": 319590193,
+                    "cached_input_tokens": 312717039,
+                    "cache_write_input_tokens": 6711808,
+                    "output_tokens": 364803,
+                    "reasoning_output_tokens": 57778,
+                    "total_tokens": 319954996
+                },
+                "last_token_usage": {
+                    "input_tokens": 203881,
+                    "cached_input_tokens": 0,
+                    "cache_write_input_tokens": 203740,
+                    "output_tokens": 280,
+                    "reasoning_output_tokens": 184,
+                    "total_tokens": 204161
+                },
+                "model_context_window": 258400
+            },
+            "rate_limits": {
+                "limit_id": "codex",
+                "limit_name": null,
+                "primary": {
+                    "used_percent": 0.0,
+                    "window_minutes": 1,
+                    "resets_at": 1787087041
+                },
+                "secondary": {
+                    "used_percent": 0.0,
+                    "window_minutes": 300,
+                    "resets_at": 1787102386
+                },
+                "credits": {
+                    "has_credits": true,
+                    "unlimited": true,
+                    "balance": null
+                },
+                "individual_limit": null,
+                "spend_control_reached": null,
+                "plan_type": "business",
+                "rate_limit_reached_type": null
+            }
+        }
+    });
+    let token_count = serde_json::to_string(&token_count)?;
+    let decoded: RolloutLine = serde_json::from_str(&token_count)?;
+    assert_eq!(decoded.ordinal, Some(5));
+    let mut file = fs::OpenOptions::new().append(true).open(&rollout_path)?;
+    writeln!(file, "{token_count}")?;
+    drop(file);
+
+    append_rollout_item_to_path(&rollout_path, &agent_message_item("offline")).await?;
+    let source = fs::read_to_string(&rollout_path)?;
+    let final_line: RolloutLine =
+        serde_json::from_str(source.lines().next_back().expect("appended rollout record"))?;
+    assert_eq!(final_line.ordinal, Some(6));
+    Ok(())
+}
+
 #[tokio::test]
 async fn list_threads_db_disabled_does_not_skip_paginated_items() -> std::io::Result<()> {
     let home = TempDir::new().expect("temp dir");

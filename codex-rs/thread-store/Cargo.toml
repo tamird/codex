@@ -29,6 +29,7 @@ codex-utils-path-uri = { workspace = true }
 futures = { workspace = true }
 libc = { workspace = true }
 pulldown-cmark = { workspace = true }
+regex = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true, features = ["arbitrary_precision", "raw_value"] }
 sha2 = { workspace = true }
@@ -42,5 +43,5 @@ zstd = { workspace = true }
 [dev-dependencies]
 codex-utils-absolute-path = { workspace = true }
 pretty_assertions = { workspace = true }
-tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
 uuid = { workspace = true }

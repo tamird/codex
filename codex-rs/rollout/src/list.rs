@@ -21,7 +21,6 @@ use super::SESSIONS_SUBDIR;
 use super::compression;
 use super::rollout_file_name::RolloutFileName;
 use crate::RolloutItem;
-use crate::RolloutLine;
 use crate::protocol::EventMsg;
 use crate::state_db;
 use codex_file_search as file_search;
@@ -771,7 +770,9 @@ async fn read_listing_session_meta_line(path: &Path) -> io::Result<SessionMetaLi
             continue;
         }
         records_scanned += 1;
-        let Ok(rollout_line) = serde_json::from_str::<RolloutLine>(trimmed) else {
+        let Ok(Some(rollout_line)) =
+            crate::recorder::RolloutRecorder::parse_rollout_line_bytes(trimmed.as_bytes())
+        else {
             if let Ok(value) = serde_json::from_str::<Value>(trimmed) {
                 crate::recorder::reject_unknown_thread_history_mode(&value)?;
             }
@@ -1240,9 +1241,10 @@ async fn read_head_summary_with_references(
             continue;
         }
 
-        let parsed: Result<RolloutLine, _> = serde_json::from_str(trimmed);
+        let parsed = crate::recorder::RolloutRecorder::parse_rollout_line_bytes(trimmed.as_bytes());
         let rollout_line = match parsed {
-            Ok(rollout_line) => rollout_line,
+            Ok(Some(rollout_line)) => rollout_line,
+            Ok(None) => continue,
             Err(_) => {
                 if !summary.saw_session_meta
                     && let Ok(value) = serde_json::from_str::<Value>(trimmed)
@@ -1399,7 +1401,9 @@ pub async fn read_head_for_summary(path: &Path) -> io::Result<Vec<serde_json::Va
         if trimmed.is_empty() {
             continue;
         }
-        if let Ok(rollout_line) = serde_json::from_str::<RolloutLine>(trimmed) {
+        if let Ok(Some(rollout_line)) =
+            crate::recorder::RolloutRecorder::parse_rollout_line_bytes(trimmed.as_bytes())
+        {
             match rollout_line.item {
                 RolloutItem::SessionMeta(session_meta_line) => {
                     if let Ok(value) = serde_json::to_value(session_meta_line) {
@@ -1472,7 +1476,9 @@ async fn read_session_meta_from_reader(
         if trimmed.is_empty() {
             continue;
         }
-        let Ok(rollout_line) = serde_json::from_str::<RolloutLine>(trimmed) else {
+        let Ok(Some(rollout_line)) =
+            crate::recorder::RolloutRecorder::parse_rollout_line_bytes(trimmed.as_bytes())
+        else {
             if let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) {
                 crate::recorder::reject_unknown_thread_history_mode(&value)?;
             }

@@ -5,6 +5,7 @@
 //! both answers because removing rollback markers must not change what the next resume sends to
 //! the model.
 
+use codex_protocol::items::TurnItem;
 use codex_protocol::protocol::EventMsg;
 use codex_rollout::RolloutItem;
 
@@ -81,6 +82,15 @@ impl ModelReplayPlanner {
             | RolloutItem::WorldState(_) => return,
         };
         self.records.push(record);
+    }
+
+    pub(super) fn observe_paginated(&mut self, record_index: usize, item: &RolloutItem) {
+        if matches!(item, RolloutItem::EventMsg(EventMsg::ItemCompleted(event)) if matches!(event.item, TurnItem::UserMessage(_)))
+        {
+            self.records.push(ReplayRecord::UserBoundary);
+        } else {
+            self.observe(record_index, item);
+        }
     }
 
     pub(super) fn finish(self) -> ModelReplayPlan {

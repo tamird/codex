@@ -13,7 +13,7 @@ use crate::compression;
 /// Filenames for reverted threads append an underscore and a distinct rollout ID after the stable
 /// thread ID.
 #[derive(Debug, PartialEq, Eq)]
-pub(crate) struct RolloutFileName {
+pub struct RolloutFileName {
     timestamp: OffsetDateTime,
     thread_id: ThreadId,
     rollout_id: RolloutId,
@@ -36,7 +36,8 @@ impl RolloutFileName {
         }
     }
 
-    pub(crate) fn parse(name: &str) -> Option<Self> {
+    /// Parses a canonical plain or compressed rollout basename.
+    pub fn parse(name: &str) -> Option<Self> {
         let name = compression::parse_rollout_file_name(name)?;
         let core = name.strip_prefix("rollout-")?.strip_suffix(".jsonl")?;
         let timestamp = core.get(..19)?;
@@ -73,11 +74,13 @@ impl RolloutFileName {
         })
     }
 
-    pub(crate) fn timestamp(&self) -> OffsetDateTime {
+    /// Returns the UTC creation timestamp encoded in the basename.
+    pub fn timestamp(&self) -> OffsetDateTime {
         self.timestamp
     }
 
-    pub(crate) fn thread_id(&self) -> ThreadId {
+    /// Returns the stable thread identity, including for reverted physical rollouts.
+    pub fn thread_id(&self) -> ThreadId {
         self.thread_id
     }
 

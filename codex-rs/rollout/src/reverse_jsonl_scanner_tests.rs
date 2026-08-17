@@ -1,6 +1,7 @@
 use std::io::Cursor;
 use std::io::Read;
 use std::io::Seek;
+use std::path::Path;
 
 use pretty_assertions::assert_eq;
 use serde::Deserialize;
@@ -195,4 +196,86 @@ fn scans_record_spanning_three_read_chunks() -> std::io::Result<()> {
     let mut scanner = ReverseJsonlScanner::new(Cursor::new(input.into_bytes()))?;
 
     assert_records(&mut scanner, &["third", &large_value, "first"])
+}
+
+#[test]
+fn scans_rollout_line_with_arbitrary_precision_decimal_payload() -> std::io::Result<()> {
+    let input = br#"{"timestamp":"2026-08-14T00:00:00Z","ordinal":7,"type":"event_msg","payload":{"type":"token_count","info":null,"rate_limits":{"primary":{"used_percent":5.0,"window_minutes":300,"resets_at":1786689000},"secondary":{"used_percent":12.5,"window_minutes":10080,"resets_at":1787292000}}}}
+"#;
+    let directly_decoded = serde_json::from_slice::<crate::RolloutLine>(input)?;
+    assert_eq!(directly_decoded.ordinal, Some(7));
+    let mut scanner = ReverseJsonlScanner::new(Cursor::new(input))?;
+
+    let line = parsed(scanner.scan_next_rollout_line()?);
+
+    assert_eq!(line.ordinal, Some(7));
+    assert!(matches!(
+        line.item,
+        crate::RolloutItem::EventMsg(codex_protocol::protocol::EventMsg::TokenCount(_))
+    ));
+    Ok(())
+}
+
+#[test]
+fn runtime_history_readers_use_rollout_compatibility_decoders() {
+    fn inspect(path: &Path, violations: &mut Vec<String>) {
+        if path.is_dir() {
+            for entry in std::fs::read_dir(path).expect("read source directory") {
+                inspect(&entry.expect("read source entry").path(), violations);
+            }
+            return;
+        }
+        if path.extension().and_then(|extension| extension.to_str()) != Some("rs")
+            || path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name == "tests.rs" || name.ends_with("_tests.rs"))
+            || path
+                .components()
+                .any(|component| component.as_os_str() == "tests")
+        {
+            return;
+        }
+        let source = std::fs::read_to_string(path).expect("read Rust source");
+        for (index, line) in source.lines().enumerate() {
+            let direct_turbofish = line.contains("::<RolloutLine>")
+                || line.contains("::<codex_rollout::RolloutLine>")
+                || line.contains("::<crate::RolloutLine>");
+            let inferred_result =
+                line.contains("Result<RolloutLine") && line.contains("serde_json::from_");
+            if direct_turbofish || inferred_result {
+                violations.push(format!("{}:{}: {line}", path.display(), index + 1));
+            }
+        }
+    }
+
+    let workspace = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("rollout crate has workspace parent");
+    let mut violations = Vec::new();
+    for relative in ["rollout/src", "app-server/src", "tui/src"] {
+        let root = workspace.join(relative);
+        if root.exists() {
+            inspect(root.as_path(), &mut violations);
+        }
+    }
+    for relative in [
+        "thread-store/src/local/live_writer.rs",
+        "thread-store/src/local/rollout_lineage.rs",
+        "thread-store/src/local/segment.rs",
+        "thread-store/src/local/thread_history/read.rs",
+        "thread-store/src/local/thread_history_materialization.rs",
+    ] {
+        let file = workspace.join(relative);
+        if file.exists() {
+            inspect(file.as_path(), &mut violations);
+        }
+    }
+
+    assert!(
+        violations.is_empty(),
+        "persisted RolloutLine records must use decode_rollout_line, \
+         RolloutRecorder::parse_rollout_line_*, or scan_next_rollout_line:\n{}",
+        violations.join("\n")
+    );
 }

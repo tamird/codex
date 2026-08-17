@@ -12,14 +12,19 @@ use std::sync::Mutex as StdMutex;
 use std::time::Duration;
 
 use codex_protocol::ThreadId;
+use codex_protocol::protocol::HistoryPosition;
 use codex_protocol::protocol::ThreadHistoryMode;
 use tempfile::NamedTempFile;
+use tokio::io::AsyncBufReadExt;
+use tokio::io::AsyncSeekExt;
+use tokio::io::BufReader;
 #[cfg(test)]
 use tokio::sync::Notify;
 use tracing::warn;
 
 use super::LocalThreadStore;
 use super::live_writer;
+use super::ordinal_recovery;
 use super::thread_history;
 use super::thread_history_materialization;
 use super::thread_rollout_resolver;
@@ -68,13 +73,16 @@ pub(super) fn inject_projection_rebuild_pause(thread_id: ThreadId) -> Arc<Projec
 
 /// A delayed rebuild selected by the most recent unprojected read.
 ///
-/// A newer read aborts the previous task, including an in-progress rebuild. Dropping the rebuild
-/// future rolls back its SQLite transaction and leaves its staging marker for the next rebuild to
-/// remove. This keeps complete-lineage maintenance out of interactive request measurements and
-/// prevents a user request from competing with projection repair for memory and I/O.
+/// A newer read resets the quiet period before work begins. Once the rebuild starts, later reads
+/// leave it running so a frequently opened thread cannot starve its projection repair.
 pub(super) struct ScheduledProjectionRebuild {
     generation: u64,
-    abort: Option<tokio::task::AbortHandle>,
+    state: ScheduledProjectionRebuildState,
+}
+
+enum ScheduledProjectionRebuildState {
+    Waiting(Option<tokio::task::AbortHandle>),
+    Rebuilding,
 }
 
 pub(super) type ScheduledProjectionRebuilds = HashMap<ThreadId, ScheduledProjectionRebuild>;
@@ -86,16 +94,28 @@ pub(super) async fn schedule(store: LocalThreadStore, thread_id: ThreadId) {
         let mut schedules = schedules
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if schedules.get(&thread_id).is_some_and(|scheduled| {
+            matches!(
+                scheduled.state,
+                ScheduledProjectionRebuildState::Rebuilding
+                    | ScheduledProjectionRebuildState::Waiting(None)
+            )
+        }) {
+            return;
+        }
         let previous = schedules.remove(&thread_id);
         let generation = previous
             .as_ref()
             .map_or(0, |scheduled| scheduled.generation.wrapping_add(1));
-        let previous_abort = previous.and_then(|scheduled| scheduled.abort);
+        let previous_abort = previous.and_then(|scheduled| match scheduled.state {
+            ScheduledProjectionRebuildState::Waiting(abort) => abort,
+            ScheduledProjectionRebuildState::Rebuilding => None,
+        });
         schedules.insert(
             thread_id,
             ScheduledProjectionRebuild {
                 generation,
-                abort: None,
+                state: ScheduledProjectionRebuildState::Waiting(None),
             },
         );
         (generation, previous_abort)
@@ -108,6 +128,18 @@ pub(super) async fn schedule(store: LocalThreadStore, thread_id: ThreadId) {
     let task_schedules = Arc::clone(&schedules);
     let task = tokio::spawn(async move {
         tokio::time::sleep(BACKGROUND_REBUILD_QUIET_PERIOD).await;
+        {
+            let mut schedules = task_schedules
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let Some(scheduled) = schedules
+                .get_mut(&thread_id)
+                .filter(|scheduled| scheduled.generation == generation)
+            else {
+                return;
+            };
+            scheduled.state = ScheduledProjectionRebuildState::Rebuilding;
+        }
         if let Err(error) = rebuild(&store, thread_id).await {
             warn!(%thread_id, %error, "background Paginated history projection rebuild failed");
         }
@@ -126,9 +158,18 @@ pub(super) async fn schedule(store: LocalThreadStore, thread_id: ThreadId) {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     match schedules.get_mut(&thread_id) {
-        Some(scheduled) if scheduled.generation == generation => {
-            scheduled.abort = Some(abort);
+        Some(scheduled)
+            if scheduled.generation == generation
+                && matches!(
+                    scheduled.state,
+                    ScheduledProjectionRebuildState::Waiting(None)
+                ) =>
+        {
+            scheduled.state = ScheduledProjectionRebuildState::Waiting(Some(abort));
         }
+        Some(scheduled)
+            if scheduled.generation == generation
+                && matches!(scheduled.state, ScheduledProjectionRebuildState::Rebuilding) => {}
         _ => abort.abort(),
     }
 }
@@ -184,6 +225,10 @@ fn register(
     Some(ProjectionRebuildRegistration { active, thread_id })
 }
 
+#[expect(
+    clippy::await_holding_invalid_type,
+    reason = "staging cleanup and publication must exclude other projection rebuilds in this store"
+)]
 async fn rebuild_registered(
     store: &LocalThreadStore,
     thread_id: ThreadId,
@@ -191,7 +236,11 @@ async fn rebuild_registered(
     if store.state_db.is_none() {
         return Ok(false);
     }
+    let _rebuild_gate = store.projection_rebuild_gate.lock().await;
     cleanup_stale_staging(store).await?;
+    if store.has_history_projection(thread_id).await? {
+        return Ok(true);
+    }
     for _ in 0..MAX_REBUILD_ATTEMPTS {
         let Some(selected) =
             thread_rollout_resolver::resolve_current_including_archived(store, thread_id).await?
@@ -213,11 +262,20 @@ async fn rebuild_registered(
         {
             return Ok(false);
         }
+        let ordinal_recovery = ordinal_recovery::prepare(store, &selected, &session_meta).await?;
+        let projection_lineage = match ordinal_recovery.as_ref() {
+            Some(recovery) => {
+                store
+                    .resolve_rollout_lineage_from_path(thread_id, &recovery.rollout_path)
+                    .await?
+            }
+            None => lineage.clone(),
+        };
 
         let staging_thread_id = ThreadId::new();
         let staging_guard =
             ProjectionStagingGuard::create(store, thread_id, staging_thread_id).await?;
-        let staged_result = stage_lineage(store, staging_thread_id, &lineage).await;
+        let staged_result = stage_lineage(store, staging_thread_id, &projection_lineage).await;
         if let Err(error) = staged_result {
             discard_staging(store, staging_thread_id, staging_guard).await?;
             return Err(error);
@@ -227,8 +285,17 @@ async fn rebuild_registered(
         #[cfg(test)]
         pause_after_staging(thread_id).await;
 
-        let _lifecycle = store.live_writer_locks.reserve_lifecycle(thread_id).await;
-        let _writers = store.reserve_rollout_writers(&[thread_id]).await?;
+        // Ordinal recovery already holds both reservations through corrected-file publication.
+        let _lifecycle = if ordinal_recovery.is_none() {
+            Some(store.live_writer_locks.reserve_lifecycle(thread_id).await)
+        } else {
+            None
+        };
+        let _writers = if ordinal_recovery.is_none() {
+            Some(store.reserve_rollout_writers(&[thread_id]).await?)
+        } else {
+            None
+        };
         match live_writer::persist_thread_reserved(store, thread_id).await {
             Ok(()) | Err(ThreadStoreError::ThreadNotFound { .. }) => {}
             Err(error) => {
@@ -241,36 +308,62 @@ async fn rebuild_registered(
             discard_staging(store, staging_thread_id, staging_guard).await?;
             continue;
         }
-        let active = current
+        let active = projection_lineage
             .segments
             .last()
             .ok_or_else(|| projection_error("selected lineage has no active segment"))?;
         let active_path = codex_rollout::existing_rollout_path(active.rollout_path())
             .await
             .ok_or_else(|| projection_error("selected active rollout is unavailable"))?;
-        if active_path.extension().and_then(|value| value.to_str()) == Some("zst") {
-            discard_staging(store, staging_thread_id, staging_guard).await?;
-            return Err(projection_error("selected active rollout is compressed"));
+        let active_is_compressed =
+            active_path.extension().and_then(|value| value.to_str()) == Some("zst");
+        if active_is_compressed {
+            let archived = store
+                .state_db
+                .as_ref()
+                .ok_or_else(|| projection_error("projection rebuild requires SQLite metadata"))?
+                .get_thread(thread_id)
+                .await
+                .map_err(|error| {
+                    projection_error(format!("failed to read archived thread metadata: {error}"))
+                })?
+                .is_some_and(|metadata| metadata.archived_at.is_some());
+            if !archived {
+                discard_staging(store, staging_thread_id, staging_guard).await?;
+                return Err(projection_error("selected active rollout is compressed"));
+            }
+        } else {
+            // An unarchived active rollout may have appended after the lineage snapshot. Catch its
+            // projection up while the writer is reserved before publishing the staged rows.
+            thread_history_materialization::materialize_to_sqlite(
+                store,
+                staging_thread_id,
+                active_path.as_path(),
+            )
+            .await?;
         }
-        thread_history_materialization::materialize_to_sqlite(
-            store,
-            staging_thread_id,
-            active_path.as_path(),
-        )
-        .await?;
         let staged_state = thread_history::projection_state(store, staging_thread_id)
             .await?
             .ok_or_else(|| projection_error("staged projection has no checkpoint"))?;
-        let active_len = tokio::fs::metadata(active_path.as_path())
-            .await
-            .map_err(projection_io_error)?
-            .len();
-        if staged_state.next_byte_offset != active_len {
-            discard_staging(store, staging_thread_id, staging_guard).await?;
-            continue;
+        if !active_is_compressed {
+            let active_len = tokio::fs::metadata(active_path.as_path())
+                .await
+                .map_err(projection_io_error)?
+                .len();
+            if staged_state.next_byte_offset != active_len {
+                discard_staging(store, staging_thread_id, staging_guard).await?;
+                continue;
+            }
         }
-        thread_history::publish_staged_projection(store, selected.rollout_id, staging_thread_id)
-            .await?;
+        thread_history::publish_staged_projection(
+            store,
+            projection_lineage.root_rollout_id,
+            staging_thread_id,
+        )
+        .await?;
+        if let Some(recovery) = ordinal_recovery {
+            recovery.select(store, thread_id).await?;
+        }
         staging_guard.remove().await?;
         return Ok(true);
     }
@@ -454,25 +547,152 @@ async fn stage_lineage(
                 ))
             })?;
         let prepared = ProjectionInput::prepare(store, existing).await?;
-        let expected_end = segment.jsonl_end_byte_offset();
-        let actual_len = tokio::fs::metadata(prepared.path())
-            .await
-            .map_err(projection_io_error)?
-            .len();
-        if expected_end.is_some_and(|end| end != actual_len) {
+        start_segment(store, staging_thread_id, prepared.path(), segment).await?;
+        if let Some(end_ordinal_exclusive) = segment.end_ordinal_exclusive {
+            let end_byte_offset = match segment.jsonl_end_byte_offset() {
+                Some(offset) => offset,
+                None => super::rollout_lineage::byte_offset_for_ordinal(
+                    prepared.path(),
+                    end_ordinal_exclusive,
+                )
+                .await?
+                .ok_or_else(|| projection_error("decoded lineage segment has no byte boundary"))?,
+            };
+            thread_history_materialization::materialize_prefix_to_sqlite(
+                store,
+                staging_thread_id,
+                prepared.path(),
+                HistoryPosition {
+                    thread_id: segment.rollout_id,
+                    end_ordinal_exclusive,
+                    end_byte_offset,
+                },
+            )
+            .await?;
+        } else {
+            // The active segment has no fixed ordinal cutoff. Its writer may still append;
+            // the reserved-writer catch-up below verifies the final publication boundary.
+            thread_history_materialization::materialize_to_sqlite(
+                store,
+                staging_thread_id,
+                prepared.path(),
+            )
+            .await?;
+        }
+    }
+    Ok(())
+}
+
+/// Starts each physical file at its own metadata boundary while retaining the selected history.
+async fn start_segment(
+    store: &LocalThreadStore,
+    staging_thread_id: ThreadId,
+    path: &Path,
+    segment: &super::rollout_lineage::RolloutLineageSegment,
+) -> ThreadStoreResult<()> {
+    let head = super::rollout_lineage::read_rollout_head(path).await?;
+    let metadata_ordinal = head
+        .session_meta_ordinal
+        .ok_or_else(|| projection_error("lineage metadata has no ordinal"))?;
+    let state = thread_history::projection_state(store, staging_thread_id).await?;
+    let next_ordinal = match state {
+        Some(state) => state.next_ordinal,
+        None if head.leading_reference.is_none()
+            && head.session_meta.meta.history_base.is_none() =>
+        {
+            metadata_ordinal
+        }
+        None => {
+            return Err(projection_error(
+                "lineage segment has no projected predecessor",
+            ));
+        }
+    };
+    let expected_start = if let Some((reference_ordinal, reference)) = &head.leading_reference {
+        let predecessor_end = reference_ordinal
+            .checked_sub(1)
+            .ok_or_else(|| projection_error("lineage reference precedes its metadata"))?;
+        // Older compatibility files repeat metadata at ordinal zero. A user-message cutoff can
+        // also omit part of the referenced ordinal range; no other reference authorizes that gap.
+        if (metadata_ordinal != predecessor_end && metadata_ordinal != 0)
+            || next_ordinal > predecessor_end
+            || (next_ordinal != predecessor_end && reference.nth_user_message.is_none())
+        {
             return Err(projection_error(format!(
-                "lineage segment {} selects {expected_end:?} of {actual_len} decoded bytes",
+                "lineage segment {} has metadata ordinal {metadata_ordinal} and reference ordinal \
+                 {reference_ordinal}, after projected ordinal {next_ordinal}",
                 segment.rollout_path().display()
             )));
         }
-        thread_history_materialization::materialize_to_sqlite(
-            store,
-            staging_thread_id,
-            prepared.path(),
-        )
-        .await?;
+        *reference_ordinal
+    } else {
+        if next_ordinal != metadata_ordinal
+            || head
+                .session_meta
+                .meta
+                .history_base
+                .is_some_and(|base| base.end_ordinal_exclusive != metadata_ordinal)
+        {
+            return Err(projection_error(format!(
+                "lineage segment {} starts at metadata ordinal {metadata_ordinal}, \
+                 after projected ordinal {next_ordinal}",
+                segment.rollout_path().display()
+            )));
+        }
+        metadata_ordinal
+            .checked_add(1)
+            .ok_or_else(|| projection_error("lineage metadata ordinal overflow"))?
+    };
+    if head.session_meta.meta.id != segment.thread_id
+        || head.session_meta.meta.history_mode != ThreadHistoryMode::Paginated
+        || head.first_local_ordinal != expected_start
+        || segment.start_ordinal != expected_start
+    {
+        return Err(projection_error(format!(
+            "lineage segment {} does not start at expected local ordinal {expected_start}",
+            segment.rollout_path().display()
+        )));
     }
-    Ok(())
+
+    let file = tokio::fs::File::open(path)
+        .await
+        .map_err(projection_io_error)?;
+    let mut reader = BufReader::new(file);
+    let mut bytes = Vec::new();
+    loop {
+        bytes.clear();
+        let count = reader
+            .read_until(b'\n', &mut bytes)
+            .await
+            .map_err(projection_io_error)?;
+        if count == 0 || !bytes.ends_with(b"\n") {
+            return Err(projection_error(
+                "lineage metadata is not a complete JSONL record",
+            ));
+        }
+        if !bytes.iter().all(u8::is_ascii_whitespace) {
+            break;
+        }
+    }
+    let metadata_end = reader
+        .stream_position()
+        .await
+        .map_err(projection_io_error)?;
+
+    thread_history::reset_projection_for_replacement(store, staging_thread_id, next_ordinal)
+        .await?;
+    thread_history::apply_projection(
+        store,
+        staging_thread_id,
+        /*start_offset*/ 0,
+        metadata_end,
+        next_ordinal,
+        vec![thread_history::RolloutProjectionStep::SkippedOrdinalRange {
+            start_ordinal: next_ordinal,
+            end_ordinal_exclusive: expected_start,
+        }],
+    )
+    .await
 }
 
 /// Plain path retained with an optional temporary decompression owner.

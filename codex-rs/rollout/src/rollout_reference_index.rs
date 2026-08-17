@@ -18,7 +18,6 @@ use codex_protocol::protocol::SessionMetaLine;
 use crate::ARCHIVED_SESSIONS_SUBDIR;
 use crate::ROTATED_ROLLOUT_SEGMENTS_SUBDIR;
 use crate::RolloutItem;
-use crate::RolloutLine;
 use crate::SESSIONS_SUBDIR;
 
 /// Direct history-base edges discovered from local rollout metadata.
@@ -237,7 +236,9 @@ async fn read_direct_reference_metadata(
     let mut session_meta = None;
     let mut leading_reference = None;
     while let Some(line) = reader.next_line().await? {
-        let Ok(line) = serde_json::from_str::<RolloutLine>(line.trim()) else {
+        let Ok(Some(line)) =
+            crate::recorder::RolloutRecorder::parse_rollout_line_bytes(line.trim().as_bytes())
+        else {
             continue;
         };
         match line.item {

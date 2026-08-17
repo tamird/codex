@@ -79,7 +79,13 @@ pub(super) async fn read_thread(
             );
             thread = rollout_thread;
         }
-        attach_history_if_requested(store, &mut thread, params.include_history).await?;
+        attach_history_if_requested(
+            store,
+            &mut thread,
+            params.include_history,
+            HistorySelection::Current,
+        )
+        .await?;
         return Ok(thread);
     }
 
@@ -101,7 +107,13 @@ pub(super) async fn read_thread(
             message: format!("thread {} is archived", thread.thread_id),
         });
     }
-    attach_history_if_requested(store, &mut thread, params.include_history).await?;
+    attach_history_if_requested(
+        store,
+        &mut thread,
+        params.include_history,
+        HistorySelection::Current,
+    )
+    .await?;
     Ok(thread)
 }
 
@@ -215,7 +227,8 @@ pub(super) async fn read_thread_by_rollout_path(
             );
         }
     }
-    attach_history_if_requested(store, &mut thread, include_history).await?;
+    attach_history_if_requested(store, &mut thread, include_history, HistorySelection::Exact)
+        .await?;
     Ok(thread)
 }
 
@@ -260,10 +273,18 @@ async fn resolve_requested_rollout_path(
     })
 }
 
+/// Explicit rollout reads retain their requested history even when another rollout is selected.
+#[derive(Clone, Copy)]
+enum HistorySelection {
+    Current,
+    Exact,
+}
+
 async fn attach_history_if_requested(
     store: &LocalThreadStore,
     thread: &mut StoredThread,
     include_history: bool,
+    selection: HistorySelection,
 ) -> ThreadStoreResult<()> {
     if !include_history {
         return Ok(());
@@ -274,14 +295,28 @@ async fn attach_history_if_requested(
             message: format!("failed to load thread history for thread {thread_id}"),
         });
     };
-    let _history_access =
-        super::goal_supervisor_runtime_repair::repair_recent_history_before_access(
-            store,
-            thread_id,
-            path.as_path(),
-        )
-        .await?;
-    if let Ok(live_path) = super::live_writer::rollout_path(store, thread_id).await {
+    let _history_access = match selection {
+        HistorySelection::Current => {
+            super::goal_supervisor_runtime_repair::repair_selected_history_before_access(
+                store,
+                thread_id,
+                path.as_path(),
+                super::goal_supervisor_runtime_repair::RepairAccess::Recent,
+            )
+            .await?
+        }
+        HistorySelection::Exact => {
+            super::goal_supervisor_runtime_repair::repair_recent_history_before_access(
+                store,
+                thread_id,
+                path.as_path(),
+            )
+            .await?
+        }
+    };
+    if matches!(selection, HistorySelection::Current)
+        && let Ok(live_path) = super::live_writer::rollout_path(store, thread_id).await
+    {
         path = live_path;
     }
     path = codex_rollout::existing_rollout_path(path.as_path())
@@ -524,7 +559,14 @@ async fn thread_name_from_metadata(
     history_mode: ThreadHistoryMode,
 ) -> Option<String> {
     match history_mode {
-        ThreadHistoryMode::Paginated => sqlite_thread_name(metadata),
+        ThreadHistoryMode::Paginated if metadata.name.is_some() => sqlite_thread_name(metadata),
+        ThreadHistoryMode::Paginated => {
+            find_thread_name_by_id(store.config.codex_home.as_path(), &metadata.id)
+                .await
+                .ok()
+                .flatten()
+                .filter(|name| !name.trim().is_empty())
+        }
         ThreadHistoryMode::Legacy => {
             if let Some(title) = distinct_thread_metadata_title(metadata) {
                 Some(title)

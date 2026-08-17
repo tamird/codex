@@ -3586,6 +3586,9 @@ model = "gpt-5.1-codex"
     async fn side_fork_excludes_turns_without_clearing_regular_ephemeral_fork() -> Result<()> {
         let codex_home = tempfile::tempdir().expect("tempdir");
         let mut config = build_config(&codex_home).await;
+        config
+            .features
+            .disable(Feature::BackgroundPaginatedRolloutMigration)?;
         config.ephemeral = true;
         let thread_id = ThreadId::from_string(
             &create_fake_rollout(

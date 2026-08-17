@@ -9043,6 +9043,67 @@ async fn queued_thread_settings_fail_after_checkpoint_becomes_indeterminate() {
 }
 
 #[tokio::test]
+async fn queued_client_info_update_succeeds_after_compacted_checkpoint_commits() {
+    let (mut session, turn_context, _) = make_session_and_context_with_rx().await;
+    attach_thread_persistence(
+        Arc::get_mut(&mut session).expect("session should be uniquely owned"),
+    )
+    .await;
+    let prepared_window_advance = session.prepare_auto_compact_window_advance().await;
+    let checkpoint_session = Arc::clone(&session);
+    let checkpoint_turn_context = Arc::clone(&turn_context);
+    let checkpoint = tokio::spawn(async move {
+        checkpoint_session
+            .replace_compacted_history(
+                &checkpoint_turn_context,
+                vec![ResponseItemEnvelope::new(user_message(
+                    "replacement history",
+                ))],
+                /*reference_context_item*/ None,
+                /*world_state_baseline*/ None,
+                CompactedHistoryMetadata {
+                    message: "compacted summary".to_string(),
+                    prepared_window_advance,
+                },
+            )
+            .await
+    });
+
+    while !session.persistence_restart_required() {
+        assert!(
+            !checkpoint.is_finished(),
+            "checkpoint must arm the restart fence before it commits"
+        );
+        tokio::task::yield_now().await;
+    }
+
+    let update_session = Arc::clone(&session);
+    let update = tokio::spawn(async move {
+        update_session
+            .set_app_server_client_info(
+                Some("codex-tui".to_string()),
+                Some("test-version".to_string()),
+                /*mcp_elicitations_auto_deny*/ false,
+            )
+            .await
+    });
+    tokio::task::yield_now().await;
+    assert!(
+        !update.is_finished(),
+        "client metadata update must wait for checkpoint classification"
+    );
+
+    checkpoint
+        .await
+        .expect("checkpoint task should finish")
+        .expect("checkpoint should commit");
+    update
+        .await
+        .expect("client metadata task should finish")
+        .expect("committed checkpoint must admit queued client metadata");
+}
+
+#[tokio::test]
 async fn turn_environments_set_primary_environment() {
     let (session, _turn_context, _rx) = make_session_and_context_with_rx().await;
     let selected_cwd =

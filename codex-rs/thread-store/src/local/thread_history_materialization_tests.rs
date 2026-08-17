@@ -161,12 +161,22 @@ async fn split_homes_support_backfill_listing_and_paginated_history() {
     .await
     .expect("create paginated rollout");
     recorder
-        .record_canonical_items(&[RolloutItem::EventMsg(EventMsg::UserMessage(
-            UserMessageEvent {
-                message: "existing thread".to_string(),
-                ..Default::default()
-            },
-        ))])
+        .record_canonical_items(&[
+            turn_started("existing-turn"),
+            completed_item(
+                thread_id,
+                "existing-turn",
+                TurnItem::UserMessage(UserMessageItem {
+                    id: "existing-user".to_string(),
+                    client_id: None,
+                    content: vec![codex_protocol::user_input::UserInput::Text {
+                        text: "existing thread".to_string(),
+                        text_elements: Vec::new(),
+                    }],
+                }),
+            ),
+            turn_completed("existing-turn"),
+        ])
         .await
         .expect("record existing user message");
     recorder.persist().await.expect("persist paginated rollout");
@@ -294,11 +304,18 @@ async fn split_homes_support_backfill_listing_and_paginated_history() {
                 )
             })
             .collect::<Vec<_>>(),
-        vec![(
-            "turn-1",
-            StoredTurnStatus::Completed,
-            vec!["user-1", "agent-1"],
-        )]
+        vec![
+            (
+                "existing-turn",
+                StoredTurnStatus::Completed,
+                vec!["existing-user"]
+            ),
+            (
+                "turn-1",
+                StoredTurnStatus::Completed,
+                vec!["user-1", "agent-1"]
+            ),
+        ]
     );
 
     let state_db_path = sqlite.state_db_path();
@@ -1488,6 +1505,77 @@ async fn paginated_realtime_items_materialize_separately_in_rollout_order() {
 }
 
 #[tokio::test]
+async fn paginated_legacy_events_never_publish_a_complete_stateless_projection() {
+    let home = TempDir::new().expect("temporary home");
+    let store = projection_store(home.path()).await;
+    let thread_id = ThreadId::new();
+    create_paginated_thread(&store, thread_id).await;
+    store
+        .persist_thread(thread_id, PersistContext::Standard)
+        .await
+        .expect("persist metadata");
+    let rollout_path = store
+        .live_rollout_path(thread_id)
+        .await
+        .expect("rollout path");
+    append_suffix(
+        &rollout_path,
+        &format!(
+            "{}\n",
+            rollout_line(
+                Some(1),
+                RolloutItem::EventMsg(EventMsg::UserMessage(UserMessageEvent {
+                    message: "legacy history must remain visible".to_string(),
+                    ..Default::default()
+                }))
+            )
+        ),
+    );
+    let mut expected_bytes = fs::read(&rollout_path).expect("legacy event bytes");
+    for append_canonical in [false, true] {
+        if append_canonical {
+            let suffix = format!(
+                "{}\n{}\n{}\n",
+                rollout_line(Some(2), turn_started("canonical-suffix")),
+                rollout_line(
+                    Some(3),
+                    completed_item(
+                        thread_id,
+                        "canonical-suffix",
+                        agent_message("canonical-item", MessagePhase::FinalAnswer),
+                    ),
+                ),
+                rollout_line(Some(4), turn_completed("canonical-suffix"))
+            );
+            append_suffix(&rollout_path, &suffix);
+            expected_bytes.extend_from_slice(suffix.as_bytes());
+        }
+        assert!(matches!(
+            super::materialize_to_sqlite(&store, thread_id, &rollout_path).await,
+            Err(ThreadStoreError::Unsupported {
+                operation: "materialize_paginated_legacy_event"
+            })
+        ));
+        assert!(matches!(
+            store.rebuild_history_projection(thread_id).await,
+            Err(ThreadStoreError::Unsupported {
+                operation: "materialize_paginated_legacy_event"
+            })
+        ));
+        assert!(
+            !store
+                .has_history_projection(thread_id)
+                .await
+                .expect("projection remains incomplete")
+        );
+        assert_eq!(
+            fs::read(&rollout_path).expect("source unchanged"),
+            expected_bytes
+        );
+    }
+}
+
+#[tokio::test]
 async fn paginated_projection_streams_across_multiple_byte_batches() {
     let home = TempDir::new().expect("temp dir");
     let store = projection_store(home.path()).await;
@@ -1649,6 +1737,15 @@ async fn referenced_paginated_rollout_projects_inherited_ordinal_range() {
         "source message after child boundary"
     ));
     let latest_history_base = latest_prepared.history_base;
+    let latest_frozen_bytes = fs::read(
+        &latest_prepared
+            .frozen_segment
+            .as_ref()
+            .expect("latest immutable prefix")
+            .reference
+            .rollout_path,
+    )
+    .expect("read latest immutable prefix");
     for (boundary, expected_base) in [
         (ForkBoundary::Latest, latest_history_base),
         (
@@ -1666,7 +1763,35 @@ async fn referenced_paginated_rollout_projects_inherited_ordinal_range() {
         (ForkBoundary::BeforeTurn("source-turn".to_string()), None),
     ] {
         let prepared = prepare_paginated_fork(&store, child_id, boundary).await;
-        assert_eq!(prepared.history_base, expected_base);
+        if expected_base.is_some() && expected_base == latest_history_base {
+            let frozen = prepared.frozen_segment.as_ref().expect("immutable prefix");
+            let position = prepared.history_base.expect("frozen boundary");
+            store
+                .resolve_rollout_lineage_at(position)
+                .await
+                .expect("compatibility position resolves to an exact source boundary");
+            let frozen_position = frozen.history_base.expect("immutable boundary");
+            assert_eq!(
+                position.end_ordinal_exclusive,
+                latest_history_base
+                    .expect("latest boundary")
+                    .end_ordinal_exclusive
+            );
+            assert_eq!(
+                frozen_position.end_ordinal_exclusive,
+                position.end_ordinal_exclusive
+            );
+            assert_eq!(
+                frozen_position.end_byte_offset,
+                latest_frozen_bytes.len() as u64
+            );
+            assert_eq!(
+                fs::read(&frozen.reference.rollout_path).expect("read immutable prefix"),
+                latest_frozen_bytes
+            );
+        } else {
+            assert_eq!(prepared.history_base, expected_base);
+        }
         assert!(matches!(
             prepared.model_context.first(),
             Some(RolloutItem::SessionMeta(meta)) if meta.meta.id == child_id
@@ -1859,7 +1984,7 @@ async fn named_fork_boundaries_reject_invisible_and_noncanonical_turns() {
         (
             child_id,
             ForkBoundary::ThroughTurn("inherited-turn".to_string()),
-            "fork boundary exceeds inherited source history",
+            "lastTurnId 'inherited-turn' identifies an in-progress turn",
         ),
         (
             source_id,
@@ -1925,15 +2050,23 @@ async fn active_turn_stores_only_its_start_position() {
     .expect("read active turn position");
     assert_eq!(turn_position, (Some(turn_start_byte_offset), None, None));
 
-    let (latest_byte_offset, latest_ordinal) = projection_state(&pool, thread_id).await;
+    let (_, latest_ordinal) = projection_state(&pool, thread_id).await;
     let prepared = prepare_paginated_fork(&store, thread_id, ForkBoundary::Latest).await;
+    let frozen = prepared.frozen_segment.as_ref().expect("immutable prefix");
+    let frozen_path = &frozen.reference.rollout_path;
+    let (_, frozen_end) = rollout_line_byte_offsets(frozen_path, /*ordinal*/ 1);
     assert_eq!(
         prepared.history_base,
         Some(HistoryPosition {
-            thread_id,
+            thread_id: frozen.reference.rollout_id.expect("immutable rollout ID"),
             end_ordinal_exclusive: u64::try_from(latest_ordinal).expect("latest ordinal"),
-            end_byte_offset: u64::try_from(latest_byte_offset).expect("latest byte offset"),
+            end_byte_offset: u64::try_from(frozen_end).expect("frozen byte offset"),
         })
+    );
+    assert_ne!(frozen_path, &rollout_path);
+    assert_eq!(
+        fs::metadata(frozen_path).expect("frozen metadata").len(),
+        frozen_end as u64
     );
     assert!(prepared.model_context.iter().any(|item| {
         matches!(item, RolloutItem::EventMsg(EventMsg::TurnStarted(event)) if event.turn_id == "turn-1")
@@ -3060,9 +3193,9 @@ async fn paginated_fork_reads_compressed_shared_lineage_without_materializing() 
         .shutdown_thread(source_thread_id)
         .await
         .expect("shutdown source");
-    let ancestor_compressed_path = ancestor_path.with_extension("jsonl.zst");
+    let ancestor_compressed_path = inherited_path.with_extension("jsonl.zst");
     let source_compressed_path = source_path.with_extension("jsonl.zst");
-    compress_rollout(ancestor_path.as_path());
+    compress_rollout(inherited_path.as_path());
     compress_rollout(source_path.as_path());
     let ancestor_modified = fs::metadata(&ancestor_compressed_path)
         .and_then(|metadata| metadata.modified())
@@ -3075,7 +3208,11 @@ async fn paginated_fork_reads_compressed_shared_lineage_without_materializing() 
         prepare_paginated_fork(&store, source_thread_id, ForkBoundary::Latest),
         prepare_paginated_fork(&store, source_thread_id, ForkBoundary::Latest),
     );
-    assert!(!ancestor_path.exists());
+    assert!(
+        ancestor_path.exists(),
+        "the original ancestor remains untouched"
+    );
+    assert!(!inherited_path.exists());
     assert!(!source_path.exists());
     assert!(ancestor_compressed_path.exists());
     assert!(source_compressed_path.exists());

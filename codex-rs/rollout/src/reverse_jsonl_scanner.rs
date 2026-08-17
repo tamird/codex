@@ -4,6 +4,10 @@ use std::io::Seek;
 use std::io::SeekFrom;
 
 use serde::de::DeserializeOwned;
+use serde_json::Value;
+
+use crate::RolloutLine;
+use crate::RolloutRecorder;
 
 const READ_CHUNK_SIZE: usize = 64 * 1024;
 
@@ -142,6 +146,30 @@ where
                     }
                 }
                 self.chunk_position = 0;
+            }
+        }
+    }
+
+    /// Scans the next rollout record through the canonical compatibility decoder.
+    ///
+    /// `RolloutLine` must not be deserialized directly because Serde's buffered
+    /// flattened fields are incompatible with `serde_json/arbitrary_precision`.
+    pub fn scan_next_rollout_line(&mut self) -> io::Result<Option<ScanOutcome<RolloutLine>>> {
+        loop {
+            let Some(outcome) = self.scan_next::<Value>()? else {
+                return Ok(None);
+            };
+            match outcome {
+                ScanOutcome::Parsed(value) => {
+                    match RolloutRecorder::parse_rollout_line_value(value) {
+                        Ok(Some(line)) => return Ok(Some(ScanOutcome::Parsed(line))),
+                        Ok(None) => continue,
+                        Err(error) => return Ok(Some(ScanOutcome::Rejected(error))),
+                    }
+                }
+                ScanOutcome::Rejected(error) => {
+                    return Ok(Some(ScanOutcome::Rejected(error)));
+                }
             }
         }
     }

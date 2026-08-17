@@ -9,7 +9,6 @@
 //! byte-for-byte. Filesystem publishing and SQLite projection intentionally live outside this
 //! module.
 
-use chrono::DateTime;
 use codex_protocol::SegmentId;
 use codex_protocol::ThreadId;
 use codex_protocol::items::ReasoningItem;
@@ -25,12 +24,17 @@ use codex_protocol::protocol::TurnCompleteEvent;
 use codex_protocol::protocol::TurnStartedEvent;
 use codex_rollout::RolloutItem;
 use codex_rollout::RolloutLine;
+use std::collections::HashMap;
 use std::collections::HashSet;
+use std::sync::Arc;
 use tokio::io::AsyncWrite;
 use tokio::io::AsyncWriteExt;
 
 use super::legacy_event;
+use super::lineage_rewrite::GeneratedItemEdit;
 use super::migration_error;
+use super::parse_rollout_timestamp;
+use super::turn_context_cache::PreparedTurnContext;
 use crate::ThreadStoreResult;
 
 #[derive(Clone)]
@@ -52,6 +56,8 @@ pub(super) struct LegacyCanonicalizerCheckpoint {
     active_turn: Option<ActiveTurn>,
     known_turn_ids: HashSet<String>,
     reasoning: Option<ReasoningItem>,
+    synthetic_item_id_remap: Arc<HashMap<String, String>>,
+    record_generated_items: bool,
 }
 
 impl LegacyCanonicalizerCheckpoint {
@@ -83,6 +89,12 @@ pub(super) struct LegacyRolloutCanonicalizer {
     active_turn: Option<ActiveTurn>,
     known_turn_ids: HashSet<String>,
     reasoning: Option<ReasoningItem>,
+    synthetic_item_id_remap: Arc<HashMap<String, String>>,
+    record_generated_items: bool,
+    /// Allocation made by this source record, or reused by its reasoning snapshot.
+    pending_generated_item_id: Option<String>,
+    /// Generated ID ranges relative to the current physical output file.
+    generated_item_edits: Vec<GeneratedItemEdit>,
 }
 
 impl LegacyRolloutCanonicalizer {
@@ -109,6 +121,10 @@ impl LegacyRolloutCanonicalizer {
             active_turn: None,
             known_turn_ids: HashSet::new(),
             reasoning: None,
+            synthetic_item_id_remap: Arc::new(HashMap::new()),
+            record_generated_items: false,
+            pending_generated_item_id: None,
+            generated_item_edits: Vec::new(),
         }
     }
 
@@ -126,6 +142,10 @@ impl LegacyRolloutCanonicalizer {
             active_turn: checkpoint.active_turn,
             known_turn_ids: checkpoint.known_turn_ids,
             reasoning: checkpoint.reasoning,
+            synthetic_item_id_remap: checkpoint.synthetic_item_id_remap,
+            record_generated_items: checkpoint.record_generated_items,
+            pending_generated_item_id: None,
+            generated_item_edits: Vec::new(),
         }
     }
 
@@ -137,11 +157,32 @@ impl LegacyRolloutCanonicalizer {
             active_turn: self.active_turn,
             known_turn_ids: self.known_turn_ids,
             reasoning: self.reasoning,
+            synthetic_item_id_remap: self.synthetic_item_id_remap,
+            record_generated_items: self.record_generated_items,
         }
+    }
+
+    /// Applies deterministic IDs to synthesized Legacy items during migration.
+    pub(super) fn with_synthetic_item_id_remap(
+        mut self,
+        synthetic_item_id_remap: Arc<HashMap<String, String>>,
+    ) -> Self {
+        self.synthetic_item_id_remap = synthetic_item_id_remap;
+        self
     }
 
     pub(super) fn next_ordinal(&self) -> u64 {
         self.next_ordinal
+    }
+
+    /// Records only IDs allocated by this canonicalizer, never explicit lookalike IDs.
+    pub(super) fn record_generated_items(mut self) -> Self {
+        self.record_generated_items = true;
+        self
+    }
+
+    pub(super) fn take_generated_item_edits(&mut self) -> Vec<GeneratedItemEdit> {
+        std::mem::take(&mut self.generated_item_edits)
     }
 
     pub(super) fn output_byte_offset(&self) -> u64 {
@@ -235,6 +276,7 @@ impl LegacyRolloutCanonicalizer {
         W: AsyncWrite + Unpin,
     {
         let source_index = self.source_line_index;
+        self.pending_generated_item_id = None;
         self.skip_source_line()?;
         let timestamp = line.timestamp;
         let bytes_before = self.bytes_written;
@@ -433,6 +475,19 @@ impl LegacyRolloutCanonicalizer {
         Ok(self.bytes_written - bytes_before)
     }
 
+    /// TurnContext is pass-through history. Reusing its verified bytes must not change turn,
+    /// reasoning, or generated-item state beyond the ordinary source-record increment.
+    pub(super) async fn process_prepared_turn_context<W: AsyncWrite + Unpin>(
+        &mut self,
+        context: &PreparedTurnContext,
+        writer: &mut W,
+    ) -> ThreadStoreResult<()> {
+        self.pending_generated_item_id = None;
+        self.skip_source_line()?;
+        let bytes = context.canonical_record(self.next_ordinal)?;
+        self.write_encoded_record(writer, bytes).await
+    }
+
     pub(super) async fn finish<W>(
         &mut self,
         writer: &mut W,
@@ -553,9 +608,7 @@ impl LegacyRolloutCanonicalizer {
     where
         W: AsyncWrite + Unpin,
     {
-        let completed_at_ms = DateTime::parse_from_rfc3339(timestamp)
-            .map_err(migration_error)?
-            .timestamp_millis();
+        let completed_at_ms = parse_rollout_timestamp(timestamp)?.timestamp_millis();
         self.write_item(
             writer,
             timestamp,
@@ -598,6 +651,9 @@ impl LegacyRolloutCanonicalizer {
             ReasoningTextKind::Raw => item.raw_content.push(text),
         }
         self.reasoning = Some(item.clone());
+        if self.record_generated_items {
+            self.pending_generated_item_id = Some(item.id.clone());
+        }
         self.write_completed_item(writer, timestamp, TurnItem::Reasoning(item))
             .await
     }
@@ -611,12 +667,35 @@ impl LegacyRolloutCanonicalizer {
     where
         W: AsyncWrite + Unpin,
     {
-        let mut bytes = serde_json::to_vec(&RolloutLine {
+        let generated_id = match &item {
+            RolloutItem::EventMsg(EventMsg::ItemCompleted(event)) => self
+                .pending_generated_item_id
+                .take()
+                .filter(|id| *id == event.item.id()),
+            _ => None,
+        };
+        let bytes = serde_json::to_vec(&RolloutLine {
             timestamp: timestamp.to_string(),
             ordinal: Some(self.next_ordinal),
             item,
         })
         .map_err(migration_error)?;
+        if let Some(item_id) = generated_id {
+            self.generated_item_edits
+                .push(GeneratedItemEdit::from_record(
+                    &bytes,
+                    self.output_byte_offset,
+                    item_id,
+                )?);
+        }
+        self.write_encoded_record(writer, bytes).await
+    }
+
+    async fn write_encoded_record<W: AsyncWrite + Unpin>(
+        &mut self,
+        writer: &mut W,
+        mut bytes: Vec<u8>,
+    ) -> ThreadStoreResult<()> {
         bytes.push(b'\n');
         writer.write_all(&bytes).await.map_err(migration_error)?;
         let byte_count = u64::try_from(bytes.len())
@@ -642,6 +721,14 @@ impl LegacyRolloutCanonicalizer {
             .next_item_index
             .checked_add(1)
             .ok_or_else(|| migration_error("legacy rollout item id overflow"))?;
+        let item_id = self
+            .synthetic_item_id_remap
+            .get(item_id.as_str())
+            .cloned()
+            .unwrap_or(item_id);
+        if self.record_generated_items {
+            self.pending_generated_item_id = Some(item_id.clone());
+        }
         Ok(item_id)
     }
 }

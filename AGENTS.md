@@ -37,6 +37,15 @@ In the codex-rs folder where the rust code lives:
 - If you change Rust dependencies (`Cargo.toml` or `Cargo.lock`), run `just bazel-lock-update` from the
   repo root to refresh `MODULE.bazel.lock`, and include that lockfile update in the same change. CI
   verifies lockfile drift.
+- Treat `serde_json`'s `arbitrary_precision` feature as active throughout the Rust application.
+  Cargo unifies dependency features, so a crate cannot rely on disabling it locally. Direct
+  deserialization from a JSON byte stream into an internally or adjacently tagged enum can present
+  an arbitrary-precision number as Serde's private map representation; numeric fields such as
+  `f64` then fail with `invalid type: map, expected f64`. When a tagged enum can contain numeric
+  fields, either materialize `serde_json::Value` before typed deserialization or use a representation
+  that does not require Serde to buffer the tagged payload. Add a regression that runs with
+  `arbitrary_precision` enabled and exercises the numeric variant. Do not treat removing the feature
+  from one crate as a fix.
 - Bazel does not automatically make source-tree files available to compile-time Rust file access. If
   you add `include_str!`, `include_bytes!`, `sqlx::migrate!`, or similar build-time file or
   directory reads, update the crate's `BUILD.bazel` (`compile_data`, `build_script_data`, or test

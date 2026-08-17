@@ -215,7 +215,9 @@ async fn list_threads(mcp: &mut TestAppServer) -> Result<ThreadListResponse> {
 async fn thread_fork_creates_new_thread_and_emits_started() -> Result<()> {
     let server = create_mock_responses_server_repeating_assistant("Done").await;
     let codex_home = TempDir::new()?;
-    MockResponsesConfig::new(&server.uri()).write(codex_home.path())?;
+    MockResponsesConfig::new(&server.uri())
+        .disable_feature(Feature::BackgroundPaginatedRolloutMigration)
+        .write(codex_home.path())?;
 
     let preview = "Saved user message";
     let conversation_id = create_fake_rollout(
@@ -3160,7 +3162,9 @@ async fn assert_thread_fork_ephemeral_remains_pathless_and_omits_listing(
 ) -> Result<()> {
     let server = create_mock_responses_server_repeating_assistant("Done").await;
     let codex_home = TempDir::new()?;
-    MockResponsesConfig::new(&server.uri()).write(codex_home.path())?;
+    MockResponsesConfig::new(&server.uri())
+        .disable_feature(Feature::BackgroundPaginatedRolloutMigration)
+        .write(codex_home.path())?;
 
     let preview = "Saved user message";
     let create_rollout = match history_mode {
@@ -3358,7 +3362,9 @@ async fn assert_thread_fork_ephemeral_remains_pathless_and_omits_listing(
 async fn thread_fork_system_ephemeral_stays_unpersisted_with_debug_materialization() -> Result<()> {
     let server = create_mock_responses_server_repeating_assistant("Done").await;
     let codex_home = TempDir::new()?;
-    MockResponsesConfig::new(&server.uri()).write(codex_home.path())?;
+    MockResponsesConfig::new(&server.uri())
+        .disable_feature(Feature::BackgroundPaginatedRolloutMigration)
+        .write(codex_home.path())?;
 
     let source_thread_id = create_fake_rollout(
         codex_home.path(),
@@ -3507,7 +3513,9 @@ async fn thread_fork_rejects_incompatible_boundaries_and_ephemeral_goal_deferral
 async fn pathless_ephemeral_thread_rejects_codex_home_path_after_reload() -> Result<()> {
     let server = create_mock_responses_server_repeating_assistant("Done").await;
     let codex_home = TempDir::new()?;
-    MockResponsesConfig::new(&server.uri()).write(codex_home.path())?;
+    MockResponsesConfig::new(&server.uri())
+        .disable_feature(Feature::BackgroundPaginatedRolloutMigration)
+        .write(codex_home.path())?;
 
     let parent_thread_id = create_fake_rollout(
         codex_home.path(),

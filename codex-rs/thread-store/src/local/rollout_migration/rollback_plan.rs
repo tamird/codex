@@ -7,12 +7,13 @@
 //! before the writer makes its second streaming pass.
 
 use std::collections::HashMap;
+use std::collections::HashSet;
 
+use codex_protocol::items::TurnItem;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::UserMessageEvent;
-use codex_rollout::CompactedItem;
 use codex_rollout::RolloutItem;
 use codex_rollout::RolloutLine;
 
@@ -21,12 +22,15 @@ use super::rollback;
 use super::rollback_replay::ModelReplayPlanner;
 use crate::ThreadStoreResult;
 
-#[derive(Clone)]
+/// Deferred edits to one compaction. The replay pass owns the large replacement history, so the
+/// planner retains only the rollback counts rather than cloning every model-context checkpoint.
 struct CompactionFrame {
     record_index: usize,
     boundary_depth: usize,
     owner: Option<usize>,
-    item: CompactedItem,
+    has_replacement_history: bool,
+    /// User-turn removals in their original replay order.
+    rollback_turns: Vec<u32>,
 }
 
 #[derive(Clone)]
@@ -39,10 +43,18 @@ struct PendingUserResponse {
 pub(super) struct RollbackPlan {
     record_boundaries: Vec<Option<usize>>,
     boundary_alive: Vec<bool>,
-    compacted_items: HashMap<usize, CompactedItem>,
+    /// A removed compaction whose empty checkpoint must still stop reverse model replay.
+    empty_replacement_history_compaction: Option<usize>,
+    /// Deferred user-turn removals keyed by parsed source-record index.
+    compacted_rollbacks: HashMap<usize, Vec<u32>>,
+    /// Explicit turn IDs whose last instruction boundary was removed.
+    removed_turn_ids: HashSet<String>,
 }
 
 impl RollbackPlan {
+    pub(super) fn removed_turn_ids(&self) -> &HashSet<String> {
+        &self.removed_turn_ids
+    }
     pub(super) fn record_count(&self) -> usize {
         self.record_boundaries.len()
     }
@@ -64,9 +76,29 @@ impl RollbackPlan {
         }
         // A rolled-back turn can still own the empty checkpoint that keeps cold resume from
         // replaying older history.
-        if let Some(compacted) = self.compacted_items.get(&record_index) {
-            line.item = RolloutItem::Compacted(compacted.clone());
+        if self.empty_replacement_history_compaction == Some(record_index) {
+            let RolloutItem::Compacted(compacted) = &mut line.item else {
+                return Err(migration_error(
+                    "rollback compaction changed during source replay",
+                ));
+            };
+            compacted.replacement_history = Some(Vec::new());
+            compacted.mcp_resource_origins = None;
             return Ok(Some(line));
+        }
+        if let Some(rollbacks) = self.compacted_rollbacks.get(&record_index) {
+            let RolloutItem::Compacted(compacted) = &mut line.item else {
+                return Err(migration_error(
+                    "rollback compaction changed during source replay",
+                ));
+            };
+            let replacement_history = compacted.replacement_history.as_mut().ok_or_else(|| {
+                migration_error("legacy rollback crosses a compaction without replacement history")
+            })?;
+            compacted.mcp_resource_origins = None;
+            for &num_turns in rollbacks {
+                rollback::drop_last_n_user_turns(replacement_history, num_turns);
+            }
         }
         if boundary.is_some_and(|boundary| !self.boundary_alive[boundary]) {
             return Ok(None);
@@ -86,6 +118,8 @@ pub(super) struct RollbackPlanner {
     pending_user_response: Option<PendingUserResponse>,
     pending_delivery_boundary: Option<usize>,
     turn_boundaries: HashMap<String, usize>,
+    /// Canonical user snapshots can be repeated after the matching model response.
+    native_user_boundaries: HashMap<(String, String), usize>,
     compactions: Vec<CompactionFrame>,
     model_replay: ModelReplayPlanner,
 }
@@ -102,12 +136,21 @@ impl RollbackPlanner {
             pending_user_response: None,
             pending_delivery_boundary: None,
             turn_boundaries: HashMap::new(),
+            native_user_boundaries: HashMap::new(),
             compactions: Vec::new(),
             model_replay: ModelReplayPlanner::new(),
         }
     }
 
     pub(super) fn observe(&mut self, line: &RolloutLine) -> ThreadStoreResult<()> {
+        self.observe_inner(line, /*native*/ false)
+    }
+
+    pub(super) fn observe_paginated(&mut self, line: &RolloutLine) -> ThreadStoreResult<()> {
+        self.observe_inner(line, /*native*/ true)
+    }
+
+    fn observe_inner(&mut self, line: &RolloutLine, native: bool) -> ThreadStoreResult<()> {
         if matches!(line.item, RolloutItem::RolloutReference(_)) {
             self.model_replay
                 .observe(self.record_boundaries.len(), &line.item);
@@ -115,7 +158,11 @@ impl RollbackPlanner {
             return Ok(());
         }
         let index = self.record_boundaries.len();
-        self.model_replay.observe(index, &line.item);
+        if native {
+            self.model_replay.observe_paginated(index, &line.item);
+        } else {
+            self.model_replay.observe(index, &line.item);
+        }
         self.record_boundaries
             .push(self.boundary_stack.last().copied());
         let paired_user_boundary = match (&self.pending_user_response, &line.item) {
@@ -123,6 +170,19 @@ impl RollbackPlanner {
                 if user_response_matches_event(&pending.content, event) =>
             {
                 Some(pending.boundary)
+            }
+            (Some(pending), RolloutItem::EventMsg(EventMsg::ItemCompleted(event))) => {
+                match &event.item {
+                    TurnItem::UserMessage(user) => match user.as_legacy_event() {
+                        EventMsg::UserMessage(event)
+                            if user_response_matches_event(&pending.content, &event) =>
+                        {
+                            Some(pending.boundary)
+                        }
+                        _ => None,
+                    },
+                    _ => None,
+                }
             }
             _ => None,
         };
@@ -191,7 +251,22 @@ impl RollbackPlanner {
                 self.record_boundaries[index] = Some(boundary);
             }
             RolloutItem::EventMsg(EventMsg::ItemCompleted(event)) => {
-                self.assign_targeted_record(index, Some(event.turn_id.as_str()));
+                if let TurnItem::UserMessage(user) = &event.item
+                    && native
+                {
+                    let key = (event.turn_id.clone(), user.id.clone());
+                    let boundary = self
+                        .native_user_boundaries
+                        .get(&key)
+                        .copied()
+                        .or(paired_user_boundary)
+                        .unwrap_or_else(|| self.start_boundary(index));
+                    self.native_user_boundaries.insert(key, boundary);
+                    self.turn_boundaries.insert(event.turn_id.clone(), boundary);
+                    self.record_boundaries[index] = Some(boundary);
+                } else {
+                    self.assign_targeted_record(index, Some(event.turn_id.as_str()));
+                }
             }
             RolloutItem::EventMsg(event) => {
                 self.assign_targeted_record(index, explicit_event_turn_id(event));
@@ -213,7 +288,8 @@ impl RollbackPlanner {
                     record_index: index,
                     boundary_depth: self.boundary_stack.len(),
                     owner,
-                    item: item.clone(),
+                    has_replacement_history: item.replacement_history.is_some(),
+                    rollback_turns: Vec::new(),
                 });
             }
             RolloutItem::TurnContext(_) => {
@@ -239,27 +315,29 @@ impl RollbackPlanner {
             boundary_alive,
             compactions,
             model_replay,
+            turn_boundaries,
             ..
         } = self;
-        let replay_anchor = model_replay.finish().empty_replacement_history_compaction;
-        let compacted_items = compactions
+        let compacted_rollbacks = compactions
             .into_iter()
-            .filter_map(|mut frame| {
-                if Some(frame.record_index) == replay_anchor {
-                    frame.item.replacement_history = Some(Vec::new());
-                    frame.item.mcp_resource_origins = None;
-                    return Some((frame.record_index, frame.item));
-                }
-                frame
-                    .owner
-                    .is_none_or(|boundary| boundary_alive[boundary])
-                    .then_some((frame.record_index, frame.item))
+            .filter(|frame| {
+                !frame.rollback_turns.is_empty()
+                    && frame.owner.is_none_or(|boundary| boundary_alive[boundary])
             })
-            .collect::<HashMap<_, _>>();
+            .map(|frame| (frame.record_index, frame.rollback_turns))
+            .collect();
+        let removed_turn_ids = turn_boundaries
+            .into_iter()
+            .filter_map(|(turn_id, boundary)| (!boundary_alive[boundary]).then_some(turn_id))
+            .collect();
         RollbackPlan {
             record_boundaries,
             boundary_alive,
-            compacted_items,
+            empty_replacement_history_compaction: model_replay
+                .finish()
+                .empty_replacement_history_compaction,
+            compacted_rollbacks,
+            removed_turn_ids,
         }
     }
 
@@ -324,17 +402,14 @@ impl RollbackPlanner {
             let post_compaction_turns = depth_before.saturating_sub(frame.boundary_depth);
             let remaining = count.saturating_sub(post_compaction_turns);
             if remaining > 0 {
-                frame.item.mcp_resource_origins = None;
-                let replacement_history =
-                    frame.item.replacement_history.as_mut().ok_or_else(|| {
-                        migration_error(
-                            "legacy rollback crosses a compaction without replacement history",
-                        )
-                    })?;
-                rollback::drop_last_n_user_turns(
-                    replacement_history,
-                    u32::try_from(remaining).unwrap_or(u32::MAX),
-                );
+                if !frame.has_replacement_history {
+                    return Err(migration_error(
+                        "legacy rollback crosses a compaction without replacement history",
+                    ));
+                }
+                frame
+                    .rollback_turns
+                    .push(u32::try_from(remaining).unwrap_or(u32::MAX));
             }
         }
         self.active_turn_id = None;

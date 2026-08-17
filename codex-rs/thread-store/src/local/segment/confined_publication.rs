@@ -197,6 +197,37 @@ pub(crate) async fn confined_entry_exists_under_root(
     .map_err(|error| io::Error::other(format!("failed to join confined entry check: {error}")))?
 }
 
+/// Detects crash-left replacement names without deleting them under a shared maintenance lease.
+pub(crate) async fn confined_staged_entries_exist_under_root(
+    codex_home: &Path,
+    path: &Path,
+    root: &ConfinedRootIdentity,
+) -> io::Result<bool> {
+    let codex_home = codex_home.to_path_buf();
+    let path = path.to_path_buf();
+    let root = root.clone();
+    tokio::task::spawn_blocking(move || {
+        #[cfg(unix)]
+        {
+            let confined = ConfinedParent::open(&codex_home, &path, Some(&root))?;
+            confined.revalidate()?;
+            let exists = !confined.staged_entries()?.is_empty();
+            confined.revalidate()?;
+            Ok(exists)
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (codex_home, path, root);
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "confined rollout entry checks are unsupported on this platform",
+            ))
+        }
+    })
+    .await
+    .map_err(|error| io::Error::other(format!("failed to join confined staging check: {error}")))?
+}
+
 /// Creates and opens every directory component below `CODEX_HOME` without following symlinks.
 pub(crate) async fn ensure_confined_directory_under_root(
     codex_home: &Path,
@@ -437,8 +468,19 @@ mod platform {
         }
 
         pub(super) fn cleanup_staged_entries(&self) -> io::Result<()> {
+            for name in self.staged_entries()? {
+                if let Err(error) = self.unlink_cstr(&name)
+                    && error.kind() != io::ErrorKind::NotFound
+                {
+                    return Err(error);
+                }
+            }
+            self.sync()
+        }
+
+        pub(super) fn staged_entries(&self) -> io::Result<Vec<CString>> {
             #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]
-            return Ok(());
+            return Ok(Vec::new());
 
             #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
             {
@@ -449,7 +491,7 @@ mod platform {
                     unsafe { File::from_raw_fd(raw_directory) };
                     return Err(io::Error::last_os_error());
                 }
-                let mut result = Ok(());
+                let mut result = Ok(Vec::new());
                 loop {
                     set_errno_zero();
                     let entry = unsafe { libc::readdir(directory_pointer) };
@@ -462,18 +504,13 @@ mod platform {
                     }
                     let name = unsafe { std::ffi::CStr::from_ptr((*entry).d_name.as_ptr()) };
                     if name.to_bytes().starts_with(self.staged_prefix().as_bytes())
-                        && let Err(error) = self.unlink_cstr(name)
-                        && error.kind() != io::ErrorKind::NotFound
+                        && let Ok(entries) = &mut result
                     {
-                        result = Err(error);
-                        break;
+                        entries.push(name.to_owned());
                     }
                 }
                 if unsafe { libc::closedir(directory_pointer) } == -1 && result.is_ok() {
                     result = Err(io::Error::last_os_error());
-                }
-                if result.is_ok() {
-                    self.sync()?;
                 }
                 result
             }

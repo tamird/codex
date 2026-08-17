@@ -13,6 +13,9 @@ use codex_protocol::ThreadId;
 use codex_protocol::protocol::HistoryPosition;
 use serde::Deserialize;
 use serde::Serialize;
+use sha2::Digest;
+use sha2::Sha256;
+use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWriteExt;
 
 use super::lineage::LegacyLineageMigrationPlan;
@@ -41,10 +44,19 @@ pub(super) enum LineageMigrationPhase {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub(super) struct LineageMigrationJournal {
     version: u32,
+    /// Absent in older v4 journals, whose authenticated source graph must not be replanned.
+    #[serde(default)]
+    pub(super) reuse_native_prefixes: bool,
+    /// Absent in journals written before mixed-format rollback replay.
+    #[serde(default)]
+    pub(super) replay_native_rollbacks: bool,
     pub(super) selected_thread_id: ThreadId,
     pub(super) selected_source_rollout_id: RolloutId,
     pub(super) phase: LineageMigrationPhase,
     pub(super) sources: Vec<LineageMigrationJournalSource>,
+    /// Authenticated ancestry files omitted by a selected prefix or filter.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(super) authentication_sources: Vec<LineageMigrationJournalSource>,
     pub(super) history_bases: Vec<LineageMigrationJournalHistoryBase>,
     pub(super) reference_dependencies: Vec<LineageMigrationJournalReference>,
     pub(super) targets: Vec<LineageMigrationJournalTarget>,
@@ -60,6 +72,13 @@ pub(super) struct LineageMigrationJournalSource {
     pub(super) byte_count: u64,
     pub(super) record_count: u64,
     pub(super) sha256: String,
+    /// Decoded source prefix used by mixed-format rollback replay.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) replay_end: Option<HistoryPosition>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) native_replay: Option<super::lineage::NativeReplayRange>,
+    #[serde(default)]
+    pub(super) materialized_predecessor: bool,
 }
 
 /// An external Paginated prefix that must remain unchanged through selection.
@@ -83,6 +102,9 @@ pub(super) struct LineageMigrationJournalReference {
     pub(super) segment_id: SegmentId,
     pub(super) path: PathBuf,
     pub(super) end_ordinal_exclusive: u64,
+    /// Decoded JSONL boundary; older journals only retained filtered references.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) end_byte_offset: Option<u64>,
     pub(super) byte_count: u64,
     pub(super) record_count: u64,
     pub(super) sha256: String,
@@ -117,21 +139,16 @@ impl LineageMigrationJournal {
     pub(super) fn from_plan(plan: &LegacyLineageMigrationPlan) -> Self {
         Self {
             version: LINEAGE_MIGRATION_JOURNAL_VERSION,
+            reuse_native_prefixes: plan.reuse_native_prefixes,
+            replay_native_rollbacks: plan.replay_native_rollbacks,
             selected_thread_id: plan.selected_thread_id,
             selected_source_rollout_id: plan.selected_rollout_id,
             phase: LineageMigrationPhase::Planned,
-            sources: plan
-                .sources
+            sources: plan.sources.iter().map(journal_source).collect(),
+            authentication_sources: plan
+                .authentication_sources
                 .iter()
-                .map(|source| LineageMigrationJournalSource {
-                    thread_id: source.thread_id,
-                    rollout_id: source.rollout_id,
-                    segment_id: source.segment_id,
-                    path: source.path.clone(),
-                    byte_count: source.byte_count,
-                    record_count: source.record_count,
-                    sha256: source.sha256.clone(),
-                })
+                .map(journal_source)
                 .collect(),
             history_bases: plan
                 .history_bases
@@ -156,6 +173,7 @@ impl LineageMigrationJournal {
                     segment_id: source.segment_id,
                     path: source.path.clone(),
                     end_ordinal_exclusive: source.end_ordinal_exclusive,
+                    end_byte_offset: Some(source.end_byte_offset),
                     byte_count: source.byte_count,
                     record_count: source.record_count,
                     sha256: source.sha256.clone(),
@@ -209,6 +227,75 @@ impl LineageMigrationJournal {
         Ok(())
     }
 
+    /// Accepts only a complete-record append to the selected source of an unpublished plan.
+    /// Every immutable dependency and every previously authenticated source byte must still match.
+    pub(super) async fn permits_selected_source_append(
+        &self,
+        plan: &LegacyLineageMigrationPlan,
+    ) -> ThreadStoreResult<bool> {
+        if self.version != LINEAGE_MIGRATION_JOURNAL_VERSION
+            || !matches!(
+                self.phase,
+                LineageMigrationPhase::Planned
+                    | LineageMigrationPhase::TargetsDurable
+                    | LineageMigrationPhase::ProjectionDurable
+            )
+        {
+            return Ok(false);
+        }
+        let Some(previous) = self.sources.last() else {
+            return Ok(false);
+        };
+        let Some(current) = plan.sources.last() else {
+            return Ok(false);
+        };
+        if current
+            .path
+            .extension()
+            .is_none_or(|extension| extension != "jsonl")
+            || current.byte_count <= previous.byte_count
+            || current.record_count <= previous.record_count
+        {
+            return Ok(false);
+        }
+        let mut previous_plan = plan.clone();
+        let Some(source) = previous_plan.sources.last_mut() else {
+            return Ok(false);
+        };
+        source.byte_count = previous.byte_count;
+        source.record_count = previous.record_count;
+        source.sha256.clone_from(&previous.sha256);
+        if !self.authenticated_inputs_match(&previous_plan)
+            || self.targets.iter().any(|old| {
+                plan.targets
+                    .iter()
+                    .any(|new| old.rollout_id == new.rollout_id)
+            })
+        {
+            return Ok(false);
+        }
+        let mut file = tokio::fs::File::open(&current.path)
+            .await
+            .map_err(migration_error)?
+            .take(previous.byte_count);
+        let mut hasher = Sha256::new();
+        let mut buffer = vec![0_u8; 256 * 1024];
+        let mut bytes = 0_u64;
+        let mut last_byte = None;
+        loop {
+            let read = file.read(&mut buffer).await.map_err(migration_error)?;
+            if read == 0 {
+                break;
+            }
+            bytes += read as u64;
+            last_byte = Some(buffer[read - 1]);
+            hasher.update(&buffer[..read]);
+        }
+        Ok(bytes == previous.byte_count
+            && last_byte == Some(b'\n')
+            && format!("{:x}", hasher.finalize()) == previous.sha256)
+    }
+
     /// Returns true when a pre-selection journal uses the previous unscoped target identity.
     pub(super) fn requires_target_identity_upgrade(
         &self,
@@ -241,6 +328,9 @@ impl LineageMigrationJournal {
                         && journal.byte_count == source.byte_count
                         && journal.record_count == source.record_count
                         && journal.sha256 == source.sha256
+                        && journal.replay_end == source.replay_end
+                        && journal.native_replay == source.native_replay
+                        && journal.materialized_predecessor == source.materialized_predecessor
                 });
         let history_bases_match = self.history_bases.len() == plan.history_bases.len()
             && self
@@ -269,11 +359,20 @@ impl LineageMigrationJournal {
                         && journal.segment_id == source.segment_id
                         && journal.path == source.path
                         && journal.end_ordinal_exclusive == source.end_ordinal_exclusive
+                        && journal
+                            .end_byte_offset
+                            .is_none_or(|offset| offset == source.end_byte_offset)
                         && journal.byte_count == source.byte_count
                         && journal.record_count == source.record_count
                         && journal.sha256 == source.sha256
                 });
         self.selected_thread_id == plan.selected_thread_id
+            && self.authentication_sources
+                == plan
+                    .authentication_sources
+                    .iter()
+                    .map(journal_source)
+                    .collect::<Vec<_>>()
             && self.selected_source_rollout_id == plan.selected_rollout_id
             && sources_match
             && history_bases_match
@@ -344,7 +443,7 @@ impl LineageMigrationJournal {
     }
 
     pub(super) async fn verify_sources(&self) -> ThreadStoreResult<()> {
-        for source in &self.sources {
+        for source in self.sources.iter().chain(&self.authentication_sources) {
             let (byte_count, sha256) = hash_file(source.path.as_path()).await?;
             if byte_count != source.byte_count || sha256 != source.sha256 {
                 return Err(migration_error(format!(
@@ -372,6 +471,21 @@ impl LineageMigrationJournal {
             }
         }
         Ok(())
+    }
+}
+
+fn journal_source(source: &super::lineage::LegacyLineageSource) -> LineageMigrationJournalSource {
+    LineageMigrationJournalSource {
+        thread_id: source.thread_id,
+        rollout_id: source.rollout_id,
+        segment_id: source.segment_id,
+        path: source.path.clone(),
+        byte_count: source.byte_count,
+        record_count: source.record_count,
+        sha256: source.sha256.clone(),
+        replay_end: source.replay_end,
+        native_replay: source.native_replay.clone(),
+        materialized_predecessor: source.materialized_predecessor,
     }
 }
 

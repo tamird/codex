@@ -848,16 +848,18 @@ impl LocalThreadStore {
             let lines = prefix
                 .split(|byte| *byte == b'\n')
                 .filter(|line| !line.iter().all(u8::is_ascii_whitespace))
-                .map(|line| {
-                    serde_json::from_slice::<RolloutLine>(line).map_err(|error| {
-                        ThreadStoreError::Internal {
+                .filter_map(
+                    |line| match RolloutRecorder::parse_rollout_line_bytes(line) {
+                        Ok(Some(line)) => Some(Ok(line)),
+                        Ok(None) => None,
+                        Err(error) => Some(Err(ThreadStoreError::Internal {
                             message: format!(
                                 "malformed rollout lineage for {requested_thread_id}: selected \
-                                 rollout prefix contains an invalid record: {error}"
+                             rollout prefix contains an invalid record: {error}"
                             ),
-                        }
-                    })
-                })
+                        })),
+                    },
+                )
                 .collect::<ThreadStoreResult<Vec<_>>>()?;
             if lines
                 .last()
@@ -986,6 +988,27 @@ async fn resolve_indexed_rollout_path_by_id(
 }
 
 impl RolloutLineage {
+    /// Applies one outer compatibility reference to an already-resolved historical parent.
+    pub(super) async fn apply_reference_constraints(
+        mut self,
+        reference: &RolloutReferenceItem,
+    ) -> ThreadStoreResult<Self> {
+        for segment in &mut self.segments {
+            segment.filter_texts =
+                codex_rollout::compose_compacted_replacement_history_filter_texts(
+                    reference
+                        .compacted_replacement_history_filter_texts
+                        .as_deref(),
+                    Some(&segment.filter_texts),
+                )
+                .unwrap_or_default();
+        }
+        if let Some(nth) = reference.nth_user_message {
+            trim_before_nth_user_message(&mut self.segments, nth, LineageOffsetMode::Resolve)
+                .await?;
+        }
+        Ok(self)
+    }
     pub(super) fn root_rollout_id(&self) -> RolloutId {
         self.root_rollout_id
     }
@@ -1105,6 +1128,7 @@ impl RolloutLineageSegment {
 #[derive(Clone)]
 pub(super) struct RolloutHead {
     pub(super) session_meta: SessionMetaLine,
+    pub(super) session_meta_ordinal: Option<u64>,
     pub(super) leading_reference: Option<(u64, RolloutReferenceItem)>,
     pub(super) first_local_ordinal: u64,
     /// Whether the physical rollout contains a local record after its optional leading reference.
@@ -1393,13 +1417,14 @@ pub(super) async fn read_rollout_head(path: &Path) -> ThreadStoreResult<RolloutH
             "source rollout does not start with session metadata",
         ));
     };
-    let empty_local_start = match session_meta.meta.history_base {
-        Some(base) => base
-            .end_ordinal_exclusive
-            .checked_add(1)
-            .ok_or_else(|| malformed_lineage(session_meta.meta.id, "source ordinal overflow"))?,
-        None => 1,
-    };
+    let empty_local_start = session_meta
+        .meta
+        .history_base
+        .map_or(first.ordinal.unwrap_or(0), |base| {
+            base.end_ordinal_exclusive
+        })
+        .checked_add(1)
+        .ok_or_else(|| malformed_lineage(session_meta.meta.id, "source ordinal overflow"))?;
     let next = next_rollout_line(&mut reader).await?;
     let (leading_reference, first_local_ordinal, has_local_history) = match next {
         Some(RolloutLine {
@@ -1427,6 +1452,7 @@ pub(super) async fn read_rollout_head(path: &Path) -> ThreadStoreResult<RolloutH
     };
     Ok(RolloutHead {
         session_meta,
+        session_meta_ordinal: first.ordinal,
         leading_reference,
         first_local_ordinal,
         has_local_history,
@@ -1471,11 +1497,14 @@ async fn next_rollout_line(
         if line.trim().is_empty() {
             continue;
         }
-        return serde_json::from_str(line.as_str())
-            .map(Some)
-            .map_err(|err| ThreadStoreError::Internal {
+        let parsed = RolloutRecorder::parse_rollout_line_bytes(line.as_bytes()).map_err(|err| {
+            ThreadStoreError::Internal {
                 message: format!("failed to read paginated rollout line: {err}"),
-            });
+            }
+        })?;
+        if parsed.is_some() {
+            return Ok(parsed);
+        }
     }
     Ok(None)
 }
@@ -1601,8 +1630,8 @@ fn trim_segment_to_history_position_in_bytes(
             && bytes[end_byte_offset..ordinal_end_byte_offset]
                 .split_inclusive(|byte| *byte == b'\n')
                 .all(|line| {
-                    serde_json::from_slice::<RolloutLine>(line)
-                        .is_ok_and(|line| line.ordinal.is_none())
+                    codex_rollout::rollout_ordinal_from_slice(line)
+                        .is_ok_and(|ordinal| ordinal.is_none())
                 });
         if !valid_unordinaled_suffix {
             return Err(malformed_lineage(
@@ -1700,7 +1729,7 @@ async fn read_decoded_rollout(path: &Path) -> ThreadStoreResult<Vec<u8>> {
     bytes.map_err(lineage_io_error)
 }
 
-async fn byte_offset_for_ordinal(
+pub(super) async fn byte_offset_for_ordinal(
     path: &Path,
     end_ordinal_exclusive: u64,
 ) -> ThreadStoreResult<Option<u64>> {
@@ -1719,10 +1748,8 @@ fn byte_offset_for_ordinal_in_bytes(
         let next_offset = offset.checked_add(line_len).ok_or_else(|| {
             malformed_lineage(ThreadId::default(), "rollout byte offset overflow")
         })?;
-        if let Ok(line) = serde_json::from_slice::<RolloutLine>(physical_line)
-            && line
-                .ordinal
-                .is_some_and(|ordinal| ordinal >= end_ordinal_exclusive)
+        if let Ok(Some(ordinal)) = codex_rollout::rollout_ordinal_from_slice(physical_line)
+            && ordinal >= end_ordinal_exclusive
         {
             return Ok(Some(offset));
         }
@@ -1747,6 +1774,7 @@ async fn trim_before_nth_user_message(
     }
     let mut event_boundaries = Vec::new();
     let mut response_boundaries = Vec::new();
+    let mut canonical_user_items = HashSet::new();
     let mut active_turn_start = None;
     for (segment_index, segment) in segments.iter().enumerate() {
         let (lines, _, parse_errors) =
@@ -1759,6 +1787,39 @@ async fn trim_before_nth_user_message(
                 "source rollout contains invalid records",
             ));
         }
+        if let Some(end) = segment.end_ordinal_exclusive {
+            // Authenticate the original reference cutoff before a user-message boundary replaces
+            // it. Otherwise the shorter prefix can conceal an ordinal beyond the source's end.
+            let actual_end = lines
+                .iter()
+                .filter_map(|line| line.ordinal)
+                .take_while(|ordinal| *ordinal < end)
+                .last()
+                .and_then(|ordinal| ordinal.checked_add(1));
+            let empty_compatibility_prefix = end == segment.start_ordinal
+                && matches!(
+                    lines.as_slice(),
+                    [
+                        RolloutLine {
+                            ordinal: Some(0),
+                            item: RolloutItem::SessionMeta(_),
+                            ..
+                        },
+                        RolloutLine {
+                            ordinal: Some(reference_ordinal),
+                            item: RolloutItem::RolloutReference(_),
+                            ..
+                        },
+                        ..
+                    ] if *reference_ordinal == end
+                );
+            if actual_end != Some(end) && !empty_compatibility_prefix {
+                return Err(malformed_lineage(
+                    segment.rollout_id,
+                    format!("cutoff ordinal {end} is not a source boundary").as_str(),
+                ));
+            }
+        }
         for line in lines {
             let Some(ordinal) = line.ordinal else {
                 continue;
@@ -1770,11 +1831,10 @@ async fn trim_before_nth_user_message(
             {
                 continue;
             }
-            let boundary = UserBoundary {
+            let boundary = active_turn_start.unwrap_or(UserBoundary {
                 segment_index,
-                rollout_ordinal: active_turn_start
-                    .map_or(ordinal, |boundary: UserBoundary| boundary.rollout_ordinal),
-            };
+                rollout_ordinal: ordinal,
+            });
             match line.item {
                 RolloutItem::EventMsg(EventMsg::TurnStarted(_)) => {
                     active_turn_start = Some(UserBoundary {
@@ -1783,6 +1843,13 @@ async fn trim_before_nth_user_message(
                     });
                 }
                 RolloutItem::EventMsg(EventMsg::UserMessage(_)) => {
+                    event_boundaries.push(boundary);
+                }
+                RolloutItem::EventMsg(EventMsg::ItemCompleted(event))
+                    if matches!(event.item, codex_protocol::items::TurnItem::UserMessage(_))
+                        && canonical_user_items
+                            .insert((event.turn_id.clone(), event.item.id())) =>
+                {
                     event_boundaries.push(boundary);
                 }
                 RolloutItem::ResponseItem(item) if item.is_user_message() => {
@@ -1820,7 +1887,7 @@ async fn trim_before_nth_user_message(
     Ok(())
 }
 
-fn filter_rollout_item(item: &mut RolloutItem, filter_texts: &[String]) -> bool {
+pub(super) fn filter_rollout_item(item: &mut RolloutItem, filter_texts: &[String]) -> bool {
     if filter_texts.is_empty() {
         return true;
     }

@@ -5,7 +5,6 @@ use super::Config;
 use super::DoctorCheck;
 use super::DoctorIssue;
 use codex_history::RolloutItem;
-use codex_history::RolloutLine;
 use codex_protocol::protocol::InternalSessionSource;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::SubAgentSource;
@@ -543,8 +542,10 @@ async fn thread_id_from_rollout(path: &Path) -> RolloutThreadId {
             Err(_) => continue,
         };
         if item_type == "session_meta" {
-            return match serde_json::from_str::<RolloutLine>(line.trim()) {
-                Ok(line) => match line.item {
+            return match codex_rollout::RolloutRecorder::parse_rollout_line_bytes(
+                line.trim().as_bytes(),
+            ) {
+                Ok(Some(line)) => match line.item {
                     RolloutItem::SessionMeta(session_meta) => {
                         RolloutThreadId::Id(session_meta.meta.id.to_string())
                     }
@@ -553,14 +554,16 @@ async fn thread_id_from_rollout(path: &Path) -> RolloutThreadId {
                         path.display()
                     )),
                 },
-                Err(_) => RolloutThreadId::Unusable(format!(
+                Ok(None) | Err(_) => RolloutThreadId::Unusable(format!(
                     "rollout at {} has invalid session metadata",
                     path.display()
                 )),
             };
         }
         if !has_legacy_item {
-            has_legacy_item = serde_json::from_str::<RolloutLine>(line.trim()).is_ok();
+            has_legacy_item =
+                codex_rollout::RolloutRecorder::parse_rollout_line_bytes(line.trim().as_bytes())
+                    .is_ok_and(|line| line.is_some());
         }
     }
 
@@ -745,6 +748,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use codex_history::RolloutLine;
     use codex_protocol::ThreadId;
     use codex_utils_absolute_path::test_support::PathExt;
     use pretty_assertions::assert_eq;

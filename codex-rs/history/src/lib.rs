@@ -33,6 +33,7 @@ use serde::Deserializer;
 use serde::Serialize;
 use serde::Serializer;
 use serde::de::Error as _;
+use serde_json::Value;
 
 /// A model-history item with room for history-only metadata.
 ///
@@ -215,13 +216,47 @@ impl From<CompactedItem> for ResponseItem {
     }
 }
 
-#[derive(Serialize, Deserialize, Clone, JsonSchema)]
+/// One physical record in a persisted rollout.
+///
+/// This type intentionally does not derive [`Deserialize`]. With
+/// `serde_json/arbitrary_precision`, Serde's buffering for the flattened `item` field can present
+/// decimal payload values as private number maps, which then fail with errors such as
+/// `invalid type: map, expected f64`. The manual implementation below removes the record envelope
+/// before decoding `item`; do not replace it with `#[derive(Deserialize)]`.
+#[derive(Serialize, Clone, JsonSchema)]
 pub struct RolloutLine {
     pub timestamp: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ordinal: Option<u64>,
     #[serde(flatten)]
     pub item: RolloutItem,
+}
+
+impl<'de> Deserialize<'de> for RolloutLine {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let Value::Object(mut fields) = Value::deserialize(deserializer)? else {
+            return Err(D::Error::custom("rollout record must be a JSON object"));
+        };
+        let timestamp = fields
+            .remove("timestamp")
+            .ok_or_else(|| D::Error::missing_field("timestamp"))
+            .and_then(|value| serde_json::from_value(value).map_err(D::Error::custom))?;
+        let ordinal = fields
+            .remove("ordinal")
+            .map(|value| serde_json::from_value::<Option<u64>>(value).map_err(D::Error::custom))
+            .transpose()?
+            .flatten();
+        let item = serde_json::from_value(Value::Object(fields)).map_err(D::Error::custom)?;
+
+        Ok(Self {
+            timestamp,
+            ordinal,
+            item,
+        })
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

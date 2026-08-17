@@ -9,14 +9,16 @@ use super::LocalThreadStore;
 use crate::ThreadStoreError;
 use crate::ThreadStoreResult;
 
+mod bulk_projection;
 mod read;
 mod realtime;
+pub(super) use bulk_projection::BulkProjection;
 mod search;
 mod segment_paging;
 mod turn_lookup;
 
+pub(super) use read::has_complete_root_projection_for_resolved;
 pub(super) use read::has_complete_segmented_legacy_projection;
-pub(super) use read::has_nonempty_newest_root_turn_for_resolved;
 pub(super) use read::list_existing_segmented_legacy_turns;
 pub(super) use read::list_items;
 pub(super) use read::list_segmented_legacy_items;
@@ -31,6 +33,7 @@ pub(super) use turn_lookup::find_visible_turn;
 /// A valid complete rollout line with its absolute byte span in durable JSONL.
 ///
 /// `start_byte_offset..end_byte_offset` includes the terminating newline.
+#[derive(Clone)]
 pub(super) struct ProjectedRolloutLine {
     pub ordinal: u64,
     pub start_byte_offset: u64,
@@ -44,6 +47,7 @@ pub(super) struct ProjectedRolloutLine {
 ///
 /// Skipped ordinal ranges keep the byte and ordinal checkpoints describing the same durable
 /// prefix even when a complete rollout line cannot be projected.
+#[derive(Clone)]
 pub(super) enum RolloutProjectionStep {
     Line(Box<ProjectedRolloutLine>),
     SkippedOrdinalRange {

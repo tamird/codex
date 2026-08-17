@@ -349,7 +349,7 @@ async fn recovers_legacy_index_name_without_requiring_sidecar_rewrite() -> color
                 .get_thread(thread_id)
                 .await
                 .map_err(std::io::Error::other)?
-                .map(|metadata| metadata.title),
+                .map(|metadata| metadata.name.unwrap_or(metadata.title)),
             runtime
                 .get_thread(scan_sentinel_id)
                 .await

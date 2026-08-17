@@ -1106,15 +1106,22 @@ async fn read_candidate_session_meta(path: &Path) -> io::Result<SessionMetaLine>
             format!("rollout at {} is empty", path.display()),
         ));
     };
-    let line = serde_json::from_str::<RolloutLine>(first_line.as_str()).map_err(|err| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!(
-                "rollout at {} has invalid session metadata: {err}",
-                path.display()
-            ),
-        )
-    })?;
+    let line = RolloutRecorder::parse_rollout_line_bytes(first_line.as_bytes())
+        .map_err(|err| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "rollout at {} has invalid session metadata: {err}",
+                    path.display()
+                ),
+            )
+        })?
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("rollout at {} has invalid session metadata", path.display()),
+            )
+        })?;
     match line.item {
         RolloutItem::SessionMeta(meta) => Ok(meta),
         _ => Err(io::Error::new(

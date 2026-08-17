@@ -5806,7 +5806,9 @@ async fn thread_resume_supports_history_and_overrides() -> Result<()> {
 async fn thread_resume_reconstructs_typed_inter_agent_communication() -> Result<()> {
     let server = create_mock_responses_server_repeating_assistant("Done").await;
     let codex_home = TempDir::new()?;
-    mock_responses_config(&server.uri()).write(codex_home.path())?;
+    mock_responses_config(&server.uri())
+        .disable_feature(Feature::BackgroundPaginatedRolloutMigration)
+        .write(codex_home.path())?;
 
     let filename_ts = "2025-01-05T12-00-00";
     let meta_rfc3339 = "2025-01-05T12:00:00Z";

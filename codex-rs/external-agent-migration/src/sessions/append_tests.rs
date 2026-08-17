@@ -44,6 +44,42 @@ fn returns_the_missing_suffix_from_its_visible_boundary() {
 }
 
 #[test]
+fn native_append_retains_display_items_and_exact_model_prefix() {
+    let thread_id = ThreadId::new();
+    let history = rollout(&[(MessageRole::User, "first request")]);
+    let source = rollout(&[
+        (MessageRole::User, "first request"),
+        (MessageRole::Assistant, "late answer"),
+        (MessageRole::User, "follow-up request"),
+    ]);
+    let native = native_import_items(thread_id, &source).expect("native imported messages");
+    let suffix = plan_append(&native, &history).expect("native suffix");
+    assert!(
+        matches!(suffix.first(), Some(RolloutItem::EventMsg(EventMsg::ItemCompleted(event)))
+        if event.thread_id == thread_id && event.turn_id == "external-import-turn-1")
+    );
+    assert_eq!(
+        model_messages(&suffix),
+        vec![
+            (MessageRole::Assistant, "late answer"),
+            (MessageRole::User, "follow-up request"),
+        ]
+    );
+    assert_eq!(
+        suffix
+            .iter()
+            .filter(|item| matches!(item, RolloutItem::EventMsg(EventMsg::ItemCompleted(_))))
+            .count(),
+        2
+    );
+    assert!(!suffix.iter().any(is_import_marker));
+    let mut appended = history;
+    appended.extend(suffix);
+    assert!(model_transcripts_match(&source, &appended));
+    assert!(plan_append(&native, &appended).is_none());
+}
+
+#[test]
 fn requires_a_strict_nonempty_model_prefix() {
     let history = rollout(&[(MessageRole::User, "first request")]);
     let source = rollout(&[

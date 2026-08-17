@@ -4,9 +4,16 @@ use super::export::EXTERNAL_SESSION_IMPORTED_MARKER;
 use super::ledger::checkpoint_existing_session_import;
 use codex_core::ThreadManager;
 use codex_protocol::ThreadId;
+use codex_protocol::items::AgentMessageContent;
+use codex_protocol::items::AgentMessageItem;
+use codex_protocol::items::TurnItem;
+use codex_protocol::items::UserMessageItem;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::EventMsg;
+use codex_protocol::protocol::ItemCompletedEvent;
+use codex_protocol::protocol::ThreadHistoryMode;
 use codex_protocol::protocol::ThreadMemoryMode;
+use codex_protocol::user_input::UserInput;
 use codex_rollout::RolloutItem;
 use codex_thread_store::AppendThreadItemsParams;
 use codex_thread_store::ReadThreadParams;
@@ -91,12 +98,20 @@ pub async fn append_existing_session(
         })
         .await
     {
-        Ok(mut thread) if thread.thread_id == thread_id && thread.archived_at.is_none() => thread
-            .history
-            .take()
-            .filter(|history| history.thread_id == thread_id)
-            .filter(|history| persistence_metadata(&history.items, thread_id).is_some())
-            .and_then(|history| plan_append(source_items, &history.items)),
+        Ok(mut thread) if thread.thread_id == thread_id && thread.archived_at.is_none() => {
+            let native_source = (thread.history_mode == ThreadHistoryMode::Paginated)
+                .then(|| native_import_items(thread_id, source_items));
+            thread
+                .history
+                .take()
+                .filter(|history| history.thread_id == thread_id)
+                .filter(|history| persistence_metadata(&history.items, thread_id).is_some())
+                .and_then(|history| match native_source {
+                    Some(Some(items)) => plan_append(&items, &history.items),
+                    Some(None) => None,
+                    None => plan_append(source_items, &history.items),
+                })
+        }
         Ok(_) | Err(_) => None,
     };
     let Some(items) = fresh_items else {
@@ -156,6 +171,60 @@ pub async fn append_existing_session(
         .await,
         Ok(Ok(true))
     )
+}
+
+/// Converts the importer's message events when its destination migrated since the first import.
+/// Model response items remain byte-equivalent for the exact-prefix comparison.
+fn native_import_items(thread_id: ThreadId, source: &[RolloutItem]) -> Option<Vec<RolloutItem>> {
+    let mut turn_id = None;
+    let mut started_at_ms = None;
+    let mut result = Vec::with_capacity(source.len());
+    for (index, item) in source.iter().enumerate() {
+        if is_import_marker(item) {
+            continue;
+        }
+        let id = format!("external-import-item-{index}");
+        let presentation = match item {
+            RolloutItem::EventMsg(EventMsg::TurnStarted(event)) => {
+                turn_id = Some(event.turn_id.clone());
+                started_at_ms = event.started_at.map(|seconds| seconds.saturating_mul(1000));
+                None
+            }
+            RolloutItem::EventMsg(EventMsg::UserMessage(event)) => {
+                Some(TurnItem::UserMessage(UserMessageItem {
+                    id,
+                    client_id: event.client_id.clone(),
+                    content: vec![UserInput::Text {
+                        text: event.message.clone(),
+                        text_elements: event.text_elements.clone(),
+                    }],
+                }))
+            }
+            RolloutItem::EventMsg(EventMsg::AgentMessage(event)) => {
+                Some(TurnItem::AgentMessage(AgentMessageItem {
+                    id,
+                    content: vec![AgentMessageContent::Text {
+                        text: event.message.clone(),
+                    }],
+                    phase: event.phase.clone(),
+                    memory_citation: event.memory_citation.clone(),
+                    delivery: event.delivery,
+                }))
+            }
+            _ => None,
+        };
+        result.push(match presentation {
+            Some(item) => RolloutItem::EventMsg(EventMsg::ItemCompleted(ItemCompletedEvent {
+                thread_id,
+                turn_id: turn_id.clone()?,
+                item,
+                started_at_ms,
+                completed_at_ms: started_at_ms.unwrap_or_default(),
+            })),
+            None => item.clone(),
+        });
+    }
+    Some(result)
 }
 
 struct SourceModelItem<'a> {
@@ -230,6 +299,9 @@ fn source_model_items(items: &[RolloutItem]) -> Option<Vec<SourceModelItem<'_>>>
                 append_start_index = Some(index);
             }
             RolloutItem::EventMsg(EventMsg::UserMessage(_)) => {
+                append_start_index.get_or_insert(index);
+            }
+            RolloutItem::EventMsg(EventMsg::ItemCompleted(_)) => {
                 append_start_index.get_or_insert(index);
             }
             RolloutItem::EventMsg(EventMsg::AgentMessage(event))

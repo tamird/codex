@@ -389,6 +389,13 @@ async fn find_thread_names_by_ids_prefers_latest_entry() -> std::io::Result<()> 
 
     let found = find_thread_names_by_ids(temp.path(), &ids).await?;
     assert_eq!(found, expected);
+    append_thread_name(temp.path(), id1, "").await?;
+    expected.remove(&id1);
+    assert_eq!(find_thread_names_by_ids(temp.path(), &ids).await?, expected);
+    assert_eq!(
+        find_thread_name_by_id(temp.path(), &id1).await?,
+        Some(String::new())
+    );
     Ok(())
 }
 

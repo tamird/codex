@@ -427,6 +427,33 @@ impl ThreadHistoryBuilder {
         }
     }
 
+    /// Reduces persisted native records, including presentation items omitted by Legacy replay.
+    /// Mixed-format migration uses this for inherited native records before applying rollbacks.
+    pub fn handle_paginated_rollout_item(&mut self, item: &RolloutItem) {
+        self.current_rollout_index = self.next_rollout_index;
+        self.next_rollout_index += 1;
+        if let RolloutItem::EventMsg(EventMsg::ItemCompleted(payload)) = item {
+            let item = ThreadItem::from(payload.item.clone());
+            if matches!(
+                payload.item,
+                codex_protocol::items::TurnItem::EnteredReviewMode(_)
+                    | codex_protocol::items::TurnItem::ExitedReviewMode(_)
+            ) {
+                self.upsert_review_mode_item(Some(&payload.turn_id), item);
+            } else {
+                self.upsert_item_in_turn_id(&payload.turn_id, item);
+            }
+        } else if let RolloutItem::EventMsg(
+            event @ (EventMsg::TurnStarted(_)
+            | EventMsg::TurnComplete(_)
+            | EventMsg::TurnAborted(_)
+            | EventMsg::ThreadRolledBack(_)),
+        ) = item
+        {
+            self.handle_event(event);
+        }
+    }
+
     /// Handles one event and returns the materialized items or turn metadata
     /// changed by that event.
     pub fn handle_event_with_changes(&mut self, event: &EventMsg) -> ThreadHistoryChangeSet {

@@ -119,7 +119,9 @@ struct SubagentHistoryFixture {
 impl SubagentHistoryFixture {
     async fn new(history_mode: ThreadHistoryMode) -> Result<Self> {
         let codex_home = TempDir::new()?;
-        MockResponsesConfig::new("http://127.0.0.1:1").write(codex_home.path())?;
+        MockResponsesConfig::new("http://127.0.0.1:1")
+            .disable_feature(codex_features::Feature::BackgroundPaginatedRolloutMigration)
+            .write(codex_home.path())?;
         let thread_id = ThreadId::new();
         let stale_agent_id = ThreadId::new();
         let recent_agent_id = ThreadId::new();

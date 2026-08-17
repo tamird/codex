@@ -559,12 +559,9 @@ pub fn thread_store_from_config(
                 state_db,
             ));
             if has_state_db && background_migration_enabled {
-                let startup_store = Arc::clone(&store);
+                store.start_automatic_rollout_migration();
                 let codex_home = config.codex_home.to_path_buf();
                 tokio::spawn(async move {
-                    if let Err(err) = startup_store.migrate_rollouts_on_startup().await {
-                        warn!("failed to migrate legacy rollouts on startup: {err}");
-                    }
                     if compression_enabled {
                         codex_rollout::spawn_rollout_compression_worker(
                             codex_home,
@@ -1521,7 +1518,6 @@ impl ThreadManager {
         &self,
         rollout_path: PathBuf,
     ) -> CodexResult<InitialHistory> {
-        let requested_rollout_path = rollout_path.clone();
         let stored_thread = self
             .state
             .thread_store
@@ -1532,7 +1528,7 @@ impl ThreadManager {
             })
             .await
             .map_err(thread_store_rollout_read_error)?;
-        stored_thread_to_initial_history(stored_thread, Some(requested_rollout_path))
+        stored_thread_to_initial_history(stored_thread, /*rollout_path*/ None)
     }
 
     /// Fork an existing thread from already-loaded store history.

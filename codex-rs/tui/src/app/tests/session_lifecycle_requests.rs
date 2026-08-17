@@ -101,8 +101,14 @@ async fn start_recording_app_server_with_history(
     failed_thread_name: Option<&'static str>,
     thread_params_mode: crate::app_server_session::ThreadParamsMode,
 ) -> Result<RecordingAppServer> {
+    let mut config = config.clone();
+    if matches!(history_capabilities, HistoryCapabilities::LegacyOnly) {
+        config
+            .features
+            .disable(Feature::BackgroundPaginatedRolloutMigration)?;
+    }
     let state_db =
-        crate::init_state_db_for_app_server_target(config, &crate::AppServerTarget::Embedded)
+        crate::init_state_db_for_app_server_target(&config, &crate::AppServerTarget::Embedded)
             .await?;
     let embedded = crate::start_embedded_app_server(
         codex_arg0::Arg0DispatchPaths::default(),
@@ -314,7 +320,7 @@ async fn start_recording_app_server_with_history(
     .await?;
 
     Ok((
-        AppServerSession::new(app_server, thread_params_mode).with_startup_config(config),
+        AppServerSession::new(app_server, thread_params_mode).with_startup_config(&config),
         requests,
         proxy,
     ))

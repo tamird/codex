@@ -4644,11 +4644,13 @@ impl Session {
             None => self.persist_rollout_items(&replacement_items).await,
         }
         state.queue_pending_session_start_source(codex_hooks::SessionStartSource::Compact);
-        drop(state);
         if persisted_checkpoint {
+            // A settings update queued behind `state` must not observe the restart fence after
+            // checkpoint publication has committed. Clear the fence before releasing `state`.
             self.persistence_restart_required
                 .store(false, Ordering::Release);
         }
+        drop(state);
         if let Some(token_count) = recomputed_token_count {
             self.send_event_raw_with_persistence(
                 Event {
