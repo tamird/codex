@@ -1307,7 +1307,7 @@ async fn list_agents_pages_are_byte_bounded_and_complete() {
             } else {
                 AgentStatus::Errored("error".repeat(4096))
             },
-            true,
+            /*visible_when_cold*/ true,
         );
         harness
             .control
@@ -2518,6 +2518,29 @@ async fn spawn_agent_fork_from_paginated_parent_uses_model_context_prefix() {
         .control
         .shutdown_live_agent(child_thread_id)
         .await
+        .expect("child shutdown before resume should submit");
+    let resumed_thread_id = harness
+        .control
+        .resume_agent_from_rollout(harness.config.clone(), child_thread_id, SessionSource::Exec)
+        .await
+        .expect("self-contained copied-prefix child should resume");
+    let resumed_thread = harness
+        .manager
+        .get_thread(resumed_thread_id)
+        .await
+        .expect("resumed copied-prefix child should be registered");
+    assert!(
+        history_contains_text(
+            resumed_thread.session.clone_history().await.raw_items(),
+            "paginated parent context",
+        ),
+        "resumed copied-prefix child should reconstruct inherited model context"
+    );
+
+    let _ = harness
+        .control
+        .shutdown_live_agent(child_thread_id)
+        .await
         .expect("child shutdown should submit");
     let _ = parent_thread
         .submit(Op::Shutdown {})
@@ -2719,6 +2742,8 @@ async fn full_history_fork_copies_paginated_history_base_lineage_across_resume()
     reference_params.parent_thread_id = Some(lineage_thread_id);
     reference_params.initial_rollout_ordinal = lineage_prepared
         .frozen_segment
+        .as_ref()
+        .expect("durable fork freezes its source")
         .next_rollout_ordinal
         .unwrap_or_default();
     store
@@ -2733,7 +2758,12 @@ async fn full_history_fork_copies_paginated_history_base_lineage_across_resume()
         .append_items(AppendThreadItemsParams {
             thread_id: reference_thread_id,
             items: vec![RolloutItem::RolloutReference(
-                lineage_prepared.frozen_segment.reference.clone(),
+                lineage_prepared
+                    .frozen_segment
+                    .as_ref()
+                    .expect("durable fork freezes its source")
+                    .reference
+                    .clone(),
             )],
         })
         .await
@@ -2752,13 +2782,8 @@ async fn full_history_fork_copies_paginated_history_base_lineage_across_resume()
         .await
         .expect("prepare excludeTurns history-base child for thread/fork");
     assert!(
-        prepared.copied_history.as_ref().is_some_and(|history| {
-            let serialized = serde_json::to_string(history.as_slice())
-                .expect("serialize copied persistence history");
-            serialized.contains("source before child boundary")
-                && serialized.contains("history-base child suffix")
-        }),
-        "excludeTurns preparation must retain full copied persistence history"
+        prepared.frozen_segment.is_some(),
+        "excludeTurns preparation must freeze the inherited boundary"
     );
     let (prepared_child, _) = harness
         .manager
@@ -2801,10 +2826,19 @@ async fn full_history_fork_copies_paginated_history_base_lineage_across_resume()
     .lines()
     .map(|line| serde_json::from_str::<RolloutLine>(line).expect("parse child rollout line"))
     .collect::<Vec<_>>();
+    let persisted_history = codex_rollout::materialize_rollout_items(
+        harness.config.codex_home.as_path(),
+        &prepared_child
+            .thread
+            .rollout_path()
+            .expect("prepared child rollout"),
+    )
+    .await
+    .expect("resolve persisted prepared child");
     assert!(
-        prepared_child_lines
-            .iter()
-            .all(|line| !matches!(line.item, RolloutItem::RolloutReference(_)))
+        !serde_json::to_string(&persisted_history)
+            .unwrap()
+            .contains("source after child boundary")
     );
     assert!(prepared_child_lines.iter().any(|line| {
         serde_json::to_string(&line.item)
@@ -2917,21 +2951,16 @@ async fn full_history_fork_copies_paginated_history_base_lineage_across_resume()
         .flush_rollout()
         .await
         .expect("persist spawn_subagent child");
-    let spawned_lines = std::fs::read_to_string(
-        spawned_child
+    // Interrupted subagent forks share immutable history; FullHistory above copies it.
+    let spawned_lines = codex_rollout::materialize_rollout_lines(
+        harness.config.codex_home.as_path(),
+        &spawned_child
             .thread
             .rollout_path()
             .expect("spawn_subagent child rollout path"),
     )
-    .expect("read spawn_subagent child rollout")
-    .lines()
-    .map(|line| serde_json::from_str::<RolloutLine>(line).expect("parse child rollout line"))
-    .collect::<Vec<_>>();
-    assert!(
-        spawned_lines
-            .iter()
-            .all(|line| !matches!(line.item, RolloutItem::RolloutReference(_)))
-    );
+    .await
+    .expect("materialize persisted subagent history");
     assert!(spawned_lines.iter().any(|line| {
         serde_json::to_string(&line.item)
             .expect("serialize spawn_subagent child item")

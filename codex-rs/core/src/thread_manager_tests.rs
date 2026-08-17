@@ -397,6 +397,7 @@ async fn prepared_fork_uses_latest_checkpoint_environment_without_source_runtime
             nth_user_message: None,
             compacted_replacement_history_filter_texts: None,
         },
+        history_base: None,
         source_session_meta,
         history_mode: ThreadHistoryMode::Paginated,
         next_rollout_ordinal: Some(1),
@@ -404,7 +405,7 @@ async fn prepared_fork_uses_latest_checkpoint_environment_without_source_runtime
     let prepared = PreparedFork::new(
         source_thread_id,
         /*history_base*/ None,
-        frozen_segment,
+        Some(frozen_segment),
         Arc::new(boundary_context.clone()),
         Arc::new(latest_context),
         Arc::new(boundary_context),

@@ -23,6 +23,7 @@ use codex_app_server_protocol::ThreadForkParams;
 use codex_app_server_protocol::ThreadForkResponse;
 use codex_app_server_protocol::ThreadHistoryMode;
 use codex_app_server_protocol::ThreadItem;
+use codex_app_server_protocol::ThreadItemEntry;
 use codex_app_server_protocol::ThreadItemsListParams;
 use codex_app_server_protocol::ThreadItemsListResponse;
 use codex_app_server_protocol::ThreadListParams;
@@ -57,14 +58,22 @@ use codex_exec_server::EnvironmentManager;
 use codex_feedback::CodexFeedback;
 use codex_protocol::AgentPath;
 use codex_protocol::SegmentId;
+use codex_protocol::config_types::ApprovalsReviewer as ProtocolApprovalsReviewer;
+use codex_protocol::config_types::CollaborationMode;
+use codex_protocol::config_types::ModeKind;
 use codex_protocol::config_types::ReasoningSummary;
+use codex_protocol::config_types::Settings;
+use codex_protocol::config_types::WindowsSandboxLevel;
 use codex_protocol::items::AgentMessageContent;
 use codex_protocol::items::AgentMessageItem;
 use codex_protocol::items::PlanItem;
 use codex_protocol::items::TurnItem as CoreTurnItem;
 use codex_protocol::items::UserMessageItem;
 use codex_protocol::models::BaseInstructions;
+use codex_protocol::models::ContentItem;
 use codex_protocol::models::MessagePhase;
+use codex_protocol::models::PermissionProfile;
+use codex_protocol::models::ResponseItem;
 use codex_protocol::openai_models::ReasoningEffort;
 use codex_protocol::protocol::AgentMessageEvent;
 use codex_protocol::protocol::AgentStatus as CoreAgentStatus;
@@ -75,16 +84,22 @@ use codex_protocol::protocol::InterAgentCommunication;
 use codex_protocol::protocol::ItemCompletedEvent;
 use codex_protocol::protocol::RolloutReferenceItem;
 use codex_protocol::protocol::SandboxPolicy;
+use codex_protocol::protocol::SegmentPreviousTurnSettings;
 use codex_protocol::protocol::SessionMeta;
 use codex_protocol::protocol::SessionMetaLine;
 use codex_protocol::protocol::SessionSource as ProtocolSessionSource;
 use codex_protocol::protocol::ThreadMemoryMode;
+use codex_protocol::protocol::ThreadSettingsAppliedEvent;
+use codex_protocol::protocol::ThreadSettingsSnapshot;
+use codex_protocol::protocol::TokenCountEvent;
 use codex_protocol::protocol::TurnCompleteEvent;
 use codex_protocol::protocol::TurnContextItem;
+use codex_protocol::protocol::TurnEnvironmentSelections;
 use codex_protocol::protocol::TurnStartedEvent;
 use codex_protocol::protocol::UserMessageEvent;
 use codex_protocol::user_input::ByteRange;
 use codex_protocol::user_input::TextElement;
+use codex_rollout::CertifiedSegmentStateCheckpoint;
 use codex_rollout::CompactedItem;
 use codex_rollout::RolloutItem;
 use codex_rollout::RolloutLine;
@@ -121,6 +136,73 @@ use uuid::Uuid;
 const DEFAULT_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(25);
 #[cfg(not(windows))]
 const DEFAULT_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+fn certified_recent_history_checkpoint(codex_home: &Path) -> CertifiedSegmentStateCheckpoint {
+    let window_id = Uuid::now_v7();
+    let cwd = codex_home.abs();
+    CertifiedSegmentStateCheckpoint::new(
+        CompactedItem {
+            message: "latest certified history checkpoint".to_string(),
+            replacement_history: Some(vec![
+                ResponseItem::Message {
+                    id: None,
+                    role: "user".to_string(),
+                    content: vec![ContentItem::InputText {
+                        text: "checkpoint replacement history".to_string(),
+                    }],
+                    phase: None,
+                    internal_chat_message_metadata_passthrough: None,
+                }
+                .into(),
+            ]),
+            mcp_resource_origins: None,
+            window_number: Some(1),
+            first_window_id: Some(window_id.to_string()),
+            previous_window_id: None,
+            window_id: Some(window_id.to_string()),
+            segment_state_checkpoint: None,
+        },
+        Some(SegmentPreviousTurnSettings {
+            model: "mock-model".to_string(),
+            comp_hash: None,
+            realtime_active: None,
+        }),
+        /*world_state*/ None,
+        /*reference_context*/ None,
+        ThreadSettingsAppliedEvent {
+            thread_settings: ThreadSettingsSnapshot {
+                model: "mock-model".to_string(),
+                model_provider_id: "mock_provider".to_string(),
+                service_tier: None,
+                approval_policy: AskForApproval::Never,
+                approvals_reviewer: ProtocolApprovalsReviewer::User,
+                permission_profile: PermissionProfile::workspace_write(),
+                active_permission_profile: None,
+                cwd: cwd.clone(),
+                environments: Some(TurnEnvironmentSelections::new(cwd, Vec::new())),
+                workspace_roots: Some(Vec::new()),
+                profile_workspace_roots: Some(Vec::new()),
+                windows_sandbox_level: Some(WindowsSandboxLevel::Disabled),
+                reasoning_effort: None,
+                reasoning_summary: None,
+                personality: None,
+                collaboration_mode: CollaborationMode {
+                    mode: ModeKind::Default,
+                    settings: Settings {
+                        model: "mock-model".to_string(),
+                        reasoning_effort: None,
+                        developer_instructions: None,
+                    },
+                },
+            },
+        },
+        TokenCountEvent {
+            info: None,
+            rate_limits: None,
+        },
+    )
+    .expect("valid recent history checkpoint")
+}
 
 #[tokio::test]
 async fn thread_read_returns_summary_without_turns() -> Result<()> {
@@ -376,7 +458,7 @@ async fn paginated_segmented_history_without_index_returns_latest_five_turns() -
     let store = LocalThreadStore::new(
         LocalThreadStoreConfig {
             codex_home: codex_home.path().to_path_buf(),
-            sqlite,
+            sqlite: sqlite.clone(),
             default_model_provider_id: "mock_provider".to_string(),
         },
         Some(state_db),
@@ -596,12 +678,286 @@ async fn paginated_segmented_history_without_index_returns_latest_five_turns() -
     let ThreadResumeResponse {
         thread,
         initial_turns_page,
+        turns_backwards_cursor,
+        items_backwards_cursor,
         ..
     } = timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(resume_id)).await??;
     assert!(thread.turns.is_empty());
     let resumed_page = initial_turns_page.expect("resume should return the latest five turns");
     assert_eq!(resumed_page.data, first_page.data);
+    let turns_backwards_cursor = turns_backwards_cursor.expect("unprojected turn head cursor");
+    let items_backwards_cursor = items_backwards_cursor.expect("unprojected item head cursor");
+    let resumed_head_turns = read_turns_page(
+        &mut mcp,
+        thread_id,
+        Some(turns_backwards_cursor),
+        Some(1),
+        SortDirection::Desc,
+        Some(TurnItemsView::NotLoaded),
+    )
+    .await?;
+    assert_eq!(resumed_head_turns.data[0].id, "turn-7");
+    let resumed_head_items = read_items_page(
+        &mut mcp,
+        thread_id,
+        /*turn_id*/ None,
+        Some(items_backwards_cursor),
+        Some(1),
+        SortDirection::Desc,
+    )
+    .await?;
+    assert_eq!(resumed_head_items.data[0].turn_id, "turn-7");
+    assert_eq!(resumed_head_items.data[0].item.id(), "agent-7");
 
+    let post_resume_page = read_turns_page(
+        &mut mcp,
+        thread_id,
+        /*cursor*/ None,
+        Some(5),
+        SortDirection::Desc,
+        Some(TurnItemsView::Full),
+    )
+    .await?;
+    assert_eq!(post_resume_page.data, first_page.data);
+    assert_eq!(post_resume_page.next_cursor, first_page.next_cursor);
+
+    let projection_state =
+        codex_state::StateRuntime::init(sqlite.clone(), "mock_provider".to_string()).await?;
+    let projection_inspector = LocalThreadStore::new(
+        LocalThreadStoreConfig {
+            codex_home: codex_home.path().to_path_buf(),
+            sqlite,
+            default_model_provider_id: "mock_provider".to_string(),
+        },
+        Some(projection_state),
+    );
+    timeout(DEFAULT_READ_TIMEOUT, async {
+        loop {
+            if projection_inspector
+                .has_history_projection(thread_id)
+                .await
+                .expect("inspect rebuilt projection")
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+    })
+    .await?;
+    drop(projection_inspector);
+
+    let saved_fallback_cursor = first_page
+        .next_cursor
+        .clone()
+        .expect("fallback first page should have an older cursor");
+    drop(mcp);
+    let mut restarted = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .without_auto_env()
+        .build_initialized()
+        .await?;
+    let continued_after_restart = read_turns_page(
+        &mut restarted,
+        thread_id,
+        Some(saved_fallback_cursor),
+        Some(5),
+        SortDirection::Desc,
+        Some(TurnItemsView::Full),
+    )
+    .await?;
+    assert_eq!(
+        continued_after_restart
+            .data
+            .iter()
+            .map(|turn| turn.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["turn-2", "turn-1", "turn-0"]
+    );
+    drop(restarted);
+    let mut indexed_server = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .without_auto_env()
+        .build_initialized()
+        .await?;
+    let indexed_after_restart = read_turns_page(
+        &mut indexed_server,
+        thread_id,
+        /*cursor*/ None,
+        Some(5),
+        SortDirection::Desc,
+        Some(TurnItemsView::Full),
+    )
+    .await?;
+    assert_eq!(indexed_after_restart.data, first_page.data);
+    assert!(
+        indexed_after_restart
+            .next_cursor
+            .as_deref()
+            .is_some_and(|cursor| cursor.contains("rolloutOrdinal")),
+        "a fresh process should use the atomically published SQLite projection"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn paginated_resume_without_index_does_not_open_obsolete_predecessor() -> Result<()> {
+    let server = create_mock_responses_server_repeating_assistant("Done").await;
+    let codex_home = TempDir::new()?;
+    MockResponsesConfig::new(&server.uri()).write(codex_home.path())?;
+    let thread_id = codex_protocol::ThreadId::new();
+    let sqlite = codex_state::SqliteConfig::new_for_testing(codex_home.path().abs());
+    let state_db =
+        codex_state::StateRuntime::init(sqlite.clone(), "mock_provider".to_string()).await?;
+    let history_db_path = sqlite.thread_history_db_path();
+    let store = LocalThreadStore::new(
+        LocalThreadStoreConfig {
+            codex_home: codex_home.path().to_path_buf(),
+            sqlite,
+            default_model_provider_id: "mock_provider".to_string(),
+        },
+        Some(state_db),
+    );
+    store
+        .create_thread(CreateThreadParams {
+            session_id: thread_id.into(),
+            thread_id,
+            extra_config: None,
+            forked_from_id: None,
+            forked_from_ordinal_exclusive: None,
+            parent_thread_id: None,
+            source: ProtocolSessionSource::Cli,
+            thread_source: None,
+            originator: "test_originator".to_string(),
+            base_instructions: BaseInstructions::default(),
+            dynamic_tools: Vec::new(),
+            selected_capability_roots: Vec::new(),
+            multi_agent_version: None,
+            history_mode: codex_protocol::protocol::ThreadHistoryMode::Paginated,
+            history_base: None,
+            subagent_history_start_ordinal: None,
+            persistence_mode: Default::default(),
+            initial_rollout_ordinal: 0,
+            initial_window_id: Uuid::now_v7().to_string(),
+            metadata: ThreadPersistenceMetadata {
+                cwd: Some(codex_home.path().to_path_buf()),
+                model_provider: "mock_provider".to_string(),
+                memory_mode: ThreadMemoryMode::Enabled,
+            },
+        })
+        .await?;
+    store
+        .persist_thread(thread_id, PersistContext::Standard)
+        .await?;
+
+    let mut oldest_segment = None;
+    for index in 0..8 {
+        store
+            .append_items(AppendThreadItemsParams {
+                thread_id,
+                items: vec![RolloutItem::EventMsg(EventMsg::AgentMessage(
+                    AgentMessageEvent {
+                        message: format!("obsolete {index}"),
+                        phase: None,
+                        delivery: None,
+                        memory_citation: None,
+                    },
+                ))],
+            })
+            .await?;
+        let frozen = store
+            .freeze_thread_segment(thread_id, FreezeRolloutSegmentParams::rotate(Vec::new()))
+            .await?;
+        oldest_segment.get_or_insert(frozen.reference.rollout_path);
+    }
+    let mut latest = certified_recent_history_checkpoint(codex_home.path()).into_items();
+    latest.extend([
+        paginated_turn_started("latest-turn"),
+        paginated_completed_item(
+            thread_id,
+            "latest-turn",
+            CoreTurnItem::UserMessage(UserMessageItem {
+                id: "latest-user".to_string(),
+                client_id: None,
+                content: vec![codex_protocol::user_input::UserInput::Text {
+                    text: "latest user".to_string(),
+                    text_elements: Vec::new(),
+                }],
+            }),
+        ),
+        paginated_completed_item(
+            thread_id,
+            "latest-turn",
+            CoreTurnItem::AgentMessage(AgentMessageItem {
+                id: "latest-agent".to_string(),
+                content: vec![AgentMessageContent::Text {
+                    text: "latest answer".to_string(),
+                }],
+                phase: None,
+                delivery: None,
+                memory_citation: None,
+            }),
+        ),
+        paginated_turn_completed("latest-turn"),
+    ]);
+    store
+        .append_items(AppendThreadItemsParams {
+            thread_id,
+            items: latest,
+        })
+        .await?;
+    store.shutdown_thread(thread_id).await?;
+    drop(store);
+
+    let history_db_name = history_db_path
+        .file_name()
+        .expect("thread history database filename")
+        .to_string_lossy();
+    for path in [
+        history_db_path.clone(),
+        history_db_path.with_file_name(format!("{history_db_name}-wal")),
+        history_db_path.with_file_name(format!("{history_db_name}-shm")),
+    ] {
+        if path.exists() {
+            std::fs::remove_file(path)?;
+        }
+    }
+    let oldest_segment = oldest_segment.expect("oldest predecessor");
+    let unavailable = oldest_segment.with_extension("jsonl.unavailable");
+    std::fs::rename(oldest_segment.as_path(), unavailable.as_path())?;
+
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .without_auto_env()
+        .build_initialized()
+        .await?;
+    let resume_id = mcp
+        .send_thread_resume_request(ThreadResumeParams {
+            thread_id: thread_id.to_string(),
+            exclude_turns: true,
+            initial_turns_page: Some(ThreadResumeInitialTurnsPageParams {
+                limit: Some(1),
+                sort_direction: Some(SortDirection::Desc),
+                items_view: Some(TurnItemsView::Full),
+            }),
+            ..Default::default()
+        })
+        .await?;
+    let ThreadResumeResponse {
+        thread,
+        initial_turns_page,
+        turns_backwards_cursor,
+        items_backwards_cursor,
+        ..
+    } = timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(resume_id)).await??;
+    assert!(thread.turns.is_empty());
+    let page = initial_turns_page.expect("bounded initial page");
+    assert_eq!(page.data.len(), 1);
+    assert_eq!(page.data[0].id, "latest-turn");
+    assert!(turns_backwards_cursor.is_some());
+    assert!(items_backwards_cursor.is_some());
+
+    std::fs::rename(unavailable, oldest_segment)?;
     Ok(())
 }
 
@@ -670,7 +1026,7 @@ async fn thread_turns_list_can_page_backward_and_forward() -> Result<()> {
 
     let read_id = mcp
         .send_thread_turns_list_request(ThreadTurnsListParams {
-            thread_id: conversation_id,
+            thread_id: conversation_id.clone(),
             cursor: Some(backwards_cursor),
             limit: Some(10),
             sort_direction: Some(SortDirection::Asc),
@@ -753,31 +1109,35 @@ async fn thread_turns_list_pages_complete_turns_across_rollout_segments() -> Res
             .freeze_thread_segment(thread_id, FreezeRolloutSegmentParams::rotate(Vec::new()))
             .await?;
     }
+    let mut recent_items = certified_recent_history_checkpoint(codex_home.path()).into_items();
+    recent_items.extend([
+        paginated_turn_started("previous-turn"),
+        RolloutItem::EventMsg(EventMsg::UserMessage(UserMessageEvent {
+            message: "previous user".to_string(),
+            ..Default::default()
+        })),
+        RolloutItem::EventMsg(EventMsg::AgentMessage(AgentMessageEvent {
+            message: "previous answer".to_string(),
+            phase: None,
+            delivery: None,
+            memory_citation: None,
+        })),
+        paginated_turn_completed("previous-turn"),
+        paginated_turn_started("latest-turn"),
+        RolloutItem::EventMsg(EventMsg::UserMessage(UserMessageEvent {
+            message: "latest user".to_string(),
+            ..Default::default()
+        })),
+    ]);
     store
         .append_items(AppendThreadItemsParams {
             thread_id,
-            items: vec![
-                paginated_turn_started("previous-turn"),
-                RolloutItem::EventMsg(EventMsg::UserMessage(UserMessageEvent {
-                    message: "previous user".to_string(),
-                    ..Default::default()
-                })),
-                RolloutItem::EventMsg(EventMsg::AgentMessage(AgentMessageEvent {
-                    message: "previous answer".to_string(),
-                    phase: None,
-                    delivery: None,
-                    memory_citation: None,
-                })),
-                paginated_turn_completed("previous-turn"),
-                paginated_turn_started("latest-turn"),
-                RolloutItem::EventMsg(EventMsg::UserMessage(UserMessageEvent {
-                    message: "latest user".to_string(),
-                    ..Default::default()
-                })),
-            ],
+            items: recent_items,
         })
         .await?;
-    for _ in 0..6 {
+    // Keep the split turn inside the shipped five-segment fallback window. A projection may span
+    // arbitrary history, but an unprojected normal read must not open a sixth predecessor.
+    for _ in 0..3 {
         store
             .freeze_thread_segment(thread_id, FreezeRolloutSegmentParams::rotate(Vec::new()))
             .await?;
@@ -885,7 +1245,12 @@ async fn thread_turns_list_pages_complete_turns_across_rollout_segments() -> Res
         [
             RolloutItem::SessionMeta(_),
             RolloutItem::RolloutReference(_),
-            RolloutItem::EventMsg(EventMsg::ThreadSettingsApplied(_))
+            RolloutItem::Compacted(CompactedItem {
+                segment_state_checkpoint: Some(_),
+                ..
+            }),
+            RolloutItem::EventMsg(EventMsg::ThreadSettingsApplied(_)),
+            RolloutItem::EventMsg(EventMsg::TokenCount(_))
         ]
     ));
     assert!(
@@ -1171,9 +1536,78 @@ async fn frodex_running_legacy_resume_returns_newest_five_segments_only() -> Res
             .collect::<Vec<_>>(),
         vec!["turn-7", "turn-6", "turn-5", "turn-4", "turn-3"]
     );
-    // LOAD BEARING: do not advertise a cursor into rollout segments older than the five segments
-    // normal Frodex reads make available. Following that cursor restored the unbounded scan.
-    assert_eq!(expected_page.next_cursor, None);
+    let newest_turn = &expected_page.data[0];
+    let newest_items = read_items_page(
+        &mut mcp,
+        thread_id,
+        Some(newest_turn.id.as_str()),
+        /*cursor*/ None,
+        Some(20),
+        SortDirection::Asc,
+    )
+    .await?;
+    assert_eq!(
+        newest_items.data,
+        newest_turn
+            .items
+            .iter()
+            .cloned()
+            .map(|item| ThreadItemEntry {
+                turn_id: newest_turn.id.clone(),
+                item,
+            })
+            .collect::<Vec<_>>(),
+        "thread/items/list must preserve the IDs already returned for a bounded Legacy turn"
+    );
+    // The initial Desktop request remains bounded to five segments. An explicit cursor may page
+    // farther back, and corruption outside the initial window is reported only when the client
+    // reaches it.
+    let older_cursor = expected_page
+        .next_cursor
+        .clone()
+        .expect("bounded latest history advertises explicit older paging");
+    let older_page = read_turns_page(
+        &mut mcp,
+        thread_id,
+        Some(older_cursor),
+        Some(5),
+        SortDirection::Desc,
+        Some(TurnItemsView::Full),
+    )
+    .await?;
+    assert_eq!(
+        older_page
+            .data
+            .iter()
+            .map(|turn| turn.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["turn-2", "turn-1", "turn-0"]
+    );
+    let corrupt_cursor = older_page
+        .next_cursor
+        .expect("the malformed predecessor remains beyond the valid older page");
+    let corrupt_request_id = mcp
+        .send_thread_turns_list_request(ThreadTurnsListParams {
+            thread_id: thread_id.to_string(),
+            cursor: Some(corrupt_cursor),
+            limit: Some(5),
+            sort_direction: Some(SortDirection::Desc),
+            items_view: Some(TurnItemsView::Full),
+        })
+        .await?;
+    let corrupt_error: JSONRPCError = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_error_message(RequestId::Integer(corrupt_request_id)),
+    )
+    .await??;
+    assert!(
+        corrupt_error.error.message.contains("invalid record")
+            || corrupt_error
+                .error
+                .message
+                .contains("anchor turn is no longer present"),
+        "the cursor beyond the last valid page must fail explicitly: {corrupt_error:?}"
+    );
 
     let resume_id = mcp
         .send_thread_resume_request(ThreadResumeParams {
@@ -1205,35 +1639,50 @@ async fn frodex_running_legacy_resume_returns_newest_five_segments_only() -> Res
 async fn frodex_thread_turns_list_stays_bounded_with_258_segments() -> Result<()> {
     assert_thread_turns_list_same_thread_segment_limit(
         codex_rollout::MAX_ROLLOUT_REFERENCE_DEPTH + 2,
-        None,
+        /*expected_error*/ None,
     )
     .await
 }
 
 #[tokio::test]
 async fn frodex_thread_turns_list_stays_bounded_with_512_segments() -> Result<()> {
-    assert_thread_turns_list_same_thread_segment_limit(512, None).await
+    assert_thread_turns_list_same_thread_segment_limit(
+        /*segment_count*/ 512, /*expected_error*/ None,
+    )
+    .await
 }
 
 #[tokio::test]
 async fn frodex_thread_turns_list_stays_bounded_with_513_segments() -> Result<()> {
-    assert_thread_turns_list_same_thread_segment_limit(513, None).await
+    assert_thread_turns_list_same_thread_segment_limit(
+        /*segment_count*/ 513, /*expected_error*/ None,
+    )
+    .await
 }
 
 #[tokio::test]
 async fn frodex_thread_turns_list_stays_bounded_with_1025_segments() -> Result<()> {
-    assert_thread_turns_list_same_thread_segment_limit(1025, None).await
+    assert_thread_turns_list_same_thread_segment_limit(
+        /*segment_count*/ 1025, /*expected_error*/ None,
+    )
+    .await
 }
 
 #[tokio::test]
 async fn frodex_thread_turns_list_stays_bounded_with_4097_segments() -> Result<()> {
-    assert_thread_turns_list_same_thread_segment_limit(4097, None).await
+    assert_thread_turns_list_same_thread_segment_limit(
+        /*segment_count*/ 4097, /*expected_error*/ None,
+    )
+    .await
 }
 
 #[tokio::test]
 #[ignore = "manual five-figure same-thread segment scaling validation"]
 async fn frodex_thread_turns_list_stays_bounded_with_10001_segments() -> Result<()> {
-    assert_thread_turns_list_same_thread_segment_limit(10001, None).await
+    assert_thread_turns_list_same_thread_segment_limit(
+        /*segment_count*/ 10001, /*expected_error*/ None,
+    )
+    .await
 }
 
 async fn assert_thread_turns_list_same_thread_segment_limit(
@@ -1269,7 +1718,7 @@ async fn assert_thread_turns_list_same_thread_segment_limit(
                     .join(codex_rollout::ROTATED_ROLLOUT_SEGMENTS_SUBDIR)
                     .join(thread_id.to_string())
                     .join(segment_id.to_string())
-                    .join("segment.jsonl")
+                    .join(active_path.file_name().expect("active rollout filename"))
             }
         })
         .collect::<Vec<_>>();
@@ -1302,6 +1751,9 @@ async fn assert_thread_turns_list_same_thread_segment_limit(
                 nth_user_message: None,
                 compacted_replacement_history_filter_texts: None,
             }));
+        }
+        if index + 1 == paths.len() {
+            items.extend(certified_recent_history_checkpoint(codex_home.path()).into_items());
         }
         let turn_id = format!("turn-{index}");
         items.extend([
@@ -1408,7 +1860,7 @@ async fn frodex_history_apis_ignore_deleted_sixth_segment() -> Result<()> {
                     .join(codex_rollout::ROTATED_ROLLOUT_SEGMENTS_SUBDIR)
                     .join(thread_id.to_string())
                     .join(segment_id.to_string())
-                    .join("segment.jsonl")
+                    .join(active_path.file_name().expect("active rollout filename"))
             }
         })
         .collect::<Vec<_>>();
@@ -1441,6 +1893,9 @@ async fn frodex_history_apis_ignore_deleted_sixth_segment() -> Result<()> {
                 nth_user_message: None,
                 compacted_replacement_history_filter_texts: None,
             }));
+        }
+        if index + 1 == paths.len() {
+            items.extend(certified_recent_history_checkpoint(codex_home.path()).into_items());
         }
         let turn_id = format!("turn-{index}");
         items.extend([
@@ -1528,11 +1983,22 @@ async fn frodex_history_apis_ignore_deleted_sixth_segment() -> Result<()> {
     let fork_id = mcp
         .send_thread_fork_request(ThreadForkParams {
             thread_id: thread_id.to_string(),
+            exclude_turns: true,
             ..Default::default()
         })
         .await?;
     let ThreadForkResponse { thread, .. } =
         timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(fork_id)).await??;
+    assert!(thread.turns.is_empty());
+
+    let complete_fork_id = mcp
+        .send_thread_fork_request(ThreadForkParams {
+            thread_id: thread_id.to_string(),
+            ..Default::default()
+        })
+        .await?;
+    let ThreadForkResponse { thread, .. } =
+        timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(complete_fork_id)).await??;
     assert_eq!(turn_user_texts(&thread.turns), expected_user_texts);
 
     let side_id = mcp
@@ -2090,7 +2556,7 @@ async fn thread_turns_list_reuses_legacy_reference_depths_without_changing_histo
     let first_page = read_turns_page(
         &mut app_server,
         thread_id,
-        None,
+        /*cursor*/ None,
         Some(1),
         SortDirection::Desc,
         Some(TurnItemsView::Full),
@@ -2099,7 +2565,7 @@ async fn thread_turns_list_reuses_legacy_reference_depths_without_changing_histo
     let repeated_first_page = read_turns_page(
         &mut app_server,
         thread_id,
-        None,
+        /*cursor*/ None,
         Some(1),
         SortDirection::Desc,
         Some(TurnItemsView::Full),
@@ -2918,7 +3384,7 @@ async fn thread_resume_initial_turns_page_matches_requested_turns_list_page() ->
 
     let resume_id = mcp
         .send_thread_resume_request(ThreadResumeParams {
-            thread_id: conversation_id,
+            thread_id: conversation_id.clone(),
             exclude_turns: true,
             initial_turns_page: Some(ThreadResumeInitialTurnsPageParams {
                 limit: Some(2),
@@ -2937,7 +3403,53 @@ async fn thread_resume_initial_turns_page_matches_requested_turns_list_page() ->
     assert!(thread.turns.is_empty());
     assert_eq!(
         initial_turns_page,
-        Some(codex_app_server_protocol::TurnsPage::from(expected_page))
+        Some(codex_app_server_protocol::TurnsPage::from(
+            expected_page.clone()
+        ))
+    );
+
+    let post_resume_id = mcp
+        .send_thread_turns_list_request(ThreadTurnsListParams {
+            thread_id: conversation_id.clone(),
+            cursor: None,
+            limit: Some(2),
+            sort_direction: Some(SortDirection::Asc),
+            items_view: Some(TurnItemsView::NotLoaded),
+        })
+        .await?;
+    let post_resume_page: ThreadTurnsListResponse =
+        timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(post_resume_id)).await??;
+    assert_eq!(post_resume_page, expected_page);
+
+    let full_page = read_turns_page(
+        &mut mcp,
+        codex_protocol::ThreadId::from_string(&conversation_id)?,
+        /*cursor*/ None,
+        Some(1),
+        SortDirection::Asc,
+        Some(TurnItemsView::Full),
+    )
+    .await?;
+    let turn = full_page.data.first().expect("one full turn");
+    let items_page = read_items_page(
+        &mut mcp,
+        codex_protocol::ThreadId::from_string(&conversation_id)?,
+        Some(turn.id.as_str()),
+        /*cursor*/ None,
+        Some(20),
+        SortDirection::Asc,
+    )
+    .await?;
+    assert_eq!(
+        items_page.data,
+        turn.items
+            .iter()
+            .cloned()
+            .map(|item| ThreadItemEntry {
+                turn_id: turn.id.clone(),
+                item,
+            })
+            .collect::<Vec<_>>()
     );
 
     Ok(())

@@ -13,7 +13,6 @@ use codex_core::TurnInputRequest;
 use codex_features::Feature;
 use codex_history::InitialHistory;
 use codex_history::ResumedHistory;
-use codex_history::RolloutItem;
 use codex_protocol::mcp::ClientMcpExtensions;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::Op;
@@ -86,9 +85,12 @@ async fn compressed_shared_fork_resume_preserves_checkpoint_and_frozen_history()
             boundary: ForkBoundary::Latest,
         })
         .await?;
-    let expected_reference = prepared.frozen_segment.reference.clone();
-    let frozen_path = expected_reference.rollout_path.clone();
-    let frozen_bytes = std::fs::read(&frozen_path)?;
+    let frozen = prepared
+        .frozen_segment
+        .as_ref()
+        .context("frozen parent segment")?;
+    let expected_history_base = frozen.history_base.context("native history base")?;
+    let frozen_path = frozen.reference.rollout_path.clone();
     let (child, _) = test
         .thread_manager
         .fork_prepared_thread(
@@ -123,21 +125,19 @@ async fn compressed_shared_fork_resume_preserves_checkpoint_and_frozen_history()
         .await?
         .meta;
     assert_eq!(
-        (child_meta.id, child_meta.forked_from_id),
-        (child.thread_id, Some(test.session_configured.thread_id)),
-    );
-    let (child_items, _, parse_errors) =
-        codex_rollout::RolloutRecorder::load_rollout_items(&child_path).await?;
-    assert_eq!(parse_errors, 0);
-    let Some(RolloutItem::RolloutReference(actual_reference)) = child_items.get(1) else {
-        anyhow::bail!("expected a leading frozen rollout reference");
-    };
-    assert_eq!(
-        serde_json::to_value(actual_reference)?,
-        serde_json::to_value(expected_reference)?,
+        (
+            child_meta.id,
+            child_meta.forked_from_id,
+            child_meta.history_base,
+        ),
+        (
+            child.thread_id,
+            Some(test.session_configured.thread_id),
+            Some(expected_history_base),
+        ),
     );
 
-    let paths = [&parent_path, &child_path];
+    let paths = [&parent_path, &child_path, &frozen_path];
     let original_bytes = paths
         .iter()
         .map(std::fs::read)
@@ -231,7 +231,11 @@ async fn compressed_shared_fork_resume_preserves_checkpoint_and_frozen_history()
         "resume must leave the live parent compressed"
     );
     assert!(parent_path.with_extension("jsonl.zst").exists());
-    assert_eq!(std::fs::read(&frozen_path)?, frozen_bytes);
+    assert!(
+        !frozen_path.exists(),
+        "reading the frozen ancestor must not materialize it"
+    );
+    assert!(frozen_path.with_extension("jsonl.zst").exists());
     resumed.thread.shutdown_and_wait().await?;
     Ok(())
 }

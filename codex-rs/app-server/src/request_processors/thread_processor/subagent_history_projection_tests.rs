@@ -13,12 +13,15 @@ use codex_protocol::SegmentId;
 use codex_protocol::ThreadId;
 use codex_protocol::protocol::CollabAgentInteractionBeginEvent;
 use codex_protocol::protocol::EventMsg;
+use codex_protocol::protocol::HistoryPosition;
 use codex_protocol::protocol::RolloutReferenceItem;
 use codex_protocol::protocol::SessionMeta;
 use codex_protocol::protocol::SessionMetaLine;
 use codex_protocol::protocol::SessionSource;
+use codex_protocol::protocol::ThreadHistoryMode;
 use codex_rollout::RolloutItem;
 use codex_rollout::RolloutLine;
+use codex_rollout::RolloutRecorder;
 use pretty_assertions::assert_eq;
 use tempfile::TempDir;
 
@@ -235,6 +238,298 @@ async fn fork_boundary_does_not_contribute_recent_ids() {
     projection.project_items(&mut items);
 
     assert_eq!(items, Vec::<ThreadItem>::new());
+}
+
+#[tokio::test]
+async fn native_projection_counts_only_same_thread_physical_segments() {
+    for segment_count in [5, 6] {
+        for include_foreign_base in [false, true] {
+            let home = TempDir::new().expect("temporary rollout home");
+            let thread_id = ThreadId::new();
+            let [stale_id, current_id, recent_id, foreign_id] =
+                std::array::from_fn(|_| ThreadId::new());
+            let foreign = write_native_chain(
+                home.path(),
+                ThreadId::new(),
+                /*segment_count*/ 1,
+                /*history_base*/ None,
+                &[(0, foreign_id)],
+            )
+            .await;
+            let segments = write_native_chain(
+                home.path(),
+                thread_id,
+                segment_count,
+                include_foreign_base.then_some(foreign[0].1),
+                &[(0, stale_id), (0, current_id), (1, recent_id)],
+            )
+            .await;
+            let projection = SubagentHistoryProjection::load(
+                home.path(),
+                &segments.last().expect("active rollout").0,
+                thread_id,
+                [current_id],
+            )
+            .await
+            .expect("load native projection");
+            if segment_count == 5 {
+                assert!(
+                    projection.is_none(),
+                    "foreign ancestry is not a sixth owned segment"
+                );
+            } else {
+                let mut items = vec![
+                    activity_item("stale", stale_id),
+                    activity_item("current", current_id),
+                    activity_item("recent", recent_id),
+                    activity_item("foreign", foreign_id),
+                ];
+                projection
+                    .expect("six owned segments enable projection")
+                    .project_items(&mut items);
+                assert_eq!(
+                    items,
+                    vec![
+                        activity_item("current", current_id),
+                        activity_item("recent", recent_id)
+                    ]
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn mixed_native_and_legacy_segments_share_the_retention_window() -> std::io::Result<()> {
+    let home = TempDir::new()?;
+    let thread_id = ThreadId::new();
+    let [stale_id, native_id, legacy_id] = std::array::from_fn(|_| ThreadId::new());
+    let native = write_native_chain(
+        home.path(),
+        thread_id,
+        /*segment_count*/ 3,
+        /*history_base*/ None,
+        &[(0, stale_id), (1, native_id)],
+    )
+    .await;
+    let legacy = write_same_thread_chain(
+        home.path(),
+        thread_id,
+        /*segment_count*/ 3,
+        &[(2, legacy_id)],
+        &[],
+    )
+    .await;
+    let (mut lines, _, _) = RolloutRecorder::load_rollout_lines(&legacy[0]).await?;
+    let RolloutItem::SessionMeta(metadata) = &mut lines[0].item else {
+        panic!("session metadata")
+    };
+    metadata.meta.history_mode = ThreadHistoryMode::Paginated;
+    metadata.meta.history_base = Some(native.last().expect("native predecessor").1);
+    write_rollout(&legacy[0], &lines).await;
+    let projection = SubagentHistoryProjection::load(
+        home.path(),
+        legacy.last().expect("active rollout"),
+        thread_id,
+        [],
+    )
+    .await?
+    .expect("six owned segments");
+    let mut items = vec![
+        activity_item("stale", stale_id),
+        activity_item("native", native_id),
+        activity_item("legacy", legacy_id),
+    ];
+    projection.project_items(&mut items);
+    assert_eq!(
+        items,
+        vec![
+            activity_item("native", native_id),
+            activity_item("legacy", legacy_id)
+        ]
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn native_projection_respects_prefix_cutoffs_without_rewriting_storage() -> std::io::Result<()>
+{
+    for compressed in [false, true] {
+        let home = TempDir::new()?;
+        let thread_id = ThreadId::new();
+        let [recent_id, suffix_id] = std::array::from_fn(|_| ThreadId::new());
+        let segments = write_native_chain(
+            home.path(),
+            thread_id,
+            /*segment_count*/ 6,
+            /*history_base*/ None,
+            &[(1, recent_id)],
+        )
+        .await;
+        let prefix_path = &segments[1].0;
+        let (mut lines, _, _) = RolloutRecorder::load_rollout_lines(prefix_path).await?;
+        let mut suffix = interaction_line(thread_id, suffix_id);
+        suffix.ordinal = Some(segments[1].1.end_ordinal_exclusive);
+        lines.push(suffix);
+        write_rollout(prefix_path, &lines).await;
+        let mut source_path = prefix_path.clone();
+        if compressed {
+            let bytes = tokio::fs::read(prefix_path).await?;
+            source_path = prefix_path.with_extension("jsonl.zst");
+            tokio::fs::write(
+                &source_path,
+                zstd::stream::encode_all(bytes.as_slice(), /*level*/ 0)?,
+            )
+            .await?;
+            tokio::fs::remove_file(prefix_path).await?;
+        }
+        let source_bytes = tokio::fs::read(&source_path).await?;
+        let source_modified = tokio::fs::metadata(&source_path).await?.modified()?;
+        let projection = SubagentHistoryProjection::load(
+            home.path(),
+            &segments.last().expect("active rollout").0,
+            thread_id,
+            [],
+        )
+        .await?
+        .expect("six owned segments");
+        let mut items = vec![
+            activity_item("recent", recent_id),
+            activity_item("suffix", suffix_id),
+        ];
+        projection.project_items(&mut items);
+        assert_eq!(items, vec![activity_item("recent", recent_id)]);
+        assert_eq!(tokio::fs::read(&source_path).await?, source_bytes);
+        assert_eq!(
+            tokio::fs::metadata(&source_path).await?.modified()?,
+            source_modified
+        );
+        assert_eq!(prefix_path.exists(), !compressed);
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn invalid_native_ancestry_cannot_enable_projection() -> std::io::Result<()> {
+    enum InvalidAncestry {
+        ByteCutoff,
+        OrdinalCutoff,
+        DuplicatePredecessor,
+        MixedCycle,
+    }
+    for invalid in [
+        InvalidAncestry::ByteCutoff,
+        InvalidAncestry::OrdinalCutoff,
+        InvalidAncestry::DuplicatePredecessor,
+        InvalidAncestry::MixedCycle,
+    ] {
+        let home = TempDir::new()?;
+        let thread_id = ThreadId::new();
+        let segments = write_native_chain(
+            home.path(),
+            thread_id,
+            /*segment_count*/ 2,
+            /*history_base*/ None,
+            &[],
+        )
+        .await;
+        let active = &segments[1].0;
+        let (mut lines, _, _) = RolloutRecorder::load_rollout_lines(active).await?;
+        let RolloutItem::SessionMeta(metadata) = &mut lines[0].item else {
+            panic!("session metadata")
+        };
+        let segment_id = metadata.meta.segment_id;
+        let position = metadata
+            .meta
+            .history_base
+            .as_mut()
+            .expect("native predecessor");
+        let reference = reference_line(RolloutReferenceItem {
+            rollout_path: active.clone(),
+            thread_id: Some(thread_id),
+            rollout_id: Some(segments[1].1.thread_id),
+            rollout_timestamp: None,
+            segment_id,
+            max_depth: 2,
+            nth_user_message: None,
+            compacted_replacement_history_filter_texts: None,
+        });
+        match invalid {
+            InvalidAncestry::ByteCutoff => position.end_byte_offset -= 1,
+            InvalidAncestry::OrdinalCutoff => position.end_ordinal_exclusive += 1,
+            InvalidAncestry::DuplicatePredecessor => lines.push(reference),
+            InvalidAncestry::MixedCycle => {
+                let (mut predecessor, _, _) =
+                    RolloutRecorder::load_rollout_lines(&segments[0].0).await?;
+                predecessor.push(reference);
+                write_rollout(&segments[0].0, &predecessor).await;
+                position.end_byte_offset = tokio::fs::metadata(&segments[0].0).await?.len();
+                position.end_ordinal_exclusive += 1;
+            }
+        }
+        write_rollout(active, &lines).await;
+        let error = SubagentHistoryProjection::load(home.path(), active, thread_id, [])
+            .await
+            .err()
+            .expect("invalid ancestry cannot construct a projection");
+        let expected = match invalid {
+            InvalidAncestry::ByteCutoff => "record boundary",
+            InvalidAncestry::OrdinalCutoff => "ordinal boundary",
+            InvalidAncestry::DuplicatePredecessor => "multiple same-thread predecessors",
+            InvalidAncestry::MixedCycle => "cycle",
+        };
+        assert!(error.to_string().contains(expected), "{error}");
+    }
+    Ok(())
+}
+
+async fn write_native_chain(
+    directory: &Path,
+    thread_id: ThreadId,
+    segment_count: usize,
+    mut history_base: Option<HistoryPosition>,
+    interactions: &[(usize, ThreadId)],
+) -> Vec<(PathBuf, HistoryPosition)> {
+    let mut segments = Vec::new();
+    for index in 0..segment_count {
+        let rollout_id = ThreadId::new();
+        let path = directory
+            .join(codex_rollout::SESSIONS_SUBDIR)
+            .join(codex_rollout::ROLLOUT_SEGMENTS_SUBDIR)
+            .join("2026/08/11")
+            .join(format!(
+                "rollout-2026-08-11T00-00-00-{thread_id}_{rollout_id}.jsonl"
+            ));
+        let mut metadata = meta_line(thread_id, SegmentId::new());
+        let RolloutItem::SessionMeta(session_meta) = &mut metadata.item else {
+            panic!("session metadata")
+        };
+        session_meta.meta.history_mode = ThreadHistoryMode::Paginated;
+        session_meta.meta.history_base = history_base;
+        let mut lines = vec![metadata];
+        lines.extend(
+            interactions
+                .iter()
+                .filter(|(segment_index, _)| *segment_index == index)
+                .map(|(_, receiver)| interaction_line(thread_id, *receiver)),
+        );
+        let start = history_base.map_or(0, |position| position.end_ordinal_exclusive);
+        for (offset, line) in lines.iter_mut().enumerate() {
+            line.ordinal = Some(start + offset as u64);
+        }
+        write_rollout(&path, &lines).await;
+        let position = HistoryPosition {
+            thread_id: rollout_id,
+            end_ordinal_exclusive: start + lines.len() as u64,
+            end_byte_offset: tokio::fs::metadata(&path)
+                .await
+                .expect("native prefix length")
+                .len(),
+        };
+        history_base = Some(position);
+        segments.push((path, position));
+    }
+    segments
 }
 
 fn activity_item(id: &str, thread_id: ThreadId) -> ThreadItem {

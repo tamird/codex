@@ -52,6 +52,23 @@ fn scans_jsonl_records_from_end() -> std::io::Result<()> {
 }
 
 #[test]
+fn reports_source_bytes_read_from_the_logical_end() -> std::io::Result<()> {
+    let input = format!(
+        "{}\n{}\n",
+        serde_json::to_string(&record("first"))?,
+        serde_json::to_string(&record(&"x".repeat(super::READ_CHUNK_SIZE * 2)))?
+    );
+    let input_len = input.len() as u64;
+    let mut scanner = ReverseJsonlScanner::new(Cursor::new(input.into_bytes()))?;
+
+    assert_eq!(scanner.bytes_scanned(), 0);
+    let _ = scanner.scan_next::<TestRecord>()?;
+    assert_eq!(scanner.bytes_scanned(), input_len);
+
+    Ok(())
+}
+
+#[test]
 fn rejects_invalid_json_and_continues_scanning() -> std::io::Result<()> {
     let input = br#"{"value":"first"}
 not-json
@@ -80,7 +97,20 @@ fn skips_records_over_the_configured_limit() -> std::io::Result<()> {
     let mut scanner = ReverseJsonlScanner::new(Cursor::new(input.into_bytes()))?
         .with_max_record_bytes(/*max_record_bytes*/ 32);
 
-    assert_records(&mut scanner, &["third", "first"])
+    assert_records(&mut scanner, &["third", "first"])?;
+    assert_eq!(scanner.oversized_records_skipped(), 1);
+    Ok(())
+}
+
+#[test]
+fn counts_an_oversized_record_at_the_start_of_the_file() -> std::io::Result<()> {
+    let input = serde_json::to_string(&record(&"x".repeat(128)))?;
+    let mut scanner = ReverseJsonlScanner::new(Cursor::new(input.into_bytes()))?
+        .with_max_record_bytes(/*max_record_bytes*/ 32);
+
+    assert!(scanner.scan_next::<TestRecord>()?.is_none());
+    assert_eq!(scanner.oversized_records_skipped(), 1);
+    Ok(())
 }
 
 #[test]

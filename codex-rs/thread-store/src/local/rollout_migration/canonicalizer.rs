@@ -10,22 +10,24 @@
 //! module.
 
 use chrono::DateTime;
+use codex_protocol::SegmentId;
 use codex_protocol::ThreadId;
 use codex_protocol::items::ReasoningItem;
 use codex_protocol::items::TurnItem;
 use codex_protocol::items::parse_hook_prompt_message;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::EventMsg;
+use codex_protocol::protocol::HistoryPosition;
 use codex_protocol::protocol::ItemCompletedEvent;
+use codex_protocol::protocol::RolloutReferenceItem;
 use codex_protocol::protocol::ThreadHistoryMode;
 use codex_protocol::protocol::TurnCompleteEvent;
 use codex_protocol::protocol::TurnStartedEvent;
 use codex_rollout::RolloutItem;
 use codex_rollout::RolloutLine;
 use std::collections::HashSet;
-use tokio::fs::File;
+use tokio::io::AsyncWrite;
 use tokio::io::AsyncWriteExt;
-use tokio::io::BufWriter;
 
 use super::legacy_event;
 use super::migration_error;
@@ -36,6 +38,34 @@ struct ActiveTurn {
     id: String,
     explicit: bool,
     saw_user: bool,
+}
+
+/// Replay state that crosses one ordinary same-thread physical segment boundary.
+///
+/// A Legacy turn can start before rotation and finish in the successor segment. Keeping this
+/// state opaque prevents the staging transaction from reconstructing turn semantics from counters
+/// alone. Fork, filter, and cross-thread boundaries deliberately do not carry this checkpoint.
+pub(super) struct LegacyCanonicalizerCheckpoint {
+    next_ordinal: u64,
+    next_item_index: u64,
+    source_line_index: u64,
+    active_turn: Option<ActiveTurn>,
+    known_turn_ids: HashSet<String>,
+    reasoning: Option<ReasoningItem>,
+}
+
+impl LegacyCanonicalizerCheckpoint {
+    pub(super) fn next_ordinal(&self) -> u64 {
+        self.next_ordinal
+    }
+
+    pub(super) fn next_item_index(&self) -> u64 {
+        self.next_item_index
+    }
+
+    pub(super) fn source_line_index(&self) -> u64 {
+        self.source_line_index
+    }
 }
 
 enum ReasoningTextKind {
@@ -57,16 +87,56 @@ pub(super) struct LegacyRolloutCanonicalizer {
 
 impl LegacyRolloutCanonicalizer {
     pub(super) fn new(thread_id: ThreadId) -> Self {
+        Self::new_at(
+            thread_id, /*next_ordinal*/ 0, /*next_item_index*/ 1,
+            /*source_line_index*/ 0,
+        )
+    }
+
+    pub(super) fn new_at(
+        thread_id: ThreadId,
+        next_ordinal: u64,
+        next_item_index: u64,
+        source_line_index: u64,
+    ) -> Self {
         Self {
             thread_id,
-            next_ordinal: 0,
-            next_item_index: 1,
+            next_ordinal,
+            next_item_index,
             output_byte_offset: 0,
             bytes_written: 0,
-            source_line_index: 0,
+            source_line_index,
             active_turn: None,
             known_turn_ids: HashSet::new(),
             reasoning: None,
+        }
+    }
+
+    pub(super) fn from_checkpoint(
+        thread_id: ThreadId,
+        checkpoint: LegacyCanonicalizerCheckpoint,
+    ) -> Self {
+        Self {
+            thread_id,
+            next_ordinal: checkpoint.next_ordinal,
+            next_item_index: checkpoint.next_item_index,
+            output_byte_offset: 0,
+            bytes_written: 0,
+            source_line_index: checkpoint.source_line_index,
+            active_turn: checkpoint.active_turn,
+            known_turn_ids: checkpoint.known_turn_ids,
+            reasoning: checkpoint.reasoning,
+        }
+    }
+
+    pub(super) fn into_checkpoint(self) -> LegacyCanonicalizerCheckpoint {
+        LegacyCanonicalizerCheckpoint {
+            next_ordinal: self.next_ordinal,
+            next_item_index: self.next_item_index,
+            source_line_index: self.source_line_index,
+            active_turn: self.active_turn,
+            known_turn_ids: self.known_turn_ids,
+            reasoning: self.reasoning,
         }
     }
 
@@ -78,11 +148,49 @@ impl LegacyRolloutCanonicalizer {
         self.output_byte_offset
     }
 
-    pub(super) async fn write_head_session_meta(
+    pub(super) fn reset_output_position(&mut self) {
+        self.output_byte_offset = 0;
+        self.bytes_written = 0;
+    }
+
+    /// Advance the Legacy physical-record position without emitting a Paginated record.
+    ///
+    /// [`ThreadHistoryBuilder`] derives implicit turn IDs from every valid persisted Legacy
+    /// record, including metadata, references, and records later removed by rollback. Migration
+    /// omits or replaces those records, but must retain their position so surviving implicit turn
+    /// IDs remain identical.
+    pub(super) fn skip_source_line(&mut self) -> ThreadStoreResult<()> {
+        self.source_line_index = self
+            .source_line_index
+            .checked_add(1)
+            .ok_or_else(|| migration_error("legacy rollout line index overflow"))?;
+        Ok(())
+    }
+
+    pub(super) async fn write_head_session_meta<W>(
         &mut self,
         line: RolloutLine,
-        writer: &mut BufWriter<File>,
-    ) -> ThreadStoreResult<u64> {
+        writer: &mut W,
+    ) -> ThreadStoreResult<u64>
+    where
+        W: AsyncWrite + Unpin,
+    {
+        self.write_segment_head_session_meta(
+            line, /*history_base*/ None, /*segment_id*/ None, writer,
+        )
+        .await
+    }
+
+    pub(super) async fn write_segment_head_session_meta<W>(
+        &mut self,
+        line: RolloutLine,
+        history_base: Option<HistoryPosition>,
+        segment_id: Option<SegmentId>,
+        writer: &mut W,
+    ) -> ThreadStoreResult<u64>
+    where
+        W: AsyncWrite + Unpin,
+    {
         let timestamp = line.timestamp;
         let RolloutItem::SessionMeta(mut metadata) = line.item else {
             return Err(migration_error("canonical session metadata is missing"));
@@ -91,7 +199,10 @@ impl LegacyRolloutCanonicalizer {
             return Err(migration_error("rollout metadata thread id changed"));
         }
         metadata.meta.history_mode = ThreadHistoryMode::Paginated;
-        metadata.meta.history_base = None;
+        metadata.meta.history_base = history_base;
+        if segment_id.is_some() {
+            metadata.meta.segment_id = segment_id;
+        }
         metadata.meta.subagent_history_start_ordinal = None;
 
         let bytes_before = self.bytes_written;
@@ -100,16 +211,31 @@ impl LegacyRolloutCanonicalizer {
         Ok(self.bytes_written - bytes_before)
     }
 
-    pub(super) async fn process_line(
+    pub(super) async fn write_rollout_reference<W>(
+        &mut self,
+        writer: &mut W,
+        timestamp: &str,
+        reference: RolloutReferenceItem,
+    ) -> ThreadStoreResult<u64>
+    where
+        W: AsyncWrite + Unpin,
+    {
+        let bytes_before = self.bytes_written;
+        self.write_item(writer, timestamp, RolloutItem::RolloutReference(reference))
+            .await?;
+        Ok(self.bytes_written - bytes_before)
+    }
+
+    pub(super) async fn process_line<W>(
         &mut self,
         line: RolloutLine,
-        writer: &mut BufWriter<File>,
-    ) -> ThreadStoreResult<u64> {
+        writer: &mut W,
+    ) -> ThreadStoreResult<u64>
+    where
+        W: AsyncWrite + Unpin,
+    {
         let source_index = self.source_line_index;
-        self.source_line_index = self
-            .source_line_index
-            .checked_add(1)
-            .ok_or_else(|| migration_error("legacy rollout line index overflow"))?;
+        self.skip_source_line()?;
         let timestamp = line.timestamp;
         let bytes_before = self.bytes_written;
         match line.item {
@@ -307,22 +433,28 @@ impl LegacyRolloutCanonicalizer {
         Ok(self.bytes_written - bytes_before)
     }
 
-    pub(super) async fn finish(
+    pub(super) async fn finish<W>(
         &mut self,
-        writer: &mut BufWriter<File>,
+        writer: &mut W,
         timestamp: &str,
-    ) -> ThreadStoreResult<u64> {
+    ) -> ThreadStoreResult<u64>
+    where
+        W: AsyncWrite + Unpin,
+    {
         let bytes_before = self.bytes_written;
         self.finish_implicit_turn(writer, timestamp).await?;
         Ok(self.bytes_written - bytes_before)
     }
 
-    async fn ensure_turn(
+    async fn ensure_turn<W>(
         &mut self,
-        writer: &mut BufWriter<File>,
+        writer: &mut W,
         timestamp: &str,
         source_index: u64,
-    ) -> ThreadStoreResult<()> {
+    ) -> ThreadStoreResult<()>
+    where
+        W: AsyncWrite + Unpin,
+    {
         if self.active_turn.is_some() {
             return Ok(());
         }
@@ -330,12 +462,15 @@ impl LegacyRolloutCanonicalizer {
         self.start_implicit_turn(writer, timestamp, turn_id).await
     }
 
-    async fn start_implicit_turn(
+    async fn start_implicit_turn<W>(
         &mut self,
-        writer: &mut BufWriter<File>,
+        writer: &mut W,
         timestamp: &str,
         turn_id: String,
-    ) -> ThreadStoreResult<()> {
+    ) -> ThreadStoreResult<()>
+    where
+        W: AsyncWrite + Unpin,
+    {
         self.active_turn = Some(ActiveTurn {
             id: turn_id.clone(),
             explicit: false,
@@ -343,16 +478,13 @@ impl LegacyRolloutCanonicalizer {
         });
         self.known_turn_ids.insert(turn_id.clone());
         self.reasoning = None;
-        let started_at = DateTime::parse_from_rfc3339(timestamp)
-            .map_err(migration_error)?
-            .timestamp();
         self.write_item(
             writer,
             timestamp,
             RolloutItem::EventMsg(EventMsg::TurnStarted(TurnStartedEvent {
                 turn_id,
                 trace_id: None,
-                started_at: Some(started_at),
+                started_at: None,
                 model_context_window: None,
                 collaboration_mode_kind: Default::default(),
             })),
@@ -360,11 +492,14 @@ impl LegacyRolloutCanonicalizer {
         .await
     }
 
-    async fn finish_implicit_turn(
+    async fn finish_implicit_turn<W>(
         &mut self,
-        writer: &mut BufWriter<File>,
+        writer: &mut W,
         timestamp: &str,
-    ) -> ThreadStoreResult<()> {
+    ) -> ThreadStoreResult<()>
+    where
+        W: AsyncWrite + Unpin,
+    {
         let Some(turn) = self.active_turn.as_ref() else {
             return Ok(());
         };
@@ -382,11 +517,7 @@ impl LegacyRolloutCanonicalizer {
                 last_agent_message: None,
                 error: None,
                 started_at: None,
-                completed_at: Some(
-                    DateTime::parse_from_rfc3339(timestamp)
-                        .map_err(migration_error)?
-                        .timestamp(),
-                ),
+                completed_at: None,
                 duration_ms: None,
                 time_to_first_token_ms: None,
             })),
@@ -394,12 +525,15 @@ impl LegacyRolloutCanonicalizer {
         .await
     }
 
-    async fn write_completed_item(
+    async fn write_completed_item<W>(
         &mut self,
-        writer: &mut BufWriter<File>,
+        writer: &mut W,
         timestamp: &str,
         item: TurnItem,
-    ) -> ThreadStoreResult<()> {
+    ) -> ThreadStoreResult<()>
+    where
+        W: AsyncWrite + Unpin,
+    {
         let turn_id = self
             .active_turn
             .as_ref()
@@ -409,13 +543,16 @@ impl LegacyRolloutCanonicalizer {
             .await
     }
 
-    async fn write_completed_item_to_turn(
+    async fn write_completed_item_to_turn<W>(
         &mut self,
-        writer: &mut BufWriter<File>,
+        writer: &mut W,
         timestamp: &str,
         turn_id: String,
         item: TurnItem,
-    ) -> ThreadStoreResult<()> {
+    ) -> ThreadStoreResult<()>
+    where
+        W: AsyncWrite + Unpin,
+    {
         let completed_at_ms = DateTime::parse_from_rfc3339(timestamp)
             .map_err(migration_error)?
             .timestamp_millis();
@@ -433,14 +570,17 @@ impl LegacyRolloutCanonicalizer {
         .await
     }
 
-    async fn write_reasoning(
+    async fn write_reasoning<W>(
         &mut self,
-        writer: &mut BufWriter<File>,
+        writer: &mut W,
         timestamp: &str,
         source_index: u64,
         text: String,
         kind: ReasoningTextKind,
-    ) -> ThreadStoreResult<()> {
+    ) -> ThreadStoreResult<()>
+    where
+        W: AsyncWrite + Unpin,
+    {
         if text.is_empty() {
             return Ok(());
         }
@@ -462,12 +602,15 @@ impl LegacyRolloutCanonicalizer {
             .await
     }
 
-    async fn write_item(
+    async fn write_item<W>(
         &mut self,
-        writer: &mut BufWriter<File>,
+        writer: &mut W,
         timestamp: &str,
         item: RolloutItem,
-    ) -> ThreadStoreResult<()> {
+    ) -> ThreadStoreResult<()>
+    where
+        W: AsyncWrite + Unpin,
+    {
         let mut bytes = serde_json::to_vec(&RolloutLine {
             timestamp: timestamp.to_string(),
             ordinal: Some(self.next_ordinal),

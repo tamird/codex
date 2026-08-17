@@ -146,3 +146,4 @@ test-case = "3.3.1"
 tokio-tungstenite = { workspace = true }
 tracing-opentelemetry = { workspace = true }
 wiremock = { workspace = true }
+zstd = { workspace = true }

@@ -2577,11 +2577,30 @@ pub struct UserMessageEvent {
     pub text_elements: Vec<crate::user_input::TextElement>,
 }
 
+/// Maximum UTF-8 bytes retained in thread discovery and fork response previews.
+pub const THREAD_PREVIEW_MAX_BYTES: usize = 1024;
+
+/// Returns bounded user-facing preview text for a persisted user message.
+pub fn bounded_thread_preview_text(message: &str) -> Option<String> {
+    let message = strip_user_message_prefix(message);
+    if message.is_empty() {
+        return None;
+    }
+    if message.len() <= THREAD_PREVIEW_MAX_BYTES {
+        return Some(message.to_string());
+    }
+    const ELLIPSIS: &str = "…";
+    let prefix = codex_utils_string::take_bytes_at_char_boundary(
+        message,
+        THREAD_PREVIEW_MAX_BYTES.saturating_sub(ELLIPSIS.len()),
+    );
+    Some(format!("{prefix}{ELLIPSIS}"))
+}
+
 /// Returns the user-facing preview text for a user message.
 pub fn user_message_preview(user: &UserMessageEvent) -> Option<String> {
-    let message = strip_user_message_prefix(user.message.as_str());
-    if !message.is_empty() {
-        return Some(message.to_string());
+    if let Some(message) = bounded_thread_preview_text(user.message.as_str()) {
+        return Some(message);
     }
     if user
         .images
@@ -6105,6 +6124,19 @@ mod tests {
         };
 
         assert_eq!(user_message_preview(&event), Some("[Audio]".to_string()));
+    }
+
+    #[test]
+    fn user_message_preview_is_utf8_safe_and_bounded() {
+        let event = UserMessageEvent {
+            message: "é".repeat(THREAD_PREVIEW_MAX_BYTES),
+            ..Default::default()
+        };
+
+        let preview = user_message_preview(&event).expect("text preview");
+
+        assert!(preview.len() <= THREAD_PREVIEW_MAX_BYTES);
+        assert!(preview.ends_with('…'));
     }
 
     #[test]

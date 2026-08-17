@@ -7,6 +7,7 @@
 use std::path::PathBuf;
 
 use codex_protocol::ThreadId;
+use codex_protocol::protocol::SessionMeta;
 use codex_protocol::protocol::ThreadHistoryMode;
 use codex_rollout::find_archived_thread_path_by_id_str;
 use codex_rollout::find_thread_path_by_id_str;
@@ -21,12 +22,14 @@ use crate::ThreadStoreResult;
 ///
 /// For ordinary threads, `thread_id` and `rollout_id` are the same. After `thread/revert`,
 /// `thread_id` stays stable while `rollout_id` identifies the new immutable rollout file.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 pub(super) struct ResolvedThreadRollout {
     pub(super) thread_id: ThreadId,
     pub(super) rollout_id: ThreadId,
     pub(super) path: PathBuf,
     pub(super) location: RolloutLocation,
+    /// Session metadata authenticated while resolving a state-database path.
+    pub(super) authenticated_session_meta: Option<SessionMeta>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -79,7 +82,10 @@ async fn resolve(
         && codex_rollout::existing_rollout_path(path.as_path())
             .await
             .is_some()
-        && let Some(resolved) = resolve_path_in_scope(store, thread_id, path, scope).await?
+        && let Some(resolved) = resolve_path_in_scope(
+            store, thread_id, path, scope, /*authenticated_session_meta*/ None,
+        )
+        .await?
     {
         return Ok(Some(resolved));
     }
@@ -95,13 +101,23 @@ async fn resolve(
                 if let Some(path) =
                     codex_rollout::existing_rollout_path(metadata.rollout_path.as_path()).await
                 {
-                    let belongs_to_thread =
-                        match codex_rollout::read_session_meta_line(path.as_path()).await {
-                            Ok(session_meta) => session_meta.meta.id == thread_id,
-                            Err(_) => true,
-                        };
+                    let session_meta = codex_rollout::read_session_meta_line(path.as_path())
+                        .await
+                        .ok();
+                    let belongs_to_thread = session_meta
+                        .as_ref()
+                        .is_none_or(|session_meta| session_meta.meta.id == thread_id);
                     if belongs_to_thread {
-                        return resolve_path_in_scope(store, thread_id, path, scope).await;
+                        let authenticated_session_meta =
+                            session_meta.map(|session_meta| session_meta.meta);
+                        return resolve_path_in_scope(
+                            store,
+                            thread_id,
+                            path,
+                            scope,
+                            authenticated_session_meta,
+                        )
+                        .await;
                     }
                 }
                 if metadata.history_mode == ThreadHistoryMode::Paginated {
@@ -124,7 +140,10 @@ async fn resolve(
     .await
     .map_err(|err| ThreadStoreError::InvalidRequest {
         message: format!("failed to locate thread id {thread_id}: {err}"),
-    })? && let Some(resolved) = resolve_path_in_scope(store, thread_id, path, scope).await?
+    })? && let Some(resolved) = resolve_path_in_scope(
+        store, thread_id, path, scope, /*authenticated_session_meta*/ None,
+    )
+    .await?
     {
         return Ok(Some(resolved));
     }
@@ -141,7 +160,12 @@ async fn resolve(
         message: format!("failed to locate archived thread id {thread_id}: {err}"),
     })?;
     match path {
-        Some(path) => resolve_path_in_scope(store, thread_id, path, scope).await,
+        Some(path) => {
+            resolve_path_in_scope(
+                store, thread_id, path, scope, /*authenticated_session_meta*/ None,
+            )
+            .await
+        }
         None => Ok(None),
     }
 }
@@ -151,12 +175,15 @@ async fn resolve_path_in_scope(
     thread_id: ThreadId,
     path: PathBuf,
     scope: LookupScope,
+    authenticated_session_meta: Option<SessionMeta>,
 ) -> ThreadStoreResult<Option<ResolvedThreadRollout>> {
     let location = location_for_path(store, path.as_path());
     if !scope.accepts(location) {
         return Ok(None);
     }
-    resolve_path(thread_id, path, location).await.map(Some)
+    resolve_path(thread_id, path, location, authenticated_session_meta)
+        .await
+        .map(Some)
 }
 
 fn location_for_path(store: &LocalThreadStore, path: &std::path::Path) -> RolloutLocation {
@@ -171,6 +198,7 @@ async fn resolve_path(
     thread_id: ThreadId,
     path: PathBuf,
     location: RolloutLocation,
+    authenticated_session_meta: Option<SessionMeta>,
 ) -> ThreadStoreResult<ResolvedThreadRollout> {
     let rollout_id = match codex_rollout::rollout_id_from_path(path.as_path()) {
         Some(rollout_id) => rollout_id,
@@ -192,6 +220,7 @@ async fn resolve_path(
         rollout_id,
         path,
         location,
+        authenticated_session_meta,
     })
 }
 

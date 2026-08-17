@@ -25,6 +25,7 @@ use crate::RolloutItem;
 use crate::RolloutLine;
 use crate::find_rollout_path_by_rollout_id;
 use crate::find_thread_path_by_id_str;
+use crate::index_rollout_paths_by_rollout_id;
 use crate::list::Cursor;
 use crate::list::ThreadItem;
 use crate::list::ThreadListConfig;
@@ -214,6 +215,72 @@ async fn filesystem_lookup_distinguishes_thread_ids_from_rollout_ids() {
 }
 
 #[tokio::test]
+async fn filesystem_thread_lookup_excludes_native_history_segments() {
+    let temp = TempDir::new().unwrap();
+    let home = temp.path();
+    let thread_uuid = Uuid::from_u128(403);
+    let segment_rollout_uuid = Uuid::from_u128(404);
+    let timestamp = "2025-01-03T13-00-00";
+    write_session_file(
+        home,
+        timestamp,
+        thread_uuid,
+        /*num_records*/ 1,
+        Some(SessionSource::Cli),
+    )
+    .unwrap();
+    let active_path = home.join(format!(
+        "sessions/2025/01/03/rollout-{timestamp}-{thread_uuid}.jsonl"
+    ));
+    let segment_path = home.join(format!(
+        "sessions/{}/2025/01/03/rollout-{timestamp}-{thread_uuid}_{segment_rollout_uuid}.jsonl",
+        crate::ROLLOUT_SEGMENTS_SUBDIR
+    ));
+    fs::create_dir_all(segment_path.parent().unwrap()).unwrap();
+    fs::copy(active_path.as_path(), segment_path.as_path()).unwrap();
+    fs::remove_file(active_path.as_path()).unwrap();
+
+    assert_eq!(
+        find_thread_path_by_id_str(
+            home,
+            thread_uuid.to_string().as_str(),
+            /*state_db_ctx*/ None,
+        )
+        .await
+        .unwrap(),
+        None,
+        "a physical history segment must not become the selected thread rollout"
+    );
+    assert_eq!(
+        find_rollout_path_by_rollout_id(home, thread_id_from_uuid(segment_rollout_uuid))
+            .await
+            .unwrap(),
+        Some(segment_path.clone()),
+        "history_base must still resolve the physical rollout ID"
+    );
+    assert_eq!(
+        index_rollout_paths_by_rollout_id(home)
+            .await
+            .unwrap()
+            .get(&thread_id_from_uuid(segment_rollout_uuid)),
+        Some(&segment_path),
+        "the filename index must include native history segments"
+    );
+
+    fs::copy(segment_path.as_path(), active_path.as_path()).unwrap();
+    assert_eq!(
+        find_thread_path_by_id_str(
+            home,
+            thread_uuid.to_string().as_str(),
+            /*state_db_ctx*/ None,
+        )
+        .await
+        .unwrap(),
+        Some(active_path)
+    );
+}
+
+#[tokio::test]
 async fn filesystem_listing_returns_one_selected_physical_rollout_per_thread() {
     let temp = TempDir::new().unwrap();
     let home = temp.path();
@@ -256,12 +323,12 @@ async fn filesystem_listing_returns_one_selected_physical_rollout_per_thread() {
 
     let page = get_threads(
         home,
-        10,
-        None,
+        /*page_size*/ 10,
+        /*cursor*/ None,
         ThreadSortKey::CreatedAt,
         INTERACTIVE_SESSION_SOURCES.as_slice(),
-        None,
-        None,
+        /*model_providers*/ None,
+        /*cwd_filters*/ None,
         TEST_PROVIDER,
     )
     .await
@@ -279,12 +346,12 @@ async fn filesystem_listing_returns_one_selected_physical_rollout_per_thread() {
     .await;
     let selected_page = get_threads_with_state_db(
         home,
-        10,
-        None,
+        /*page_size*/ 10,
+        /*cursor*/ None,
         ThreadSortKey::CreatedAt,
         INTERACTIVE_SESSION_SOURCES.as_slice(),
-        None,
-        None,
+        /*model_providers*/ None,
+        /*cwd_filters*/ None,
         TEST_PROVIDER,
         Some(runtime.as_ref()),
     )
@@ -297,12 +364,12 @@ async fn filesystem_listing_returns_one_selected_physical_rollout_per_thread() {
     runtime.close().await;
     let fallback_page = get_threads_with_state_db(
         home,
-        10,
-        None,
+        /*page_size*/ 10,
+        /*cursor*/ None,
         ThreadSortKey::CreatedAt,
         INTERACTIVE_SESSION_SOURCES.as_slice(),
-        None,
-        None,
+        /*model_providers*/ None,
+        /*cwd_filters*/ None,
         TEST_PROVIDER,
         Some(runtime.as_ref()),
     )
@@ -324,7 +391,7 @@ async fn filesystem_listing_omits_stale_singleton_from_unselected_collection() {
         home,
         "2025-01-03T13-00-00",
         thread_uuid,
-        1,
+        /*num_records*/ 1,
         Some(SessionSource::Cli),
     )
     .unwrap();
@@ -341,7 +408,7 @@ async fn filesystem_listing_omits_stale_singleton_from_unselected_collection() {
         home,
         "2025-01-04T13-00-00",
         thread_uuid,
-        1,
+        /*num_records*/ 1,
         Some(SessionSource::Cli),
     )
     .unwrap();
@@ -352,16 +419,16 @@ async fn filesystem_listing_omits_stale_singleton_from_unselected_collection() {
         "rollout-2025-01-04T13-00-00-{thread_uuid}_{second_rollout_uuid}.jsonl"
     ));
     fs::rename(active_source, &active_path).unwrap();
-    let runtime = insert_state_db_thread(home, thread_id, &archived_path, true).await;
+    let runtime = insert_state_db_thread(home, thread_id, &archived_path, /*archived*/ true).await;
 
     let active_page = get_threads_with_state_db(
         home,
-        10,
-        None,
+        /*page_size*/ 10,
+        /*cursor*/ None,
         ThreadSortKey::CreatedAt,
         INTERACTIVE_SESSION_SOURCES.as_slice(),
-        None,
-        None,
+        /*model_providers*/ None,
+        /*cwd_filters*/ None,
         TEST_PROVIDER,
         Some(runtime.as_ref()),
     )
@@ -370,8 +437,8 @@ async fn filesystem_listing_omits_stale_singleton_from_unselected_collection() {
     assert!(active_page.items.is_empty());
     let archived_page = get_threads_in_root_with_state_db(
         archived_root,
-        10,
-        None,
+        /*page_size*/ 10,
+        /*cursor*/ None,
         ThreadSortKey::CreatedAt,
         ThreadListConfig {
             allowed_sources: INTERACTIVE_SESSION_SOURCES.as_slice(),
@@ -399,7 +466,7 @@ async fn filesystem_listing_includes_authenticated_selected_noncanonical_rollout
         home,
         "2025-01-03T13-00-00",
         thread_uuid,
-        1,
+        /*num_records*/ 1,
         Some(SessionSource::Cli),
     )
     .unwrap();
@@ -408,25 +475,25 @@ async fn filesystem_listing_includes_authenticated_selected_noncanonical_rollout
     ));
     let imported_path = canonical_path.with_file_name("rollout-imported.jsonl");
     fs::rename(canonical_path, &imported_path).unwrap();
-    let runtime = insert_state_db_thread(home, thread_id, &imported_path, false).await;
+    let runtime = insert_state_db_thread(home, thread_id, &imported_path, /*archived*/ false).await;
     let older_uuid = Uuid::from_u128(432);
     write_session_file(
         home,
         "2025-01-02T13-00-00",
         older_uuid,
-        1,
+        /*num_records*/ 1,
         Some(SessionSource::Cli),
     )
     .unwrap();
 
     let page = get_threads_with_state_db(
         home,
-        1,
-        None,
+        /*page_size*/ 1,
+        /*cursor*/ None,
         ThreadSortKey::CreatedAt,
         INTERACTIVE_SESSION_SOURCES.as_slice(),
-        None,
-        None,
+        /*model_providers*/ None,
+        /*cwd_filters*/ None,
         TEST_PROVIDER,
         Some(runtime.as_ref()),
     )
@@ -438,12 +505,12 @@ async fn filesystem_listing_includes_authenticated_selected_noncanonical_rollout
     let next_cursor = page.next_cursor.expect("noncanonical page cursor");
     let next_page = get_threads_with_state_db(
         home,
-        1,
+        /*page_size*/ 1,
         Some(&next_cursor),
         ThreadSortKey::CreatedAt,
         INTERACTIVE_SESSION_SOURCES.as_slice(),
-        None,
-        None,
+        /*model_providers*/ None,
+        /*cwd_filters*/ None,
         TEST_PROVIDER,
         Some(runtime.as_ref()),
     )
@@ -503,8 +570,14 @@ async fn indexed_preview_summary_skips_compacted_replacement_history() {
     let temp = TempDir::new().expect("temp dir");
     let uuid = Uuid::from_u128(30_305);
     let ts = "2025-01-03T12-00-00";
-    write_session_file(temp.path(), ts, uuid, 1, Some(SessionSource::Cli))
-        .expect("write session file");
+    write_session_file(
+        temp.path(),
+        ts,
+        uuid,
+        /*num_records*/ 1,
+        Some(SessionSource::Cli),
+    )
+    .expect("write session file");
     let path = temp
         .path()
         .join(format!("sessions/2025/01/03/rollout-{ts}-{uuid}.jsonl"));
@@ -607,8 +680,14 @@ async fn indexed_preview_summary_preserves_large_non_compacted_records() {
     let temp = TempDir::new().expect("temp dir");
     let uuid = Uuid::from_u128(30_307);
     let ts = "2025-01-03T12-00-00";
-    write_session_file(temp.path(), ts, uuid, 1, Some(SessionSource::Cli))
-        .expect("write session file");
+    write_session_file(
+        temp.path(),
+        ts,
+        uuid,
+        /*num_records*/ 1,
+        Some(SessionSource::Cli),
+    )
+    .expect("write session file");
     let path = temp
         .path()
         .join(format!("sessions/2025/01/03/rollout-{ts}-{uuid}.jsonl"));

@@ -71,8 +71,14 @@ pub(in crate::local) async fn search_thread_occurrences(
         "thread/searchOccurrences",
     )
     .await?;
-    let lineage = store.resolve_rollout_lineage(params.thread_id).await?;
+    let lineage = match super::read::indexed_same_thread_lineage(store, params.thread_id).await? {
+        Some(lineage) => lineage,
+        None => store.resolve_rollout_lineage(params.thread_id).await?,
+    };
     let root_rollout_id = lineage.root_rollout_id();
+    let complete_root_projection = super::projection_state(store, root_rollout_id)
+        .await?
+        .is_some_and(|state| state.lineage_complete);
     let cursor = parse_cursor(
         params.cursor.as_deref(),
         params.thread_id,
@@ -100,6 +106,11 @@ pub(in crate::local) async fn search_thread_occurrences(
         .enumerate()
         .skip(cursor_segment.unwrap_or(0))
     {
+        let projection_rollout_id = if complete_root_projection {
+            root_rollout_id
+        } else {
+            segment.rollout_id()
+        };
         let segment_start_ordinal = sqlite_integer(segment.start_ordinal(), "rollout ordinal")?;
         let next_rollout_ordinal = if Some(segment_index) == cursor_segment {
             cursor
@@ -157,12 +168,12 @@ FROM (
 ORDER BY rollout_ordinal ASC
         "#,
         )
-        .bind(segment.rollout_id().to_string())
+        .bind(projection_rollout_id.to_string())
         .bind(next_rollout_ordinal)
         .bind(end_rollout_ordinal)
         .bind(segment_start_ordinal)
         .bind(end_rollout_ordinal)
-        .bind(segment.rollout_id().to_string())
+        .bind(projection_rollout_id.to_string())
         .bind(next_rollout_ordinal)
         .bind(end_rollout_ordinal)
         .bind(segment_start_ordinal)

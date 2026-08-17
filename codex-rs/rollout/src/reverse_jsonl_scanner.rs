@@ -19,12 +19,14 @@ pub enum ScanOutcome<T> {
 /// Read-only scanner for newline-delimited JSON records, starting from the end.
 pub struct ReverseJsonlScanner<R> {
     reader: R,
+    scan_end: u64,
     next_chunk_end: u64,
     chunk_position: usize,
     chunk: Vec<u8>,
     record_reversed: Vec<u8>,
     max_record_bytes: Option<usize>,
     discarding_oversized_record: bool,
+    oversized_records_skipped: u64,
 }
 
 impl<R> ReverseJsonlScanner<R>
@@ -50,12 +52,14 @@ where
         }
         Ok(Self {
             reader,
+            scan_end: end_byte_offset,
             next_chunk_end: end_byte_offset,
             chunk_position: 0,
             chunk: vec![0; READ_CHUNK_SIZE],
             record_reversed: Vec::new(),
             max_record_bytes: None,
             discarding_oversized_record: false,
+            oversized_records_skipped: 0,
         })
     }
 
@@ -63,6 +67,16 @@ where
     pub fn with_max_record_bytes(mut self, max_record_bytes: usize) -> Self {
         self.max_record_bytes = Some(max_record_bytes);
         self
+    }
+
+    /// Returns source bytes read from the configured logical end.
+    pub fn bytes_scanned(&self) -> u64 {
+        self.scan_end.saturating_sub(self.next_chunk_end)
+    }
+
+    /// Returns the number of records discarded because they exceeded the configured limit.
+    pub fn oversized_records_skipped(&self) -> u64 {
+        self.oversized_records_skipped
     }
 
     /// Scans the next nonblank record.
@@ -78,6 +92,8 @@ where
                 if self.next_chunk_end == 0 {
                     if self.discarding_oversized_record {
                         self.discarding_oversized_record = false;
+                        self.oversized_records_skipped =
+                            self.oversized_records_skipped.saturating_add(1);
                         return Ok(None);
                     }
                     return Ok(self.finish_record());
@@ -107,6 +123,8 @@ where
                 self.chunk_position = newline_position;
                 if self.discarding_oversized_record {
                     self.discarding_oversized_record = false;
+                    self.oversized_records_skipped =
+                        self.oversized_records_skipped.saturating_add(1);
                     continue;
                 }
                 if let Some(outcome) = self.finish_record() {

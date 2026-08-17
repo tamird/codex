@@ -68,6 +68,8 @@ pub fn decode_rollout_line(value: Value) -> serde_json::Result<RolloutLine> {
 }
 
 pub const SESSIONS_SUBDIR: &str = "sessions";
+/// Native `SessionMeta.history_base` predecessors stored below `sessions/`.
+pub const ROLLOUT_SEGMENTS_SUBDIR: &str = "rollout_segments";
 pub const ARCHIVED_SESSIONS_SUBDIR: &str = "archived_sessions";
 pub const ROTATED_ROLLOUT_SEGMENTS_SUBDIR: &str = "rotated_rollout_segments";
 pub static INTERACTIVE_SESSION_SOURCES: LazyLock<Vec<SessionSource>> = LazyLock::new(|| {
@@ -113,6 +115,7 @@ pub use list::find_thread_path_by_id_str;
 pub use list::find_thread_path_by_id_str as find_conversation_path_by_id_str;
 pub use list::get_threads;
 pub use list::get_threads_in_root;
+pub use list::index_rollout_paths_by_rollout_id;
 pub use list::parse_cursor;
 pub use list::read_head_for_summary;
 pub use list::read_session_meta_line;
@@ -124,7 +127,9 @@ pub use maintenance::RolloutMaintenanceGuard;
 pub use maintenance::try_acquire_rollout_maintenance_lock;
 pub use metadata::builder_from_items;
 pub use metadata::forked_from_ordinal_exclusive;
+pub use metadata::history_rollout_path_with_rollout_id;
 pub use metadata::rollout_id_from_path;
+pub use metadata::rollout_path_with_rollout_id;
 pub use metadata::thread_id_from_path;
 pub use model_context::ModelContextScan;
 pub use model_context::ModelContextScanProgress;
@@ -142,6 +147,7 @@ pub use reference::BoundedRolloutMaterializer;
 pub use reference::FRODEX_RECENT_ROLLOUT_SEGMENTS;
 pub use reference::MAX_ROLLOUT_REFERENCE_DEPTH;
 pub use reference::compose_compacted_replacement_history_filter_texts;
+pub use reference::load_history_base_prefix;
 pub use reference::materialize_bounded_rollout_lines;
 pub use reference::materialize_model_context_rollout_items_from;
 pub use reference::materialize_recent_rollout_items;

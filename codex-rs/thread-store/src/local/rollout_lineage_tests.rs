@@ -18,6 +18,7 @@ use tempfile::TempDir;
 
 use super::super::LocalThreadStore;
 use super::super::test_support::test_config;
+use super::LineageOffsetMode;
 use super::RolloutLineage;
 use super::RolloutLineageSegment;
 use super::resolve_path;
@@ -67,6 +68,9 @@ async fn resolves_nested_lineage_with_empty_intermediate_segments() {
                 jsonl_end_byte_offset: Some(root_end.end_byte_offset),
                 end_byte_offset: Some(root_end.end_byte_offset),
                 filter_texts: Vec::new(),
+                goal_supervisor_provenance: Default::default(),
+                uses_history_base: false,
+                uses_fork_boundary: false,
             },
             RolloutLineageSegment {
                 thread_id: middle,
@@ -77,6 +81,9 @@ async fn resolves_nested_lineage_with_empty_intermediate_segments() {
                 jsonl_end_byte_offset: Some(middle_end.end_byte_offset),
                 end_byte_offset: Some(middle_end.end_byte_offset),
                 filter_texts: Vec::new(),
+                goal_supervisor_provenance: Default::default(),
+                uses_history_base: true,
+                uses_fork_boundary: true,
             },
             RolloutLineageSegment {
                 thread_id: child,
@@ -87,6 +94,9 @@ async fn resolves_nested_lineage_with_empty_intermediate_segments() {
                 jsonl_end_byte_offset: Some(child_len),
                 end_byte_offset: Some(child_len),
                 filter_texts: Vec::new(),
+                goal_supervisor_provenance: Default::default(),
+                uses_history_base: true,
+                uses_fork_boundary: true,
             },
         ]
     );
@@ -155,7 +165,10 @@ async fn preserves_history_position_byte_boundary_for_compressed_ancestor() {
     let parent_segment = lineage.segments.first().expect("parent segment");
 
     assert_eq!(parent_segment.rollout_path(), compressed_parent);
-    assert_eq!(parent_segment.end_byte_offset(), None);
+    assert_eq!(
+        parent_segment.end_byte_offset(),
+        Some(parent_end.end_byte_offset)
+    );
     assert_eq!(
         parent_segment.jsonl_end_byte_offset(),
         Some(parent_end.end_byte_offset)
@@ -163,7 +176,7 @@ async fn preserves_history_position_byte_boundary_for_compressed_ancestor() {
 }
 
 #[tokio::test]
-async fn unbounded_compressed_segment_has_no_decoded_byte_boundary() {
+async fn unbounded_compressed_segment_retains_decoded_byte_boundary() {
     let home = TempDir::new().expect("temp dir");
     let store = LocalThreadStore::new(test_config(home.path()), /*state_db*/ None);
     let thread_id = ThreadId::default();
@@ -173,6 +186,9 @@ async fn unbounded_compressed_segment_has_no_decoded_byte_boundary() {
         /*history_base*/ None,
         /*next_ordinal*/ 3,
     );
+    let decoded_len = std::fs::metadata(rollout_path.as_path())
+        .expect("plain rollout metadata")
+        .len();
     let compressed_path = compress_rollout(rollout_path.as_path());
 
     let lineage = store
@@ -182,7 +198,7 @@ async fn unbounded_compressed_segment_has_no_decoded_byte_boundary() {
     let segment = lineage.segments.first().expect("root segment");
 
     assert_eq!(segment.rollout_path(), compressed_path);
-    assert_eq!(segment.jsonl_end_byte_offset(), None);
+    assert_eq!(segment.jsonl_end_byte_offset(), Some(decoded_len));
 }
 
 #[tokio::test]
@@ -278,6 +294,9 @@ async fn resolves_lineage_at_explicit_history_position() {
                 jsonl_end_byte_offset: Some(root_end.end_byte_offset),
                 end_byte_offset: Some(root_end.end_byte_offset),
                 filter_texts: Vec::new(),
+                goal_supervisor_provenance: Default::default(),
+                uses_history_base: false,
+                uses_fork_boundary: false,
             },
             RolloutLineageSegment {
                 thread_id: child,
@@ -288,6 +307,9 @@ async fn resolves_lineage_at_explicit_history_position() {
                 jsonl_end_byte_offset: Some(end.end_byte_offset),
                 end_byte_offset: Some(end.end_byte_offset),
                 filter_texts: Vec::new(),
+                goal_supervisor_provenance: Default::default(),
+                uses_history_base: true,
+                uses_fork_boundary: true,
             },
         ]
     );
@@ -295,108 +317,135 @@ async fn resolves_lineage_at_explicit_history_position() {
 
 #[tokio::test]
 async fn fork_lineage_preserves_validated_unordinaled_ancestor_cutoff() {
-    let home = TempDir::new().expect("temp dir");
-    let config = test_config(home.path());
-    let state_db = codex_state::StateRuntime::init(
-        config.sqlite.clone(),
-        config.default_model_provider_id.clone(),
-    )
-    .await
-    .expect("initialize state database");
-    let store = LocalThreadStore::new(config.clone(), Some(state_db.clone()));
-    let parent = ThreadId::default();
-    let child = ThreadId::default();
-    let mutable_parent_path = write_rollout(
-        home.path(),
-        parent,
-        /*history_base*/ None,
-        /*next_ordinal*/ 3,
-    );
-    let segment_id = SegmentId::new();
-    let parent_path = home
-        .path()
-        .join(codex_rollout::ROTATED_ROLLOUT_SEGMENTS_SUBDIR)
-        .join(parent.to_string())
-        .join(segment_id.to_string())
-        .join(
-            mutable_parent_path
-                .file_name()
-                .expect("parent rollout file name"),
-        );
-    let mut lines = fs::read_to_string(mutable_parent_path.as_path())
-        .expect("read parent rollout")
-        .lines()
-        .map(serde_json::from_str::<RolloutLine>)
-        .collect::<Result<Vec<_>, _>>()
-        .expect("parse parent rollout");
-    let Some(RolloutItem::SessionMeta(session_meta)) = lines.first_mut().map(|line| &mut line.item)
-    else {
-        panic!("parent rollout must start with session metadata");
-    };
-    session_meta.meta.segment_id = Some(segment_id);
-    let records = lines
-        .iter()
-        .map(serde_json::to_string)
-        .collect::<Result<Vec<_>, _>>()
-        .expect("serialize parent rollout");
-    fs::create_dir_all(parent_path.parent().expect("parent segment directory"))
-        .expect("create immutable parent directory");
-    fs::write(parent_path.as_path(), format!("{}\n", records.join("\n")))
-        .expect("write immutable parent rollout");
-    let parent_end = history_position(
-        parent_path.as_path(),
-        parent,
-        /*end_ordinal_exclusive*/ 2,
-    );
-    lines.insert(
-        2,
-        RolloutLine {
-            timestamp: "2026-07-16T00:00:00.000Z".to_string(),
-            ordinal: None,
-            item: RolloutItem::EventMsg(codex_protocol::protocol::EventMsg::ShutdownComplete),
-        },
-    );
-    let records = lines
-        .iter()
-        .map(serde_json::to_string)
-        .collect::<Result<Vec<_>, _>>()
-        .expect("serialize parent rollout");
-    fs::write(parent_path.as_path(), format!("{}\n", records.join("\n")))
-        .expect("write parent rollout");
-    fs::remove_file(mutable_parent_path.as_path()).expect("remove mutable parent rollout");
-    let mut parent_metadata = codex_state::ThreadMetadataBuilder::new(
-        parent,
-        parent_path.clone(),
-        Utc::now(),
-        SessionSource::Cli,
-    );
-    parent_metadata.history_mode = ThreadHistoryMode::Paginated;
-    state_db
-        .upsert_thread(&parent_metadata.build(config.default_model_provider_id.as_str()))
-        .await
-        .expect("register immutable parent rollout");
-    write_rollout(
-        home.path(),
-        child,
-        Some(parent_end),
-        /*next_ordinal*/ 2,
-    );
+    for immutable_parent in [false, true] {
+        for compressed in [false, true] {
+            let home = TempDir::new().expect("temp dir");
+            let config = test_config(home.path());
+            let state_db = codex_state::StateRuntime::init(
+                config.sqlite.clone(),
+                config.default_model_provider_id.clone(),
+            )
+            .await
+            .expect("initialize state database");
+            let store = LocalThreadStore::new(config.clone(), Some(state_db.clone()));
+            let parent = ThreadId::default();
+            let child = ThreadId::default();
+            let mutable_parent_path = write_rollout(
+                home.path(),
+                parent,
+                /*history_base*/ None,
+                /*next_ordinal*/ 3,
+            );
+            let segment_id = SegmentId::new();
+            let parent_path = if immutable_parent {
+                home.path()
+                    .join(codex_rollout::ROTATED_ROLLOUT_SEGMENTS_SUBDIR)
+                    .join(parent.to_string())
+                    .join(segment_id.to_string())
+                    .join(
+                        mutable_parent_path
+                            .file_name()
+                            .expect("parent rollout file name"),
+                    )
+            } else {
+                mutable_parent_path.clone()
+            };
+            let mut lines = fs::read_to_string(mutable_parent_path.as_path())
+                .expect("read parent rollout")
+                .lines()
+                .map(serde_json::from_str::<RolloutLine>)
+                .collect::<Result<Vec<_>, _>>()
+                .expect("parse parent rollout");
+            let Some(RolloutItem::SessionMeta(session_meta)) =
+                lines.first_mut().map(|line| &mut line.item)
+            else {
+                panic!("parent rollout must start with session metadata");
+            };
+            session_meta.meta.segment_id = immutable_parent.then_some(segment_id);
+            let records = lines
+                .iter()
+                .map(serde_json::to_string)
+                .collect::<Result<Vec<_>, _>>()
+                .expect("serialize parent rollout");
+            fs::create_dir_all(parent_path.parent().expect("parent segment directory"))
+                .expect("create immutable parent directory");
+            fs::write(parent_path.as_path(), format!("{}\n", records.join("\n")))
+                .expect("write immutable parent rollout");
+            let parent_end = history_position(
+                parent_path.as_path(),
+                parent,
+                /*end_ordinal_exclusive*/ 2,
+            );
+            lines.insert(
+                2,
+                RolloutLine {
+                    timestamp: "2026-07-16T00:00:00.000Z".to_string(),
+                    ordinal: None,
+                    item: RolloutItem::EventMsg(
+                        codex_protocol::protocol::EventMsg::ShutdownComplete,
+                    ),
+                },
+            );
+            let records = lines
+                .iter()
+                .map(serde_json::to_string)
+                .collect::<Result<Vec<_>, _>>()
+                .expect("serialize parent rollout");
+            fs::write(parent_path.as_path(), format!("{}\n", records.join("\n")))
+                .expect("write parent rollout");
+            if immutable_parent {
+                fs::remove_file(mutable_parent_path.as_path())
+                    .expect("remove mutable parent rollout");
+            }
+            let parent_path = if compressed {
+                compress_rollout(parent_path.as_path())
+            } else {
+                parent_path
+            };
+            let parent_before =
+                fs::read(&parent_path).expect("capture shared ancestor representation");
+            let mut parent_metadata = codex_state::ThreadMetadataBuilder::new(
+                parent,
+                parent_path.clone(),
+                Utc::now(),
+                SessionSource::Cli,
+            );
+            parent_metadata.history_mode = ThreadHistoryMode::Paginated;
+            state_db
+                .upsert_thread(&parent_metadata.build(config.default_model_provider_id.as_str()))
+                .await
+                .expect("register immutable parent rollout");
+            write_rollout(
+                home.path(),
+                child,
+                Some(parent_end),
+                /*next_ordinal*/ 2,
+            );
 
-    let expected = store
-        .resolve_rollout_lineage(child)
-        .await
-        .expect("resolve child lineage with explicit byte cutoff");
-    assert_eq!(
-        expected.segments[0].end_byte_offset,
-        Some(parent_end.end_byte_offset),
-    );
+            let expected = store
+                .resolve_rollout_lineage(child)
+                .await
+                .expect("resolve child lineage with explicit byte cutoff");
+            assert_eq!(
+                expected.segments[0].end_byte_offset,
+                Some(parent_end.end_byte_offset),
+            );
 
-    let (prepared, _writer_reservation, _projection_was_missing) = store
-        .resolve_rollout_lineage_for_reference(child, /*expected_rollout_id*/ None)
-        .await
-        .expect("prepare child lineage for a fork reference");
+            let (prepared, _writer_reservation, _projection_was_missing) = store
+                .resolve_rollout_lineage_for_reference(child, /*expected_rollout_id*/ None)
+                .await
+                .expect("prepare child lineage for a fork reference");
 
-    assert_eq!(prepared.segments, expected.segments);
+            assert_eq!(prepared.segments, expected.segments);
+            assert_eq!(
+                fs::read(&parent_path).expect("read shared ancestor"),
+                parent_before
+            );
+            if compressed {
+                assert!(!codex_rollout::plain_rollout_path(&parent_path).exists());
+            }
+        }
+    }
 }
 
 #[tokio::test]
@@ -437,8 +486,9 @@ async fn normalizes_rollout_references_and_same_thread_rotations() {
                     /*end_ordinal_exclusive*/ 3,
                 )),
             ),
-            expected_segment(
+            expected_segment_with_provenance(
                 child, child_path, /*start_ordinal*/ 4, /*end*/ None,
+                /*uses_history_base*/ false, /*uses_fork_boundary*/ true,
             ),
         ]
     );
@@ -463,6 +513,7 @@ async fn normalizes_rollout_references_and_same_thread_rotations() {
             /*inherited_filter_texts*/ None,
             /*graph_depth*/ 0,
             &mut active_paths,
+            LineageOffsetMode::Resolve,
         )
         .await
         .expect("resolve same-thread rotation"),
@@ -530,8 +581,9 @@ async fn history_base_cutoff_survives_parent_rotation() {
                 /*start_ordinal*/ 1,
                 Some(parent_end),
             ),
-            expected_segment(
+            expected_segment_with_provenance(
                 child, child_path, /*start_ordinal*/ 5, /*end*/ None,
+                /*uses_history_base*/ true, /*uses_fork_boundary*/ true,
             ),
         ]
     );
@@ -542,6 +594,24 @@ fn expected_segment(
     rollout_path: std::path::PathBuf,
     start_ordinal: u64,
     end: Option<HistoryPosition>,
+) -> RolloutLineageSegment {
+    expected_segment_with_provenance(
+        thread_id,
+        rollout_path,
+        start_ordinal,
+        end,
+        /*uses_history_base*/ false,
+        /*uses_fork_boundary*/ false,
+    )
+}
+
+fn expected_segment_with_provenance(
+    thread_id: ThreadId,
+    rollout_path: std::path::PathBuf,
+    start_ordinal: u64,
+    end: Option<HistoryPosition>,
+    uses_history_base: bool,
+    uses_fork_boundary: bool,
 ) -> RolloutLineageSegment {
     RolloutLineageSegment {
         thread_id,
@@ -560,6 +630,9 @@ fn expected_segment(
         rollout_path,
         start_ordinal,
         filter_texts: Vec::new(),
+        goal_supervisor_provenance: Default::default(),
+        uses_history_base,
+        uses_fork_boundary,
     }
 }
 
@@ -706,6 +779,7 @@ async fn rejects_reference_graphs_past_the_global_depth_limit() {
         /*inherited_filter_texts*/ None,
         codex_rollout::MAX_ROLLOUT_REFERENCE_DEPTH - 1,
         &mut active_paths,
+        LineageOffsetMode::Resolve,
     )
     .await
     .expect("the final permitted reference edge should resolve");
@@ -720,6 +794,7 @@ async fn rejects_reference_graphs_past_the_global_depth_limit() {
         /*inherited_filter_texts*/ None,
         codex_rollout::MAX_ROLLOUT_REFERENCE_DEPTH,
         &mut active_paths,
+        LineageOffsetMode::Resolve,
     )
     .await
     .expect_err("a reference edge beyond the global limit must fail");
@@ -752,6 +827,7 @@ async fn rejects_reference_graphs_past_the_global_depth_limit() {
         /*inherited_filter_texts*/ None,
         codex_rollout::MAX_ROLLOUT_REFERENCE_DEPTH,
         &mut active_paths,
+        LineageOffsetMode::Resolve,
     )
     .await
     .expect_err("a history_base edge beyond the global limit must fail");
@@ -834,6 +910,7 @@ async fn resolves_512_same_thread_lineage_segments() {
         /*inherited_filter_texts*/ None,
         /*graph_depth*/ 0,
         &mut active_paths,
+        LineageOffsetMode::Resolve,
     )
     .await
     .expect("ordinary same-thread rotation must not exhaust fork depth");
@@ -896,6 +973,7 @@ async fn resolves_512_same_thread_lineage_segments() {
         /*inherited_filter_texts*/ None,
         /*graph_depth*/ 0,
         &mut active_paths,
+        LineageOffsetMode::Resolve,
     )
     .await
     .expect("same-thread lineage must remain readable beyond 512 segments");

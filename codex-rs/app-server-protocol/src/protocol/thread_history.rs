@@ -275,6 +275,23 @@ impl ThreadHistoryBuilder {
             .or_else(|| self.turns.last().map(|turn| turn.id.as_str()))
     }
 
+    /// Next generated `item-N` suffix after reducing the supplied Legacy records.
+    ///
+    /// Migration uses this at an immutable reference boundary so the first synthesized item in a
+    /// converted Legacy suffix retains the ID it had in the pre-migration Desktop view. Canonical
+    /// Paginated items with explicit IDs do not advance this counter.
+    pub fn next_synthetic_item_index(&self) -> i64 {
+        self.next_item_index
+    }
+
+    /// Number of persisted records already reduced into Legacy implicit-turn positioning.
+    ///
+    /// The persistence policy can omit Paginated-only `ItemCompleted` records from a Legacy view,
+    /// so this value is not necessarily the number of physical lines supplied by a caller.
+    pub fn next_legacy_rollout_index(&self) -> usize {
+        self.next_rollout_index
+    }
+
     pub fn turn_snapshot(&self, turn_id: &str) -> Option<Turn> {
         self.current_turn
             .as_ref()

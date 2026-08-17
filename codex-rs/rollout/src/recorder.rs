@@ -1135,6 +1135,14 @@ impl RolloutRecorder {
         crate::decode_rollout_line(value).map(Some)
     }
 
+    /// Parses one physical JSONL record through the canonical compatibility decoder.
+    pub fn parse_rollout_line_bytes(
+        bytes: &[u8],
+    ) -> Result<Option<RolloutLine>, serde_json::Error> {
+        let value = serde_json::from_slice(bytes)?;
+        Self::parse_rollout_line_value(value)
+    }
+
     /// Loads physical rollout records without discarding their lineage ordinals.
     pub async fn load_rollout_lines(
         path: &Path,

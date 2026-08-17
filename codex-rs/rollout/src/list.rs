@@ -1646,6 +1646,15 @@ async fn find_thread_path_by_id_str_in_subdir(
                 .matches
                 .into_iter()
                 .map(|m| m.full_path())
+                .filter(|path| {
+                    !path
+                        .strip_prefix(root.as_path())
+                        .ok()
+                        .and_then(|relative| relative.components().next())
+                        .is_some_and(|component| {
+                            component.as_os_str() == crate::ROLLOUT_SEGMENTS_SUBDIR
+                        })
+                })
                 .find_map(compression::RolloutFile::from_path)
                 .map(compression::RolloutFile::into_path);
 
@@ -1690,6 +1699,14 @@ async fn find_thread_path_by_id_from_filenames(
     };
     let mut newest = None;
     visit_rollout_filenames::<()>(root, |file_name, path| {
+        if path
+            .strip_prefix(root)
+            .ok()
+            .and_then(|relative| relative.components().next())
+            .is_some_and(|component| component.as_os_str() == crate::ROLLOUT_SEGMENTS_SUBDIR)
+        {
+            return ControlFlow::Continue(());
+        }
         if file_name.thread_id() != target {
             return ControlFlow::Continue(());
         }
@@ -1795,6 +1812,25 @@ async fn find_rollout_path_by_rollout_id_from_filenames(
         }
     })
     .await
+}
+
+/// Indexes immutable rollout IDs from active and archived rollout filenames.
+///
+/// Native `history_base` traversal uses this to avoid repeating a recursive filesystem scan for
+/// every physical segment. It deliberately reads filenames only; callers still validate each
+/// selected rollout's session metadata before using it.
+pub async fn index_rollout_paths_by_rollout_id(
+    codex_home: &Path,
+) -> io::Result<std::collections::HashMap<RolloutId, PathBuf>> {
+    let mut paths = std::collections::HashMap::new();
+    for subdir in [SESSIONS_SUBDIR, ARCHIVED_SESSIONS_SUBDIR] {
+        visit_rollout_filenames::<()>(codex_home.join(subdir).as_path(), |file_name, path| {
+            paths.entry(file_name.rollout_id()).or_insert(path);
+            ControlFlow::Continue(())
+        })
+        .await?;
+    }
+    Ok(paths)
 }
 
 /// Locate the newest rollout file owned by a thread ID.

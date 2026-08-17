@@ -644,6 +644,15 @@ mod thread_processor_behavior_tests {
     }
 
     #[test]
+    fn app_server_thread_preview_is_bounded() {
+        let preview =
+            bounded_thread_preview("é".repeat(codex_protocol::protocol::THREAD_PREVIEW_MAX_BYTES));
+
+        assert!(preview.len() <= codex_protocol::protocol::THREAD_PREVIEW_MAX_BYTES);
+        assert!(preview.ends_with('…'));
+    }
+
+    #[test]
     fn config_load_error_marks_cloud_config_bundle_failures_for_relogin() {
         let err = std::io::Error::other(CloudConfigBundleLoadError::new(
             CloudConfigBundleLoadErrorCode::Auth,

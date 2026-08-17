@@ -4231,12 +4231,14 @@ async fn indexed_paginated_fork_appends_interrupted_suffix_after_capturing_paren
         .await?
         .0;
     assert_contains_certified_segment_state_checkpoint(&child_rollout_items);
-    assert_eq!(
-        child_rollout_items
+    assert!(
+        matches!(child_rollout_items.first(), Some(RolloutItem::SessionMeta(meta))
+        if meta.meta.history_base.is_some())
+    );
+    assert!(
+        !child_rollout_items
             .iter()
-            .filter(|item| matches!(item, RolloutItem::RolloutReference(_)))
-            .count(),
-        1
+            .any(|item| matches!(item, RolloutItem::RolloutReference(_)))
     );
     let child_response_items = child_rollout_items
         .iter()
@@ -4488,7 +4490,7 @@ async fn assert_prepared_paginated_fork_preserves_parent_model_messages(
     assert!(
         child_rollout_items
             .iter()
-            .any(|line| matches!(line.item, RolloutItem::RolloutReference(_)))
+            .any(|line| matches!(&line.item, RolloutItem::SessionMeta(meta) if meta.meta.history_base.is_some()))
     );
     assert!(
         child_rollout_items

@@ -177,23 +177,6 @@ async fn assert_indexed_cursor_pages_ignore_missing_predecessors(history_mode: T
     let db = history_db(&store).await;
     let next_ordinal = i64::try_from(SEGMENT_COUNT).expect("segment count fits ordinal") * 4;
 
-    sqlx::query(
-        "INSERT INTO thread_history_projection_state (thread_id, next_rollout_byte_offset, next_rollout_ordinal) VALUES (?, ?, ?)",
-    )
-    .bind(thread_id.to_string())
-    .bind(
-        i64::try_from(
-            fs::metadata(active_path.as_path())
-                .expect("active segment metadata")
-                .len(),
-        )
-        .expect("active segment length fits SQLite integer"),
-    )
-    .bind(next_ordinal)
-    .execute(db)
-    .await
-    .expect("seed current projected history");
-
     for index in 0..TURN_COUNT {
         let segment_index = SEGMENT_COUNT - TURN_COUNT + index;
         let ordinal = i64::try_from(segment_index).expect("turn segment fits ordinal") * 4;
@@ -228,6 +211,22 @@ async fn assert_indexed_cursor_pages_ignore_missing_predecessors(history_mode: T
         )
         .await;
     }
+    sqlx::query(
+        "INSERT INTO thread_history_projection_state (thread_id, next_rollout_byte_offset, next_rollout_ordinal) VALUES (?, ?, ?)",
+    )
+    .bind(thread_id.to_string())
+    .bind(
+        i64::try_from(
+            fs::metadata(active_path.as_path())
+                .expect("active segment metadata")
+                .len(),
+        )
+        .expect("active segment length fits SQLite integer"),
+    )
+    .bind(next_ordinal)
+    .execute(db)
+    .await
+    .expect("publish current projected history after its rows");
 
     let immutable_directory = home
         .path()
@@ -1405,7 +1404,7 @@ async fn cursors_are_bound_to_the_selected_rollout_generation() {
         db,
         first_rollout_id,
         "first-turn-3",
-        30,
+        /*rollout_ordinal*/ 30,
         "completed",
         /*error_json*/ None,
         /*first_user_item_id*/ None,
@@ -1647,16 +1646,6 @@ async fn segmented_legacy_projection_preserves_legacy_turn_cursors() {
     let (home, store, thread_id) = store_with_mode(ThreadHistoryMode::Legacy).await;
     let rollout_len = write_segmented_legacy_rollout(home.path(), thread_id);
     let db = history_db(&store).await;
-    sqlx::query(
-        "INSERT INTO thread_history_projection_state (thread_id, next_rollout_byte_offset, next_rollout_ordinal) VALUES (?, ?, ?)",
-    )
-    .bind(thread_id.to_string())
-    .bind(i64::try_from(rollout_len).expect("rollout length fits SQLite integer"))
-    .bind(100_i64)
-    .execute(db)
-    .await
-    .expect("insert legacy projection state");
-
     for index in 1_i64..=5 {
         let turn_id = format!("turn-{index}");
         let user_id = format!("user-{index}");
@@ -1701,6 +1690,15 @@ async fn segmented_legacy_projection_preserves_legacy_turn_cursors() {
         /*final_agent_item_id*/ None,
     )
     .await;
+    sqlx::query(
+        "INSERT INTO thread_history_projection_state (thread_id, next_rollout_byte_offset, next_rollout_ordinal) VALUES (?, ?, ?)",
+    )
+    .bind(thread_id.to_string())
+    .bind(i64::try_from(rollout_len).expect("rollout length fits SQLite integer"))
+    .bind(100_i64)
+    .execute(db)
+    .await
+    .expect("publish legacy projection state after its rows");
 
     let first_page = list_segmented_legacy_turns(
         &store,
@@ -1771,15 +1769,6 @@ async fn segmented_legacy_projection_pages_full_turn_items() {
     let (home, store, thread_id) = store_with_mode(ThreadHistoryMode::Legacy).await;
     let rollout_len = write_segmented_legacy_rollout(home.path(), thread_id);
     let db = history_db(&store).await;
-    sqlx::query(
-        "INSERT INTO thread_history_projection_state (thread_id, next_rollout_byte_offset, next_rollout_ordinal) VALUES (?, ?, ?)",
-    )
-    .bind(thread_id.to_string())
-    .bind(i64::try_from(rollout_len).expect("rollout length fits SQLite integer"))
-    .bind(100_i64)
-    .execute(db)
-    .await
-    .expect("insert legacy projection state");
     insert_turn(
         db,
         thread_id,
@@ -1794,6 +1783,15 @@ async fn segmented_legacy_projection_pages_full_turn_items() {
     for (item_id, ordinal) in [("item-1", 11), ("item-2", 12), ("item-3", 13)] {
         insert_item(db, thread_id, "turn-1", item_id, ordinal).await;
     }
+    sqlx::query(
+        "INSERT INTO thread_history_projection_state (thread_id, next_rollout_byte_offset, next_rollout_ordinal) VALUES (?, ?, ?)",
+    )
+    .bind(thread_id.to_string())
+    .bind(i64::try_from(rollout_len).expect("rollout length fits SQLite integer"))
+    .bind(100_i64)
+    .execute(db)
+    .await
+    .expect("publish legacy projection state after its rows");
 
     let first_page = list_segmented_legacy_items(
         &store,
@@ -1831,15 +1829,6 @@ async fn segmented_legacy_summary_uses_last_agent_message_after_final_answer() {
     let (home, store, thread_id) = store_with_mode(ThreadHistoryMode::Legacy).await;
     let rollout_len = write_segmented_legacy_rollout(home.path(), thread_id);
     let db = history_db(&store).await;
-    sqlx::query(
-        "INSERT INTO thread_history_projection_state (thread_id, next_rollout_byte_offset, next_rollout_ordinal) VALUES (?, ?, ?)",
-    )
-    .bind(thread_id.to_string())
-    .bind(i64::try_from(rollout_len).expect("rollout length fits SQLite integer"))
-    .bind(100_i64)
-    .execute(db)
-    .await
-    .expect("insert current legacy projection state");
     insert_turn(
         db,
         thread_id,
@@ -1858,6 +1847,15 @@ async fn segmented_legacy_summary_uses_last_agent_message_after_final_answer() {
     ] {
         insert_item(db, thread_id, "turn-1", item_id, ordinal).await;
     }
+    sqlx::query(
+        "INSERT INTO thread_history_projection_state (thread_id, next_rollout_byte_offset, next_rollout_ordinal) VALUES (?, ?, ?)",
+    )
+    .bind(thread_id.to_string())
+    .bind(i64::try_from(rollout_len).expect("rollout length fits SQLite integer"))
+    .bind(100_i64)
+    .execute(db)
+    .await
+    .expect("publish current legacy projection state after its rows");
 
     let page = list_segmented_legacy_turns(
         &store,
@@ -2052,15 +2050,6 @@ async fn segmented_legacy_reads_accept_historical_fork_and_parent_metadata() {
             parent_thread_id,
         );
         let db = history_db(&store).await;
-        sqlx::query(
-            "INSERT INTO thread_history_projection_state (thread_id, next_rollout_byte_offset, next_rollout_ordinal) VALUES (?, ?, ?)",
-        )
-        .bind(thread_id.to_string())
-        .bind(i64::try_from(rollout_len).expect("rollout length fits SQLite integer"))
-        .bind(100_i64)
-        .execute(db)
-        .await
-        .expect("insert complete same-thread legacy projection state");
         insert_turn(
             db,
             thread_id,
@@ -2076,6 +2065,15 @@ async fn segmented_legacy_reads_accept_historical_fork_and_parent_metadata() {
             db, thread_id, "turn-1", "item-1", /*rollout_ordinal*/ 11,
         )
         .await;
+        sqlx::query(
+            "INSERT INTO thread_history_projection_state (thread_id, next_rollout_byte_offset, next_rollout_ordinal) VALUES (?, ?, ?)",
+        )
+        .bind(thread_id.to_string())
+        .bind(i64::try_from(rollout_len).expect("rollout length fits SQLite integer"))
+        .bind(100_i64)
+        .execute(db)
+        .await
+        .expect("publish complete same-thread legacy projection after its rows");
 
         let turns = list_segmented_legacy_turns(
             &store,

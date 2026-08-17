@@ -10,6 +10,7 @@ use sqlx::Row;
 use super::super::LocalThreadStore;
 use super::super::rollout_lineage::RolloutLineage;
 use super::super::rollout_lineage::RolloutLineageSegment;
+use super::super::thread_rollout_resolver::ResolvedThreadRollout;
 use super::segment_paging::page_indexed_item_rows;
 use super::segment_paging::page_indexed_turn_rows;
 use super::segment_paging::page_item_rows;
@@ -129,11 +130,19 @@ pub(in crate::local) async fn list_turns(
         Some(lineage) => lineage,
         None => store.resolve_rollout_lineage(params.thread_id).await?,
     };
+    list_turns_from_lineage(store, params, &lineage).await
+}
+
+async fn list_turns_from_lineage(
+    store: &LocalThreadStore,
+    params: ListTurnsParams,
+    lineage: &RolloutLineage,
+) -> ThreadStoreResult<TurnPage> {
     let pool = store.thread_history_db().await?;
     let page = page_turn_rows(
         pool,
         params.thread_id,
-        &lineage,
+        lineage,
         params.cursor.as_deref(),
         params.page_size,
         params.sort_direction,
@@ -151,7 +160,7 @@ pub(in crate::local) async fn list_turns(
             {
                 // Synthetic fork-boundary rows are interrupted without local summary IDs.
                 // Load their summary from the earliest visible source turn.
-                load_inherited_summary_items(pool, &lineage, &turn).await?
+                load_inherited_summary_items(pool, lineage, &turn).await?
             }
             StoredTurnItemsView::Summary => turn.summary_items,
         };
@@ -204,7 +213,7 @@ pub(in crate::local) async fn list_items(
 ///
 /// Immutable predecessors were validated when their SQLite rows were projected. Revalidating
 /// every predecessor during an indexed page would make the request depend on thread length.
-async fn indexed_same_thread_lineage(
+pub(in crate::local) async fn indexed_same_thread_lineage(
     store: &LocalThreadStore,
     thread_id: ThreadId,
 ) -> ThreadStoreResult<Option<RolloutLineage>> {
@@ -214,11 +223,23 @@ async fn indexed_same_thread_lineage(
     else {
         return Ok(None);
     };
+    indexed_same_thread_lineage_from_resolved(store, thread_id, resolved).await
+}
+
+async fn indexed_same_thread_lineage_from_resolved(
+    store: &LocalThreadStore,
+    thread_id: ThreadId,
+    resolved: ResolvedThreadRollout,
+) -> ThreadStoreResult<Option<RolloutLineage>> {
     let rollout_id = resolved.rollout_id;
     let rollout_path = resolved.path;
+    let authenticated_session_meta = resolved.authenticated_session_meta;
     let Some(projection) = super::projection_state(store, rollout_id).await? else {
         return Ok(None);
     };
+    if !projection.lineage_complete {
+        return Ok(None);
+    }
     let Some(state_db) = store.state_db().await else {
         return Ok(None);
     };
@@ -243,16 +264,22 @@ async fn indexed_same_thread_lineage(
         return Ok(None);
     }
 
-    let Ok(session_meta) = codex_rollout::read_session_meta_line(rollout_path.as_path()).await
-    else {
-        return Ok(None);
+    let session_meta = match authenticated_session_meta {
+        Some(session_meta) => session_meta,
+        None => {
+            let Ok(session_meta) =
+                codex_rollout::read_session_meta_line(rollout_path.as_path()).await
+            else {
+                return Ok(None);
+            };
+            session_meta.meta
+        }
     };
-    let session_meta = session_meta.meta;
     if session_meta.id != thread_id
         || session_meta.history_mode != ThreadHistoryMode::Paginated
-        || session_meta.forked_from_id.is_some()
-        || session_meta.history_base.is_some()
-        || session_meta.subagent_history_start_ordinal.is_some()
+        || (session_meta.forked_from_id.is_some() && session_meta.history_base.is_none())
+        || (session_meta.subagent_history_start_ordinal.is_some()
+            && session_meta.history_base.is_none())
     {
         return Ok(None);
     }
@@ -268,8 +295,43 @@ async fn indexed_same_thread_lineage(
             jsonl_end_byte_offset: None,
             end_byte_offset: None,
             filter_texts: Vec::new(),
+            goal_supervisor_provenance: Default::default(),
+            uses_history_base: false,
+            uses_fork_boundary: false,
         }],
     }))
+}
+
+/// Checks the newest projected root turn without resolving the selected rollout a second time.
+///
+/// Forked histories return `None` so callers retain the complete lineage check. A complete
+/// same-thread native `history_base` projection is already one logical ordinal range.
+pub(in crate::local) async fn has_nonempty_newest_root_turn_for_resolved(
+    store: &LocalThreadStore,
+    thread_id: ThreadId,
+    resolved: ResolvedThreadRollout,
+) -> ThreadStoreResult<Option<bool>> {
+    let Some(lineage) =
+        indexed_same_thread_lineage_from_resolved(store, thread_id, resolved).await?
+    else {
+        return Ok(None);
+    };
+    let page = list_turns_from_lineage(
+        store,
+        ListTurnsParams {
+            thread_id,
+            include_archived: true,
+            cursor: None,
+            page_size: 1,
+            sort_direction: crate::SortDirection::Desc,
+            items_view: StoredTurnItemsView::Summary,
+        },
+        &lineage,
+    )
+    .await?;
+    Ok(Some(
+        page.turns.first().is_none_or(|turn| !turn.items.is_empty()),
+    ))
 }
 
 /// Read an existing segmented legacy projection without exposing indexed cursors.

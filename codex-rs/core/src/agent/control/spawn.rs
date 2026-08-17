@@ -1057,9 +1057,21 @@ impl AgentControl {
             });
             if let (Some(reference_rollout_items), Some(unsanitized_parent_history)) =
                 (reference_rollout_items, unsanitized_parent_history)
-                && serde_json::to_value(&forked_rollout_items)? == unsanitized_parent_history
             {
-                forked_rollout_items = reference_rollout_items;
+                if serde_json::to_value(&forked_rollout_items)? == unsanitized_parent_history {
+                    forked_rollout_items = reference_rollout_items;
+                } else {
+                    // Sanitized history is a self-contained copy. Keeping its source history_base
+                    // would restore the unsanitized ancestor and duplicate the copied model input.
+                    forked_rollout_items.retain_mut(|item| match item {
+                        RolloutItem::SessionMeta(meta) => {
+                            meta.meta.history_base = None;
+                            true
+                        }
+                        RolloutItem::RolloutReference(_) => false,
+                        _ => true,
+                    });
+                }
             }
         }
         // Full forks reuse the parent's reference context instead of rebuilding it. If that

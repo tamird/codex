@@ -16,6 +16,7 @@ use crate::AppendThreadItemsParams;
 use crate::ArchiveThreadParams;
 use crate::CreateThreadParams;
 use crate::DeleteThreadParams;
+use crate::FreezeRolloutSegmentParams;
 use crate::ListTurnsParams;
 use crate::RevertThreadParams;
 use crate::SortDirection;
@@ -39,15 +40,21 @@ async fn revert_keeps_thread_id_and_hides_suffix_across_repeated_reverts() {
     store
         .append_items(AppendThreadItemsParams {
             thread_id,
-            items: vec![
-                turn_started("turn-1"),
-                turn_completed("turn-1"),
-                turn_started("turn-2"),
-                turn_completed("turn-2"),
-            ],
+            items: vec![turn_started("turn-1"), turn_completed("turn-1")],
         })
         .await
-        .expect("append turns");
+        .expect("append first turn");
+    store
+        .freeze_thread_segment(thread_id, FreezeRolloutSegmentParams::rotate(Vec::new()))
+        .await
+        .expect("seal first turn");
+    store
+        .append_items(AppendThreadItemsParams {
+            thread_id,
+            items: vec![turn_started("turn-2"), turn_completed("turn-2")],
+        })
+        .await
+        .expect("append second turn");
     let original_path = store
         .live_rollout_path(thread_id)
         .await
@@ -118,7 +125,7 @@ async fn revert_keeps_thread_id_and_hides_suffix_across_repeated_reverts() {
         .await
         .expect("unarchive reverted thread");
     let owned_rollout_paths = rollout_paths_for_thread(home.path(), thread_id).await;
-    assert_eq!(owned_rollout_paths.len(), 3);
+    assert_eq!(owned_rollout_paths.len(), 4);
     assert!(
         owned_rollout_paths
             .iter()

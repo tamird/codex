@@ -1,6 +1,9 @@
 use std::fs::File;
 use std::fs::Metadata;
 use std::io;
+use std::io::BufRead;
+use std::io::BufReader;
+use std::io::Read;
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
@@ -23,6 +26,19 @@ use crate::LoadThreadHistoryParams;
 use crate::StoredModelContext;
 use crate::ThreadStoreError;
 use crate::ThreadStoreResult;
+
+/// Maximum source bytes an interactive latest-state request may scan for model context.
+///
+/// Valid segmented histories place a certified checkpoint inside the bounded active segment.
+/// Older one-file histories without a recent compaction require explicit migration instead of
+/// consuming memory and latency proportional to the complete JSONL.
+pub(super) const MAX_INTERACTIVE_MODEL_CONTEXT_SCAN_BYTES: u64 = 64 * 1024 * 1024;
+// `MAX_USER_INPUT_TEXT_CHARS` permits one mebibyte of characters. Eight mebibytes leaves room
+// for four-byte UTF-8 plus JSON escaping and record metadata without admitting an unbounded line.
+pub(super) const MAX_INTERACTIVE_MODEL_CONTEXT_RECORD_BYTES: usize =
+    codex_protocol::user_input::MAX_USER_INPUT_TEXT_CHARS * 8;
+const MODEL_CONTEXT_MIGRATION_REQUIRED: &str =
+    "latest model context exceeds the interactive scan limit; run `codex migrate-rollouts`";
 
 #[cfg(test)]
 #[path = "model_context_tests.rs"]
@@ -55,40 +71,13 @@ pub(super) async fn load_latest_model_context(
     let mut path = resolved.path;
     let rollout_id = resolved.rollout_id;
 
-    let mut session_meta = codex_rollout::read_session_meta_line(path.as_path())
-        .await
-        .map_err(|err| ThreadStoreError::Internal {
-            message: format!("failed to read session metadata {}: {err}", path.display()),
-        })?;
-    if session_meta.meta.id != params.thread_id {
-        return Err(ThreadStoreError::InvalidRequest {
-            message: format!(
-                "rollout at {} belongs to thread {}, not {}",
-                path.display(),
-                session_meta.meta.id,
-                params.thread_id
-            ),
-        });
-    }
-
-    let projected_active =
-        scan_projected_active_model_context(store, rollout_id, &path, &session_meta).await?;
-    let used_active_checkpoint = projected_active.is_some();
-    let mut history_access = if used_active_checkpoint {
+    let mut history_access =
         super::goal_supervisor_runtime_repair::repair_active_history_before_access(
             store,
             params.thread_id,
             path.as_path(),
         )
-        .await?
-    } else {
-        super::goal_supervisor_runtime_repair::repair_compatibility_history_before_access(
-            store,
-            params.thread_id,
-            path.as_path(),
-        )
-        .await?
-    };
+        .await?;
     path = codex_rollout::existing_rollout_path(path.as_path())
         .await
         .ok_or_else(|| ThreadStoreError::Internal {
@@ -97,15 +86,12 @@ pub(super) async fn load_latest_model_context(
                 path.display()
             ),
         })?;
-    session_meta = codex_rollout::read_session_meta_line(path.as_path())
-        .await
-        .map_err(|err| ThreadStoreError::Internal {
-            message: format!("failed to read session metadata {}: {err}", path.display()),
-        })?;
-
-    let mut projected_after_repair =
-        scan_projected_active_model_context(store, rollout_id, &path, &session_meta).await?;
-    if used_active_checkpoint && projected_after_repair.is_none() {
+    let certified_snapshot = history_access
+        .take_certified_active_snapshot()
+        .filter(|snapshot| snapshot.rollout_path == path);
+    let (session_meta, projected_after_repair) = if let Some(snapshot) = certified_snapshot {
+        (snapshot.head.session_meta, Some(snapshot.scan.items))
+    } else {
         drop(history_access);
         history_access =
             super::goal_supervisor_runtime_repair::repair_compatibility_history_before_access(
@@ -122,13 +108,24 @@ pub(super) async fn load_latest_model_context(
                     path.display()
                 ),
             })?;
-        session_meta = codex_rollout::read_session_meta_line(path.as_path())
+        let session_meta = codex_rollout::read_session_meta_line(path.as_path())
             .await
             .map_err(|err| ThreadStoreError::Internal {
                 message: format!("failed to read session metadata {}: {err}", path.display()),
             })?;
-        projected_after_repair =
+        let projected =
             scan_projected_active_model_context(store, rollout_id, &path, &session_meta).await?;
+        (session_meta, projected)
+    };
+    if session_meta.meta.id != params.thread_id {
+        return Err(ThreadStoreError::InvalidRequest {
+            message: format!(
+                "rollout at {} belongs to thread {}, not {}",
+                path.display(),
+                session_meta.meta.id,
+                params.thread_id
+            ),
+        });
     }
     let _history_access = history_access;
 
@@ -181,18 +178,16 @@ pub(super) async fn scan_projected_active_model_context(
         .await
         .map_err(thread_store_io_error)?;
     let active_scan = if compressed_active {
-        let (lines, _, parse_errors) = codex_rollout::RolloutRecorder::load_rollout_lines(path)
-            .await
-            .map_err(thread_store_io_error)?;
-        if parse_errors != 0 {
-            return Err(ThreadStoreError::Internal {
-                message: format!(
-                    "active rollout {} contains {parse_errors} invalid record(s)",
-                    path.display()
-                ),
-            });
-        }
-        scan_loaded_active_model_context(lines, session_meta.clone())
+        let path_for_scan = path.to_path_buf();
+        let meta_for_scan = session_meta.clone();
+        tokio::task::spawn_blocking(move || {
+            scan_compressed_active_model_context_blocking(&path_for_scan, meta_for_scan)
+        })
+        .await
+        .map_err(|err| ThreadStoreError::Internal {
+            message: format!("failed to join compressed active model context scan: {err}"),
+        })?
+        .map_err(interactive_model_context_scan_error)?
     } else {
         let path_for_scan = path.to_path_buf();
         let meta_for_scan = session_meta.clone();
@@ -203,7 +198,7 @@ pub(super) async fn scan_projected_active_model_context(
         .map_err(|err| ThreadStoreError::Internal {
             message: format!("failed to join active model context scan: {err}"),
         })?
-        .map_err(thread_store_io_error)?
+        .map_err(interactive_model_context_scan_error)?
     };
     let Some(active_scan) = active_scan else {
         return Ok(None);
@@ -232,10 +227,12 @@ pub(super) async fn scan_projected_active_model_context(
     Ok(Some(active_scan.items))
 }
 
-struct ActiveModelContextScan {
-    items: Vec<RolloutItem>,
-    segment_checkpoint: bool,
-    records_scanned: u64,
+pub(super) struct ActiveModelContextScan {
+    pub(super) items: Vec<RolloutItem>,
+    pub(super) suffix_lines: Vec<RolloutLine>,
+    pub(super) segment_checkpoint: bool,
+    pub(super) records_scanned: u64,
+    pub(super) latest_ordinal: Option<u64>,
 }
 
 fn scan_loaded_active_model_context(
@@ -243,20 +240,28 @@ fn scan_loaded_active_model_context(
     session_meta: SessionMetaLine,
 ) -> Option<ActiveModelContextScan> {
     let mut scan = ModelContextScan::default();
+    let mut suffix_lines = Vec::new();
+    let mut latest_ordinal = None;
     for (index, line) in lines.into_iter().rev().enumerate() {
         let records_scanned = u64::try_from(index).unwrap_or(u64::MAX).saturating_add(1);
+        latest_ordinal = latest_ordinal.max(line.ordinal);
         if matches!(
             line.item,
             RolloutItem::SessionMeta(_) | RolloutItem::RolloutReference(_)
         ) {
             continue;
         }
-        if scan.push(line.item).is_complete() {
+        let complete = scan.push(line.item.clone()).is_complete();
+        suffix_lines.push(line);
+        if complete {
             let segment_checkpoint = scan.completed_at_segment_checkpoint();
+            suffix_lines.reverse();
             return Some(ActiveModelContextScan {
                 items: scan.finish(session_meta),
+                suffix_lines,
                 segment_checkpoint,
                 records_scanned,
+                latest_ordinal,
             });
         }
     }
@@ -267,11 +272,36 @@ fn scan_projected_active_model_context_blocking(
     path: &Path,
     session_meta: SessionMetaLine,
 ) -> io::Result<Option<ActiveModelContextScan>> {
+    scan_projected_active_model_context_blocking_with_limit(
+        path,
+        session_meta,
+        MAX_INTERACTIVE_MODEL_CONTEXT_SCAN_BYTES,
+    )
+}
+
+fn scan_projected_active_model_context_blocking_with_limit(
+    path: &Path,
+    session_meta: SessionMetaLine,
+    max_scan_bytes: u64,
+) -> io::Result<Option<ActiveModelContextScan>> {
     let file = File::open(path)?;
-    let mut scanner = ReverseJsonlScanner::new(file)?;
+    let mut scanner = ReverseJsonlScanner::new(file)?
+        .with_max_record_bytes(MAX_INTERACTIVE_MODEL_CONTEXT_RECORD_BYTES);
     let mut scan = ModelContextScan::default();
+    let mut suffix_lines = Vec::new();
     let mut records_scanned = 0_u64;
-    while let Some(outcome) = scanner.scan_next::<serde_json::Value>()? {
+    let mut latest_ordinal = None;
+    loop {
+        let outcome = scanner.scan_next::<serde_json::Value>()?;
+        if scanner.oversized_records_skipped() != 0 {
+            return Err(interactive_model_context_too_large());
+        }
+        if scanner.bytes_scanned() > max_scan_bytes {
+            return Err(interactive_model_context_too_large());
+        }
+        let Some(outcome) = outcome else {
+            break;
+        };
         let value = match outcome {
             ScanOutcome::Parsed(value) => value,
             ScanOutcome::Rejected(err) => {
@@ -284,22 +314,117 @@ fn scan_projected_active_model_context_blocking(
             continue;
         };
         records_scanned = records_scanned.saturating_add(1);
+        latest_ordinal = latest_ordinal.max(line.ordinal);
         if matches!(
             line.item,
             RolloutItem::SessionMeta(_) | RolloutItem::RolloutReference(_)
         ) {
             continue;
         }
-        if scan.push(line.item).is_complete() {
+        let complete = scan.push(line.item.clone()).is_complete();
+        suffix_lines.push(line);
+        if complete {
             let segment_checkpoint = scan.completed_at_segment_checkpoint();
+            suffix_lines.reverse();
             return Ok(Some(ActiveModelContextScan {
                 items: scan.finish(session_meta),
+                suffix_lines,
                 segment_checkpoint,
                 records_scanned,
+                latest_ordinal,
             }));
         }
     }
     Ok(None)
+}
+
+fn scan_compressed_active_model_context_blocking(
+    path: &Path,
+    session_meta: SessionMetaLine,
+) -> io::Result<Option<ActiveModelContextScan>> {
+    scan_compressed_active_model_context_blocking_with_limit(
+        path,
+        session_meta,
+        MAX_INTERACTIVE_MODEL_CONTEXT_SCAN_BYTES,
+        MAX_INTERACTIVE_MODEL_CONTEXT_RECORD_BYTES,
+    )
+}
+
+fn scan_compressed_active_model_context_blocking_with_limit(
+    path: &Path,
+    session_meta: SessionMetaLine,
+    max_scan_bytes: u64,
+    max_record_bytes: usize,
+) -> io::Result<Option<ActiveModelContextScan>> {
+    let input = File::open(path)?;
+    let decoder = zstd::stream::read::Decoder::new(input)?;
+    let mut reader = BufReader::new(decoder);
+    let mut lines = Vec::new();
+    let mut decoded_bytes = 0_u64;
+    loop {
+        let mut record = Vec::new();
+        let read = reader
+            .by_ref()
+            .take(max_record_bytes.saturating_add(1) as u64)
+            .read_until(b'\n', &mut record)?;
+        if read == 0 {
+            break;
+        }
+        if read > max_record_bytes {
+            return Err(interactive_model_context_too_large());
+        }
+        decoded_bytes = decoded_bytes.saturating_add(read as u64);
+        if decoded_bytes > max_scan_bytes {
+            return Err(interactive_model_context_too_large());
+        }
+        if record.iter().all(u8::is_ascii_whitespace) {
+            continue;
+        }
+        let value = serde_json::from_slice(record.as_slice())
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        if let Some(line) = RolloutRecorder::parse_rollout_line_value(value)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?
+        {
+            lines.push(line);
+        }
+    }
+    Ok(scan_loaded_active_model_context(lines, session_meta))
+}
+
+fn interactive_model_context_too_large() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::FileTooLarge,
+        MODEL_CONTEXT_MIGRATION_REQUIRED,
+    )
+}
+
+pub(super) fn interactive_model_context_scan_error(error: io::Error) -> ThreadStoreError {
+    if error.kind() == io::ErrorKind::FileTooLarge {
+        ThreadStoreError::InvalidRequest {
+            message: MODEL_CONTEXT_MIGRATION_REQUIRED.to_string(),
+        }
+    } else {
+        thread_store_io_error(error)
+    }
+}
+
+/// Reads only the certified suffix of a plain active rollout.
+///
+/// Indexed latest-fork preparation uses the same reverse scan as resume. Keeping this helper in
+/// the model-context module prevents fork preparation from buffering the complete active JSONL.
+pub(super) async fn scan_plain_active_model_context_snapshot(
+    path: &Path,
+    session_meta: SessionMetaLine,
+) -> ThreadStoreResult<Option<ActiveModelContextScan>> {
+    let path = path.to_path_buf();
+    let result = tokio::task::spawn_blocking(move || {
+        scan_projected_active_model_context_blocking(path.as_path(), session_meta)
+    })
+    .await
+    .map_err(|err| ThreadStoreError::Internal {
+        message: format!("failed to join active model context scan: {err}"),
+    })?;
+    result.map_err(interactive_model_context_scan_error)
 }
 
 fn unchanged_active_rollout(before: &Metadata, after: &Metadata) -> io::Result<bool> {
@@ -346,6 +471,31 @@ pub(super) async fn load_for_fork(
     }
 }
 
+/// Loads a fork boundary only when its selected physical segment contains a certified checkpoint.
+///
+/// This is the proof required by bounded explicit-fork preparation: a single physical segment is
+/// sufficient only when its checkpoint replaces all older model-visible context.
+pub(super) fn load_certified_prefix_for_fork(
+    lines: &[RolloutLine],
+) -> ThreadStoreResult<Option<Vec<RolloutItem>>> {
+    let Some(RolloutItem::SessionMeta(session_meta)) = lines.first().map(|line| &line.item) else {
+        return Err(ThreadStoreError::Internal {
+            message: "bounded fork prefix does not start with session metadata".to_string(),
+        });
+    };
+    let Some(scan) = scan_loaded_active_model_context(lines.to_vec(), session_meta.clone()) else {
+        return Ok(None);
+    };
+    let items = scan.items;
+    let certified = items.iter().enumerate().any(|(index, item)| {
+        let RolloutItem::Compacted(compacted) = item else {
+            return false;
+        };
+        codex_rollout::validated_segment_state_checkpoint(compacted, &items[index + 1..]).is_some()
+    });
+    Ok(certified.then_some(items))
+}
+
 /// Loads the complete logical prefix selected for a prepared fork.
 ///
 /// Unlike [`load_for_fork`], this is response hydration rather than model input, so it must not
@@ -364,6 +514,15 @@ pub(super) async fn load_full_for_fork(
     let session_meta = codex_rollout::read_session_meta_line(source_path)
         .await
         .map_err(thread_store_io_error)?;
+    load_full_for_fork_with_session_meta(lineage, history_base, session_meta).await
+}
+
+/// Loads complete fork history when the caller already authenticated the source metadata.
+pub(super) async fn load_full_for_fork_with_session_meta(
+    lineage: RolloutLineage,
+    history_base: Option<HistoryPosition>,
+    session_meta: SessionMetaLine,
+) -> ThreadStoreResult<Vec<RolloutItem>> {
     let Some(history_base) = history_base else {
         return Ok(vec![RolloutItem::SessionMeta(session_meta)]);
     };

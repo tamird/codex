@@ -16,6 +16,7 @@ mod segment_paging;
 mod turn_lookup;
 
 pub(super) use read::has_complete_segmented_legacy_projection;
+pub(super) use read::has_nonempty_newest_root_turn_for_resolved;
 pub(super) use read::list_existing_segmented_legacy_turns;
 pub(super) use read::list_items;
 pub(super) use read::list_segmented_legacy_items;
@@ -23,6 +24,7 @@ pub(super) use read::list_segmented_legacy_turns;
 pub(super) use read::list_turns;
 pub(super) use realtime::list_timeline;
 pub(super) use search::search_thread_occurrences;
+pub(super) use turn_lookup::find_projected_turn;
 pub(super) use turn_lookup::find_source_turn;
 pub(super) use turn_lookup::find_visible_turn;
 
@@ -53,6 +55,8 @@ pub(super) enum RolloutProjectionStep {
 pub(super) struct RolloutProjectionState {
     pub next_byte_offset: u64,
     pub next_ordinal: u64,
+    /// Whether this projection includes every selected same-thread predecessor.
+    pub lineage_complete: bool,
 }
 
 /// An existing SQLite offset reserved until every legacy predecessor has been indexed.
@@ -60,6 +64,112 @@ pub(super) struct RolloutProjectionState {
 /// A crash during a predecessor transaction must not make an incomplete projection appear current
 /// merely because that predecessor has the same byte length as the active rollout.
 pub(super) const INCOMPLETE_LEGACY_PROJECTION_BYTE_OFFSET: i64 = i64::MAX;
+
+/// Installs guards that invalidate a published projection when rows change outside its writer.
+///
+/// Projection writers update the rows and checkpoint in one transaction, so their final
+/// checkpoint restores the intended completeness marker. An out-of-band row mutation has no
+/// matching checkpoint update and leaves the reversible negative marker for canonical fallback
+/// and rebuild. The triggers live in the rebuildable history database rather than a numbered
+/// state migration.
+pub(super) async fn ensure_projection_integrity_triggers(
+    pool: &sqlx::SqlitePool,
+) -> ThreadStoreResult<()> {
+    for statement in [
+        r#"
+CREATE TRIGGER IF NOT EXISTS frodex_thread_turns_projection_insert
+AFTER INSERT ON thread_turns
+BEGIN
+    UPDATE thread_history_projection_state
+    SET next_rollout_byte_offset = CASE
+        WHEN next_rollout_byte_offset >= 0
+             AND next_rollout_byte_offset < 9223372036854775807
+            THEN -1 - next_rollout_byte_offset
+        ELSE next_rollout_byte_offset
+    END
+    WHERE thread_id = NEW.thread_id;
+END
+        "#,
+        r#"
+CREATE TRIGGER IF NOT EXISTS frodex_thread_turns_projection_update
+AFTER UPDATE ON thread_turns
+WHEN OLD.thread_id = NEW.thread_id
+BEGIN
+    UPDATE thread_history_projection_state
+    SET next_rollout_byte_offset = CASE
+        WHEN next_rollout_byte_offset >= 0
+             AND next_rollout_byte_offset < 9223372036854775807
+            THEN -1 - next_rollout_byte_offset
+        ELSE next_rollout_byte_offset
+    END
+    WHERE thread_id = NEW.thread_id;
+END
+        "#,
+        r#"
+CREATE TRIGGER IF NOT EXISTS frodex_thread_turns_projection_delete
+AFTER DELETE ON thread_turns
+BEGIN
+    UPDATE thread_history_projection_state
+    SET next_rollout_byte_offset = CASE
+        WHEN next_rollout_byte_offset >= 0
+             AND next_rollout_byte_offset < 9223372036854775807
+            THEN -1 - next_rollout_byte_offset
+        ELSE next_rollout_byte_offset
+    END
+    WHERE thread_id = OLD.thread_id;
+END
+        "#,
+        r#"
+CREATE TRIGGER IF NOT EXISTS frodex_thread_items_projection_insert
+AFTER INSERT ON thread_items
+BEGIN
+    UPDATE thread_history_projection_state
+    SET next_rollout_byte_offset = CASE
+        WHEN next_rollout_byte_offset >= 0
+             AND next_rollout_byte_offset < 9223372036854775807
+            THEN -1 - next_rollout_byte_offset
+        ELSE next_rollout_byte_offset
+    END
+    WHERE thread_id = NEW.thread_id;
+END
+        "#,
+        r#"
+CREATE TRIGGER IF NOT EXISTS frodex_thread_items_projection_update
+AFTER UPDATE ON thread_items
+WHEN OLD.thread_id = NEW.thread_id
+BEGIN
+    UPDATE thread_history_projection_state
+    SET next_rollout_byte_offset = CASE
+        WHEN next_rollout_byte_offset >= 0
+             AND next_rollout_byte_offset < 9223372036854775807
+            THEN -1 - next_rollout_byte_offset
+        ELSE next_rollout_byte_offset
+    END
+    WHERE thread_id = NEW.thread_id;
+END
+        "#,
+        r#"
+CREATE TRIGGER IF NOT EXISTS frodex_thread_items_projection_delete
+AFTER DELETE ON thread_items
+BEGIN
+    UPDATE thread_history_projection_state
+    SET next_rollout_byte_offset = CASE
+        WHEN next_rollout_byte_offset >= 0
+             AND next_rollout_byte_offset < 9223372036854775807
+            THEN -1 - next_rollout_byte_offset
+        ELSE next_rollout_byte_offset
+    END
+    WHERE thread_id = OLD.thread_id;
+END
+        "#,
+    ] {
+        sqlx::query(statement)
+            .execute(pool)
+            .await
+            .map_err(thread_history_error)?;
+    }
+    Ok(())
+}
 
 pub(super) async fn projection_state(
     store: &LocalThreadStore,
@@ -90,14 +200,10 @@ WHERE thread_id = ?
     .map_err(thread_history_error)?;
     state
         .map(|(next_byte_offset, next_ordinal)| {
+            let (next_byte_offset, lineage_complete) =
+                decode_paginated_projection_offset(next_byte_offset)?;
             Ok(RolloutProjectionState {
-                next_byte_offset: u64::try_from(next_byte_offset).map_err(|_| {
-                    ThreadStoreError::Internal {
-                        message: format!(
-                            "thread history projection for {thread_id} has a negative byte offset"
-                        ),
-                    }
-                })?,
+                next_byte_offset,
                 next_ordinal: u64::try_from(next_ordinal).map_err(|_| {
                     ThreadStoreError::Internal {
                         message: format!(
@@ -105,9 +211,35 @@ WHERE thread_id = ?
                         ),
                     }
                 })?,
+                lineage_complete,
             })
         })
         .transpose()
+}
+
+/// Marks a new active-only projection incomplete before any of its rows become visible.
+pub(super) async fn begin_incomplete_paginated_projection(
+    store: &LocalThreadStore,
+    thread_id: ThreadId,
+    initial_ordinal: u64,
+) -> ThreadStoreResult<()> {
+    let pool = store.thread_history_db().await?;
+    sqlx::query(
+        r#"
+INSERT INTO thread_history_projection_state (
+    thread_id,
+    next_rollout_byte_offset,
+    next_rollout_ordinal
+) VALUES (?, -1, ?)
+ON CONFLICT(thread_id) DO NOTHING
+        "#,
+    )
+    .bind(thread_id.to_string())
+    .bind(sqlite_integer(initial_ordinal, "rollout ordinal")?)
+    .execute(pool)
+    .await
+    .map_err(thread_history_error)?;
+    Ok(())
 }
 
 pub(super) async fn reset_projection_for_replacement(
@@ -118,33 +250,44 @@ pub(super) async fn reset_projection_for_replacement(
     let pool = store.thread_history_db().await?;
     let thread_id = thread_id.to_string();
     let next_rollout_ordinal = sqlite_integer(next_rollout_ordinal, "rollout ordinal")?;
-    let existing_next_ordinal = sqlx::query_scalar::<_, i64>(
-        "SELECT next_rollout_ordinal FROM thread_history_projection_state WHERE thread_id = ?",
+    let existing_state = sqlx::query_as::<_, (i64, i64)>(
+        "SELECT next_rollout_byte_offset, next_rollout_ordinal FROM thread_history_projection_state WHERE thread_id = ?",
     )
     .bind(thread_id.as_str())
     .fetch_optional(pool)
     .await
     .map_err(thread_history_error)?;
-    if existing_next_ordinal.is_some_and(|ordinal| ordinal != next_rollout_ordinal) {
+    if existing_state
+        .as_ref()
+        .is_some_and(|(_, ordinal)| *ordinal != next_rollout_ordinal)
+    {
         return Err(ThreadStoreError::Conflict {
             message: format!(
                 "thread history projection for {thread_id} does not end at ordinal {next_rollout_ordinal}"
             ),
         });
     }
+    let lineage_complete = existing_state
+        .map(|(encoded_offset, _)| decode_paginated_projection_offset(encoded_offset))
+        .transpose()?
+        .is_none_or(|(_, lineage_complete)| lineage_complete);
     sqlx::query(
         r#"
 INSERT INTO thread_history_projection_state (
     thread_id,
     next_rollout_byte_offset,
     next_rollout_ordinal
-) VALUES (?, 0, ?)
+) VALUES (?, ?, ?)
 ON CONFLICT(thread_id) DO UPDATE SET
-    next_rollout_byte_offset = 0,
+    next_rollout_byte_offset = excluded.next_rollout_byte_offset,
     next_rollout_ordinal = excluded.next_rollout_ordinal
         "#,
     )
     .bind(thread_id)
+    .bind(encode_paginated_projection_offset(
+        /*offset*/ 0,
+        lineage_complete,
+    )?)
     .bind(next_rollout_ordinal)
     .execute(pool)
     .await
@@ -162,6 +305,71 @@ pub(super) async fn clear_projection_cursor(
         .execute(pool)
         .await
         .map_err(thread_history_error)?;
+    Ok(())
+}
+
+/// Atomically replaces a visible projection with rows prepared under a staging identity.
+pub(super) async fn publish_staged_projection(
+    store: &LocalThreadStore,
+    thread_id: ThreadId,
+    staging_thread_id: ThreadId,
+) -> ThreadStoreResult<()> {
+    if thread_id == staging_thread_id {
+        return Err(ThreadStoreError::Internal {
+            message: "staged history projection reuses the selected rollout identity".to_string(),
+        });
+    }
+    let pool = store.thread_history_db().await?;
+    let mut transaction = pool
+        .begin_with("BEGIN IMMEDIATE")
+        .await
+        .map_err(thread_history_error)?;
+    #[cfg(test)]
+    let selected_thread_id = thread_id;
+    let thread_id = thread_id.to_string();
+    let staging_thread_id = staging_thread_id.to_string();
+    let staged_state_count = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM thread_history_projection_state WHERE thread_id = ?",
+    )
+    .bind(staging_thread_id.as_str())
+    .fetch_one(&mut *transaction)
+    .await
+    .map_err(thread_history_error)?;
+    if staged_state_count != 1 {
+        return Err(ThreadStoreError::Internal {
+            message: format!(
+                "staged history projection for {thread_id} has {staged_state_count} checkpoints"
+            ),
+        });
+    }
+    for statement in [
+        "DELETE FROM thread_items WHERE thread_id = ?",
+        "DELETE FROM thread_turns WHERE thread_id = ?",
+        "DELETE FROM thread_history_projection_state WHERE thread_id = ?",
+    ] {
+        sqlx::query(statement)
+            .bind(thread_id.as_str())
+            .execute(&mut *transaction)
+            .await
+            .map_err(thread_history_error)?;
+    }
+    for statement in [
+        "UPDATE thread_turns SET thread_id = ? WHERE thread_id = ?",
+        "UPDATE thread_items SET thread_id = ? WHERE thread_id = ?",
+        "UPDATE thread_history_projection_state SET thread_id = ? WHERE thread_id = ?",
+    ] {
+        sqlx::query(statement)
+            .bind(thread_id.as_str())
+            .bind(staging_thread_id.as_str())
+            .execute(&mut *transaction)
+            .await
+            .map_err(thread_history_error)?;
+    }
+    #[cfg(test)]
+    super::projection_rebuild::crash_at_boundary(selected_thread_id, "before_projection_commit");
+    transaction.commit().await.map_err(thread_history_error)?;
+    #[cfg(test)]
+    super::projection_rebuild::crash_at_boundary(selected_thread_id, "after_projection_commit");
     Ok(())
 }
 
@@ -205,7 +413,7 @@ pub(super) async fn apply_projection(
         next_offset,
         initial_ordinal,
         projections,
-        None,
+        /*legacy_backfill_complete*/ None,
     )
     .await
 }
@@ -260,8 +468,18 @@ WHERE thread_id = ?
     .fetch_optional(&mut *transaction)
     .await
     .map_err(thread_history_error)?;
-    let (expected_offset, mut next_ordinal) =
-        projection_state.unwrap_or((0, sqlite_integer(initial_ordinal, "rollout ordinal")?));
+    let (expected_offset, mut next_ordinal, lineage_complete) = match projection_state {
+        Some((encoded_offset, next_ordinal)) => {
+            let (expected_offset, lineage_complete) =
+                decode_paginated_projection_offset(encoded_offset)?;
+            (
+                sqlite_integer(expected_offset, "rollout byte offset")?,
+                next_ordinal,
+                lineage_complete,
+            )
+        }
+        None => (0, sqlite_integer(initial_ordinal, "rollout ordinal")?, true),
+    };
     let start_offset = sqlite_integer(start_offset, "rollout byte offset")?;
     if expected_offset != start_offset
         && !(legacy_backfill_complete.is_some()
@@ -370,7 +588,7 @@ ON CONFLICT(thread_id) DO UPDATE SET
     .bind(thread_id.as_str())
     .bind(match legacy_backfill_complete {
         Some(false) => INCOMPLETE_LEGACY_PROJECTION_BYTE_OFFSET,
-        _ => sqlite_integer(next_offset, "rollout byte offset")?,
+        _ => encode_paginated_projection_offset(next_offset, lineage_complete)?,
     })
     .bind(next_ordinal)
     .execute(&mut *transaction)
@@ -730,6 +948,41 @@ fn sqlite_integer(value: u64, field: &str) -> ThreadStoreResult<i64> {
     i64::try_from(value).map_err(|_| ThreadStoreError::Internal {
         message: format!("{field} exceeds SQLite integer range"),
     })
+}
+
+/// Stores active-only projection offsets as `-1 - offset` without changing the SQLite schema.
+fn encode_paginated_projection_offset(
+    offset: u64,
+    lineage_complete: bool,
+) -> ThreadStoreResult<i64> {
+    let offset = sqlite_integer(offset, "rollout byte offset")?;
+    if lineage_complete {
+        Ok(offset)
+    } else {
+        Ok(-1 - offset)
+    }
+}
+
+fn decode_paginated_projection_offset(encoded: i64) -> ThreadStoreResult<(u64, bool)> {
+    let (offset, lineage_complete) = if encoded < 0 {
+        (
+            encoded
+                .checked_neg()
+                .and_then(|value| value.checked_sub(1))
+                .ok_or_else(|| ThreadStoreError::Internal {
+                    message: "thread history projection has an invalid incomplete byte offset"
+                        .to_string(),
+                })?,
+            false,
+        )
+    } else {
+        (encoded, true)
+    };
+    u64::try_from(offset)
+        .map(|offset| (offset, lineage_complete))
+        .map_err(|_| ThreadStoreError::Internal {
+            message: "thread history projection has an invalid byte offset".to_string(),
+        })
 }
 
 fn thread_history_error(err: impl std::fmt::Display) -> ThreadStoreError {

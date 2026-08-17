@@ -281,6 +281,9 @@ async fn attach_history_if_requested(
             path.as_path(),
         )
         .await?;
+    if let Ok(live_path) = super::live_writer::rollout_path(store, thread_id).await {
+        path = live_path;
+    }
     path = codex_rollout::existing_rollout_path(path.as_path())
         .await
         .ok_or_else(|| ThreadStoreError::Internal {
@@ -362,10 +365,14 @@ pub(super) async fn load_history_items(
             .map_err(|err| ThreadStoreError::Internal {
                 message: format!("failed to load thread history {}: {err}", path.display()),
             })?;
-    if lines
-        .iter()
-        .any(|line| matches!(line.item, codex_rollout::RolloutItem::RolloutReference(_)))
-    {
+    if lines.iter().any(|line| {
+        matches!(line.item, codex_rollout::RolloutItem::RolloutReference(_))
+            || matches!(
+                &line.item,
+                codex_rollout::RolloutItem::SessionMeta(meta)
+                    if meta.meta.history_base.is_some()
+            )
+    }) {
         if parse_errors != 0
             && lines.first().is_some_and(|line| {
                 matches!(

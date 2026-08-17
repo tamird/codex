@@ -7,6 +7,7 @@ use codex_protocol::ThreadId;
 use codex_protocol::models::AgentMessageInputContent;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::RolloutReferenceItem;
+use codex_protocol::protocol::SessionMetaLine;
 use codex_rollout::RolloutItem;
 use codex_rollout::RolloutLine;
 
@@ -33,26 +34,33 @@ pub(super) enum GoalSupervisorLineageProvenance {
 }
 
 impl GoalSupervisorLineageProvenance {
+    /// Applies one physical rollout's persisted identity to inherited lineage provenance.
+    pub(super) fn continued_through_session_meta(self, meta: &SessionMetaLine) -> Self {
+        if meta.meta.model_provider.as_deref() != Some("openai") {
+            return Self::Untrusted;
+        }
+        let inherited_same_thread = matches!(
+            self,
+            Self::AffectedAlpha6 { thread_id } if thread_id == meta.meta.id
+        );
+        if meta.meta.cli_version == AFFECTED_CLI_VERSION || inherited_same_thread {
+            Self::AffectedAlpha6 {
+                thread_id: meta.meta.id,
+            }
+        } else {
+            Self::Untrusted
+        }
+    }
+
     pub(super) fn continued_through(self, lines: &[RolloutLine]) -> Self {
         let Some(meta) = lines.iter().find_map(|line| match &line.item {
-            RolloutItem::SessionMeta(meta) => Some(&meta.meta),
+            RolloutItem::SessionMeta(meta) => Some(meta),
             _ => None,
         }) else {
             // Callers may split one already-classified physical file at rejected JSONL records.
             return self;
         };
-        if meta.model_provider.as_deref() != Some("openai") {
-            return Self::Untrusted;
-        }
-        let inherited_same_thread = matches!(
-            self,
-            Self::AffectedAlpha6 { thread_id } if thread_id == meta.id
-        );
-        if meta.cli_version == AFFECTED_CLI_VERSION || inherited_same_thread {
-            Self::AffectedAlpha6 { thread_id: meta.id }
-        } else {
-            Self::Untrusted
-        }
+        self.continued_through_session_meta(meta)
     }
 
     /// Carries affected provenance only across a canonical, unfiltered same-thread rotation.
@@ -128,12 +136,15 @@ pub(super) fn repair_legacy_goal_supervisor_lines(
 
 /// Repairs exact legacy damage when this rollout or same-thread rotation ancestry proves that the
 /// affected Frodex build wrote the lineage.
-#[cfg(test)]
 pub(super) fn repair_legacy_goal_supervisor_lines_with_provenance(
     lines: &mut [RolloutLine],
     inherited_provenance: GoalSupervisorLineageProvenance,
 ) -> ThreadStoreResult<GoalSupervisorRepairCount> {
-    repair_selected_legacy_goal_supervisor_lines_with_provenance(lines, inherited_provenance, None)
+    repair_selected_legacy_goal_supervisor_lines_with_provenance(
+        lines,
+        inherited_provenance,
+        /*selected_message_ids*/ None,
+    )
 }
 
 /// Repairs only candidates whose message IDs occur in `selected_message_ids`.
@@ -241,11 +252,14 @@ pub(super) fn reject_malformed_goal_supervisor_supplied_history(
             item,
         })
         .collect::<Vec<_>>();
-    validate_candidates(lines.as_slice(), /*affected_ancestry*/ false, None).map_err(|_| {
-        ThreadStoreError::InvalidRequest {
-            message: "supplied history contains an untrusted goal-supervisor encrypted envelope"
-                .to_string(),
-        }
+    validate_candidates(
+        lines.as_slice(),
+        /*affected_ancestry*/ false,
+        /*selected_message_ids*/ None,
+    )
+    .map_err(|_| ThreadStoreError::InvalidRequest {
+        message: "supplied history contains an untrusted goal-supervisor encrypted envelope"
+            .to_string(),
     })
 }
 
@@ -363,7 +377,7 @@ pub(super) fn repair_legacy_goal_supervisor_jsonl_lines_with_provenance(
     repair_selected_legacy_goal_supervisor_jsonl_lines_with_provenance(
         source,
         inherited_provenance,
-        None,
+        /*selected_message_ids*/ None,
     )
 }
 
@@ -450,7 +464,10 @@ fn validate_candidates(
                     || (!affected_ancestry
                         && classification == CandidateClassification::ExactLegacyDamage)
                 {
-                    return Err(ambiguous_candidate_error(line.ordinal, None));
+                    return Err(ambiguous_candidate_error(
+                        line.ordinal,
+                        /*compacted_index*/ None,
+                    ));
                 }
             }
             RolloutItem::Compacted(compacted) => {

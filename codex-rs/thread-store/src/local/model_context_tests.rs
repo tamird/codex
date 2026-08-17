@@ -49,6 +49,101 @@ use crate::local::test_support::write_session_file_with_fork;
 use crate::local::test_support::write_session_file_with_history_mode;
 
 #[tokio::test]
+async fn active_model_context_scan_stops_at_the_interactive_byte_limit() {
+    let home = TempDir::new().expect("temp dir");
+    let uuid = Uuid::from_u128(/*v*/ 2039);
+    let path = write_session_file_with_history_mode(
+        home.path(),
+        "2025-01-03T13-39-00",
+        uuid,
+        ThreadHistoryMode::Paginated,
+    )
+    .expect("write active rollout");
+    let session_meta = codex_rollout::read_session_meta_line(path.as_path())
+        .await
+        .expect("read session metadata");
+
+    let error = match scan_projected_active_model_context_blocking_with_limit(
+        path.as_path(),
+        session_meta,
+        /*max_scan_bytes*/ 1,
+    ) {
+        Ok(_) => panic!("oversized active scan must stop before complete replay"),
+        Err(error) => error,
+    };
+
+    assert_eq!(error.kind(), std::io::ErrorKind::FileTooLarge);
+    assert!(error.to_string().contains("migrate-rollouts"));
+}
+
+#[tokio::test]
+async fn compressed_active_model_context_scan_stops_at_the_interactive_byte_limit() {
+    let home = TempDir::new().expect("temp dir");
+    let uuid = Uuid::from_u128(/*v*/ 2038);
+    let path = write_session_file_with_history_mode(
+        home.path(),
+        "2025-01-03T13-38-00",
+        uuid,
+        ThreadHistoryMode::Paginated,
+    )
+    .expect("write active rollout");
+    let session_meta = codex_rollout::read_session_meta_line(path.as_path())
+        .await
+        .expect("read session metadata");
+    let compressed_path = path.with_extension("jsonl.zst");
+    let source = std::fs::read(path.as_path()).expect("read active rollout");
+    let compressed = zstd::stream::encode_all(source.as_slice(), 0).expect("compress rollout");
+    std::fs::write(compressed_path.as_path(), compressed).expect("write compressed rollout");
+
+    let error = match scan_compressed_active_model_context_blocking_with_limit(
+        compressed_path.as_path(),
+        session_meta,
+        /*max_scan_bytes*/ 1,
+        /*max_record_bytes*/ 1024,
+    ) {
+        Ok(_) => panic!("oversized compressed scan must stop before complete replay"),
+        Err(error) => error,
+    };
+
+    assert_eq!(error.kind(), std::io::ErrorKind::FileTooLarge);
+    assert!(error.to_string().contains("migrate-rollouts"));
+}
+
+#[tokio::test]
+async fn active_model_context_scan_rejects_an_oversized_record() {
+    let home = TempDir::new().expect("temp dir");
+    let uuid = Uuid::from_u128(/*v*/ 2037);
+    let path = write_session_file_with_history_mode(
+        home.path(),
+        "2025-01-03T13-37-00",
+        uuid,
+        ThreadHistoryMode::Paginated,
+    )
+    .expect("write active rollout");
+    let session_meta = codex_rollout::read_session_meta_line(path.as_path())
+        .await
+        .expect("read session metadata");
+    let mut file = OpenOptions::new()
+        .append(true)
+        .open(path.as_path())
+        .expect("open active rollout");
+    writeln!(
+        file,
+        "{{\"oversized\":\"{}\"}}",
+        "x".repeat(MAX_INTERACTIVE_MODEL_CONTEXT_RECORD_BYTES)
+    )
+    .expect("append oversized record");
+
+    let error = match scan_projected_active_model_context_blocking(path.as_path(), session_meta) {
+        Ok(_) => panic!("oversized active record must require migration"),
+        Err(error) => error,
+    };
+
+    assert_eq!(error.kind(), std::io::ErrorKind::FileTooLarge);
+    assert!(error.to_string().contains("migrate-rollouts"));
+}
+
+#[tokio::test]
 async fn certified_active_checkpoint_does_not_open_missing_predecessor() {
     let home = TempDir::new().expect("temp dir");
     let uuid = Uuid::from_u128(/*v*/ 2040);

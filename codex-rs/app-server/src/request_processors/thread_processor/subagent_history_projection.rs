@@ -2,6 +2,7 @@ use std::collections::HashSet;
 use std::io;
 use std::io::ErrorKind;
 use std::path::Path;
+use std::path::PathBuf;
 
 use codex_app_server_protocol::CollabAgentTool;
 use codex_app_server_protocol::ThreadItem;
@@ -9,9 +10,12 @@ use codex_app_server_protocol::Turn;
 use codex_protocol::ThreadId;
 use codex_protocol::items::TurnItem as CoreTurnItem;
 use codex_protocol::protocol::EventMsg;
+use codex_protocol::protocol::HistoryPosition;
 use codex_protocol::protocol::RolloutReferenceItem;
+use codex_protocol::protocol::ThreadHistoryMode;
 use codex_rollout::RolloutItem;
 use codex_rollout::RolloutLine;
+use codex_rollout::RolloutRecorder;
 
 const UNFILTERED_SEGMENT_COUNT: usize = 5;
 
@@ -40,25 +44,50 @@ impl SubagentHistoryProjection {
             .into_iter()
             .map(|thread_id| thread_id.to_string())
             .collect::<HashSet<_>>();
-        let mut rollout_path = active_rollout_path.to_path_buf();
-        let mut visited_paths = HashSet::new();
+        let path = codex_rollout::existing_rollout_path(active_rollout_path)
+            .await
+            .ok_or_else(|| io::Error::new(ErrorKind::NotFound, "active rollout disappeared"))?;
+        let mut segment = LoadedSegment {
+            path: tokio::fs::canonicalize(path).await?,
+            prefix: None,
+        };
+        let mut visited_paths = HashSet::from([codex_rollout::plain_rollout_path(&segment.path)]);
 
         for segment_index in 0..UNFILTERED_SEGMENT_COUNT {
-            if !visited_paths.insert(rollout_path.clone()) {
-                return Err(invalid_data("same-thread rollout reference cycle"));
-            }
-            let predecessor =
-                scan_segment(rollout_path.as_path(), thread_id, &mut retained_thread_ids).await?;
+            let predecessor = scan_segment(segment, thread_id, &mut retained_thread_ids).await?;
             let Some(predecessor) = predecessor else {
                 return Ok(None);
             };
+            segment = match predecessor {
+                Predecessor::Reference(reference) => LoadedSegment {
+                    path: codex_rollout::resolve_rollout_reference_path(codex_home, &reference)
+                        .await?,
+                    prefix: None,
+                },
+                Predecessor::HistoryBase(position) => {
+                    let (path, lines) =
+                        codex_rollout::load_history_base_prefix(codex_home, position).await?;
+                    if !matches!(
+                        lines.first().map(|line| &line.item),
+                        Some(RolloutItem::SessionMeta(metadata)) if metadata.meta.id == thread_id
+                    ) {
+                        return Ok(None);
+                    }
+                    LoadedSegment {
+                        path,
+                        prefix: Some(lines),
+                    }
+                }
+            };
+            segment.path = tokio::fs::canonicalize(&segment.path).await?;
+            if !visited_paths.insert(codex_rollout::plain_rollout_path(&segment.path)) {
+                return Err(invalid_data("same-thread rollout reference cycle"));
+            }
             if segment_index + 1 == UNFILTERED_SEGMENT_COUNT {
                 return Ok(Some(Self {
                     retained_thread_ids,
                 }));
             }
-            rollout_path =
-                codex_rollout::resolve_rollout_reference_path(codex_home, &predecessor).await?;
         }
 
         Ok(None)
@@ -99,46 +128,50 @@ impl SubagentHistoryProjection {
     }
 }
 
-async fn scan_segment(
-    rollout_path: &Path,
+enum Predecessor {
+    Reference(RolloutReferenceItem),
+    HistoryBase(HistoryPosition),
+}
+
+struct LoadedSegment {
+    path: PathBuf,
+    prefix: Option<Vec<RolloutLine>>,
+}
+
+struct SegmentScan<'a> {
+    rollout_path: &'a Path,
     expected_thread_id: ThreadId,
-    retained_thread_ids: &mut HashSet<String>,
-) -> io::Result<Option<RolloutReferenceItem>> {
-    let mut reader = codex_rollout::open_rollout_line_reader(rollout_path).await?;
-    let mut saw_session_meta = false;
-    let mut predecessor = None;
-    while let Some(line) = reader.next_line().await? {
-        if line.trim().is_empty() {
-            continue;
-        }
-        let line = serde_json::from_str::<RolloutLine>(&line).map_err(|error| {
-            invalid_data(format!(
-                "failed to decode rollout {}: {error}",
-                rollout_path.display()
-            ))
-        })?;
-        match line.item {
+    retained_thread_ids: &'a mut HashSet<String>,
+    saw_session_meta: bool,
+    predecessor: Option<Predecessor>,
+}
+
+impl SegmentScan<'_> {
+    fn record(&mut self, item: RolloutItem) -> io::Result<()> {
+        match item {
             RolloutItem::SessionMeta(session_meta) => {
-                if saw_session_meta || session_meta.meta.id != expected_thread_id {
+                if self.saw_session_meta || session_meta.meta.id != self.expected_thread_id {
                     return Err(invalid_data(format!(
                         "rollout {} has unexpected session metadata",
-                        rollout_path.display()
+                        self.rollout_path.display()
                     )));
                 }
-                saw_session_meta = true;
+                self.saw_session_meta = true;
+                if session_meta.meta.history_mode == ThreadHistoryMode::Paginated
+                    && let Some(position) = session_meta.meta.history_base
+                {
+                    self.set_predecessor(Predecessor::HistoryBase(position))?;
+                }
             }
             RolloutItem::RolloutReference(reference)
                 if reference.nth_user_message.is_none()
-                    && reference.thread_id == Some(expected_thread_id) =>
+                    && reference.thread_id == Some(self.expected_thread_id) =>
             {
-                if predecessor.replace(reference).is_some() {
-                    return Err(invalid_data(format!(
-                        "rollout {} has multiple same-thread predecessors",
-                        rollout_path.display()
-                    )));
-                }
+                self.set_predecessor(Predecessor::Reference(reference))?;
             }
-            RolloutItem::EventMsg(event) => collect_event_thread_ids(&event, retained_thread_ids),
+            RolloutItem::EventMsg(event) => {
+                collect_event_thread_ids(&event, self.retained_thread_ids);
+            }
             RolloutItem::RolloutReference(_)
             | RolloutItem::ResponseItem(_)
             | RolloutItem::InterAgentCommunication(_)
@@ -149,14 +182,61 @@ async fn scan_segment(
             | RolloutItem::RealtimeItem(_)
             | RolloutItem::WorldState(_) => {}
         }
+        Ok(())
     }
-    if !saw_session_meta {
+
+    fn set_predecessor(&mut self, predecessor: Predecessor) -> io::Result<()> {
+        if self.predecessor.replace(predecessor).is_some() {
+            return Err(invalid_data(format!(
+                "rollout {} has multiple same-thread predecessors",
+                self.rollout_path.display()
+            )));
+        }
+        Ok(())
+    }
+}
+
+async fn scan_segment(
+    segment: LoadedSegment,
+    expected_thread_id: ThreadId,
+    retained_thread_ids: &mut HashSet<String>,
+) -> io::Result<Option<Predecessor>> {
+    let mut scan = SegmentScan {
+        rollout_path: &segment.path,
+        expected_thread_id,
+        retained_thread_ids,
+        saw_session_meta: false,
+        predecessor: None,
+    };
+    if let Some(lines) = segment.prefix {
+        for line in lines {
+            scan.record(line.item)?;
+        }
+    } else {
+        let mut reader = codex_rollout::open_rollout_line_reader(&segment.path).await?;
+        while let Some(line) = reader.next_line().await? {
+            if line.trim().is_empty() {
+                continue;
+            }
+            if let Some(line) =
+                RolloutRecorder::parse_rollout_line_bytes(line.as_bytes()).map_err(|error| {
+                    invalid_data(format!(
+                        "failed to decode rollout {}: {error}",
+                        segment.path.display()
+                    ))
+                })?
+            {
+                scan.record(line.item)?;
+            }
+        }
+    }
+    if !scan.saw_session_meta {
         return Err(invalid_data(format!(
             "rollout {} has no session metadata",
-            rollout_path.display()
+            segment.path.display()
         )));
     }
-    Ok(predecessor)
+    Ok(scan.predecessor)
 }
 
 fn collect_event_thread_ids(event: &EventMsg, retained_thread_ids: &mut HashSet<String>) {
