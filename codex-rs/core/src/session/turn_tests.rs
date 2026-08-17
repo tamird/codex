@@ -45,17 +45,17 @@ fn post_sampling_token_estimate_is_disabled_by_always_on_sinks() {
     let subscriber = tracing_subscriber::registry()
         .with(feedback.logger_layer())
         .with(tracing_subscriber::fmt::layer().with_filter(codex_state::log_db::default_filter()));
+    let metadata = tracing::trace_span!(
+        target: POST_SAMPLING_TOKEN_ESTIMATE_TARGET,
+        "post sampling token estimate",
+        turn_id = tracing::field::Empty,
+        estimated_token_count = tracing::field::Empty,
+        message = tracing::field::Empty
+    )
+    .metadata()
+    .expect("TRACE probe should expose its callsite metadata");
 
-    tracing::subscriber::with_default(subscriber, || {
-        tracing::callsite::rebuild_interest_cache();
-        assert!(!tracing::event_enabled!(
-            target: POST_SAMPLING_TOKEN_ESTIMATE_TARGET,
-            tracing::Level::TRACE,
-            turn_id,
-            estimated_token_count,
-            message
-        ));
-    });
+    assert!(tracing::Subscriber::register_callsite(&subscriber, metadata).is_never());
 }
 
 #[tokio::test]
