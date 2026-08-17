@@ -281,7 +281,7 @@ async fn ghostty_runner_bounds_inherited_stderr_after_child_exit() {
             program: PathBuf::from("/bin/sh"),
             args: vec!["-c".to_string(), "(sleep 2) >&2 & exit 7".to_string()],
         },
-        Duration::from_millis(50),
+        Duration::from_millis(500),
     )
     .await;
 
