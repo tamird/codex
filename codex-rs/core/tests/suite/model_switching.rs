@@ -919,6 +919,7 @@ async fn custom_model_alias_uses_backing_model_in_responses_request() -> Result<
             routing_profile: None,
             model_context_window: Some(123_456),
             model_auto_compact_token_limit: Some(100_000),
+            trust_candidate_constraints: false,
         },
     );
     let remote_model = test_model_info(

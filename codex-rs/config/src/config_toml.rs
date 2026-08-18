@@ -543,6 +543,10 @@ pub enum ThreadStoreToml {
 pub struct AutoReviewToml {
     /// Additional policy instructions inserted into the guardian prompt.
     pub policy: Option<String>,
+
+    /// Runs approval autoreview on `gpt-5.6-sol` with UltraFast preferred and Fast fallback.
+    #[serde(default)]
+    pub use_ultrafast: bool,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema)]

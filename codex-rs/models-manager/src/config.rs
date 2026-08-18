@@ -25,6 +25,11 @@ pub struct CustomModelConfig {
     pub model_context_window: Option<i64>,
     /// Optional auto-compaction limit applied to every candidate in this alias.
     pub model_auto_compact_token_limit: Option<i64>,
+    /// Whether provider validation, rather than catalog metadata, owns candidate constraints.
+    ///
+    /// User-defined aliases leave this disabled. Frodex uses it only for fixed internal routing
+    /// profiles whose service tiers can precede the public model catalog.
+    pub trust_candidate_constraints: bool,
 }
 
 impl CustomModelConfig {

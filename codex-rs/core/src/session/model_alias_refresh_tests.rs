@@ -9,6 +9,7 @@ fn routed_alias(candidates: Vec<ModelRoutingCandidate>) -> CustomModelConfig {
         routing_profile: Some(ModelRoutingProfile { candidates }),
         model_context_window: None,
         model_auto_compact_token_limit: None,
+        trust_candidate_constraints: false,
     }
 }
 
@@ -82,6 +83,7 @@ fn direct_alias_removal_detaches_only_the_model() {
             routing_profile: None,
             model_context_window: None,
             model_auto_compact_token_limit: None,
+            trust_candidate_constraints: false,
         },
     )]);
 

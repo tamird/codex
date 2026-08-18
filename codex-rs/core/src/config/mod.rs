@@ -688,6 +688,9 @@ pub struct Config {
     /// guardian developer prompt.
     pub guardian_policy_config: Option<String>,
 
+    /// Whether approval autoreview uses the fixed UltraFast-to-Fast routing profile.
+    pub auto_review_use_ultrafast: bool,
+
     /// Whether to inject the `<permissions instructions>` developer block.
     pub include_permissions_instructions: bool,
 
@@ -3225,6 +3228,7 @@ pub(crate) fn resolve_custom_models(
                 routing_profile,
                 model_context_window: custom_model.model_context_window,
                 model_auto_compact_token_limit: custom_model.model_auto_compact_token_limit,
+                trust_candidate_constraints: false,
             },
         );
     }
@@ -4088,6 +4092,10 @@ impl Config {
                             auto_review.policy.as_deref(),
                         ))
                 });
+        let auto_review_use_ultrafast = cfg
+            .auto_review
+            .as_ref()
+            .is_some_and(|auto_review| auto_review.use_ultrafast);
         let personality = personality
             .or(cfg.personality)
             .or_else(|| {
@@ -4422,6 +4430,7 @@ impl Config {
                 .or(show_raw_agent_reasoning)
                 .unwrap_or(false),
             guardian_policy_config,
+            auto_review_use_ultrafast,
             model_reasoning_effort: cfg.model_reasoning_effort,
             plan_mode_reasoning_effort: cfg.plan_mode_reasoning_effort,
             model_reasoning_summary: cfg.model_reasoning_summary,

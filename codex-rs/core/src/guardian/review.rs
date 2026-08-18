@@ -8,7 +8,11 @@ use codex_analytics::GuardianReviewedAction;
 use codex_core_plugins::PluginCommandAttribution;
 use codex_extension_api::ThreadIdleCause;
 use codex_features::Feature;
+use codex_models_manager::CustomModelConfig;
+use codex_models_manager::ModelRoutingCandidate;
+use codex_models_manager::ModelRoutingProfile;
 use codex_protocol::config_types::ApprovalsReviewer;
+use codex_protocol::config_types::ServiceTier;
 use codex_protocol::openai_models::MODEL_SPECIALTY_CYBER;
 use codex_protocol::openai_models::ModelInfo;
 use codex_protocol::protocol::AskForApproval;
@@ -76,6 +80,9 @@ const GUARDIAN_TIMEOUT_INSTRUCTIONS: &str = concat!(
 );
 
 const GUARDIAN_REVIEW_MAX_ATTEMPTS: i64 = 3;
+const ULTRAFAST_AUTO_REVIEW_MODEL: &str = "gpt-5.6-sol";
+const ULTRAFAST_AUTO_REVIEW_PROFILE: &str = "__frodex_auto_review_ultrafast";
+const ULTRAFAST_SERVICE_TIER: &str = "ultrafast";
 
 fn plugin_attribution_for_guardian_request(
     turn: &TurnContext,
@@ -821,6 +828,7 @@ pub(crate) fn spawn_approval_request_review(
 pub(super) struct GuardianReviewSessionConfig {
     pub(super) spawn_config: crate::config::Config,
     model: String,
+    analytics_model: String,
     reasoning_effort: Option<codex_protocol::openai_models::ReasoningEffort>,
     default_review_model_id: String,
     catalog_contains_auto_review: bool,
@@ -853,7 +861,12 @@ pub(super) async fn guardian_review_session_config(
             fallback
         }
     };
-    let model_override = turn.model_info().auto_review_model_override.as_deref();
+    let use_ultrafast = turn.config.auto_review_use_ultrafast;
+    let model_override = if use_ultrafast {
+        Some(ULTRAFAST_AUTO_REVIEW_MODEL)
+    } else {
+        turn.model_info().auto_review_model_override.as_deref()
+    };
     let review_model_id = model_override.unwrap_or(default_review_model_id);
     let review_model = available_models
         .iter()
@@ -863,7 +876,7 @@ pub(super) async fn guardian_review_session_config(
         .any(|preset| preset.model == default_review_model_id);
     let guardian_review_model_overridden = model_override.is_some();
     let guardian_review_model_override = model_override.map(str::to_string);
-    let (guardian_model, guardian_reasoning_effort) = if let Some(preset) = review_model {
+    let (mut guardian_model, guardian_reasoning_effort) = if let Some(preset) = review_model {
         let reasoning_effort = preferred_reasoning_effort(
             preset
                 .supported_reasoning_efforts
@@ -915,12 +928,36 @@ pub(super) async fn guardian_review_session_config(
                 )
             })?;
     }
+    let analytics_model = guardian_model.clone();
+    if use_ultrafast {
+        let candidates = [ULTRAFAST_SERVICE_TIER, ServiceTier::Fast.request_value()]
+            .into_iter()
+            .map(|service_tier| ModelRoutingCandidate {
+                model: ULTRAFAST_AUTO_REVIEW_MODEL.to_string(),
+                reasoning_effort: guardian_reasoning_effort.clone(),
+                service_tier: Some(service_tier.to_string()),
+            })
+            .collect();
+        spawn_config.custom_models.insert(
+            ULTRAFAST_AUTO_REVIEW_PROFILE.to_string(),
+            CustomModelConfig {
+                model: ULTRAFAST_AUTO_REVIEW_MODEL.to_string(),
+                routing_profile: Some(ModelRoutingProfile { candidates }),
+                model_context_window: None,
+                model_auto_compact_token_limit: None,
+                trust_candidate_constraints: true,
+            },
+        );
+        guardian_model = ULTRAFAST_AUTO_REVIEW_PROFILE.to_string();
+        spawn_config.model = Some(guardian_model.clone());
+    }
     if guardian_model != turn.model_info().slug {
         spawn_config.model_context_window = None;
         spawn_config.model_auto_compact_token_limit = None;
     }
     Ok(GuardianReviewSessionConfig {
         spawn_config,
+        analytics_model,
         model: guardian_model,
         reasoning_effort: guardian_reasoning_effort,
         default_review_model_id: default_review_model_id.to_string(),
@@ -975,6 +1012,7 @@ async fn run_guardian_review_session_before_deadline(
                 reasons,
                 schema,
                 model: session_config.model,
+                analytics_model: session_config.analytics_model,
                 reasoning_effort: session_config.reasoning_effort,
                 guardian_default_review_model_id: session_config.default_review_model_id,
                 guardian_catalog_contains_auto_review: session_config.catalog_contains_auto_review,

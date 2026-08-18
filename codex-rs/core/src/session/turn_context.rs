@@ -674,7 +674,10 @@ impl TurnContext {
             {
                 return None;
             }
-            if !has_authoritative_metadata && !model_info.supports_service_tier(service_tier) {
+            if !model_info.supports_service_tier(service_tier)
+                && (validation == RoutingCandidateValidation::TrustConfiguration
+                    || !has_authoritative_metadata)
+            {
                 Arc::make_mut(&mut model_info)
                     .service_tiers
                     .push(ModelServiceTier {

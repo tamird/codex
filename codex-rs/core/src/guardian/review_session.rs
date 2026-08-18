@@ -113,6 +113,7 @@ pub(crate) struct GuardianReviewSessionParams {
     pub(crate) reasons: ApprovalRequestReasons,
     pub(crate) schema: Value,
     pub(crate) model: String,
+    pub(crate) analytics_model: String,
     pub(crate) reasoning_effort: Option<ReasoningEffortConfig>,
     pub(crate) guardian_default_review_model_id: String,
     pub(crate) guardian_catalog_contains_auto_review: bool,
@@ -919,7 +920,7 @@ async fn run_review_on_session(
         GuardianReviewAnalyticsResult::from_session(GuardianReviewSessionAnalyticsParams {
             guardian_thread_id: review_session.session.thread_id().to_string(),
             guardian_session_kind,
-            guardian_model: params.model.clone(),
+            guardian_model: params.analytics_model.clone(),
             guardian_reasoning_effort: guardian_reasoning_effort.map(|effort| effort.to_string()),
             guardian_default_review_model_id: params.guardian_default_review_model_id.clone(),
             guardian_catalog_contains_auto_review: params.guardian_catalog_contains_auto_review,

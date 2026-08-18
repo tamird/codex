@@ -112,6 +112,7 @@ async fn routed_websocket_test(server: &WebSocketTestServer) -> TestCodex {
             }),
             model_context_window: None,
             model_auto_compact_token_limit: None,
+            trust_candidate_constraints: false,
         },
     )]);
     let mut primary_model = model_info_from_slug(ROUTED_WEBSOCKET_PRIMARY);

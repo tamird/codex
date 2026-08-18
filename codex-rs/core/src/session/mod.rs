@@ -2612,6 +2612,7 @@ impl Session {
                 .with_user_layer_from(&next_config.config_layer_stack);
             config.tool_suggest =
                 resolve_tool_suggest_config_from_layer_stack(&config.config_layer_stack);
+            config.auto_review_use_ultrafast = next_config.auto_review_use_ultrafast;
             config.custom_models = next_config.custom_models.clone();
             config.mcp_servers = next_config.mcp_servers.clone();
             config.mcp_optional_startup_grace = next_config.mcp_optional_startup_grace;

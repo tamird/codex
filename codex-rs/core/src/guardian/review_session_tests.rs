@@ -111,6 +111,7 @@ async fn test_review_params() -> GuardianReviewSessionParams {
         },
         reasons: ApprovalRequestReasons::default(),
         schema: super::super::prompt::guardian_output_schema(),
+        analytics_model: model.clone(),
         model,
         reasoning_effort,
         guardian_default_review_model_id: "codex-auto-review".to_string(),

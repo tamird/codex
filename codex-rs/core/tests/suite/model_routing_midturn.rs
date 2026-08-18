@@ -61,6 +61,7 @@ fn routing_models() -> HashMap<String, CustomModelConfig> {
             }),
             model_context_window: None,
             model_auto_compact_token_limit: None,
+            trust_candidate_constraints: false,
         },
     )])
 }

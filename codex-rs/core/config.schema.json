@@ -348,6 +348,11 @@
         "policy": {
           "description": "Additional policy instructions inserted into the guardian prompt.",
           "type": "string"
+        },
+        "use_ultrafast": {
+          "default": false,
+          "description": "Runs approval autoreview on `gpt-5.6-sol` with UltraFast preferred and Fast fallback.",
+          "type": "boolean"
         }
       },
       "type": "object"

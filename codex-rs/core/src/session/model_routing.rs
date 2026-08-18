@@ -104,12 +104,9 @@ impl Session {
         profile_name: &str,
         attempted: &HashSet<ModelRoutingCandidate>,
     ) -> Option<ModelRoutingSelection> {
-        let profile = base
-            .config
-            .custom_models
-            .get(profile_name)?
-            .routing_profile
-            .as_ref()?;
+        let custom_model = base.config.custom_models.get(profile_name)?;
+        let profile = custom_model.routing_profile.as_ref()?;
+        let trust_candidate_constraints = custom_model.trust_candidate_constraints;
         let now = self.model_routing_now().await;
         let mut attempted = attempted.clone();
         let mut last_rejected = None;
@@ -150,10 +147,20 @@ impl Session {
                     });
                 }
             };
-            if let Some(context) = base
-                .with_routing_candidate(profile_name, &candidate, &self.services.models_manager)
-                .await
-            {
+            let context = if trust_candidate_constraints {
+                Some(
+                    base.with_unchecked_routing_candidate(
+                        profile_name,
+                        &candidate,
+                        &self.services.models_manager,
+                    )
+                    .await,
+                )
+            } else {
+                base.with_routing_candidate(profile_name, &candidate, &self.services.models_manager)
+                    .await
+            };
+            if let Some(context) = context {
                 return Some(ModelRoutingSelection {
                     context,
                     last_success: previous_success,
