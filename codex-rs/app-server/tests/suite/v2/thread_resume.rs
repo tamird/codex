@@ -2620,7 +2620,7 @@ async fn thread_resume_keeps_paused_goal_paused() -> Result<()> {
 }
 
 #[tokio::test]
-async fn app_server_restart_recovers_overdue_goal_without_thread_resume() -> Result<()> {
+async fn app_server_restart_recovers_overdue_goal_with_default_supervisor() -> Result<()> {
     let server = create_mock_responses_server_repeating_assistant("Done").await;
     let codex_home = TempDir::new()?;
     mock_responses_config(&server.uri()).write(codex_home.path())?;
@@ -2628,10 +2628,7 @@ async fn app_server_restart_recovers_overdue_goal_without_thread_resume() -> Res
     let config = std::fs::read_to_string(&config_path)?;
     std::fs::write(
         &config_path,
-        config.replace(
-            "personality = true\n",
-            "personality = true\ngoals = true\ngoal_supervisor = true\n",
-        ),
+        config.replace("personality = true\n", "personality = true\ngoals = true\n"),
     )?;
     let thread_id = create_fake_rollout(
         codex_home.path(),

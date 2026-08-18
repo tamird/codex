@@ -2769,6 +2769,10 @@ async fn code_mode_excludes_default_namespace_tools() {
 
 #[tokio::test]
 async fn multi_agent_feature_selects_one_agent_tool_family() {
+    let default = probe(|_| {}).await;
+    default.assert_visible_contains(&[MULTI_AGENT_V2_NAMESPACE]);
+    default.assert_visible_lacks(&[MULTI_AGENT_V1_NAMESPACE]);
+
     let v1 = probe(|turn| {
         set_feature(turn, Feature::Collab, /*enabled*/ true);
         set_feature(turn, Feature::MultiAgentV2, /*enabled*/ false);
@@ -2914,9 +2918,11 @@ async fn multi_agent_feature_selects_one_agent_tool_family() {
 }
 
 #[tokio::test]
-async fn multi_agent_v2_ownership_tools_use_separate_opt_in_namespace() {
+async fn multi_agent_v2_ownership_tools_use_separate_default_namespace() {
     let disabled = probe(|turn| {
-        set_feature(turn, Feature::MultiAgentV2, /*enabled*/ true);
+        update_config(turn, |config| {
+            config.multi_agent_v2.enable_thread_adoption = false;
+        });
     })
     .await;
 
@@ -2935,13 +2941,7 @@ async fn multi_agent_v2_ownership_tools_use_separate_opt_in_namespace() {
             ))
     );
 
-    let enabled = probe(|turn| {
-        set_feature(turn, Feature::MultiAgentV2, /*enabled*/ true);
-        update_config(turn, |config| {
-            config.multi_agent_v2.enable_thread_adoption = true;
-        });
-    })
-    .await;
+    let enabled = probe(|_| {}).await;
     assert_eq!(
         enabled.namespace_function_names(FRODEX_AGENT_OWNERSHIP_NAMESPACE),
         &[
@@ -2967,7 +2967,7 @@ async fn multi_agent_v2_ownership_tools_use_separate_opt_in_namespace() {
             )
         })
     else {
-        panic!("explicit thread adoption must expose adopt_agent");
+        panic!("default thread adoption must expose adopt_agent");
     };
     let properties = adopt_agent
         .parameters

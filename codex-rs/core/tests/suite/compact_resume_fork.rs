@@ -846,6 +846,18 @@ async fn start_test_conversation(
     let base_url = format!("{}/v1", server.uri());
     let model = model.map(str::to_string);
     let mut builder = test_codex().with_config(move |config| {
+        config
+            .features
+            .disable(codex_features::Feature::AgentPromptInjection)
+            .expect("disable prompt injection in fixture");
+        config
+            .features
+            .disable(codex_features::Feature::MultiAgentV2)
+            .expect("disable multi-agent V2 in fixture");
+        config
+            .features
+            .disable(codex_features::Feature::Collab)
+            .expect("disable collaboration in fixture");
         config.model_provider.name = "Non-OpenAI Model provider".to_string();
         config.model_provider.base_url = Some(base_url);
         config.compact_prompt = Some(SUMMARIZATION_PROMPT.to_string());

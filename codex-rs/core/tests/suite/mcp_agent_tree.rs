@@ -69,6 +69,10 @@ fn configure_mcp_with_env_and_timeout(
 ) {
     config
         .features
+        .disable(Feature::MultiAgentV2)
+        .expect("the default fixture calls multi_agent_v1 tools");
+    config
+        .features
         .enable(Feature::Collab)
         .expect("test config should enable collaboration");
     config

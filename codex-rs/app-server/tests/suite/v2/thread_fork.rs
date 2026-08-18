@@ -1139,12 +1139,10 @@ async fn thread_fork_defers_inherited_active_goal_until_next_turn() -> Result<()
     assert_eq!(forked_goal.goal_id, source_goal.goal_id);
     assert_eq!(forked_goal.objective, source_goal.objective);
     assert_eq!(forked_goal.token_budget, Some(150));
-    assert_eq!(forked_goal.tokens_used, 157);
+    // The explicit turn is charged to the fork. Frodex's supervisor check is a separate task.
+    assert_eq!(forked_goal.tokens_used, 57);
     assert!(forked_goal.time_used_seconds >= source_goal.time_used_seconds);
-    assert_eq!(
-        forked_goal.status,
-        codex_state::ThreadGoalStatus::BudgetLimited
-    );
+    assert_eq!(forked_goal.status, codex_state::ThreadGoalStatus::Active);
     assert_eq!(
         state_db
             .thread_goals()

@@ -432,33 +432,52 @@ fn codex_hooks_is_legacy_alias_for_hooks() {
 }
 
 #[test]
-fn agent_prompt_injection_is_under_development_and_disabled_by_default() {
+fn agent_prompt_injection_is_stable_and_enabled_by_default() {
     assert_eq!(
         feature_for_key("agent_prompt_injection"),
         Some(Feature::AgentPromptInjection)
     );
-    assert_eq!(
-        Feature::AgentPromptInjection.stage(),
-        Stage::UnderDevelopment
-    );
-    assert_eq!(Feature::AgentPromptInjection.default_enabled(), false);
-    assert!(!Features::with_defaults().enabled(Feature::AgentPromptInjection));
+    assert_eq!(Feature::AgentPromptInjection.stage(), Stage::Stable);
+    assert!(Feature::AgentPromptInjection.default_enabled());
+
+    let mut features = Features::with_defaults();
+    assert!(features.enabled(Feature::AgentPromptInjection));
+
+    features.apply_map(&BTreeMap::from([(
+        "agent_prompt_injection".to_string(),
+        false,
+    )]));
+    assert!(!features.enabled(Feature::AgentPromptInjection));
 }
 
 #[test]
-fn goal_supervisor_is_experimental_and_disabled_by_default() {
+fn goal_supervisor_is_stable_and_enabled_by_default() {
     assert_eq!(
         feature_for_key("goal_supervisor"),
         Some(Feature::GoalSupervisor)
     );
-    assert!(matches!(
-        Feature::GoalSupervisor.stage(),
-        Stage::Experimental { .. }
-    ));
-    assert!(!Feature::GoalSupervisor.default_enabled());
-    assert!(!Features::with_defaults().enabled(Feature::GoalSupervisor));
+    assert_eq!(Feature::GoalSupervisor.stage(), Stage::Stable);
+    assert!(Feature::GoalSupervisor.default_enabled());
+    assert!(Features::with_defaults().enabled(Feature::GoalSupervisor));
 }
 
+#[test]
+fn multi_agent_v2_is_stable_and_enabled_by_default() {
+    assert_eq!(
+        feature_for_key("multi_agent_v2"),
+        Some(Feature::MultiAgentV2)
+    );
+    assert_eq!(Feature::MultiAgentV2.stage(), Stage::Stable);
+    assert!(Feature::MultiAgentV2.default_enabled());
+
+    let mut features = Features::with_defaults();
+    assert!(features.enabled(Feature::MultiAgentV2));
+
+    features.apply_map(&BTreeMap::from([("multi_agent_v2".to_string(), false)]));
+    assert!(!features.enabled(Feature::MultiAgentV2));
+}
+
+#[test]
 fn apps_require_feature_flag_and_chatgpt_auth() {
     let mut features = Features::with_defaults();
     assert!(!features.apps_enabled_for_auth(/*has_chatgpt_auth*/ false));

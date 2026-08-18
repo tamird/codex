@@ -4722,6 +4722,12 @@ async fn fork_startup_context_then_first_turn_diff_snapshot() -> anyhow::Result<
     .await;
 
     let mut builder = test_codex().with_config(|config| {
+        config
+            .features
+            .disable(Feature::AgentPromptInjection)
+            .unwrap();
+        config.features.disable(Feature::MultiAgentV2).unwrap();
+        config.features.disable(Feature::Collab).unwrap();
         config.permissions.approval_policy =
             codex_config::Constrained::allow_any(AskForApproval::OnRequest);
     });
@@ -13943,16 +13949,10 @@ async fn root_agent_prompt_prefers_user_goal_over_coordination() {
 async fn root_agent_role_prompt_includes_persistent_goal_scheduling() {
     let codex_home = tempfile::tempdir().expect("create temp dir");
     let mut config = build_test_config(codex_home.path()).await;
-    for feature in [
-        Feature::AgentPromptInjection,
-        Feature::Goals,
-        Feature::GoalSupervisor,
-    ] {
-        config
-            .features
-            .enable(feature)
-            .expect("test config should enable goal supervisor prompt injection");
-    }
+    config
+        .features
+        .enable(Feature::Goals)
+        .expect("test config should enable goals");
 
     let prompt = load_agent_role_prompt(&config, &SessionSource::Cli)
         .await

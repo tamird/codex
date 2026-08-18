@@ -12128,24 +12128,39 @@ fn multi_agent_v2_exposes_model_overrides_by_default() {
 }
 
 #[test]
-fn multi_agent_v2_thread_adoption_is_disabled_by_default() {
-    let config = resolve_multi_agent_v2_config(&ConfigToml::default());
+fn frodex_maintained_agent_defaults_are_enabled() {
+    let features = codex_features::Features::with_defaults();
+    for feature in [
+        Feature::MultiAgentV2,
+        Feature::GoalSupervisor,
+        Feature::AgentPromptInjection,
+    ] {
+        assert!(features.enabled(feature), "{feature:?} must be enabled");
+    }
 
-    assert!(!config.enable_thread_adoption);
+    let config = resolve_multi_agent_v2_config(&ConfigToml::default());
+    assert!(config.enable_thread_adoption);
 }
 
 #[test]
-fn multi_agent_v2_thread_adoption_can_be_enabled_from_feature_table() {
+fn multi_agent_v2_thread_adoption_is_enabled_by_default() {
+    let config = resolve_multi_agent_v2_config(&ConfigToml::default());
+
+    assert!(config.enable_thread_adoption);
+}
+
+#[test]
+fn multi_agent_v2_thread_adoption_can_be_disabled_from_feature_table() {
     let config_toml = toml::from_str(
         r#"[features.multi_agent_v2]
-enable_thread_adoption = true
+enable_thread_adoption = false
 "#,
     )
     .expect("multi-agent v2 thread adoption config should parse");
 
     let config = resolve_multi_agent_v2_config(&config_toml);
 
-    assert!(config.enable_thread_adoption);
+    assert!(!config.enable_thread_adoption);
 }
 
 #[tokio::test]

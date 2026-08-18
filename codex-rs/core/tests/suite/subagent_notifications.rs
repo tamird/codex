@@ -1130,6 +1130,10 @@ async fn spawned_child_receives_forked_parent_context(
         .with_config(|config| {
             config
                 .features
+                .disable(Feature::MultiAgentV2)
+                .expect("the fixture calls multi_agent_v1 tools");
+            config
+                .features
                 .enable(Feature::Collab)
                 .expect("test config should allow feature update");
             config.model = Some(INHERITED_MODEL.to_string());

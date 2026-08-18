@@ -283,7 +283,7 @@ pub struct MultiAgentV2ConfigToml {
     /// Expose the multi-agent v2 `wait_agent` tool.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub wait_agent_enabled: Option<bool>,
-    /// Expose same-thread adoption and subagent promotion only when explicitly enabled.
+    /// Expose same-thread adoption and subagent promotion unless explicitly disabled.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub enable_thread_adoption: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]

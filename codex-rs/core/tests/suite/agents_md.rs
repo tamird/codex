@@ -1503,6 +1503,7 @@ async fn run_subagent_global_instruction_case(fork_context: bool) -> Result<()> 
         .with_home(Arc::clone(&home))
         .with_config(|config| {
             let _ = config.features.enable(Feature::Collab);
+            let _ = config.features.disable(Feature::MultiAgentV2);
             let _ = config.features.disable(Feature::EnableRequestCompression);
         });
     let test = builder.build(&server).await?;

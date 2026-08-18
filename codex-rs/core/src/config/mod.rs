@@ -1283,7 +1283,7 @@ pub struct MultiAgentV2Config {
     pub hide_spawn_agent_metadata: bool,
     pub expose_spawn_agent_model_overrides: bool,
     pub wait_agent_enabled: bool,
-    /// Expose same-thread adoption and promotion only after explicit opt-in.
+    /// Expose same-thread adoption and promotion unless explicitly disabled.
     pub enable_thread_adoption: bool,
     pub non_code_mode_only: bool,
 }
@@ -1304,7 +1304,7 @@ impl MultiAgentV2Config {
             hide_spawn_agent_metadata: true,
             expose_spawn_agent_model_overrides: true,
             wait_agent_enabled: true,
-            enable_thread_adoption: false,
+            enable_thread_adoption: true,
             non_code_mode_only: true,
         }
     }
