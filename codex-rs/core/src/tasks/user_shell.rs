@@ -218,6 +218,7 @@ pub(crate) async fn execute_user_shell_command(
         // inherit a managed proxy from the surrounding session or turn.
         network: None,
         network_environment_id: None,
+        environment_proxy_lease: None,
         expiration: timeout_ms.unwrap_or(USER_SHELL_TIMEOUT_MS).into(),
         capture_policy: ExecCapturePolicy::ShellTool,
         sandbox: SandboxType::None,

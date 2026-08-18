@@ -16,6 +16,7 @@ use codex_execpolicy::Evaluation;
 use codex_execpolicy::MatchOptions;
 use codex_execpolicy::Policy;
 use codex_execpolicy::RuleMatch;
+use codex_network_proxy::EnvironmentProxyLease;
 use codex_protocol::config_types::WindowsSandboxLevel;
 use codex_protocol::error::CodexErr;
 use codex_protocol::models::AdditionalPermissionProfile;
@@ -135,6 +136,7 @@ pub(crate) async fn prepare_unified_exec_zsh_fork(
         env: exec_request.env.clone(),
         network: exec_request.network.clone(),
         network_environment_id: exec_request.network_environment_id.clone(),
+        _environment_proxy_lease: exec_request.environment_proxy_lease.clone(),
         windows_sandbox_level: exec_request.windows_sandbox_level,
         arg0: exec_request.arg0.clone(),
         sandbox_policy_cwd,
@@ -572,6 +574,8 @@ struct CoreShellCommandExecutor {
     env: HashMap<String, String>,
     network: Option<codex_network_proxy::NetworkProxy>,
     network_environment_id: Option<String>,
+    /// Keeps the proxy addresses in `env` live for every command in this escalation session.
+    _environment_proxy_lease: Option<EnvironmentProxyLease>,
     windows_sandbox_level: WindowsSandboxLevel,
     arg0: Option<String>,
     sandbox_policy_cwd: AbsolutePathBuf,
@@ -644,6 +648,7 @@ impl CoreShellCommandExecutor {
                 exec_server_shell_snapshot: None,
                 network: self.network.clone(),
                 network_environment_id: self.network_environment_id.clone(),
+                environment_proxy_lease: None,
                 expiration: ExecExpiration::Cancellation(cancel_rx),
                 capture_policy: ExecCapturePolicy::ShellTool,
                 sandbox: self.sandbox,

@@ -41,6 +41,7 @@ use crate::unified_exec::UnifiedExecError;
 use crate::unified_exec::UnifiedExecProcess;
 use crate::unified_exec::UnifiedExecProcessManager;
 use codex_core_plugins::PluginMetricsSidecar;
+use codex_network_proxy::EnvironmentProxyLease;
 use codex_network_proxy::ManagedNetworkSandboxContext;
 use codex_network_proxy::NetworkProxy;
 use codex_protocol::error::CodexErr;
@@ -109,6 +110,8 @@ pub(crate) struct UnifiedExecAttempt {
     pub(crate) process: UnifiedExecProcess,
     pub(crate) metrics_sidecar: Option<PluginMetricsSidecar>,
     pub(crate) permissions: TerminalPermissions,
+    /// Keeps the command's environment-specific proxy listeners alive until process exit.
+    pub(crate) environment_proxy_lease: Option<EnvironmentProxyLease>,
 }
 
 fn unified_exec_options(
@@ -287,35 +290,36 @@ impl<'a> ToolRuntime<UnifiedExecRequest, UnifiedExecAttempt> for UnifiedExecRunt
             launch_sandbox_permissions,
         ));
         let env = exec_env_for_sandbox_permissions(&req.env, launch_sandbox_permissions);
-        let (mut env, managed_network_context, network_proxy_launch) = match managed_network {
-            Some(network) if environment_is_remote => {
-                let mut launch = network.remote_launch_config().await.map_err(|err| {
-                    ToolError::Codex(CodexErr::Io(io::Error::other(err.to_string())))
-                })?;
-                if routes_approval_policy_to_guardian(
-                    ctx.step_context.settings.approval_policy(),
-                    ctx.step_context.settings.approvals_reviewer(),
-                ) && network.remote_policy_decider().is_some()
-                {
-                    let timeout = ctx
-                        .session
-                        .hooks()
-                        .max_permission_request_timeout()
-                        .saturating_add(GUARDIAN_REVIEW_TIMEOUT)
-                        .saturating_add(REMOTE_NETWORK_POLICY_DECISION_MARGIN);
-                    launch.policy_decision_timeout_ms =
-                        Some(u64::try_from(timeout.as_millis()).map_err(|_| {
-                            ToolError::Rejected(
-                                "remote network policy decision timeout exceeds protocol limit"
-                                    .to_string(),
-                            )
-                        })?);
-                }
-                if !launch.proxy.enabled {
-                    (env, None, None)
-                } else {
-                    let environment_info =
-                        req.turn_environment
+        let (mut env, managed_network_context, network_proxy_launch, environment_proxy_lease) =
+            match managed_network {
+                Some(network) if environment_is_remote => {
+                    let mut launch = network.remote_launch_config().await.map_err(|err| {
+                        ToolError::Codex(CodexErr::Io(io::Error::other(err.to_string())))
+                    })?;
+                    if routes_approval_policy_to_guardian(
+                        ctx.step_context.settings.approval_policy(),
+                        ctx.step_context.settings.approvals_reviewer(),
+                    ) && network.remote_policy_decider().is_some()
+                    {
+                        let timeout = ctx
+                            .session
+                            .hooks()
+                            .max_permission_request_timeout()
+                            .saturating_add(GUARDIAN_REVIEW_TIMEOUT)
+                            .saturating_add(REMOTE_NETWORK_POLICY_DECISION_MARGIN);
+                        launch.policy_decision_timeout_ms =
+                            Some(u64::try_from(timeout.as_millis()).map_err(|_| {
+                                ToolError::Rejected(
+                                    "remote network policy decision timeout exceeds protocol limit"
+                                        .to_string(),
+                                )
+                            })?);
+                    }
+                    if !launch.proxy.enabled {
+                        (env, None, None, None)
+                    } else {
+                        let environment_info = req
+                            .turn_environment
                             .environment
                             .info()
                             .await
@@ -324,31 +328,36 @@ impl<'a> ToolRuntime<UnifiedExecRequest, UnifiedExecAttempt> for UnifiedExecRunt
                                     "failed to query exec-server capabilities: {err}"
                                 ))))
                             })?;
-                    if !environment_info.capabilities.network_proxy_launch {
-                        return Err(ToolError::Rejected(
+                        if !environment_info.capabilities.network_proxy_launch {
+                            return Err(ToolError::Rejected(
                             "selected exec-server does not support executor-local network proxy launches"
                                 .to_string(),
                         ));
+                        }
+                        (env, None, Some(launch), None)
                     }
-                    (env, None, Some(launch))
                 }
-            }
-            Some(network) => {
-                let prepared = network
-                    .prepare_for_optional_environment(
-                        env,
-                        Some(&req.turn_environment.selection.environment_id),
+                Some(network) => {
+                    let prepared = network
+                        .prepare_for_optional_environment(
+                            env,
+                            Some(&req.turn_environment.selection.environment_id),
+                        )
+                        .map_err(|err| {
+                            ToolError::Codex(CodexErr::Io(io::Error::other(format!(
+                                "failed to prepare network proxy for environment `{}`: {err}",
+                                req.turn_environment.selection.environment_id
+                            ))))
+                        })?;
+                    (
+                        prepared.env,
+                        Some(prepared.sandbox_context),
+                        None,
+                        prepared.environment_proxy_lease,
                     )
-                    .map_err(|err| {
-                        ToolError::Codex(CodexErr::Io(io::Error::other(format!(
-                            "failed to prepare network proxy for environment `{}`: {err}",
-                            req.turn_environment.selection.environment_id
-                        ))))
-                    })?;
-                (prepared.env, Some(prepared.sandbox_context), None)
-            }
-            None => (env, None, None),
-        };
+                }
+                None => (env, None, None, None),
+            };
         let explicit_env_overrides = req.explicit_env_overrides.clone();
         let metrics_sidecar = sidecar_for_command(
             ctx,
@@ -496,6 +505,7 @@ impl<'a> ToolRuntime<UnifiedExecRequest, UnifiedExecAttempt> for UnifiedExecRunt
                         process,
                         metrics_sidecar,
                         permissions,
+                        environment_proxy_lease,
                     });
                 }
                 None => {
@@ -541,6 +551,7 @@ impl<'a> ToolRuntime<UnifiedExecRequest, UnifiedExecAttempt> for UnifiedExecRunt
             process,
             metrics_sidecar,
             permissions,
+            environment_proxy_lease,
         })
     }
 }

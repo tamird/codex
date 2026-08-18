@@ -154,6 +154,9 @@ pub fn arg0_dispatch() -> Option<Arg0PathEntryGuard> {
         std::process::exit(exit_code);
     }
 
+    #[cfg(unix)]
+    raise_open_file_limit();
+
     // This modifies the environment, which is not thread-safe, so do this
     // before creating any threads/the Tokio runtime.
     load_dotenv();
@@ -171,6 +174,38 @@ pub fn arg0_dispatch() -> Option<Arg0PathEntryGuard> {
         }
     }
     path_entry_guard
+}
+
+/// Raises the soft descriptor limit to the process's existing hard limit.
+///
+/// Listener retirement keeps steady-state descriptor use low. This additional headroom prevents
+/// a short command or connection burst from failing unrelated persistence work with `EMFILE`.
+#[cfg(unix)]
+fn raise_open_file_limit() {
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: `limit` points to writable storage for one `rlimit` value.
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &raw mut limit) } != 0 {
+        eprintln!(
+            "WARNING: failed to read the open-file limit: {}",
+            std::io::Error::last_os_error()
+        );
+        return;
+    }
+    if limit.rlim_cur >= limit.rlim_max {
+        return;
+    }
+
+    limit.rlim_cur = limit.rlim_max;
+    // SAFETY: `limit` was initialized by `getrlimit` and retains its existing hard limit.
+    if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &raw const limit) } != 0 {
+        eprintln!(
+            "WARNING: failed to raise the open-file limit: {}",
+            std::io::Error::last_os_error()
+        );
+    }
 }
 
 fn prepare_path_env_var_with_aliases(
