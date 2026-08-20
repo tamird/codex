@@ -437,9 +437,14 @@ async fn generated_id_rewrite_matches_replay_and_preserves_explicit_ids() {
     let mut plan = plan_legacy_lineage(home.path(), &active)
         .await
         .expect("plan lineage");
-    let mut rewritten = stage_legacy_lineage(&plan, &home.path().join("rewrite"))
-        .await
-        .expect("stage original IDs");
+    let mut rewritten = stage_legacy_lineage(
+        &plan,
+        &home.path().join("rewrite"),
+        &mut super::RolloutMigrationRateLimiter::new(/*max_mib_per_second*/ None)
+            .expect("migration limiter"),
+    )
+    .await
+    .expect("stage original IDs");
     plan.synthetic_item_id_remap.extend([
         ("item-1".to_string(), "item-10000000000".to_string()),
         ("item-2".to_string(), "item-30000000000".to_string()),
@@ -448,9 +453,14 @@ async fn generated_id_rewrite_matches_replay_and_preserves_explicit_ids() {
         ("item-5".to_string(), "item-60000000000".to_string()),
         ("item-6".to_string(), "item-70000000000".to_string()),
     ]);
-    let expected = stage_legacy_lineage(&plan, &home.path().join("reference"))
-        .await
-        .expect("replay with remap");
+    let expected = stage_legacy_lineage(
+        &plan,
+        &home.path().join("reference"),
+        &mut super::RolloutMigrationRateLimiter::new(/*max_mib_per_second*/ None)
+            .expect("migration limiter"),
+    )
+    .await
+    .expect("replay with remap");
     rewrite_generated_item_ids(&mut rewritten, &plan.synthetic_item_id_remap)
         .await
         .expect("rewrite generated IDs");
@@ -504,9 +514,14 @@ async fn generated_id_rewrite_matches_replay_and_preserves_explicit_ids() {
     );
 
     let remap = std::mem::take(&mut plan.synthetic_item_id_remap);
-    let mut damaged = stage_legacy_lineage(&plan, &home.path().join("damaged"))
-        .await
-        .expect("stage damage fixture");
+    let mut damaged = stage_legacy_lineage(
+        &plan,
+        &home.path().join("damaged"),
+        &mut super::RolloutMigrationRateLimiter::new(/*max_mib_per_second*/ None)
+            .expect("migration limiter"),
+    )
+    .await
+    .expect("stage damage fixture");
     let mut bytes = fs::read(&damaged[0].staged_path).expect("read damage fixture");
     *bytes.last_mut().expect("nonempty staged file") = b' ';
     fs::write(&damaged[0].staged_path, bytes).expect("damage unpublished staging");
@@ -1926,9 +1941,14 @@ async fn old_durable_native_parent_journals_keep_their_recorded_targets() {
             .await
             .expect("old plan");
         assert_eq!(old_plan.sources.len(), 2);
-        let staged = stage_legacy_lineage(&old_plan, &journal_path.with_extension("staging"))
-            .await
-            .expect("stage old native-parent plan");
+        let staged = stage_legacy_lineage(
+            &old_plan,
+            &journal_path.with_extension("staging"),
+            &mut super::RolloutMigrationRateLimiter::new(/*max_mib_per_second*/ None)
+                .expect("migration limiter"),
+        )
+        .await
+        .expect("stage old native-parent plan");
         let expected = staged
             .iter()
             .map(|target| {
@@ -2072,9 +2092,19 @@ async fn lineage_migration_stages_one_contiguous_paginated_ordinal_space() {
         "skipping rollback planning must preserve every staged byte and target identity"
     );
     let stage_root = home.path().join("rollout-migrations/staging-a");
-    let staged = stage_legacy_lineage(&plan, stage_root.as_path())
+    let mut limiter =
+        RolloutMigrationRateLimiter::new(/*max_mib_per_second*/ None).expect("migration limiter");
+    let staged = stage_legacy_lineage(&plan, stage_root.as_path(), &mut limiter)
         .await
         .expect("stage lineage");
+    assert!(
+        limiter.reporter.activity().io_bytes > 0,
+        "streamed staging reports observed bytes"
+    );
+    assert_eq!(
+        limiter.bytes_processed, 0,
+        "observability does not charge the throughput limiter"
+    );
 
     assert_eq!(staged.len(), 3);
     assert_eq!(measured.len(), staged.len());
@@ -2152,6 +2182,7 @@ async fn lineage_migration_stages_one_contiguous_paginated_ordinal_space() {
     let repeated = stage_legacy_lineage(
         &plan,
         home.path().join("rollout-migrations/staging-b").as_path(),
+        &mut limiter,
     )
     .await
     .expect("repeat stage lineage");
@@ -3504,6 +3535,8 @@ async fn lineage_migration_stages_cross_thread_history_base_without_copying_pare
     let staged = stage_legacy_lineage(
         &plan,
         home.path().join("rollout-migrations/fork-stage").as_path(),
+        &mut RolloutMigrationRateLimiter::new(/*max_mib_per_second*/ None)
+            .expect("migration limiter"),
     )
     .await
     .expect("stage fork lineage");
@@ -4266,6 +4299,8 @@ async fn desktop_compatible_staging_can_reuse_a_validated_plan() {
         fixture.home.path(),
         &mut plan,
         &fixture.home.path().join("first"),
+        &mut super::RolloutMigrationRateLimiter::new(/*max_mib_per_second*/ None)
+            .expect("migration limiter"),
     )
     .await
     .expect("first compatible staging");
@@ -4275,6 +4310,8 @@ async fn desktop_compatible_staging_can_reuse_a_validated_plan() {
         fixture.home.path(),
         &mut plan,
         &fixture.home.path().join("second"),
+        &mut super::RolloutMigrationRateLimiter::new(/*max_mib_per_second*/ None)
+            .expect("migration limiter"),
     )
     .await
     .expect("repeat compatible staging");
@@ -4308,6 +4345,8 @@ async fn durable_v4_journal_retains_older_collision_id_allocation() {
             fixture.home.path(),
             &mut old_plan,
             initial_stage.path(),
+            &mut super::RolloutMigrationRateLimiter::new(/*max_mib_per_second*/ None)
+                .expect("migration limiter"),
         )
         .await
         .expect("derive valid remap");
@@ -4321,9 +4360,14 @@ async fn durable_v4_journal_retains_older_collision_id_allocation() {
             .synthetic_item_id_remap
             .insert("item-2".to_string(), first);
         let journal_path = migration_journal_path(fixture.home.path(), fixture.thread_id);
-        let staged = stage_legacy_lineage(&old_plan, &journal_path.with_extension("staging"))
-            .await
-            .expect("stage old allocation");
+        let staged = stage_legacy_lineage(
+            &old_plan,
+            &journal_path.with_extension("staging"),
+            &mut super::RolloutMigrationRateLimiter::new(/*max_mib_per_second*/ None)
+                .expect("migration limiter"),
+        )
+        .await
+        .expect("stage old allocation");
         let expected = staged
             .iter()
             .map(|target| {

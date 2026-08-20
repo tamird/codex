@@ -26,6 +26,9 @@ use codex_protocol::protocol::ThreadHistoryMode;
 use codex_protocol::protocol::ThreadSource;
 use codex_rollout::RolloutItem;
 use codex_rollout::RolloutLine;
+use codex_rollout::RolloutMaintenanceOperation;
+use codex_rollout::RolloutMaintenancePhase;
+use codex_rollout::RolloutMaintenanceReporter;
 use serde::Serialize;
 use serde_json::Value;
 use tokio::fs::File;
@@ -63,6 +66,7 @@ mod lineage_transaction;
 mod mixed_rollback_tests;
 mod ordinal_rewrite;
 mod payload_decoder;
+mod progress;
 mod publish;
 #[cfg(test)]
 mod reference_header_tests;
@@ -241,6 +245,7 @@ struct RolloutMigrationRateLimiter {
     bytes_processed: u64,
     bytes_per_second: Option<u64>,
     bytes_since_yield: u64,
+    reporter: RolloutMaintenanceReporter,
 }
 
 struct RolloutRecord {
@@ -291,10 +296,17 @@ impl RolloutMigrationRateLimiter {
             bytes_processed: 0,
             bytes_per_second,
             bytes_since_yield: 0,
+            reporter: RolloutMaintenanceReporter::new(
+                codex_rollout::RolloutMaintenanceActivity::new(
+                    RolloutMaintenanceOperation::ManualMigration,
+                    /*thread_id*/ None,
+                ),
+            ),
         })
     }
 
     async fn account(&mut self, bytes: u64) {
+        self.reporter.observe_io(bytes);
         self.bytes_processed = self.bytes_processed.saturating_add(bytes);
         self.bytes_since_yield = self.bytes_since_yield.saturating_add(bytes);
         if self.bytes_since_yield < PROJECTION_BATCH_BYTES {
@@ -350,6 +362,10 @@ impl LocalThreadStore {
                 .await
                 .unwrap_or_default();
         let mut limiter = RolloutMigrationRateLimiter::new(options.max_mib_per_second)?;
+        let activity = limiter.activity(
+            RolloutMaintenanceOperation::BackgroundMigration,
+            Some(thread_id),
+        );
         loop {
             let guard = match admission {
                 MigrationAdmission::Shared(dependencies) => {
@@ -367,6 +383,24 @@ impl LocalThreadStore {
             }
             .map_err(migration_error)?;
             let Some(guard) = guard else {
+                // A representative home owner need not own this job's shared dependency.
+                let status = if matches!(admission, MigrationAdmission::Shared(_)) {
+                    codex_rollout::read_rollout_maintenance_exclusive_status(
+                        &self.config.codex_home,
+                    )
+                } else {
+                    codex_rollout::read_rollout_maintenance_status(&self.config.codex_home)
+                };
+                let owner = match status {
+                    Ok(codex_rollout::RolloutMaintenanceStatus::Busy { owner }) => owner,
+                    Ok(codex_rollout::RolloutMaintenanceStatus::Idle) | Err(_) => None,
+                };
+                codex_rollout::report_rollout_maintenance_status(
+                    codex_rollout::RolloutMaintenanceRequestStatus::WaitingForMaintenance {
+                        thread_id: activity.thread_id,
+                        owner,
+                    },
+                );
                 return Err(ThreadStoreError::Conflict {
                     message: "rollout migration dependencies or capacity are busy".to_string(),
                 });
@@ -390,6 +424,10 @@ impl LocalThreadStore {
                     bytes_read = dependencies.bytes_read,
                     "admitted independent rollout migration"
                 );
+            }
+            let guard = guard.with_activity(&self.config.codex_home, activity);
+            if let Some(reporter) = guard.reporter() {
+                limiter.attach_reporter(reporter);
             }
             let result = self
                 .migrate_rollout_path(
@@ -445,8 +483,12 @@ impl LocalThreadStore {
         paths: RolloutMigrationPaths,
     ) -> ThreadStoreResult<RolloutMigrationReport> {
         let telemetry = RolloutMigrationTelemetry::new(trigger, &options);
+        let operation = match trigger {
+            RolloutMigrationTrigger::Manual => RolloutMaintenanceOperation::ManualMigration,
+            RolloutMigrationTrigger::Startup => RolloutMaintenanceOperation::BackgroundMigration,
+        };
         let result = self
-            .migrate_rollouts_with_progress_inner(options, &mut on_progress, paths)
+            .migrate_rollouts_with_progress_inner(options, &mut on_progress, paths, operation)
             .await;
         telemetry.finish(&result);
         result
@@ -457,16 +499,31 @@ impl LocalThreadStore {
         options: RolloutMigrationOptions,
         on_progress: &mut impl FnMut(RolloutMigrationProgress),
         paths: RolloutMigrationPaths,
+        operation: RolloutMaintenanceOperation,
     ) -> ThreadStoreResult<RolloutMigrationReport> {
         let mut limiter = RolloutMigrationRateLimiter::new(options.max_mib_per_second)?;
+        limiter.attach_reporter(RolloutMaintenanceReporter::new(
+            limiter.activity(operation, /*thread_id*/ None),
+        ));
+        limiter.phase(RolloutMaintenancePhase::Inventory);
         let inventory_guard = match options.mode {
             RolloutMigrationMode::DryRun => None,
             RolloutMigrationMode::Apply => Some(
-                codex_rollout::acquire_rollout_maintenance_job_lock(&self.config.codex_home)
-                    .await
-                    .map_err(migration_error)?,
+                codex_rollout::acquire_rollout_maintenance_job(
+                    &self.config.codex_home,
+                    limiter.activity(operation, /*thread_id*/ None),
+                )
+                .await
+                .map_err(migration_error)?,
             ),
         };
+        if let Some(reporter) = inventory_guard
+            .as_ref()
+            .and_then(codex_rollout::RolloutMaintenanceJobGuard::reporter)
+        {
+            limiter.attach_reporter(reporter);
+            limiter.phase(RolloutMaintenancePhase::Inventory);
+        }
         let mut paths = match paths {
             RolloutMigrationPaths::Discover => {
                 find_all_rollout_paths(&self.config.codex_home).await?
@@ -530,11 +587,20 @@ impl LocalThreadStore {
             let job_guard = match options.mode {
                 RolloutMigrationMode::DryRun => None,
                 RolloutMigrationMode::Apply => Some(
-                    codex_rollout::acquire_rollout_maintenance_job_lock(&self.config.codex_home)
-                        .await
-                        .map_err(migration_error)?,
+                    codex_rollout::acquire_rollout_maintenance_job(
+                        &self.config.codex_home,
+                        limiter.activity(operation, codex_rollout::thread_id_from_path(&path)),
+                    )
+                    .await
+                    .map_err(migration_error)?,
                 ),
             };
+            if let Some(reporter) = job_guard
+                .as_ref()
+                .and_then(codex_rollout::RolloutMaintenanceJobGuard::reporter)
+            {
+                limiter.attach_reporter(reporter);
+            }
             let outcome = self
                 .migrate_rollout_path(
                     path,
@@ -568,6 +634,7 @@ impl LocalThreadStore {
         admission: &mut MigrationAdmission,
         job_guard: Option<codex_rollout::RolloutMaintenanceJobGuard>,
     ) -> ThreadStoreResult<Option<RolloutMigrationOutcome>> {
+        limiter.phase(RolloutMaintenancePhase::Planning);
         // Compression can replace an inventoried file before this path acquires its job.
         path = codex_rollout::existing_rollout_path(&path)
             .await
@@ -658,6 +725,7 @@ impl LocalThreadStore {
             *admission = MigrationAdmission::RequiresExclusive;
             return Ok(None);
         }
+        limiter.selected_thread(thread_id);
         if !matches_selection(&options.thread_ids, Some(thread_id)) {
             return Ok(None);
         }
@@ -711,6 +779,7 @@ impl LocalThreadStore {
         {
             let bytes_before = limiter.bytes_processed;
             let result = if pending_published_migration {
+                limiter.phase(RolloutMaintenancePhase::Recovering);
                 let _live_writer_guard = self.live_writer_locks.lock(thread_id).await;
                 let lineage_journal = tokio::fs::metadata(&journal_path)
                     .await
@@ -823,19 +892,18 @@ impl LocalThreadStore {
             // lease must not survive into projection's lifecycle wait behind a queued writer.
             drop(job_guard);
             let result = match result {
-                Ok(RolloutMigrationStatus::Migrated) => self
-                    .ensure_complete_migrated_projection(thread_id)
-                    .await
-                    .map_err(|error| {
-                        RolloutMigrationFailure::new(
-                            RolloutMigrationFailureReason::SqliteMaterializationFailed,
-                            error,
-                        )
-                    })
-                    .map(|()| RolloutMigrationStatus::Migrated),
+                Ok(RolloutMigrationStatus::Migrated) => {
+                    limiter.phase(RolloutMaintenancePhase::Projecting);
+                    with_failure_reason(
+                        self.ensure_complete_migrated_projection(thread_id).await,
+                        RolloutMigrationFailureReason::SqliteMaterializationFailed,
+                    )
+                    .map(|()| RolloutMigrationStatus::Migrated)
+                }
                 Ok(RolloutMigrationStatus::AlreadyPaginated)
                     if options.mode == RolloutMigrationMode::Apply =>
                 {
+                    limiter.phase(RolloutMaintenancePhase::Projecting);
                     // Text-filtered histories can legitimately retain their supported reader.
                     self.try_complete_history_projection(thread_id)
                         .await
@@ -860,6 +928,7 @@ impl LocalThreadStore {
         }
 
         if options.mode == RolloutMigrationMode::DryRun {
+            limiter.phase(RolloutMaintenancePhase::Planning);
             let lineage_plan = with_failure_reason(
                 legacy_lineage_migration_plan(self, &path, &metadata).await,
                 RolloutMigrationFailureReason::LegacyRolloutConversionFailed,
@@ -879,7 +948,7 @@ impl LocalThreadStore {
                 let manifest = with_failure_reason(
                     async {
                         self.validate_legacy_lineage_plan(&plan).await?;
-                        self.validate_legacy_lineage_desktop_compatibility(&mut plan)
+                        self.validate_legacy_lineage_desktop_compatibility(&mut plan, limiter)
                             .await?;
                         build_lineage_manifest(&plan).await
                     }
@@ -925,6 +994,7 @@ impl LocalThreadStore {
             ));
         }
 
+        limiter.phase(RolloutMaintenancePhase::WaitingForWriter);
         let _live_writer_guard = if matches!(admission, MigrationAdmission::Manual) {
             self.live_writer_locks.lock(thread_id).await
         } else {
@@ -1003,6 +1073,7 @@ impl LocalThreadStore {
                 Err(error) => return Err(error),
             }
         }
+        limiter.phase(RolloutMaintenancePhase::Planning);
         let lineage_plan = with_failure_reason(
             legacy_lineage_migration_plan(self, &path, &locked_metadata).await,
             RolloutMigrationFailureReason::LegacyRolloutConversionFailed,
@@ -1055,6 +1126,7 @@ impl LocalThreadStore {
             let result = match result {
                 Ok(selected_path) => {
                     path = selected_path;
+                    limiter.phase(RolloutMaintenancePhase::Projecting);
                     with_failure_reason(
                         self.ensure_complete_migrated_projection(thread_id)
                             .await
@@ -1149,6 +1221,7 @@ impl LocalThreadStore {
         }
 
         let rollout_id = migration_rollout_id(rollout_path, thread_id);
+        limiter.phase(RolloutMaintenancePhase::Staging);
         let compressed = rollout_path_is_compressed(rollout_path);
         let staged_path = with_failure_reason(
             staged_rollout_path(rollout_path),
@@ -1304,6 +1377,7 @@ impl LocalThreadStore {
         )?;
 
         // SQLite sees only the final staged bytes, so all projection failures share one reason.
+        limiter.phase(RolloutMaintenancePhase::Projecting);
         let projection_result = async {
             self.project_rollout_in_batches(
                 rollout_id,
@@ -1332,6 +1406,7 @@ impl LocalThreadStore {
 
         // Once projection is verified, the remaining work publishes the replacement and clears
         // the durable pending journal.
+        limiter.phase(RolloutMaintenancePhase::Publishing);
         let publish_result = async {
             let compressed_staged_path = if compressed {
                 let path = compressed_staged_rollout_path(rollout_path)?;

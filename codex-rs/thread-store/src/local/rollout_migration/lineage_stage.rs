@@ -27,6 +27,7 @@ use tokio::io::AsyncWriteExt;
 use tokio::io::BufWriter;
 
 use super::MAX_ROLLOUT_LINE_BYTES;
+use super::RolloutMigrationRateLimiter;
 use super::canonicalizer::LegacyCanonicalizerCheckpoint;
 use super::canonicalizer::LegacyRolloutCanonicalizer;
 use super::line_parser;
@@ -79,26 +80,36 @@ pub(super) struct MeasuredLineageTarget {
 pub(super) async fn stage_legacy_lineage(
     plan: &LegacyLineageMigrationPlan,
     stage_root: &Path,
+    limiter: &mut RolloutMigrationRateLimiter,
 ) -> ThreadStoreResult<Vec<StagedLineageTarget>> {
-    stage_lineage_with_context_cache(plan, stage_root, TurnContextCache::default()).await
+    stage_lineage_with_context_cache(plan, stage_root, TurnContextCache::default(), limiter).await
 }
 
 #[cfg(test)]
 pub(super) async fn stage_legacy_lineage_without_context_cache(
     plan: &LegacyLineageMigrationPlan,
     stage_root: &Path,
+    limiter: &mut RolloutMigrationRateLimiter,
 ) -> ThreadStoreResult<Vec<StagedLineageTarget>> {
-    stage_lineage_with_context_cache(plan, stage_root, TurnContextCache::disabled()).await
+    stage_lineage_with_context_cache(plan, stage_root, TurnContextCache::disabled(), limiter).await
 }
 
 async fn stage_lineage_with_context_cache(
     plan: &LegacyLineageMigrationPlan,
     stage_root: &Path,
     mut context_cache: TurnContextCache,
+    limiter: &mut RolloutMigrationRateLimiter,
 ) -> ThreadStoreResult<Vec<StagedLineageTarget>> {
+    let reporter = limiter.reporter.clone();
+    let mut on_read = |bytes| reporter.observe_io(bytes);
+    limiter.phase_progress(
+        /*completed*/ 0,
+        plan.targets.len() as u64,
+        codex_rollout::RolloutMaintenanceProgressUnit::Segments,
+    );
     validate_plan_shape(plan)?;
     let started = std::time::Instant::now();
-    let rollback_plan = build_rollback_plan(plan, &mut context_cache).await?;
+    let rollback_plan = build_rollback_plan(plan, &mut context_cache, &mut on_read).await?;
     tracing::info!(thread_id = %plan.selected_thread_id, phase = "plan_rollbacks", elapsed_ms = started.elapsed().as_millis() as u64, "rollout migration phase complete");
     let started = std::time::Instant::now();
     tokio::fs::create_dir_all(stage_root)
@@ -154,6 +165,7 @@ async fn stage_lineage_with_context_cache(
             &mut replay,
             &mut writer,
             Some(&mut generated_item_edits),
+            &mut on_read,
         )
         .await?;
         writer.flush().await.map_err(migration_error)?;
@@ -178,6 +190,11 @@ async fn stage_lineage_with_context_cache(
             selected: target.selected,
             generated_item_edits,
         });
+        limiter.phase_progress(
+            staged.len() as u64,
+            plan.targets.len() as u64,
+            codex_rollout::RolloutMaintenanceProgressUnit::Segments,
+        );
     }
     replay.verify_complete(rollback_plan.as_ref())?;
     tracing::info!(thread_id = %plan.selected_thread_id, phase = "write_canonical_targets", elapsed_ms = started.elapsed().as_millis() as u64, "rollout migration phase complete");
@@ -189,8 +206,9 @@ pub(super) async fn measure_legacy_lineage(
     plan: &LegacyLineageMigrationPlan,
 ) -> ThreadStoreResult<Vec<MeasuredLineageTarget>> {
     validate_plan_shape(plan)?;
+    let mut on_read = |_| {};
     let mut context_cache = TurnContextCache::default();
-    let rollback_plan = build_rollback_plan(plan, &mut context_cache).await?;
+    let rollback_plan = build_rollback_plan(plan, &mut context_cache, &mut on_read).await?;
     let mut replay = LineageReplayState::new(plan, context_cache);
     let mut measured = Vec::with_capacity(plan.targets.len());
     for (index, target) in plan.targets.iter().enumerate() {
@@ -214,6 +232,7 @@ pub(super) async fn measure_legacy_lineage(
             &mut replay,
             &mut writer,
             /*generated_item_edits*/ None,
+            &mut on_read,
         )
         .await?;
         writer.flush().await.map_err(migration_error)?;
@@ -404,6 +423,10 @@ impl LineageReplayState {
     }
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Replay carries authenticated lineage state, optional item edits, and an independent read-progress sink."
+)]
 async fn replay_target<W>(
     plan: &LegacyLineageMigrationPlan,
     rollback_plan: Option<&RollbackPlan>,
@@ -412,6 +435,7 @@ async fn replay_target<W>(
     replay: &mut LineageReplayState,
     writer: &mut W,
     generated_item_edits: Option<&mut Vec<GeneratedItemEdit>>,
+    on_read: &mut impl FnMut(u64),
 ) -> ThreadStoreResult<(u64, u64)>
 where
     W: AsyncWrite + Unpin,
@@ -425,8 +449,16 @@ where
         .get(index)
         .ok_or_else(|| migration_error("lineage replay target is missing"))?;
     if source.history_mode == ThreadHistoryMode::Paginated {
-        return replay_paginated_target(plan, rollback_plan, index, history_base, replay, writer)
-            .await;
+        return replay_paginated_target(
+            plan,
+            rollback_plan,
+            index,
+            history_base,
+            replay,
+            writer,
+            on_read,
+        )
+        .await;
     }
     let mut canonicalizer = match replay.continuation.take() {
         Some(checkpoint) => {
@@ -469,6 +501,7 @@ where
         .await
         .map_err(migration_error)?;
     while let Some(raw) = reader.next_line().await.map_err(migration_error)? {
+        on_read(raw.len() as u64);
         if raw.len() > MAX_ROLLOUT_LINE_BYTES {
             continue;
         }
@@ -545,6 +578,7 @@ async fn replay_paginated_target<W>(
     history_base: Option<HistoryPosition>,
     replay: &mut LineageReplayState,
     writer: &mut W,
+    on_read: &mut impl FnMut(u64),
 ) -> ThreadStoreResult<(u64, u64)>
 where
     W: AsyncWrite + Unpin,
@@ -646,6 +680,7 @@ where
         .await
         .map_err(migration_error)?;
     while let Some(raw) = reader.next_line().await.map_err(migration_error)? {
+        on_read(raw.len() as u64);
         if raw.trim().is_empty() {
             continue;
         }
@@ -952,6 +987,7 @@ fn ordinary_same_thread_successor(
 pub(super) async fn build_rollback_plan(
     plan: &LegacyLineageMigrationPlan,
     context_cache: &mut TurnContextCache,
+    on_read: &mut impl FnMut(u64),
 ) -> ThreadStoreResult<Option<RollbackPlan>> {
     // Source authentication already inspected every record. Without a rollback marker, the
     // ownership and reverse-compaction planners leave every record unchanged.
@@ -971,6 +1007,7 @@ pub(super) async fn build_rollback_plan(
             .await
             .map_err(migration_error)?;
         while let Some(raw) = reader.next_line().await.map_err(migration_error)? {
+            on_read(raw.len() as u64);
             if raw.len() > MAX_ROLLOUT_LINE_BYTES {
                 continue;
             }

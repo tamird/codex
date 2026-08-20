@@ -375,6 +375,18 @@ pub async fn acquire_rollout_maintenance_job_lock(
     .await
 }
 
+/// Wait for a migration job while reporting contention and the admitted job's activity.
+pub async fn acquire_rollout_maintenance_job(
+    codex_home: &Path,
+    activity: RolloutMaintenanceActivity,
+) -> io::Result<RolloutMaintenanceJobGuard> {
+    Ok(
+        acquire_inner(codex_home, Some(activity), try_acquire_foreground_job)
+            .await?
+            .with_activity(codex_home, activity),
+    )
+}
+
 /// Report contention for clean access without claiming it performs history repair.
 pub async fn acquire_rollout_maintenance_read(
     codex_home: &Path,
@@ -492,15 +504,27 @@ async fn acquire_inner<T>(
 /// Read one current maintenance owner. Independent jobs may have additional owners.
 /// Every reported owner is checked against its own exclusive reservation and reporter lease.
 pub fn read_rollout_maintenance_status(codex_home: &Path) -> io::Result<RolloutMaintenanceStatus> {
+    let status = read_rollout_maintenance_exclusive_status(codex_home)?;
+    if status != RolloutMaintenanceStatus::Idle {
+        return Ok(status);
+    }
     let directory = codex_home.join(".tmp");
-    for prefix in ["rollout-maintenance", "rollout-maintenance-job"] {
-        let status = read_lock_status(&directory, prefix)?;
+    for slot in 0..MAX_CONCURRENT_ROLLOUT_MIGRATIONS {
+        let status = read_lock_status(&directory, &format!("rollout-migration-slot-{slot}"))?;
         if status != RolloutMaintenanceStatus::Idle {
             return Ok(status);
         }
     }
-    for slot in 0..MAX_CONCURRENT_ROLLOUT_MIGRATIONS {
-        let status = read_lock_status(&directory, &format!("rollout-migration-slot-{slot}"))?;
+    Ok(RolloutMaintenanceStatus::Idle)
+}
+
+/// Identify only owners that exclude every migration, not unrelated dependency jobs.
+pub fn read_rollout_maintenance_exclusive_status(
+    codex_home: &Path,
+) -> io::Result<RolloutMaintenanceStatus> {
+    let directory = codex_home.join(".tmp");
+    for prefix in ["rollout-maintenance", "rollout-maintenance-job"] {
+        let status = read_lock_status(&directory, prefix)?;
         if status != RolloutMaintenanceStatus::Idle {
             return Ok(status);
         }

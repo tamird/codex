@@ -96,6 +96,7 @@ impl LocalThreadStore {
     pub(super) async fn validate_legacy_lineage_desktop_compatibility(
         &self,
         plan: &mut LegacyLineageMigrationPlan,
+        limiter: &mut RolloutMigrationRateLimiter,
     ) -> ThreadStoreResult<()> {
         // Paginated sources already persist stable turn and item identities. The bounded-view
         // comparison below protects Legacy synthetic IDs, which can depend on how many
@@ -110,6 +111,7 @@ impl LocalThreadStore {
         super::lineage_compatibility::validate_bounded_desktop_history(
             self.config.codex_home.as_path(),
             plan,
+            limiter,
         )
         .await
     }
@@ -227,6 +229,7 @@ impl LocalThreadStore {
         limiter: &mut RolloutMigrationRateLimiter,
         stop_after: Option<LineageMigrationPhase>,
     ) -> ClassifiedMigrationResult<PathBuf> {
+        limiter.phase(codex_rollout::RolloutMaintenancePhase::Validating);
         with_failure_reason(
             super::lineage::expand_filtered_native_rollbacks(self, &mut plan).await,
             LegacyRolloutConversionFailed,
@@ -488,10 +491,12 @@ impl LocalThreadStore {
                         .await
                         .map_err(migration_error)?;
                 }
+                limiter.phase(codex_rollout::RolloutMaintenancePhase::Staging);
                 let staged = stage_compatible_lineage(
                     self.config.codex_home.as_path(),
                     &mut plan,
                     stage_root.as_path(),
+                    limiter,
                 )
                 .await?;
                 journal.record_staged_targets(staged.as_slice())
@@ -510,6 +515,12 @@ impl LocalThreadStore {
         }
 
         if journal.phase == LineageMigrationPhase::TargetsDurable {
+            limiter.phase(codex_rollout::RolloutMaintenancePhase::Projecting);
+            limiter.phase_progress(
+                /*completed*/ 0,
+                journal.targets.len() as u64,
+                codex_rollout::RolloutMaintenanceProgressUnit::Segments,
+            );
             let started = Instant::now();
             with_failure_reason(journal.verify_sources().await, RolloutReadFailed)?;
             with_failure_reason(
@@ -545,7 +556,7 @@ impl LocalThreadStore {
                         SqliteMaterializationFailed,
                     )?;
                 }
-                for target in &journal.targets {
+                for (index, target) in journal.targets.iter().enumerate() {
                     let staged_path = with_failure_reason(
                         target.staged_path.as_ref().ok_or_else(|| {
                             migration_error("lineage target is missing its staged path")
@@ -632,8 +643,18 @@ impl LocalThreadStore {
                             ),
                         ));
                     }
+                    limiter.phase_progress(
+                        index.saturating_add(1) as u64,
+                        journal.targets.len() as u64,
+                        codex_rollout::RolloutMaintenanceProgressUnit::Segments,
+                    );
                 }
             }
+            limiter.phase_progress(
+                journal.targets.len() as u64,
+                journal.targets.len() as u64,
+                codex_rollout::RolloutMaintenanceProgressUnit::Segments,
+            );
             with_failure_reason(
                 journal.advance(LineageMigrationPhase::ProjectionDurable),
                 InterruptedMigrationRecoveryFailed,
@@ -654,6 +675,7 @@ impl LocalThreadStore {
             InterruptedMigrationRecoveryFailed,
         )?;
         if journal.phase == LineageMigrationPhase::ProjectionDurable {
+            limiter.phase(codex_rollout::RolloutMaintenancePhase::Publishing);
             let started = Instant::now();
             with_failure_reason(journal.verify_sources().await, RolloutReadFailed)?;
             let state_db = self.state_db.as_ref().ok_or_else(|| {
@@ -735,6 +757,7 @@ impl LocalThreadStore {
         }
 
         if journal.phase == LineageMigrationPhase::Selected {
+            limiter.phase(codex_rollout::RolloutMaintenancePhase::Verifying);
             let started = Instant::now();
             with_failure_reason(
                 verify_published_lineage_targets(&journal, &selected_target_path).await,

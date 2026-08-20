@@ -9,6 +9,7 @@ use serde_json::json;
 
 use super::DecodeMode;
 use super::TurnContextCache;
+use crate::local::rollout_migration::RolloutMigrationRateLimiter;
 use crate::local::rollout_migration::line_parser;
 use crate::local::rollout_migration::lineage::plan_legacy_lineage;
 use crate::local::rollout_migration::lineage_stage::stage_legacy_lineage;
@@ -155,12 +156,22 @@ async fn cached_staging_matches_uncached_rollback_and_generated_item_coordinates
         .expect("source plan");
     let cached_root = tempfile::tempdir().expect("cached staging");
     let reference_root = tempfile::tempdir().expect("uncached staging");
-    let cached = stage_legacy_lineage(&plan, cached_root.path())
-        .await
-        .expect("cached staging");
-    let reference = stage_legacy_lineage_without_context_cache(&plan, reference_root.path())
-        .await
-        .expect("uncached staging");
+    let cached = stage_legacy_lineage(
+        &plan,
+        cached_root.path(),
+        &mut RolloutMigrationRateLimiter::new(/*max_mib_per_second*/ None)
+            .expect("migration limiter"),
+    )
+    .await
+    .expect("cached staging");
+    let reference = stage_legacy_lineage_without_context_cache(
+        &plan,
+        reference_root.path(),
+        &mut RolloutMigrationRateLimiter::new(/*max_mib_per_second*/ None)
+            .expect("migration limiter"),
+    )
+    .await
+    .expect("uncached staging");
     assert_eq!(cached.len(), reference.len());
     for (mut actual, expected) in cached.into_iter().zip(reference) {
         assert_eq!(

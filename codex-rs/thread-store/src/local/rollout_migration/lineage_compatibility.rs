@@ -24,6 +24,7 @@ use codex_protocol::protocol::DEFAULT_ROLLOUT_REFERENCE_DEPTH;
 use codex_protocol::protocol::ThreadHistoryMode;
 use codex_rollout::RolloutItem;
 
+use super::RolloutMigrationRateLimiter;
 use super::canonical_projection::project_canonical_record;
 use super::jsonl_spans::JsonlSpanKind;
 use super::lineage::LegacyLineageMigrationPlan;
@@ -36,9 +37,10 @@ use crate::ThreadStoreResult;
 pub(super) async fn validate_bounded_desktop_history(
     codex_home: &Path,
     plan: &mut LegacyLineageMigrationPlan,
+    limiter: &mut RolloutMigrationRateLimiter,
 ) -> ThreadStoreResult<()> {
     let stage = tempfile::tempdir().map_err(migration_error)?;
-    stage_compatible_lineage(codex_home, plan, stage.path()).await?;
+    stage_compatible_lineage(codex_home, plan, stage.path(), limiter).await?;
     Ok(())
 }
 
@@ -48,6 +50,7 @@ pub(super) async fn stage_compatible_lineage(
     codex_home: &Path,
     plan: &mut LegacyLineageMigrationPlan,
     stage_root: &Path,
+    limiter: &mut RolloutMigrationRateLimiter,
 ) -> ThreadStoreResult<Vec<StagedLineageTarget>> {
     // Derive the remap from original generated IDs even when a caller reuses a validated plan.
     plan.synthetic_item_id_remap.clear();
@@ -56,12 +59,13 @@ pub(super) async fn stage_compatible_lineage(
         .iter()
         .all(|source| source.history_mode == ThreadHistoryMode::Paginated)
     {
-        return stage_legacy_lineage(plan, stage_root).await;
+        return stage_legacy_lineage(plan, stage_root, limiter).await;
     }
     let removed_turn_ids = if plan.replay_native_rollbacks {
         super::lineage_stage::build_rollback_plan(
             plan,
             &mut super::turn_context_cache::TurnContextCache::default(),
+            &mut |bytes| limiter.reporter.observe_io(bytes),
         )
         .await?
         .map(|plan| plan.removed_turn_ids().clone())
@@ -94,7 +98,7 @@ pub(super) async fn stage_compatible_lineage(
         .flat_map(|turn| turn.items.iter().map(|item| item.id().to_string()))
         .collect::<HashSet<_>>();
 
-    let mut staged = stage_legacy_lineage(plan, stage_root).await?;
+    let mut staged = stage_legacy_lineage(plan, stage_root, limiter).await?;
     let mut canonical = canonical_turns_from_rollouts(
         staged_paths(staged.as_slice()).as_slice(),
         &retained_turn_ids,

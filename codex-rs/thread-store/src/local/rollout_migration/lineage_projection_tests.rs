@@ -36,9 +36,14 @@ async fn bulk_lineage_projection_checks_phase_budget_and_authenticated_coordinat
         .await
         .expect("plan source");
     let stage = tempfile::tempdir().expect("private stage");
-    let staged = stage_legacy_lineage(&plan, stage.path())
-        .await
-        .expect("canonical targets");
+    let staged = stage_legacy_lineage(
+        &plan,
+        stage.path(),
+        &mut super::RolloutMigrationRateLimiter::new(/*max_mib_per_second*/ None)
+            .expect("migration limiter"),
+    )
+    .await
+    .expect("canonical targets");
     let store = indexed_store(home.path()).await;
     let mut journal = LineageMigrationJournal::from_plan(&plan);
     let mut limiter =
@@ -181,7 +186,9 @@ async fn realtime_only_lineage_projection_preserves_payloads_budget_and_subagent
             .await
             .expect("plan source");
         let stage = tempfile::tempdir().expect("private stage");
-        let mut staged = stage_legacy_lineage(&plan, stage.path())
+        let mut limiter = RolloutMigrationRateLimiter::new(/*max_mib_per_second*/ None)
+            .expect("unlimited migration");
+        let mut staged = stage_legacy_lineage(&plan, stage.path(), &mut limiter)
             .await
             .expect("canonical target");
         if let Some(boundary) = boundary {
@@ -206,8 +213,6 @@ async fn realtime_only_lineage_projection_preserves_payloads_budget_and_subagent
             .expect("root eligibility");
         assert_eq!(complete_root, boundary.is_none().then_some(target));
         let store = indexed_store(home.path()).await;
-        let mut limiter = RolloutMigrationRateLimiter::new(/*max_mib_per_second*/ None)
-            .expect("unlimited migration");
         let fits_zero_budget = try_project_staged_targets(
             &store,
             &journal,

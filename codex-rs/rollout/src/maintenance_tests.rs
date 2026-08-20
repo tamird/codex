@@ -435,6 +435,11 @@ fn independent_migrations_overlap_but_shared_ancestors_and_capacity_do_not() -> 
             owner: Some(first_activity),
         }
     );
+    assert_eq!(
+        read_rollout_maintenance_exclusive_status(home.path())?,
+        RolloutMaintenanceStatus::Idle,
+        "an independent slot owner is not necessarily the dependency blocker"
+    );
     assert!(try_acquire_rollout_migration_dependency_lock(home.path(), &[unrelated])?.is_none());
     assert!(try_acquire_rollout_maintenance_job_lock(home.path())?.is_none());
     assert!(try_acquire_rollout_maintenance_lock(home.path())?.is_none());

@@ -523,6 +523,8 @@ async fn mixed_rollback_case(
                 home.path(),
                 &mut plan,
                 &journal_path.with_extension("staging"),
+                &mut super::RolloutMigrationRateLimiter::new(/*max_mib_per_second*/ None)
+                    .expect("migration limiter"),
             )
             .await
             .expect("stage old bytes");

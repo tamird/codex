@@ -341,18 +341,29 @@ async fn benchmark_supplied_lineage_staging() {
     );
     let stage = tempfile::tempdir().expect("private staging directory");
     let started = Instant::now();
-    let first = stage_legacy_lineage(&plan, stage.path())
-        .await
-        .expect("stage supplied lineage");
+    let first = stage_legacy_lineage(
+        &plan,
+        stage.path(),
+        &mut super::RolloutMigrationRateLimiter::new(/*max_mib_per_second*/ None)
+            .expect("migration limiter"),
+    )
+    .await
+    .expect("stage supplied lineage");
     eprintln!(
         "stage_once_ms={} bytes={}",
         started.elapsed().as_millis(),
         first.iter().map(|target| target.byte_count).sum::<u64>()
     );
     let started = Instant::now();
-    let compatible = stage_compatible_lineage(&home, &mut plan, stage.path())
-        .await
-        .expect("stage compatible supplied lineage");
+    let compatible = stage_compatible_lineage(
+        &home,
+        &mut plan,
+        stage.path(),
+        &mut super::RolloutMigrationRateLimiter::new(/*max_mib_per_second*/ None)
+            .expect("migration limiter"),
+    )
+    .await
+    .expect("stage compatible supplied lineage");
     eprintln!(
         "stage_compatible_ms={} remapped_ids={} bytes={}",
         started.elapsed().as_millis(),
@@ -369,9 +380,14 @@ async fn benchmark_supplied_lineage_staging() {
     );
     let reference_root = tempfile::tempdir().expect("reference staging directory");
     let started = Instant::now();
-    let reference = stage_legacy_lineage_without_context_cache(&plan, reference_root.path())
-        .await
-        .expect("uncached full replay with remap");
+    let reference = stage_legacy_lineage_without_context_cache(
+        &plan,
+        reference_root.path(),
+        &mut super::RolloutMigrationRateLimiter::new(/*max_mib_per_second*/ None)
+            .expect("migration limiter"),
+    )
+    .await
+    .expect("uncached full replay with remap");
     eprintln!("reference_replay_ms={}", started.elapsed().as_millis());
     for (actual, expected) in compatible.iter().zip(&reference) {
         assert_eq!(
