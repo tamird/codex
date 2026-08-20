@@ -17,6 +17,8 @@ use serde::Serialize;
 use serde_json::Value as JsonValue;
 use uuid::Uuid;
 
+use crate::code_mode_notification::CodeModeNotificationOrigins;
+use crate::code_mode_notification::trace_request_with_notifications;
 use crate::model::AgentThreadId;
 use crate::model::CodexTurnId;
 use crate::model::InferenceCallId;
@@ -51,6 +53,7 @@ struct EnabledInferenceTraceContext {
     codex_turn_id: CodexTurnId,
     model: String,
     provider_name: String,
+    code_mode_notifications: CodeModeNotificationOrigins,
 }
 
 /// One concrete upstream request attempt.
@@ -114,8 +117,17 @@ impl InferenceTraceContext {
                 codex_turn_id,
                 model,
                 provider_name,
+                code_mode_notifications: CodeModeNotificationOrigins::new(),
             }),
         }
+    }
+
+    /// Supplies trusted notification provenance for trace copies of this prompt.
+    pub fn with_code_mode_notifications(mut self, origins: CodeModeNotificationOrigins) -> Self {
+        if let InferenceTraceContextState::Enabled(context) = &mut self.state {
+            context.code_mode_notifications = origins;
+        }
+        self
     }
 
     /// Starts a new attempt after the concrete provider request has been built.
@@ -175,11 +187,24 @@ impl InferenceTraceAttempt {
         let InferenceTraceAttemptState::Enabled(attempt) = &self.state else {
             return;
         };
-        let Some(request_payload) = write_json_payload_best_effort(
-            &attempt.context.writer,
-            RawPayloadKind::InferenceRequest,
-            request,
-        ) else {
+        let request_payload = if attempt.context.code_mode_notifications.is_empty() {
+            write_json_payload_best_effort(
+                &attempt.context.writer,
+                RawPayloadKind::InferenceRequest,
+                request,
+            )
+        } else {
+            trace_request_with_notifications(request, &attempt.context.code_mode_notifications)
+                .ok()
+                .and_then(|request| {
+                    write_json_payload_best_effort(
+                        &attempt.context.writer,
+                        RawPayloadKind::InferenceRequest,
+                        &request,
+                    )
+                })
+        };
+        let Some(request_payload) = request_payload else {
             return;
         };
 

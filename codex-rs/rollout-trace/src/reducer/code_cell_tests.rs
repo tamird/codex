@@ -2,6 +2,10 @@ use pretty_assertions::assert_eq;
 use serde_json::json;
 use tempfile::TempDir;
 
+use crate::CodeModeNotificationOrigin;
+use crate::CodeModeNotificationOrigins;
+use crate::CompactionCheckpointTracePayload;
+use crate::code_mode_notification::trace_request_with_notifications;
 use crate::model::CodeCellRuntimeStatus;
 use crate::model::ConversationItemKind;
 use crate::model::ExecutionStatus;
@@ -11,13 +15,176 @@ use crate::model::ToolCallSummary;
 use crate::payload::RawPayloadKind;
 use crate::raw_event::RawToolCallRequester;
 use crate::raw_event::RawTraceEventPayload;
+use crate::reducer::test_support::append_inference_start;
 use crate::reducer::test_support::create_started_writer;
+use crate::reducer::test_support::expect_replay_error;
 use crate::reducer::test_support::message;
 use crate::reducer::test_support::start_turn;
 use crate::reducer::test_support::start_turn_for_thread;
 use crate::reducer::test_support::trace_context;
 use crate::reducer::test_support::trace_context_for_thread;
 use crate::replay_bundle;
+
+#[test]
+fn notifications_keep_trusted_identity_across_compaction() -> anyhow::Result<()> {
+    let temp = TempDir::new()?;
+    let writer = create_started_writer(&temp)?;
+    start_turn(&writer, "turn-1")?;
+    let origins = ["ctco_first", "ctco_second"].map(|source_item_id| CodeModeNotificationOrigin {
+        source_item_id: source_item_id.to_string(),
+        call_id: "call-code".to_string(),
+        cell_id: "1".to_string(),
+    });
+    let raw_origins = origins
+        .iter()
+        .cloned()
+        .map(|origin| (origin.source_item_id.clone(), origin))
+        .collect::<CodeModeNotificationOrigins>();
+    let mut plain = message("user", "notification text");
+    plain["id"] = json!("msg_plain");
+    let source = json!({
+        "type": "custom_tool_call", "name": "exec", "call_id": "call-code",
+        "input": "notify('progress')"
+    });
+    let outputs = [
+        ("ctco_first", "first progress"),
+        ("ctco_final", "complete"),
+        ("ctco_second", "second progress"),
+    ]
+    .map(|(id, output)| {
+        json!({
+            "type": "custom_tool_call_output", "id": id,
+            "call_id": "call-code", "output": output,
+        })
+    });
+    writer.append_with_context(
+        trace_context("turn-1"),
+        RawTraceEventPayload::CodeCellStarted {
+            runtime_cell_id: "1".to_string(),
+            model_visible_call_id: "call-code".to_string(),
+            source_js: "notify('progress')".to_string(),
+        },
+    )?;
+    let input = vec![
+        plain.clone(),
+        source,
+        outputs[0].clone(),
+        outputs[1].clone(),
+        outputs[2].clone(),
+    ];
+    let request = writer.write_json_payload(
+        RawPayloadKind::InferenceRequest,
+        &trace_request_with_notifications(&json!({ "input": input }), &raw_origins)?,
+    )?;
+    append_inference_start(&writer, "inference-before", "turn-1", request)?;
+
+    let mut input_history = input
+        .into_iter()
+        .map(serde_json::from_value)
+        .collect::<Result<Vec<codex_protocol::models::ResponseItem>, _>>()?;
+    if let Some(codex_protocol::models::ResponseItem::CustomToolCallOutput { output, .. }) =
+        input_history.get_mut(2)
+    {
+        *output = codex_protocol::models::FunctionCallOutputPayload::from_text(
+            "truncated progress".to_string(),
+        );
+    }
+    let replacement_history = vec![serde_json::from_value(plain.clone())?];
+    let checkpoint = writer.write_json_payload(
+        RawPayloadKind::CompactionCheckpoint,
+        &CompactionCheckpointTracePayload {
+            input_history: &input_history,
+            replacement_history: &replacement_history,
+            input_code_mode_notifications: &raw_origins,
+            replacement_code_mode_notifications: &CodeModeNotificationOrigins::new(),
+        },
+    )?;
+    writer.append_with_context(
+        trace_context("turn-1"),
+        RawTraceEventPayload::CompactionInstalled {
+            compaction_id: "compaction-1".to_string(),
+            checkpoint_payload: checkpoint,
+        },
+    )?;
+
+    let projections = ["msg_first", "msg_second"].map(|id| {
+        let mut item = plain.clone();
+        item["id"] = json!(id);
+        item
+    });
+    let projected_origins = ["msg_first", "msg_second"]
+        .into_iter()
+        .zip(origins)
+        .map(|(id, origin)| (id.to_string(), origin))
+        .chain(std::iter::once((
+            "msg_absent".to_string(),
+            raw_origins["ctco_first"].clone(),
+        )))
+        .collect::<CodeModeNotificationOrigins>();
+    let projected_request = trace_request_with_notifications(
+        &json!({ "input": [plain, projections[0], projections[1]] }),
+        &projected_origins,
+    )?;
+    assert!(
+        projected_request["_codex_code_mode_notifications"]
+            .get("msg_absent")
+            .is_none()
+    );
+    for inference_id in ["inference-after", "inference-retry"] {
+        let request =
+            writer.write_json_payload(RawPayloadKind::InferenceRequest, &projected_request)?;
+        append_inference_start(&writer, inference_id, "turn-1", request)?;
+    }
+
+    let rollout = replay_bundle(temp.path())?;
+    let before = &rollout.inference_calls["inference-before"].request_item_ids;
+    let after = &rollout.inference_calls["inference-after"].request_item_ids;
+    let compacted = &rollout.compactions["compaction-1"].input_item_ids;
+    assert_eq!(
+        after,
+        &rollout.inference_calls["inference-retry"].request_item_ids
+    );
+    let code_cell_id = test_reduced_code_cell_id("call-code");
+    assert_eq!(
+        rollout.code_cells[&code_cell_id].output_item_ids,
+        vec![
+            before[2].clone(),
+            before[3].clone(),
+            before[4].clone(),
+            compacted[2].clone(),
+            after[1].clone(),
+            after[2].clone(),
+        ]
+    );
+    assert_ne!(after[0], after[1]);
+    assert_ne!(after[1], after[2]);
+    let producer = ProducerRef::CodeCell { code_cell_id };
+    assert!(
+        !rollout.conversation_items[&after[0]]
+            .produced_by
+            .contains(&producer)
+    );
+    for item_id in &after[1..] {
+        let item = &rollout.conversation_items[item_id];
+        assert_eq!(
+            (&item.kind, &item.call_id, &item.produced_by),
+            (
+                &ConversationItemKind::Message,
+                &None,
+                &vec![producer.clone()],
+            )
+        );
+    }
+
+    let invalid = writer.write_json_payload(RawPayloadKind::InferenceRequest, &json!({
+        "input": [{"type": "custom_tool_call_output", "call_id": "call-code", "output": "untrusted extra output"}]
+    }))?;
+    append_inference_start(&writer, "inference-invalid", "turn-1", invalid)?;
+    expect_replay_error(
+        &temp,
+        "model-visible call id call-code was reused with different content",
+    )
+}
 
 #[test]
 fn code_cell_lifecycle_links_nested_tools_waits_and_outputs() -> anyhow::Result<()> {

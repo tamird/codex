@@ -8,6 +8,7 @@
 
 mod bundle;
 mod code_cell;
+mod code_mode_notification;
 mod compaction;
 mod inference;
 mod mcp;
@@ -24,6 +25,10 @@ mod writer;
 pub use bundle::REDUCED_STATE_FILE_NAME;
 /// No-op-capable handle for recording one code-mode runtime cell.
 pub use code_cell::CodeCellTraceContext;
+/// Trusted trace-only origin of one model-visible code-mode notification.
+pub use code_mode_notification::CodeModeNotificationOrigin;
+/// Notification origins indexed by model-visible Responses item ID.
+pub use code_mode_notification::CodeModeNotificationOrigins;
 /// Raw checkpoint payload for a remote compaction install event.
 pub use compaction::CompactionCheckpointTracePayload;
 /// No-op-capable handle for recording remote-compaction requests.

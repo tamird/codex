@@ -354,6 +354,8 @@ async fn run_remote_compact_task_inner_impl(
         compaction_trace.record_installed(&CompactionCheckpointTracePayload {
             input_history: trace_input_history,
             replacement_history: &replacement_history,
+            input_code_mode_notifications: &Default::default(),
+            replacement_code_mode_notifications: &Default::default(),
         });
     }
     sess.replace_compacted_history(

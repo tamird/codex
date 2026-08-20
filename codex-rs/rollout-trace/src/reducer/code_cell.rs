@@ -205,6 +205,14 @@ impl TraceReducer {
         for item_id in output_item_ids {
             self.add_code_cell_output_item(&started.code_cell_id, &item_id)?;
         }
+        let call_id = self
+            .rollout
+            .code_cells
+            .get(&started.code_cell_id)
+            .context("newly inserted code cell disappeared")?
+            .model_visible_call_id
+            .clone();
+        self.attach_existing_code_mode_notifications(&thread_id, &call_id)?;
         self.flush_pending_code_cell_lifecycle_events(&started.code_cell_id)?;
 
         Ok(())
@@ -693,7 +701,11 @@ impl TraceReducer {
         })
     }
 
-    fn add_code_cell_output_item(&mut self, code_cell_id: &str, item_id: &str) -> Result<()> {
+    pub(super) fn add_code_cell_output_item(
+        &mut self,
+        code_cell_id: &str,
+        item_id: &str,
+    ) -> Result<()> {
         let Some(cell) = self.rollout.code_cells.get_mut(code_cell_id) else {
             bail!("code cell {code_cell_id} disappeared during output linking");
         };

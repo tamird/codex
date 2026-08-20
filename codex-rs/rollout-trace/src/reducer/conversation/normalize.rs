@@ -7,6 +7,8 @@ use codex_protocol::models::AgentMessageInputContent;
 use codex_protocol::models::ResponseItem;
 use serde_json::Value;
 
+use crate::code_mode_notification::CodeModeNotificationOrigin;
+use crate::code_mode_notification::CodeModeNotificationOrigins;
 use crate::model::AgentMessageMetadata;
 use crate::model::ConversationBody;
 use crate::model::ConversationChannel;
@@ -29,12 +31,24 @@ pub(super) struct NormalizedConversationItem {
     pub(super) agent_message: Option<AgentMessageMetadata>,
     pub(super) body: ConversationBody,
     pub(super) call_id: Option<String>,
+    pub(super) code_mode_notification: Option<CodeModeNotificationOrigin>,
 }
 
 pub(super) fn normalize_model_items(
     items: &[Value],
     raw_payload: &RawPayloadRef,
+    notification_origins: Option<&Value>,
 ) -> Result<Vec<NormalizedConversationItem>> {
+    let notification_origins: CodeModeNotificationOrigins = notification_origins
+        .map(|origins| serde_json::from_value(origins.clone()))
+        .transpose()
+        .with_context(|| {
+            format!(
+                "invalid notification origins in {}",
+                raw_payload.raw_payload_id
+            )
+        })?
+        .unwrap_or_default();
     let mut normalized_items = Vec::new();
     for item in items {
         if item.get("type").and_then(Value::as_str) == Some("additional_tools") {
@@ -45,7 +59,34 @@ pub(super) fn normalize_model_items(
         if let Some(object) = model_visible_item.as_object_mut() {
             object.remove("internal_chat_message_metadata_passthrough");
         }
-        normalized_items.push(normalize_model_item(&model_visible_item, raw_payload)?);
+        let mut normalized = normalize_model_item(&model_visible_item, raw_payload)?;
+        if let Some(origin) = item
+            .get("id")
+            .and_then(Value::as_str)
+            .and_then(|id| notification_origins.get(id))
+        {
+            let valid_item = match (&normalized.kind, &normalized.role) {
+                (ConversationItemKind::Message, ConversationRole::User) => true,
+                (ConversationItemKind::CustomToolCallOutput, _) => {
+                    normalized.call_id.as_deref() == Some(origin.call_id.as_str())
+                        && item.get("id").and_then(Value::as_str)
+                            == Some(origin.source_item_id.as_str())
+                }
+                _ => false,
+            };
+            if !valid_item
+                || origin.source_item_id.is_empty()
+                || origin.call_id.is_empty()
+                || origin.cell_id.is_empty()
+            {
+                bail!(
+                    "invalid code-mode notification origin in {}",
+                    raw_payload.raw_payload_id
+                );
+            }
+            normalized.code_mode_notification = Some(origin.clone());
+        }
+        normalized_items.push(normalized);
     }
     Ok(normalized_items)
 }
@@ -79,6 +120,7 @@ fn normalize_model_item(
             channel: Some(ConversationChannel::Commentary),
             kind: ConversationItemKind::FunctionCall,
             agent_message: None,
+            code_mode_notification: None,
             body: raw_text_or_json_body(item.get("arguments"), raw_payload),
             call_id: item
                 .get("call_id")
@@ -90,6 +132,7 @@ fn normalize_model_item(
             channel: Some(ConversationChannel::Commentary),
             kind: ConversationItemKind::FunctionCallOutput,
             agent_message: None,
+            code_mode_notification: None,
             body: tool_output_body(item.get("output"), raw_payload),
             call_id: item
                 .get("call_id")
@@ -101,6 +144,7 @@ fn normalize_model_item(
             channel: Some(ConversationChannel::Commentary),
             kind: ConversationItemKind::CustomToolCall,
             agent_message: None,
+            code_mode_notification: None,
             body: custom_tool_call_body(item, raw_payload),
             call_id: item
                 .get("call_id")
@@ -112,6 +156,7 @@ fn normalize_model_item(
             channel: Some(ConversationChannel::Commentary),
             kind: ConversationItemKind::CustomToolCallOutput,
             agent_message: None,
+            code_mode_notification: None,
             body: tool_output_body(item.get("output"), raw_payload),
             call_id: item
                 .get("call_id")
@@ -124,6 +169,7 @@ fn normalize_model_item(
                 channel: Some(ConversationChannel::Commentary),
                 kind: ConversationItemKind::FunctionCall,
                 agent_message: None,
+                code_mode_notification: None,
                 body: json_body(item, raw_payload),
                 call_id: item
                     .get("call_id")
@@ -136,6 +182,7 @@ fn normalize_model_item(
             channel: Some(ConversationChannel::Commentary),
             kind: ConversationItemKind::FunctionCallOutput,
             agent_message: None,
+            code_mode_notification: None,
             body: json_body(item, raw_payload),
             call_id: item
                 .get("call_id")
@@ -148,6 +195,7 @@ fn normalize_model_item(
                 channel: Some(ConversationChannel::Summary),
                 kind: ConversationItemKind::Message,
                 agent_message: None,
+                code_mode_notification: None,
                 body: compaction_body(item, raw_payload)?,
                 call_id: None,
             })
@@ -183,6 +231,7 @@ fn normalize_message_item(
             .and_then(channel_from_phase),
         kind: ConversationItemKind::Message,
         agent_message: None,
+        code_mode_notification: None,
         body: ConversationBody {
             parts: content_parts(item.get("content"), raw_payload),
         },
@@ -229,6 +278,7 @@ fn normalize_agent_message_item(
         channel: Some(ConversationChannel::Analysis),
         kind: ConversationItemKind::Message,
         agent_message: Some(AgentMessageMetadata { author, recipient }),
+        code_mode_notification: None,
         body: ConversationBody { parts },
         call_id: None,
     })
@@ -285,6 +335,7 @@ fn normalize_reasoning_item(
         channel: Some(ConversationChannel::Analysis),
         kind: ConversationItemKind::Reasoning,
         agent_message: None,
+        code_mode_notification: None,
         body: ConversationBody { parts },
         call_id: None,
     })

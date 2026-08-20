@@ -16,6 +16,7 @@ use crate::bundle::MANIFEST_FILE_NAME;
 use crate::bundle::RAW_EVENT_LOG_FILE_NAME;
 use crate::bundle::REDUCED_TRACE_SCHEMA_VERSION;
 use crate::bundle::TraceBundleManifest;
+use crate::code_mode_notification::CodeModeNotificationOrigin;
 use crate::model::ExecutionStatus;
 use crate::model::RolloutTrace;
 use crate::payload::RawPayloadRef;
@@ -23,6 +24,7 @@ use crate::raw_event::RawTraceEvent;
 use crate::raw_event::RawTraceEventPayload;
 
 mod code_cell;
+mod code_mode_notifications;
 mod compaction;
 mod conversation;
 mod inference;
@@ -58,6 +60,7 @@ pub fn replay_bundle(bundle_dir: impl AsRef<Path>) -> Result<RolloutTrace> {
         next_conversation_item_ordinal: 1,
         next_terminal_operation_ordinal: 1,
         thread_conversation_snapshots: BTreeMap::new(),
+        code_mode_notifications: BTreeMap::new(),
         pending_compaction_replacement_item_ids: BTreeMap::new(),
         code_cell_ids_by_runtime: BTreeMap::new(),
         pending_code_cell_starts: BTreeMap::new(),
@@ -97,6 +100,8 @@ struct TraceReducer {
     /// when the same normalized item appears at the same position; identical
     /// content at a new position must remain a distinct conversation item.
     thread_conversation_snapshots: BTreeMap<String, Vec<String>>,
+    /// Trusted origins indexed by reduced conversation item, including projected messages.
+    code_mode_notifications: BTreeMap<String, CodeModeNotificationOrigin>,
     /// Replacement snapshot installed by compaction but not yet seen in a sampling request.
     ///
     /// The first full request after compaction should compare against the installed replacement

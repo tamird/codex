@@ -15,6 +15,7 @@ use serde::Serialize;
 use serde_json::Value as JsonValue;
 use tracing::warn;
 
+use crate::code_mode_notification::CodeModeNotificationOrigins;
 use crate::inference::trace_response_item_json;
 use crate::model::AgentThreadId;
 use crate::model::CodexTurnId;
@@ -84,6 +85,10 @@ struct TracedCompactionCompleted {
 pub struct CompactionCheckpointTracePayload<'a> {
     pub input_history: &'a [ResponseItem],
     pub replacement_history: &'a [ResponseItem],
+    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub input_code_mode_notifications: &'a CodeModeNotificationOrigins,
+    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub replacement_code_mode_notifications: &'a CodeModeNotificationOrigins,
 }
 
 impl CompactionTraceContext {

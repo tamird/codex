@@ -13,6 +13,7 @@ use serde_json::Value;
 
 use self::normalize::NormalizedConversationItem;
 use super::TraceReducer;
+use crate::code_mode_notification::INFERENCE_NOTIFICATIONS_FIELD;
 use crate::model::CompactionId;
 use crate::model::ConversationBody;
 use crate::model::ConversationItem;
@@ -53,7 +54,11 @@ impl TraceReducer {
             );
         };
 
-        let items = normalize::normalize_model_items(request_items, request_payload)?;
+        let items = normalize::normalize_model_items(
+            request_items,
+            request_payload,
+            payload.get(INFERENCE_NOTIFICATIONS_FIELD),
+        )?;
 
         let previous_response_id = payload.get("previous_response_id").and_then(Value::as_str);
         // After compaction, the next full request is compared against the installed replacement
@@ -152,7 +157,11 @@ impl TraceReducer {
             bail!("inference response referenced unknown call {inference_call_id}");
         };
 
-        let items = normalize::normalize_model_items(output_items, response_payload)?;
+        let items = normalize::normalize_model_items(
+            output_items,
+            response_payload,
+            /*notification_origins*/ None,
+        )?;
         // Response output is appended immediately: it was produced by the model,
         // so it is conversation even before a later request carries it forward.
         let append_at = self
@@ -268,6 +277,9 @@ impl TraceReducer {
                 tool_link_item.call_id.as_deref(),
                 &tool_link_item.kind,
             )?;
+            if let Some(origin) = &tool_link_item.code_mode_notification {
+                self.attach_code_mode_notification_item(&item_id, origin)?;
+            }
             self.resolve_pending_agent_edges_for_item(&item_id)?;
             item_ids.push(item_id);
         }
@@ -293,9 +305,16 @@ impl TraceReducer {
         let replacement_history =
             required_array(&payload, "replacement_history", checkpoint_payload)?;
 
-        let input_items = normalize::normalize_model_items(input_history, checkpoint_payload)?;
-        let replacement_items =
-            normalize::normalize_model_items(replacement_history, checkpoint_payload)?;
+        let input_items = normalize::normalize_model_items(
+            input_history,
+            checkpoint_payload,
+            payload.get("input_code_mode_notifications"),
+        )?;
+        let replacement_items = normalize::normalize_model_items(
+            replacement_history,
+            checkpoint_payload,
+            payload.get("replacement_code_mode_notifications"),
+        )?;
         let input_candidates = self
             .thread_conversation_snapshots
             .get(thread_id)
@@ -327,6 +346,7 @@ impl TraceReducer {
                 // empty so transcript renderers cannot mistake the boundary for prompt content.
                 body: ConversationBody { parts: Vec::new() },
                 call_id: None,
+                code_mode_notification: None,
             },
             vec![ProducerRef::Compaction {
                 compaction_id: compaction_id.clone(),
@@ -393,6 +413,9 @@ impl TraceReducer {
                 tool_link_item.call_id.as_deref(),
                 &tool_link_item.kind,
             )?;
+            if let Some(origin) = &tool_link_item.code_mode_notification {
+                self.attach_code_mode_notification_item(&item_id, origin)?;
+            }
             self.resolve_pending_agent_edges_for_item(&item_id)?;
             item_ids.push(item_id);
         }
@@ -410,6 +433,9 @@ impl TraceReducer {
         produced_by: Vec<ProducerRef>,
     ) -> String {
         let item_id = self.next_conversation_item_id();
+        if let Some(origin) = item.code_mode_notification {
+            self.code_mode_notifications.insert(item_id.clone(), origin);
+        }
         self.rollout.conversation_items.insert(
             item_id.clone(),
             ConversationItem {
@@ -491,6 +517,11 @@ impl TraceReducer {
                 && item.call_id.as_deref() == Some(call_id)
                 && item.kind == normalized.kind
                 && !conversation_item_matches(item, normalized)
+                && !(normalized.kind == ConversationItemKind::CustomToolCallOutput
+                    && self.distinct_notification_output(
+                        &item.item_id,
+                        normalized.code_mode_notification.as_ref(),
+                    ))
             {
                 bail!("model-visible call id {call_id} was reused with different content");
             }
@@ -502,7 +533,8 @@ impl TraceReducer {
         let Some(item) = self.rollout.conversation_items.get(item_id) else {
             return false;
         };
-        conversation_item_matches(item, normalized)
+        self.notification_identity_matches(item_id, normalized.code_mode_notification.as_ref())
+            && conversation_item_matches(item, normalized)
     }
 
     fn next_conversation_item_id(&mut self) -> String {

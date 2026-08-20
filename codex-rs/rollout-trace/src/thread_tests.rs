@@ -150,6 +150,8 @@ fn disabled_thread_context_accepts_trace_calls_without_writing() -> anyhow::Resu
     compaction_trace.record_installed(&CompactionCheckpointTracePayload {
         input_history: &[],
         replacement_history: &[],
+        input_code_mode_notifications: &crate::CodeModeNotificationOrigins::new(),
+        replacement_code_mode_notifications: &crate::CodeModeNotificationOrigins::new(),
     });
 
     let built_dispatch_invocation = Cell::new(false);
