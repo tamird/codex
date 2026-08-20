@@ -10,6 +10,8 @@ use codex_app_server_protocol::ClientResponsePayload;
 use codex_app_server_protocol::JSONRPCErrorError;
 use codex_app_server_protocol::RequestId;
 use codex_app_server_protocol::Result;
+use codex_app_server_protocol::RolloutMaintenanceRequestStatus;
+use codex_app_server_protocol::RolloutMaintenanceStatusChangedNotification;
 use codex_app_server_protocol::ServerNotification;
 use codex_app_server_protocol::ServerNotificationEnvelope;
 use codex_app_server_protocol::ServerRequest;
@@ -56,6 +58,7 @@ pub(crate) struct ConnectionRequestId {
 #[derive(Clone)]
 pub(crate) struct RequestContext {
     request_id: ConnectionRequestId,
+    incarnation: Arc<()>,
     span: Span,
     parent_trace: Option<W3cTraceContext>,
     _diagnostics_guard: Arc<GaugeGuard>,
@@ -69,6 +72,7 @@ impl RequestContext {
     ) -> Self {
         Self {
             request_id,
+            incarnation: Arc::new(()),
             span,
             parent_trace,
             _diagnostics_guard: Arc::new(IN_FLIGHT_REQUESTS.track()),
@@ -271,6 +275,39 @@ impl OutgoingMessageSender {
     ) -> Option<RequestContext> {
         let mut request_contexts = self.request_contexts.lock().await;
         request_contexts.remove(request_id)
+    }
+
+    /// Admit advisory progress only for this still-active request incarnation.
+    ///
+    /// The nonblocking enqueue stays under the same lock as response/error removal. Admitted
+    /// progress therefore precedes the final response, and a reused JSON-RPC ID cannot receive
+    /// an earlier request's delayed progress.
+    pub(crate) async fn try_send_rollout_maintenance_status(
+        &self,
+        context: &RequestContext,
+        status: RolloutMaintenanceRequestStatus,
+    ) -> bool {
+        let request_contexts = self.request_contexts.lock().await;
+        if !request_contexts
+            .get(&context.request_id)
+            .is_some_and(|active| Arc::ptr_eq(&active.incarnation, &context.incarnation))
+        {
+            return false;
+        }
+        self.sender
+            .try_send(OutgoingEnvelope::ToConnection {
+                connection_id: context.request_id.connection_id,
+                message: timestamped_server_notification(
+                    ServerNotification::RolloutMaintenanceStatusChanged(
+                        RolloutMaintenanceStatusChangedNotification::Request {
+                            request_id: context.request_id.request_id.clone(),
+                            status,
+                        },
+                    ),
+                ),
+                write_complete_tx: None,
+            })
+            .is_ok()
     }
 
     #[cfg(test)]
@@ -1132,6 +1169,135 @@ mod tests {
             .await;
 
         assert_eq!(outgoing.request_context_count().await, 0);
+    }
+
+    #[tokio::test]
+    async fn maintenance_progress_respects_request_incarnation_and_backpressure() {
+        let (tx, mut rx) = mpsc::channel::<OutgoingEnvelope>(/*buffer*/ 1);
+        let outgoing =
+            OutgoingMessageSender::new(tx, codex_analytics::AnalyticsEventsClient::disabled());
+        let request_id = ConnectionRequestId {
+            connection_id: ConnectionId(42),
+            request_id: RequestId::Integer(7),
+        };
+        let first = RequestContext::new(
+            request_id.clone(),
+            tracing::Span::none(),
+            /*parent_trace*/ None,
+        );
+        let first_status = RolloutMaintenanceRequestStatus::QueuedForMigration {
+            thread_id: "first".to_string(),
+        };
+        outgoing.register_request_context(first.clone()).await;
+        assert!(
+            outgoing
+                .try_send_rollout_maintenance_status(&first, first_status.clone())
+                .await
+        );
+        assert!(
+            !timeout(
+                Duration::from_secs(1),
+                outgoing.try_send_rollout_maintenance_status(
+                    &first,
+                    RolloutMaintenanceRequestStatus::Idle
+                ),
+            )
+            .await
+            .expect("advisory progress must not wait for queue capacity")
+        );
+
+        let response = outgoing.send_response(
+            request_id.clone(),
+            codex_app_server_protocol::ThreadArchiveResponse {},
+        );
+        tokio::pin!(response);
+        assert!(
+            timeout(Duration::from_millis(10), &mut response)
+                .await
+                .is_err()
+        );
+        assert_eq!(outgoing.request_context_count().await, 0);
+        assert!(
+            !outgoing
+                .try_send_rollout_maintenance_status(&first, first_status.clone())
+                .await
+        );
+
+        let maintenance = |envelope| match envelope {
+            OutgoingEnvelope::ToConnection {
+                connection_id,
+                message: OutgoingMessage::AppServerNotification(envelope),
+                ..
+            } => match envelope.notification {
+                ServerNotification::RolloutMaintenanceStatusChanged(status) => {
+                    (connection_id, status)
+                }
+                other => panic!("expected maintenance notification, got {other:?}"),
+            },
+            other => panic!("expected targeted notification, got {other:?}"),
+        };
+        assert_eq!(
+            maintenance(rx.recv().await.expect("first progress")),
+            (
+                request_id.connection_id,
+                RolloutMaintenanceStatusChangedNotification::Request {
+                    request_id: request_id.request_id.clone(),
+                    status: first_status,
+                }
+            ),
+        );
+        timeout(Duration::from_secs(1), &mut response)
+            .await
+            .expect("response can now enqueue");
+        assert!(
+            matches!(rx.recv().await, Some(OutgoingEnvelope::ToConnection {
+            message: OutgoingMessage::Response(response), ..
+        }) if response.id == request_id.request_id)
+        );
+
+        let second = RequestContext::new(
+            request_id.clone(),
+            tracing::Span::none(),
+            /*parent_trace*/ None,
+        );
+        let second_status = RolloutMaintenanceRequestStatus::QueuedForMigration {
+            thread_id: "second".to_string(),
+        };
+        outgoing.register_request_context(second.clone()).await;
+        assert!(
+            !outgoing
+                .try_send_rollout_maintenance_status(&first, RolloutMaintenanceRequestStatus::Idle)
+                .await
+        );
+        assert!(
+            outgoing
+                .try_send_rollout_maintenance_status(&second, second_status.clone())
+                .await
+        );
+        assert_eq!(
+            maintenance(rx.recv().await.expect("new request progress")),
+            (
+                request_id.connection_id,
+                RolloutMaintenanceStatusChangedNotification::Request {
+                    request_id: request_id.request_id.clone(),
+                    status: second_status,
+                }
+            ),
+        );
+        outgoing
+            .send_error(request_id.clone(), internal_error("done"))
+            .await;
+        assert!(
+            !outgoing
+                .try_send_rollout_maintenance_status(&second, RolloutMaintenanceRequestStatus::Idle)
+                .await
+        );
+        assert!(
+            matches!(rx.recv().await, Some(OutgoingEnvelope::ToConnection {
+            message: OutgoingMessage::Error(error), ..
+        }) if error.id == request_id.request_id)
+        );
+        assert!(rx.try_recv().is_err());
     }
 
     #[tokio::test]

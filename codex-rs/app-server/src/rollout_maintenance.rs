@@ -1,5 +1,6 @@
 //! Bounded app-server delivery of storage-owned maintenance status.
 
+use std::future::Future;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -11,13 +12,16 @@ use codex_app_server_protocol::RolloutMaintenanceStatusReadResponse;
 use codex_app_server_protocol::ServerNotification;
 use codex_rollout::RolloutMaintenanceRequestStatus;
 use codex_rollout::read_rollout_maintenance_status;
+use codex_rollout::with_rollout_maintenance_observer;
 use tokio::sync::Mutex;
+use tokio::sync::oneshot;
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
 use crate::error_code::internal_error;
 use crate::outgoing_message::ConnectionId;
 use crate::outgoing_message::OutgoingMessageSender;
+use crate::outgoing_message::RequestContext;
 
 pub(crate) struct RolloutMaintenanceProcessor {
     codex_home: PathBuf,
@@ -109,6 +113,49 @@ impl RolloutMaintenanceProcessor {
         }
     }
 
+    /// Observe the actual queued handler, not the task that merely enqueues it.
+    pub(crate) async fn observe_request<F: Future>(
+        &self,
+        request_context: RequestContext,
+        future: F,
+    ) -> F::Output {
+        let (updates, mut receiver) = watch::channel(RolloutMaintenanceRequestStatus::Idle);
+        let (finished, mut completion) = oneshot::channel();
+        let request = async {
+            let output = with_rollout_maintenance_observer(
+                Arc::new(move |status| {
+                    updates.send_replace(status);
+                }),
+                future,
+            )
+            .await;
+            let _ = finished.send(());
+            output
+        };
+        let forwarding = async {
+            let mut previous = RolloutMaintenanceRequestStatus::Idle;
+            loop {
+                tokio::select! {
+                    _ = &mut completion => {
+                        break;
+                    }
+                    changed = receiver.changed() => {
+                        if changed.is_err() {
+                            break;
+                        }
+                        let status = *receiver.borrow_and_update();
+                        if status != previous {
+                            previous = status;
+                            self.outgoing.try_send_rollout_maintenance_status(&request_context, status.into()).await;
+                        }
+                    }
+                }
+            }
+        };
+        // Outgoing backpressure must not stop the handler while it owns a storage lock.
+        let (output, ()) = tokio::join!(request, forwarding);
+        output
+    }
 }
 
 impl Drop for RolloutMaintenanceProcessor {

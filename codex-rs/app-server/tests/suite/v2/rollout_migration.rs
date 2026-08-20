@@ -6,6 +6,7 @@ use app_test_support::TestAppServer;
 use codex_app_server_protocol::ClientRequest;
 use codex_app_server_protocol::ExperimentalFeatureEnablementSetParams;
 use codex_app_server_protocol::ExperimentalFeatureEnablementSetResponse;
+use codex_app_server_protocol::RequestId;
 use codex_app_server_protocol::RolloutMaintenanceLockStatus;
 use codex_app_server_protocol::RolloutMaintenanceRequestStatus;
 use codex_app_server_protocol::RolloutMaintenanceSnapshot;
@@ -1137,6 +1138,33 @@ async fn automatic_migration_keeps_list_nonblocking_and_gates_resume() -> Result
             ..Default::default()
         })
         .await?;
+    let waiting_status = RolloutMaintenanceRequestStatus::WaitingForMaintenance {
+        thread_id: Some(thread.id.clone()),
+        owner: Some(owner.into()),
+    };
+    wait_for_maintenance_update(
+        &mut secondary,
+        RolloutMaintenanceStatusChangedNotification::Request {
+            request_id: RequestId::Integer(resume_id),
+            status: waiting_status.clone(),
+        },
+    )
+    .await?;
+    let status: RolloutMaintenanceStatusReadResponse = secondary
+        .request(|request_id| ClientRequest::RolloutMaintenanceStatusRead {
+            request_id,
+            params: None,
+        })
+        .await?;
+    assert_eq!(
+        status,
+        RolloutMaintenanceStatusReadResponse {
+            status: RolloutMaintenanceSnapshot {
+                lock,
+                background_migration: Some(waiting_status),
+            },
+        }
+    );
     let mut resumed = Box::pin(secondary.read_response::<ThreadResumeResponse>(resume_id));
     assert!(
         timeout(std::time::Duration::from_millis(100), &mut resumed)
