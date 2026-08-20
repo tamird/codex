@@ -3847,6 +3847,7 @@ async fn prepared_fork_preserves_parent_cached_model_state_without_copying_histo
         metadata: Some(CodexHarnessMetadata {
             client_authored: true,
             fallback_token_limit_override: None,
+            ..Default::default()
         }),
     }]);
     let reference_context_item = source_turn.to_turn_context_item();

@@ -6,6 +6,7 @@ use std::ops::DerefMut;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use codex_protocol::ResponseItemId;
 use codex_protocol::ThreadId;
 use codex_protocol::capabilities::SelectedCapabilityRoot;
 use codex_protocol::dynamic_tools::DynamicToolSpec;
@@ -56,6 +57,18 @@ pub struct CodexHarnessMetadata {
     /// Measured in tokens, with any tool-specific allowance already included.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fallback_token_limit_override: Option<usize>,
+
+    /// Trusted origin of an asynchronous code-mode notification.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code_mode_notification: Option<CodeModeNotificationOrigin>,
+}
+
+/// Identifies the executed cell even after compaction removes its model-visible call.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema)]
+pub struct CodeModeNotificationOrigin {
+    pub source_item_id: ResponseItemId,
+    pub call_id: String,
+    pub cell_id: String,
 }
 
 impl ResponseItemEnvelope {

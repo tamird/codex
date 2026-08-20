@@ -17,6 +17,7 @@ use crate::connectors;
 use crate::context::ContextualUserFragment;
 use crate::context::InterruptedResponseRecord;
 use crate::context::world_state::WorldState;
+use crate::context_manager::code_mode_notification_origins;
 use crate::environment_selection::TurnEnvironmentSnapshot;
 use crate::feedback_tags;
 use crate::hook_runtime::PostCompactHookOutcome;
@@ -87,6 +88,7 @@ use codex_extension_api::TurnInputEnvironment;
 use codex_features::Feature;
 use codex_file_system::FindUpErrorPolicy;
 use codex_file_system::find_nearest_ancestor_with_markers;
+use codex_history::ResponseItemEnvelope;
 use codex_login::CodexAuth;
 use codex_model_provider::RemoteCompactionSupport;
 use codex_protocol::ResponseItemId;
@@ -121,6 +123,7 @@ use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::TurnDiffEvent;
 use codex_protocol::protocol::WarningEvent;
 use codex_protocol::user_input::UserInput;
+use codex_rollout_trace::CodeModeNotificationOrigins;
 use codex_skills::ToolMentionKind;
 use codex_skills::app_id_from_path;
 use codex_skills::build_skill_name_counts;
@@ -483,10 +486,10 @@ pub(crate) async fn run_turn(
                 .await?;
 
             // Construct the input that we will send to the model.
-            let sampling_request_input: Vec<ResponseItem> = async {
+            let sampling_request_input = async {
                 sess.clone_history()
                     .await
-                    .for_prompt(&step_context.settings.model_info.input_modalities)
+                    .for_prompt_annotated(&step_context.settings.model_info.input_modalities)
             }
             .instrument(trace_span!("run_turn.prepare_sampling_request_input"))
             .await;
@@ -521,8 +524,12 @@ pub(crate) async fn run_turn(
                         sess.notify_model_routing_candidate_change(previous, &turn_context, reason)
                             .await;
                     }
-                    sess.record_model_routing_success(&turn_context, task_done, &cancellation_token)
-                        .await;
+                    sess.record_model_routing_success(
+                        &turn_context,
+                        task_done,
+                        &cancellation_token,
+                    )
+                    .await;
                     initial_routing_change_pending = false;
                 }
                 let SamplingRequestResult {
@@ -535,10 +542,7 @@ pub(crate) async fn run_turn(
                         .refresh_active_turn_context(&turn_context, task_done, &cancellation_token)
                         .await?;
                     let refreshed_step_context = sess
-                        .capture_step_context(
-                            Arc::clone(&turn_context),
-                            &cancellation_token,
-                        )
+                        .capture_step_context(Arc::clone(&turn_context), &cancellation_token)
                         .await?;
                     let display_roots =
                         turn_diff_display_roots(refreshed_step_context.as_ref()).await;
@@ -744,9 +748,12 @@ pub(crate) async fn run_turn(
                 let routing_failure = classify_model_routing_failure(failure.error.details());
                 if let Some(routing_failure) = routing_failure.as_ref() {
                     sess.record_model_routing_failure(
-                        &turn_context, task_done, &cancellation_token, routing_failure,
+                        &turn_context,
+                        task_done,
+                        &cancellation_token,
+                        routing_failure,
                     )
-                        .await;
+                    .await;
                 }
                 if failure.reroute_safe
                     && let Some(routing_failure) = routing_failure
@@ -1773,7 +1780,7 @@ async fn run_sampling_request(
     turn_diff_tracker: SharedTurnDiffTracker,
     client_session: &mut ModelClientSession,
     responses_metadata: &CodexResponsesMetadata,
-    input: Vec<ResponseItem>,
+    input: Vec<ResponseItemEnvelope>,
     cancellation_token: CancellationToken,
     interrupted_response_recorded: &mut bool,
 ) -> Result<(SamplingRequestResult, Vec<ResponseItem>), SamplingRequestFailure> {
@@ -1805,12 +1812,19 @@ async fn run_sampling_request(
         } else {
             sess.clone_history()
                 .await
-                .for_prompt(&step_context.settings.model_info.input_modalities)
+                .for_prompt_annotated(&step_context.settings.model_info.input_modalities)
         };
-        let mut prompt_input = prompt_input;
+        let notifications = code_mode_notification_origins(&prompt_input);
+        let mut prompt_input = prompt_input
+            .into_iter()
+            .map(ResponseItemEnvelope::into_item)
+            .collect::<Vec<_>>();
         if let Some(executed_tool_calls) = sess.services.executed_tool_calls.as_ref()
-            && executed_tool_calls
-                .attach_pending_to_prompt(&mut prompt_input, &mut executed_tool_calls_by_output)
+            && executed_tool_calls.attach_pending_to_prompt(
+                &mut prompt_input,
+                &notifications,
+                &mut executed_tool_calls_by_output,
+            )
         {
             codex_protocol::models::bound_executed_tool_calls_for_prompt(&mut prompt_input);
         }
@@ -1828,6 +1842,7 @@ async fn run_sampling_request(
             responses_metadata,
             Arc::clone(&turn_diff_tracker),
             &prompt,
+            notifications,
             cancellation_token.child_token(),
             Arc::clone(&reroute_safe),
             Arc::clone(&interrupted_response),
@@ -2902,6 +2917,7 @@ async fn try_run_sampling_request(
     responses_metadata: &CodexResponsesMetadata,
     turn_diff_tracker: SharedTurnDiffTracker,
     prompt: &Prompt,
+    notifications: CodeModeNotificationOrigins,
     cancellation_token: CancellationToken,
     reroute_safe: Arc<AtomicBool>,
     interrupted_response: Arc<AtomicBool>,
@@ -2915,11 +2931,15 @@ async fn try_run_sampling_request(
         auth_mode = sess.services.auth_manager.auth_mode(),
         features = sess.features.enabled_features(),
     );
-    let inference_trace = sess.services.rollout_thread_trace.inference_trace_context(
-        turn_context.sub_id.as_str(),
-        step_context.settings.model_info.slug.as_str(),
-        turn_context.provider.info().name.as_str(),
-    );
+    let inference_trace = sess
+        .services
+        .rollout_thread_trace
+        .inference_trace_context(
+            turn_context.sub_id.as_str(),
+            step_context.settings.model_info.slug.as_str(),
+            turn_context.provider.info().name.as_str(),
+        )
+        .with_code_mode_notifications(notifications);
     let sampling_timing_guard = turn_context.turn_timing_state.begin_sampling();
     let uses_sequential_cutoff_reasoning_summaries = turn_context
         .config

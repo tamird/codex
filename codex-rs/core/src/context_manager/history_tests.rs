@@ -536,6 +536,7 @@ fn fork_copy_on_write_preserves_harness_metadata() {
         metadata: Some(CodexHarnessMetadata {
             client_authored: true,
             fallback_token_limit_override: None,
+            ..Default::default()
         }),
     };
     let mut parent = ContextManager::new();

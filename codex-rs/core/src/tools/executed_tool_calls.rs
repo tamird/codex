@@ -8,6 +8,7 @@ use codex_protocol::models::ResponseItem;
 use codex_protocol::models::bound_executed_tool_calls_for_prompt_prioritizing_recent;
 use codex_protocol::models::executed_tool_call_metadata_bytes;
 use codex_protocol::openai_models::ToolMode;
+use codex_rollout_trace::CodeModeNotificationOrigins;
 use serde_json::Value as JsonValue;
 
 use crate::tools::context::ToolCallSource;
@@ -18,6 +19,40 @@ use crate::utils::json::serialized_json_bytes;
 const MAX_EXECUTED_TOOL_CALL_ARGUMENT_BYTES: usize = 8 * 1024;
 const MAX_EXECUTED_TOOL_CALL_FULL_ARGUMENT_BYTES_PER_OUTPUT: usize = 32 * 1024;
 const MAX_PENDING_EXECUTED_TOOL_CALLS: usize = 256;
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(crate) enum ExecutedToolOutputKind {
+    Function,
+    Custom,
+    ToolSearch,
+}
+
+fn output_identity<'a>(
+    item: &'a ResponseItem,
+    notifications: &'a CodeModeNotificationOrigins,
+) -> Option<(ExecutedToolOutputKind, &'a str)> {
+    match item {
+        ResponseItem::FunctionCallOutput {
+            id: _,
+            call_id: Some(call_id),
+            name: _,
+            namespace: _,
+            output: _,
+            internal_chat_message_metadata_passthrough: _,
+        } => Some((ExecutedToolOutputKind::Function, call_id)),
+        ResponseItem::CustomToolCallOutput { call_id, .. } => {
+            Some((ExecutedToolOutputKind::Custom, call_id))
+        }
+        ResponseItem::ToolSearchOutput {
+            call_id: Some(call_id),
+            ..
+        } => Some((ExecutedToolOutputKind::ToolSearch, call_id)),
+        ResponseItem::Message { id: Some(id), .. } => notifications
+            .get(id.as_str())
+            .map(|origin| (ExecutedToolOutputKind::Custom, origin.call_id.as_str())),
+        _ => None,
+    }
+}
 
 /// Best-effort, session-scoped attempted-tool metadata; cancellation, compaction,
 /// and yielded cells without another wait can leave pending calls unreported.
@@ -31,7 +66,7 @@ struct ExecutedToolCallRecorderState {
     direct_calls: HashMap<String, ExecutedToolCall>,
     cells: HashMap<CellId, RecordedCell>,
     output_cells: HashMap<String, CellId>,
-    retained_calls: HashMap<(std::mem::Discriminant<ResponseItem>, String), RetainedToolCalls>,
+    retained_calls: HashMap<(ExecutedToolOutputKind, String), RetainedToolCalls>,
     pending_nested_calls: usize,
 }
 
@@ -229,10 +264,8 @@ impl ExecutedToolCallRecorder {
     pub(crate) fn attach_pending_to_prompt(
         &self,
         items: &mut [ResponseItem],
-        retry_cache: &mut HashMap<
-            (std::mem::Discriminant<ResponseItem>, String),
-            Vec<ExecutedToolCall>,
-        >,
+        notifications: &CodeModeNotificationOrigins,
+        retry_cache: &mut HashMap<(ExecutedToolOutputKind, String), Vec<ExecutedToolCall>>,
     ) -> bool {
         let mut state = self
             .state
@@ -259,19 +292,10 @@ impl ExecutedToolCallRecorder {
             {
                 break;
             }
-            let call_id = match &*item {
-                ResponseItem::FunctionCallOutput {
-                    call_id: Some(call_id),
-                    ..
-                }
-                | ResponseItem::CustomToolCallOutput { call_id, .. }
-                | ResponseItem::ToolSearchOutput {
-                    call_id: Some(call_id),
-                    ..
-                } => call_id,
-                _ => continue,
+            let Some((kind, call_id)) = output_identity(item, notifications) else {
+                continue;
             };
-            let key = (std::mem::discriminant(&*item), call_id.clone());
+            let key = (kind, call_id.to_string());
             let retained = state.retained_calls.get(&key);
             let mut complete = retained.is_some_and(|retained| retained.complete);
             let mut cell_id = retained.and_then(|retained| retained.cell_id.clone());
@@ -349,19 +373,10 @@ impl ExecutedToolCallRecorder {
             bound_executed_tool_calls_for_prompt_prioritizing_recent(items);
             let retained_before_bounding = std::mem::take(&mut state.retained_calls);
             for item in items {
-                let call_id = match &*item {
-                    ResponseItem::FunctionCallOutput {
-                        call_id: Some(call_id),
-                        ..
-                    }
-                    | ResponseItem::CustomToolCallOutput { call_id, .. }
-                    | ResponseItem::ToolSearchOutput {
-                        call_id: Some(call_id),
-                        ..
-                    } => call_id,
-                    _ => continue,
+                let Some((kind, call_id)) = output_identity(item, notifications) else {
+                    continue;
                 };
-                let key = (std::mem::discriminant(&*item), call_id.clone());
+                let key = (kind, call_id.to_string());
                 let metadata = item.executed_tool_call_metadata();
                 if let Some(retained) = retained_before_bounding.get(&key)
                     && let Some(runtime_cell_id) = &retained.runtime_cell_id

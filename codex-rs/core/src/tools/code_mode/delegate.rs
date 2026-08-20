@@ -7,6 +7,9 @@ use codex_code_mode::CodeModeNestedToolCall;
 use codex_code_mode::CodeModeSessionDelegate;
 use codex_code_mode::NotificationFuture;
 use codex_code_mode::ToolInvocationFuture;
+use codex_history::CodeModeNotificationOrigin;
+use codex_history::CodexHarnessMetadata;
+use codex_history::ResponseItemEnvelope;
 use codex_protocol::ResponseItemId;
 use codex_protocol::models::FunctionCallOutputPayload;
 use codex_protocol::models::ResponseItem;
@@ -374,14 +377,25 @@ impl CoreTurnHost {
         if text.trim().is_empty() {
             return Ok(());
         }
+        let source_item_id = ResponseItemId::new("ctco");
         self.exec
             .session
-            .inject_if_running(vec![ResponseItem::CustomToolCallOutput {
-                id: None,
-                call_id,
-                name: Some(PUBLIC_TOOL_NAME.to_string()),
-                output: FunctionCallOutputPayload::from_text(text),
-                internal_chat_message_metadata_passthrough: None,
+            .inject_annotated_if_running(vec![ResponseItemEnvelope {
+                item: ResponseItem::CustomToolCallOutput {
+                    id: Some(source_item_id.clone()),
+                    call_id: call_id.clone(),
+                    name: Some(PUBLIC_TOOL_NAME.to_string()),
+                    output: FunctionCallOutputPayload::from_text(text),
+                    internal_chat_message_metadata_passthrough: None,
+                },
+                metadata: Some(CodexHarnessMetadata {
+                    code_mode_notification: Some(CodeModeNotificationOrigin {
+                        source_item_id,
+                        call_id,
+                        cell_id: cell_id.to_string(),
+                    }),
+                    ..Default::default()
+                }),
             }])
             .await
             .map_err(|_| {

@@ -13,6 +13,55 @@ fn output(call_id: &str) -> ResponseItem {
 }
 
 #[test]
+fn executed_tool_metadata_survives_notification_projection() {
+    let recorder = ExecutedToolCallRecorder::default();
+    let cell_id = CellId::new("1".to_string());
+    recorder.register_cell(&cell_id, "call-1");
+    recorder.record_nested_tool_call(
+        cell_id,
+        ExecutedToolCall::new("nested".to_string(), json!({})),
+        /*original_bytes*/ 2,
+    );
+    let mut raw = [ResponseItem::CustomToolCallOutput {
+        id: None,
+        call_id: "call-1".to_string(),
+        name: Some("exec".to_string()),
+        output: FunctionCallOutputPayload::from_text("progress".to_string()),
+        internal_chat_message_metadata_passthrough: None,
+    }];
+    let mut retry_cache = HashMap::new();
+    assert!(recorder.attach_pending_to_prompt(&mut raw, &Default::default(), &mut retry_cache));
+    let message = ResponseItem::Message {
+        id: Some(codex_protocol::ResponseItemId::from_server(
+            "msg_projection".to_string(),
+        )),
+        role: "user".to_string(),
+        content: vec![codex_protocol::models::ContentItem::InputText {
+            text: "progress".to_string(),
+        }],
+        phase: None,
+        internal_chat_message_metadata_passthrough: None,
+    };
+    let notifications = CodeModeNotificationOrigins::from([(
+        "msg_projection".to_string(),
+        codex_rollout_trace::CodeModeNotificationOrigin {
+            source_item_id: "ctco_source".to_string(),
+            call_id: "call-1".to_string(),
+            cell_id: "1".to_string(),
+        },
+    )]);
+    let mut replay_cache = HashMap::new();
+    for cache in [&mut retry_cache, &mut replay_cache] {
+        let mut projected = [message.clone()];
+        assert!(recorder.attach_pending_to_prompt(&mut projected, &notifications, cache));
+        assert_eq!(
+            projected[0].executed_tool_call_metadata(),
+            raw[0].executed_tool_call_metadata()
+        );
+    }
+}
+
+#[test]
 fn executed_tool_call_recorder_bounds_pending_calls_and_preserves_overflow() {
     let recorder = ExecutedToolCallRecorder::default();
 
@@ -93,7 +142,7 @@ fn executed_tool_call_recorder_bounds_pending_calls_and_preserves_overflow() {
     }];
     let mut retry_cache = HashMap::new();
     recorder.finish_cell_recording(&cell_id);
-    recorder.attach_pending_to_prompt(&mut items, &mut retry_cache);
+    recorder.attach_pending_to_prompt(&mut items, &Default::default(), &mut retry_cache);
 
     assert_eq!(
         items[0]
@@ -140,7 +189,11 @@ fn executed_tool_call_recorder_bounds_pending_calls_and_preserves_overflow() {
         internal_chat_message_metadata_passthrough: None,
     }];
     let mut replay_retry_cache = HashMap::new();
-    assert!(recorder.attach_pending_to_prompt(&mut replayed_items, &mut replay_retry_cache));
+    assert!(recorder.attach_pending_to_prompt(
+        &mut replayed_items,
+        &Default::default(),
+        &mut replay_retry_cache
+    ));
     assert_eq!(
         replayed_items[0]
             .executed_tool_call_metadata()
@@ -149,7 +202,11 @@ fn executed_tool_call_recorder_bounds_pending_calls_and_preserves_overflow() {
     );
 
     let mut compacted_retry_cache = HashMap::new();
-    assert!(!recorder.attach_pending_to_prompt(&mut [], &mut compacted_retry_cache));
+    assert!(!recorder.attach_pending_to_prompt(
+        &mut [],
+        &Default::default(),
+        &mut compacted_retry_cache
+    ));
     let state = recorder
         .state
         .lock()
@@ -188,7 +245,11 @@ fn executed_tool_call_recorder_bounds_retained_history_and_reports_omissions() {
             internal_chat_message_metadata_passthrough: None,
         });
         prompt = history.clone();
-        assert!(recorder.attach_pending_to_prompt(&mut prompt, &mut HashMap::new()));
+        assert!(recorder.attach_pending_to_prompt(
+            &mut prompt,
+            &Default::default(),
+            &mut HashMap::new()
+        ));
         codex_protocol::models::bound_executed_tool_calls_for_prompt(&mut prompt);
         let latest_call = prompt
             .last()
@@ -258,7 +319,7 @@ fn tool_call_completeness_requires_finished_lossless_recording() {
         recorder.finish_cell_recording(&cell_id);
 
         let mut items = [output("output")];
-        recorder.attach_pending_to_prompt(&mut items, &mut HashMap::new());
+        recorder.attach_pending_to_prompt(&mut items, &Default::default(), &mut HashMap::new());
         assert_eq!(
             items[0]
                 .executed_tool_call_metadata()
@@ -311,7 +372,11 @@ fn tool_call_completeness_survives_waits_without_changing_deltas() {
             let mut retry_cache = HashMap::new();
             for _ in 0..2 {
                 let mut prompt = history.clone();
-                assert!(recorder.attach_pending_to_prompt(&mut prompt, &mut retry_cache));
+                assert!(recorder.attach_pending_to_prompt(
+                    &mut prompt,
+                    &Default::default(),
+                    &mut retry_cache
+                ));
                 assert_eq!(prompt, expected);
             }
         }
@@ -335,7 +400,7 @@ fn cell_correlation_uses_originating_exec_across_runtime_restarts() {
         );
 
         let mut initial = [output(originating_call_id)];
-        recorder.attach_pending_to_prompt(&mut initial, &mut HashMap::new());
+        recorder.attach_pending_to_prompt(&mut initial, &Default::default(), &mut HashMap::new());
         assert_eq!(
             initial[0]
                 .executed_tool_call_metadata()
@@ -346,7 +411,11 @@ fn cell_correlation_uses_originating_exec_across_runtime_restarts() {
         recorder.register_cell(&runtime_cell_id, "wait");
         recorder.finish_cell_recording(&runtime_cell_id);
         let mut final_output = [output("wait")];
-        recorder.attach_pending_to_prompt(&mut final_output, &mut HashMap::new());
+        recorder.attach_pending_to_prompt(
+            &mut final_output,
+            &Default::default(),
+            &mut HashMap::new(),
+        );
         let metadata = final_output[0]
             .executed_tool_call_metadata()
             .expect("completed cell must have metadata");
@@ -373,7 +442,11 @@ fn request_truncation_prevents_completion_after_compaction() {
     }
 
     let mut initial = [output("exec")];
-    assert!(recorder.attach_pending_to_prompt(&mut initial, &mut HashMap::new()));
+    assert!(recorder.attach_pending_to_prompt(
+        &mut initial,
+        &Default::default(),
+        &mut HashMap::new()
+    ));
     assert!(
         initial[0]
             .executed_tool_call_metadata()
@@ -384,11 +457,11 @@ fn request_truncation_prevents_completion_after_compaction() {
             )))
     );
 
-    recorder.attach_pending_to_prompt(&mut [], &mut HashMap::new());
+    recorder.attach_pending_to_prompt(&mut [], &Default::default(), &mut HashMap::new());
     recorder.register_cell(&cell_id, "wait");
     recorder.finish_cell_recording(&cell_id);
     let mut final_output = [output("wait")];
-    recorder.attach_pending_to_prompt(&mut final_output, &mut HashMap::new());
+    recorder.attach_pending_to_prompt(&mut final_output, &Default::default(), &mut HashMap::new());
     assert_eq!(
         final_output[0]
             .executed_tool_call_metadata()
@@ -405,7 +478,11 @@ fn finished_cells_without_more_waits_do_not_block_new_calls() {
         let cell = CellId::new(format!("cell-{index}"));
         recorder.start_cell(&cell, cell.as_str());
         recorder.record_nested_tool_call(cell.clone(), call.clone(), /*original_bytes*/ 2);
-        recorder.attach_pending_to_prompt(&mut [output(cell.as_str())], &mut HashMap::new());
+        recorder.attach_pending_to_prompt(
+            &mut [output(cell.as_str())],
+            &Default::default(),
+            &mut HashMap::new(),
+        );
         recorder.finish_cell_recording(&cell);
     }
     let fresh = CellId::new("fresh".to_string());
@@ -417,6 +494,10 @@ fn finished_cells_without_more_waits_do_not_block_new_calls() {
     expected.set_tool_call_cell_id("fresh-output");
     expected.mark_tool_calls_complete();
     let mut items = [output("fresh-output")];
-    assert!(recorder.attach_pending_to_prompt(&mut items, &mut HashMap::new()));
+    assert!(recorder.attach_pending_to_prompt(
+        &mut items,
+        &Default::default(),
+        &mut HashMap::new()
+    ));
     assert_eq!(items, [expected]);
 }

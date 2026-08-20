@@ -296,10 +296,16 @@ async fn run_remote_compact_task_inner_impl(
     // thread history. Keep it distinct from the later inference request so the reducer can
     // still represent repeated developer/context prefix items exactly as the model saw them.
     if let Some(trace_input_history) = trace_input_history.as_deref() {
+        let input_history = trace_input_history
+            .iter()
+            .map(|envelope| envelope.item.clone())
+            .collect::<Vec<_>>();
         compaction_trace.record_installed(&CompactionCheckpointTracePayload {
-            input_history: trace_input_history,
+            input_history: &input_history,
             replacement_history: &new_history,
-            input_code_mode_notifications: &Default::default(),
+            input_code_mode_notifications: &crate::context_manager::code_mode_notification_origins(
+                trace_input_history,
+            ),
             replacement_code_mode_notifications: &Default::default(),
         });
     }

@@ -9,6 +9,7 @@ use crate::responses_metadata::CodexResponsesRequestKind;
 use crate::responses_metadata::CompactionTurnMetadata;
 use crate::session::session::Session;
 use crate::session::step_context::StepContext;
+use codex_history::ResponseItemEnvelope;
 use codex_protocol::auth::AuthMode;
 use codex_protocol::error::Result as CodexResult;
 use codex_protocol::models::ResponseItem;
@@ -17,7 +18,7 @@ use tracing::info;
 
 pub(super) struct RemoteCompactAttempt {
     pub(super) new_history: Vec<ResponseItem>,
-    pub(super) trace_input_history: Option<Vec<ResponseItem>>,
+    pub(super) trace_input_history: Option<Vec<ResponseItemEnvelope>>,
 }
 
 pub(super) async fn run_remote_compact_attempt(
@@ -57,7 +58,7 @@ pub(super) async fn run_remote_compact_attempt(
     }
     let trace_input_history = compaction_trace
         .is_enabled()
-        .then(|| history.raw_items().cloned().collect());
+        .then(|| history.annotated_items().to_vec());
     let prompt_input = history.for_prompt(&turn_context.model_info().input_modalities);
     let tool_router = &step_context.tool_router;
     let prompt = Prompt {
