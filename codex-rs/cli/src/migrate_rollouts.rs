@@ -2,6 +2,8 @@ use std::io;
 use std::io::IsTerminal;
 use std::io::Write;
 use std::path::Path;
+use std::sync::Arc;
+use std::sync::Mutex;
 use std::time::Duration;
 use std::time::Instant;
 
@@ -9,6 +11,8 @@ use anyhow::Context;
 use clap::Parser;
 use codex_core::config::ConfigBuilder;
 use codex_protocol::ThreadId;
+use codex_rollout::RolloutMaintenanceRequestStatus;
+use codex_rollout::with_rollout_maintenance_observer;
 use codex_thread_store::LocalThreadStore;
 use codex_thread_store::LocalThreadStoreConfig;
 use codex_thread_store::RolloutMigrationMode;
@@ -17,6 +21,10 @@ use codex_thread_store::RolloutMigrationProgress;
 use codex_thread_store::RolloutMigrationReport;
 use codex_thread_store::RolloutMigrationStatus;
 use codex_utils_cli::CliConfigOverrides;
+
+mod progress;
+
+use progress::maintenance_line;
 
 #[derive(Debug, Parser)]
 pub(crate) struct MigrateRolloutsCommand {
@@ -95,19 +103,51 @@ pub(crate) async fn run(
         None
     };
     let store = LocalThreadStore::new(LocalThreadStoreConfig::from_config(&config), state_db);
-    let mut progress = MigrationProgress::new(mode, json);
-    progress.begin();
-    let result = store
-        .migrate_rollouts_with_progress(
+    let progress = Arc::new(Mutex::new(MigrationProgress::new(mode, json)));
+    progress
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .begin();
+    let maintenance_progress = Arc::clone(&progress);
+    let migration = with_rollout_maintenance_observer(
+        Arc::new(move |status| {
+            maintenance_progress
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .update_maintenance(status);
+        }),
+        store.migrate_rollouts_with_progress(
             RolloutMigrationOptions {
                 mode,
                 thread_ids: command.thread,
                 max_mib_per_second: command.max_mib_per_second,
             },
-            |update| progress.update(update),
-        )
-        .await;
-    progress.finish();
+            |update| {
+                progress
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .update(update)
+            },
+        ),
+    );
+    tokio::pin!(migration);
+    let mut refresh = tokio::time::interval(TTY_PROGRESS_INTERVAL);
+    refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let result = loop {
+        tokio::select! {
+            result = &mut migration => break result,
+            _ = refresh.tick(), if !json => {
+                progress.lock().unwrap_or_else(std::sync::PoisonError::into_inner).refresh();
+            }
+        }
+    };
+    let elapsed = {
+        let mut progress = progress
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        progress.finish();
+        progress.elapsed()
+    };
     let report = result?;
     let thread_storage = match thread_storage_before {
         Some(before) => thread_storage_bytes(
@@ -123,7 +163,7 @@ pub(crate) async fn run(
     if json {
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
-        print_human_report(&report, mode, verbose, progress.elapsed(), thread_storage);
+        print_human_report(&report, mode, verbose, elapsed, thread_storage);
     }
 
     if report
@@ -137,7 +177,7 @@ pub(crate) async fn run(
 }
 
 const TTY_PROGRESS_INTERVAL: Duration = Duration::from_millis(250);
-const NON_TTY_PROGRESS_INTERVAL: usize = 1_000;
+const NON_TTY_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(5);
 const MAX_EXCEPTION_DETAILS: usize = 20;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -152,7 +192,8 @@ struct MigrationProgress {
     output: ProgressOutput,
     started_at: Instant,
     last_rendered_at: Instant,
-    last_plain_processed: usize,
+    last_update: Option<RolloutMigrationProgress>,
+    maintenance: RolloutMaintenanceRequestStatus,
     counts: MigrationCounts,
     wrote_tty_line: bool,
 }
@@ -174,7 +215,8 @@ impl MigrationProgress {
             output,
             started_at: now,
             last_rendered_at: now,
-            last_plain_processed: 0,
+            last_update: None,
+            maintenance: RolloutMaintenanceRequestStatus::Idle,
             counts: MigrationCounts::default(),
             wrote_tty_line: false,
         }
@@ -187,34 +229,64 @@ impl MigrationProgress {
     }
 
     fn update(&mut self, update: RolloutMigrationProgress) {
+        self.last_update = Some(update);
         if let Some(status) = update.outcome_status {
             self.counts.observe(status);
         }
+        if update.processed_paths == update.total_paths {
+            self.render();
+        }
+    }
+
+    fn update_maintenance(&mut self, status: RolloutMaintenanceRequestStatus) {
+        let entering_wait = !matches!(
+            self.maintenance,
+            RolloutMaintenanceRequestStatus::WaitingForMaintenance { .. }
+        ) && matches!(
+            status,
+            RolloutMaintenanceRequestStatus::WaitingForMaintenance { .. }
+        );
+        self.maintenance = status;
+        if entering_wait {
+            self.render();
+        }
+    }
+
+    fn refresh(&mut self) {
+        let interval = match self.output {
+            ProgressOutput::Quiet => return,
+            ProgressOutput::Tty => TTY_PROGRESS_INTERVAL,
+            ProgressOutput::Plain => NON_TTY_MAINTENANCE_INTERVAL,
+        };
+        if self.last_rendered_at.elapsed() >= interval {
+            self.render();
+        }
+    }
+
+    fn render(&mut self) {
+        let mut line = self.last_update.map_or_else(
+            || {
+                format!(
+                    "Scanning local rollouts  •  {}",
+                    format_elapsed(self.elapsed())
+                )
+            },
+            |update| self.line(update),
+        );
+        if let Some(maintenance) = maintenance_line(self.maintenance) {
+            line.push_str(&format!("  •  {maintenance}"));
+        }
         match self.output {
-            ProgressOutput::Quiet => {}
-            ProgressOutput::Tty
-                if update.processed_paths == update.total_paths
-                    || self.last_rendered_at.elapsed() >= TTY_PROGRESS_INTERVAL =>
-            {
-                let line = self.line(update);
+            ProgressOutput::Quiet => return,
+            ProgressOutput::Tty => {
                 let mut stderr = io::stderr().lock();
                 let _ = write!(stderr, "\r\x1b[2K{line}");
                 let _ = stderr.flush();
-                self.last_rendered_at = Instant::now();
                 self.wrote_tty_line = true;
             }
-            ProgressOutput::Plain
-                if update.processed_paths == update.total_paths
-                    || update
-                        .processed_paths
-                        .saturating_sub(self.last_plain_processed)
-                        >= NON_TTY_PROGRESS_INTERVAL =>
-            {
-                eprintln!("{}", self.line(update));
-                self.last_plain_processed = update.processed_paths;
-            }
-            ProgressOutput::Tty | ProgressOutput::Plain => {}
+            ProgressOutput::Plain => eprintln!("{line}"),
         }
+        self.last_rendered_at = Instant::now();
     }
 
     fn finish(&mut self) {
