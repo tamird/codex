@@ -16,6 +16,11 @@ use std::io;
 use std::path::Path;
 use std::sync::Arc;
 
+use crate::maintenance_observer::RolloutMaintenanceRequestScope;
+use crate::maintenance_status::RolloutMaintenanceActivity;
+use crate::maintenance_status::RolloutMaintenanceReporter;
+use crate::maintenance_status::RolloutMaintenanceRequestStatus;
+
 const ROLLOUT_MAINTENANCE_LOCK: &str = "rollout-maintenance.lock";
 const ROLLOUT_MAINTENANCE_JOB_LOCK: &str = "rollout-maintenance-job.lock";
 const ROLLOUT_MAINTENANCE_FOREGROUND_LOCK: &str = "rollout-maintenance-foreground.lock";
@@ -47,9 +52,25 @@ pub struct RolloutMaintenanceIntentGuard {
     _file: Arc<MaintenanceFileLock>,
 }
 
+#[cfg(test)]
+#[path = "maintenance_tests.rs"]
+mod tests;
+
 /// Holds exclusive ownership of operations that replace local rollout files.
 pub struct RolloutMaintenanceGuard {
     _file: MaintenanceFileLock,
+    reporter: Option<RolloutMaintenanceReporter>,
+}
+
+impl RolloutMaintenanceGuard {
+    pub fn reporter(&self) -> Option<RolloutMaintenanceReporter> {
+        self.reporter.clone()
+    }
+
+    fn with_activity(mut self, activity: RolloutMaintenanceActivity) -> Self {
+        self.reporter = Some(RolloutMaintenanceReporter::start(activity));
+        self
+    }
 }
 
 /// Excludes old maintenance implementations and exclusive history repair, but permits clean
@@ -320,12 +341,22 @@ pub fn try_acquire_rollout_maintenance_lock(
     codex_home: &Path,
 ) -> io::Result<Option<RolloutMaintenanceGuard>> {
     let lock = try_open_lock(codex_home, ROLLOUT_MAINTENANCE_LOCK, LockMode::Exclusive)?;
-    Ok(lock.map(|file| RolloutMaintenanceGuard { _file: file }))
+    Ok(lock.map(|file| RolloutMaintenanceGuard {
+        _file: file,
+        reporter: None,
+    }))
 }
 
-#[cfg(test)]
-#[path = "maintenance_tests.rs"]
-mod tests;
+/// Try maintenance without waiting, identifying the work while the lock is held.
+pub fn try_acquire_rollout_maintenance(
+    codex_home: &Path,
+    activity: RolloutMaintenanceActivity,
+) -> io::Result<Option<RolloutMaintenanceGuard>> {
+    Ok(
+        try_acquire_rollout_maintenance_lock(codex_home)?
+            .map(|guard| guard.with_activity(activity)),
+    )
+}
 
 /// Wait for exclusive ownership of operations that replace local rollout files.
 ///
@@ -335,11 +366,41 @@ mod tests;
 pub async fn acquire_rollout_maintenance_lock(
     codex_home: &Path,
 ) -> io::Result<RolloutMaintenanceGuard> {
+    acquire_inner(codex_home, /*activity*/ None).await
+}
+
+/// Wait for maintenance while reporting actual contention to the current request.
+pub async fn acquire_rollout_maintenance(
+    codex_home: &Path,
+    activity: RolloutMaintenanceActivity,
+) -> io::Result<RolloutMaintenanceGuard> {
+    acquire_inner(codex_home, Some(activity)).await
+}
+
+async fn acquire_inner(
+    codex_home: &Path,
+    activity: Option<RolloutMaintenanceActivity>,
+) -> io::Result<RolloutMaintenanceGuard> {
     let _foreground = acquire_foreground_intent(codex_home).await?;
     let mut delay = std::time::Duration::from_millis(25);
+    let mut waiting: Option<RolloutMaintenanceRequestScope> = None;
     loop {
         if let Some(guard) = try_acquire_rollout_maintenance_lock(codex_home)? {
-            return Ok(guard);
+            drop(waiting);
+            return Ok(match activity {
+                Some(activity) => guard.with_activity(activity),
+                None => guard,
+            });
+        }
+        if let Some(activity) = activity
+            && waiting.is_none()
+        {
+            waiting = Some(RolloutMaintenanceRequestScope::new(
+                RolloutMaintenanceRequestStatus::WaitingForMaintenance {
+                    thread_id: activity.thread_id,
+                    owner: None,
+                },
+            ));
         }
         tokio::time::sleep(delay).await;
         delay = delay

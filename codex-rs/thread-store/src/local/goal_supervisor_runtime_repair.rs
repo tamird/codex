@@ -401,16 +401,34 @@ async fn repair_before_access(
             lifecycle.push(reserve_history_repair_lifecycle(store, id).await);
         }
         let (maintenance, read_maintenance) = if exclusive {
-            (Some(acquire_maintenance(store).await?), None)
+            (
+                Some(acquire_history_repair_maintenance(store, thread_id).await?),
+                None,
+            )
         } else {
             (
                 None,
                 Some(
-                    codex_rollout::acquire_rollout_maintenance_read_lock(
+                    match codex_rollout::try_acquire_rollout_maintenance_read_lock(
                         store.config.codex_home.as_path(),
                     )
-                    .await
-                    .map_err(thread_store_io_error)?,
+                    .map_err(thread_store_io_error)?
+                    {
+                        Some(guard) => guard,
+                        None => {
+                            let _waiting = codex_rollout::RolloutMaintenanceRequestScope::new(
+                                codex_rollout::RolloutMaintenanceRequestStatus::WaitingForMaintenance {
+                                    thread_id: Some(thread_id),
+                                    owner: None,
+                                },
+                            );
+                            codex_rollout::acquire_rollout_maintenance_read_lock(
+                                store.config.codex_home.as_path(),
+                            )
+                            .await
+                            .map_err(thread_store_io_error)?
+                        }
+                    },
                 ),
             )
         };
@@ -571,12 +589,6 @@ fn indeterminate_repair_error(thread_id: ThreadId) -> ThreadStoreError {
             "goal-supervisor history repair for thread {thread_id} has indeterminate durability; restart before continuing"
         ),
     }
-}
-
-async fn acquire_maintenance(
-    store: &LocalThreadStore,
-) -> ThreadStoreResult<HistoryRepairMaintenanceLease> {
-    acquire_history_repair_maintenance(store).await
 }
 
 async fn discover_scope(

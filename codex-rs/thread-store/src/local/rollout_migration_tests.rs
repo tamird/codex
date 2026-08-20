@@ -9305,7 +9305,7 @@ async fn migration_recovers_a_published_rollout_with_missing_projection() {
     let repaired = tokio::time::timeout(Duration::from_secs(5), async {
         let maintenance =
             crate::local::segment::history_repair_publication::acquire_history_repair_maintenance(
-                &store,
+                &store, thread_id,
             )
             .await
             .expect("repair acquires maintenance while migration rebuilds its projection");

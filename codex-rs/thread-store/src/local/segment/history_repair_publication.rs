@@ -136,6 +136,7 @@ pub(crate) async fn reserve_history_repair_maintenance(
 
 pub(crate) async fn acquire_history_repair_maintenance(
     store: &LocalThreadStore,
+    thread_id: ThreadId,
 ) -> ThreadStoreResult<HistoryRepairMaintenanceLease> {
     let canonical_home = fs::canonicalize(store.config.codex_home.as_path())
         .await
@@ -143,9 +144,15 @@ pub(crate) async fn acquire_history_repair_maintenance(
     let root_identity = confined_root_identity(canonical_home.as_path())
         .await
         .map_err(thread_store_io_error)?;
-    let guard = codex_rollout::acquire_rollout_maintenance_lock(canonical_home.as_path())
-        .await
-        .map_err(thread_store_io_error)?;
+    let guard = codex_rollout::acquire_rollout_maintenance(
+        canonical_home.as_path(),
+        codex_rollout::RolloutMaintenanceActivity::new(
+            codex_rollout::RolloutMaintenanceOperation::HistoryRepair,
+            Some(thread_id),
+        ),
+    )
+    .await
+    .map_err(thread_store_io_error)?;
     Ok(HistoryRepairMaintenanceLease {
         store_identity: store_identity(store),
         root_identity,

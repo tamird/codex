@@ -1,4 +1,88 @@
+use pretty_assertions::assert_eq;
+
 use super::*;
+use crate::RolloutMaintenanceOperation;
+use crate::RolloutMaintenanceRequestScope;
+use crate::with_rollout_maintenance_observer;
+
+#[tokio::test]
+async fn canceled_wait_and_last_reporter_clear_only_their_own_status() {
+    use std::future::Future;
+    use std::task::Poll;
+
+    let home = tempfile::tempdir().expect("temporary home");
+    let held = try_acquire_rollout_maintenance_lock(home.path())
+        .expect("raw lock")
+        .expect("available");
+    let statuses = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let observed = std::sync::Arc::clone(&statuses);
+    let escaped = with_rollout_maintenance_observer(
+        std::sync::Arc::new(move |status| {
+            observed.lock().expect("statuses").push(status);
+        }),
+        async {
+            let activity = RolloutMaintenanceActivity::new(
+                RolloutMaintenanceOperation::HistoryRepair,
+                /*thread_id*/ None,
+            );
+            let mut pending = Box::pin(acquire_rollout_maintenance(home.path(), activity));
+            assert!(
+                std::future::poll_fn(|cx| Poll::Ready(pending.as_mut().poll(cx)))
+                    .await
+                    .is_pending()
+            );
+            drop(pending);
+            assert_eq!(
+                statuses.lock().expect("statuses").last(),
+                Some(&RolloutMaintenanceRequestStatus::Idle)
+            );
+            drop(held);
+            let guard = acquire_rollout_maintenance(home.path(), activity)
+                .await
+                .expect("reported guard");
+            let reporter = guard.reporter().expect("retained migration reporter");
+            drop(guard);
+            assert_eq!(
+                statuses.lock().expect("statuses").last(),
+                Some(&RolloutMaintenanceRequestStatus::Running { activity })
+            );
+            let newer = RolloutMaintenanceRequestScope::new(
+                RolloutMaintenanceRequestStatus::WaitingForMaintenance {
+                    thread_id: None,
+                    owner: None,
+                },
+            );
+            drop(reporter);
+            assert_eq!(
+                statuses.lock().expect("statuses").last(),
+                Some(&RolloutMaintenanceRequestStatus::WaitingForMaintenance {
+                    thread_id: None,
+                    owner: None
+                })
+            );
+            drop(newer);
+            assert_eq!(
+                statuses.lock().expect("statuses").last(),
+                Some(&RolloutMaintenanceRequestStatus::Idle)
+            );
+            RolloutMaintenanceRequestScope::new(RolloutMaintenanceRequestStatus::Running {
+                activity,
+            })
+        },
+    )
+    .await;
+    let count = statuses.lock().expect("statuses").len();
+    escaped.update(RolloutMaintenanceRequestStatus::WaitingForMaintenance {
+        thread_id: None,
+        owner: None,
+    });
+    drop(escaped);
+    assert_eq!(
+        statuses.lock().expect("statuses").len(),
+        count,
+        "a completed request cannot be revived"
+    );
+}
 
 #[test]
 fn migration_dependency_child() -> std::io::Result<()> {

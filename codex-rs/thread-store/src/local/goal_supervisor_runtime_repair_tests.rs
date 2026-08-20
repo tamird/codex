@@ -480,8 +480,14 @@ async fn clean_history_waits_for_rollout_maintenance_beyond_ten_seconds() {
         .expect("open rollout-maintenance lock")
         .expect("acquire rollout-maintenance lock");
     let repair_store = store.clone();
+    let statuses = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let observed = std::sync::Arc::clone(&statuses);
     let repair = tokio::spawn(async move {
-        repair_compatibility_history_before_access(&repair_store, thread_id, path.as_path()).await
+        codex_rollout::with_rollout_maintenance_observer(
+            std::sync::Arc::new(move |status| observed.lock().expect("status lock").push(status)),
+            repair_compatibility_history_before_access(&repair_store, thread_id, path.as_path()),
+        )
+        .await
     });
 
     tokio::task::yield_now().await;
@@ -492,12 +498,23 @@ async fn clean_history_waits_for_rollout_maintenance_beyond_ten_seconds() {
         "a healthy maintenance owner must not become a terminal thread-read error"
     );
 
+    assert!(statuses.lock().expect("status lock").contains(
+        &codex_rollout::RolloutMaintenanceRequestStatus::WaitingForMaintenance {
+            thread_id: Some(thread_id),
+            owner: None,
+        }
+    ));
+
     drop(maintenance);
     tokio::time::advance(std::time::Duration::from_millis(500)).await;
     repair
         .await
         .expect("join waiting history access")
         .expect("read history after maintenance completes");
+    assert_eq!(
+        statuses.lock().expect("status lock").last(),
+        Some(&codex_rollout::RolloutMaintenanceRequestStatus::Idle)
+    );
 }
 
 #[tokio::test]
