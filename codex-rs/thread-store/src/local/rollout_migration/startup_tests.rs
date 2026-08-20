@@ -2,6 +2,7 @@ use std::fs;
 use std::io::Write;
 use std::path::Path;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
 use codex_protocol::SegmentId;
@@ -1067,17 +1068,35 @@ async fn maintenance_conflict_blocks_only_the_requested_thread_migration() {
     );
 
     let load_store = store.clone();
+    let (progress, mut updates) =
+        tokio::sync::watch::channel(codex_rollout::RolloutMaintenanceRequestStatus::Idle);
     let mut load = tokio::spawn(async move {
-        ThreadStore::read_thread(
-            &load_store,
-            ReadThreadParams {
-                thread_id,
-                include_archived: false,
-                include_history: true,
-            },
+        codex_rollout::with_rollout_maintenance_observer(
+            Arc::new(move |status| {
+                progress.send_replace(status);
+            }),
+            ThreadStore::read_thread(
+                &load_store,
+                ReadThreadParams {
+                    thread_id,
+                    include_archived: false,
+                    include_history: true,
+                },
+            ),
         )
         .await
     });
+    let waiting = codex_rollout::RolloutMaintenanceRequestStatus::WaitingForMaintenance {
+        thread_id: Some(thread_id),
+        owner: None,
+    };
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        updates.wait_for(|status| *status == waiting),
+    )
+    .await
+    .expect("requested thread reports its maintenance blocker")
+    .expect("migration status remains available");
     assert!(
         tokio::time::timeout(Duration::from_millis(100), &mut load)
             .await

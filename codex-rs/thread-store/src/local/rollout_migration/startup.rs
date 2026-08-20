@@ -28,7 +28,10 @@ use std::time::SystemTime;
 
 use codex_protocol::ThreadId;
 use codex_protocol::protocol::ThreadHistoryMode;
+use codex_rollout::RolloutMaintenanceRequestScope;
+use codex_rollout::RolloutMaintenanceRequestStatus;
 use codex_rollout::StateDbHandle;
+use codex_rollout::with_rollout_maintenance_observer;
 use codex_state::RolloutMigrationCursor;
 use codex_state::RolloutMigrationSkippedRollout;
 use tokio::sync::Mutex;
@@ -112,11 +115,13 @@ enum MigrationEntryStatus {
 #[derive(Clone, Debug)]
 enum MigrationCompletion {
     Pending,
+    Progress(RolloutMaintenanceRequestStatus),
     Complete(Result<(), String>),
 }
 
 struct MigrationWork {
     thread_id: ThreadId,
+    completion: watch::Sender<MigrationCompletion>,
     path: PathBuf,
     rollout_id: codex_protocol::RolloutId,
     source_fingerprint: RolloutFingerprint,
@@ -339,21 +344,26 @@ pub(super) async fn await_thread_migration(
     };
     ensure_worker(store).await?;
 
+    let mut waiting: Option<RolloutMaintenanceRequestScope> = None;
     loop {
         let completion = receiver.borrow().clone();
-        match completion {
+        let status = match completion {
             MigrationCompletion::Pending => {
-                receiver.changed().await.map_err(|_| {
-                    migration_error(format!(
-                        "automatic rollout migration stopped before thread {thread_id} completed"
-                    ))
-                })?;
+                RolloutMaintenanceRequestStatus::QueuedForMigration { thread_id }
             }
+            MigrationCompletion::Progress(status) => status,
             MigrationCompletion::Complete(Ok(())) => return Ok(()),
-            MigrationCompletion::Complete(Err(message)) => {
-                return Err(migration_error(message));
-            }
+            MigrationCompletion::Complete(Err(message)) => return Err(migration_error(message)),
+        };
+        match &waiting {
+            Some(waiting) => waiting.update(status),
+            None => waiting = Some(RolloutMaintenanceRequestScope::new(status)),
         }
+        receiver.changed().await.map_err(|_| {
+            migration_error(format!(
+                "automatic rollout migration stopped before thread {thread_id} completed"
+            ))
+        })?;
     }
 }
 
@@ -418,9 +428,20 @@ async fn run_worker(store: LocalThreadStore) {
             .lock()
             .await
             .push(work.thread_id);
-        let result = store
-            .migrate_rollout_path_on_demand(work.thread_id, work.path.clone(), &mut work.admission)
-            .await;
+        let completion = work.completion.clone();
+        let result = with_rollout_maintenance_observer(
+            Arc::new(move |status| {
+                if status != RolloutMaintenanceRequestStatus::Idle {
+                    completion.send_replace(MigrationCompletion::Progress(status));
+                }
+            }),
+            store.migrate_rollout_path_on_demand(
+                work.thread_id,
+                work.path.clone(),
+                &mut work.admission,
+            ),
+        )
+        .await;
         let result = match result {
             Ok(Some(outcome)) if outcome.status == RolloutMigrationStatus::Failed => {
                 let message = outcome.message.clone().unwrap_or_else(|| {
@@ -484,6 +505,7 @@ async fn run_worker(store: LocalThreadStore) {
             match result {
                 Ok(Some(outcome)) if outcome.status == RolloutMigrationStatus::SkippedBusy => {
                     entry.status = MigrationEntryStatus::Pending;
+                    entry.completion.send_replace(MigrationCompletion::Pending);
                     entry.not_before =
                         tokio::time::Instant::now() + std::time::Duration::from_millis(50);
                     state.priority.push_back(work.thread_id);
@@ -553,8 +575,10 @@ async fn next_work(store: &LocalThreadStore) -> Option<MigrationWork> {
             if let Some(thread_id) = thread_id {
                 let entry = state.entries.get_mut(&thread_id)?;
                 entry.status = MigrationEntryStatus::Running;
+                entry.completion.send_replace(MigrationCompletion::Pending);
                 return Some(MigrationWork {
                     thread_id,
+                    completion: entry.completion.clone(),
                     path: entry.path.clone(),
                     rollout_id: entry.rollout_id,
                     source_fingerprint: entry.source_fingerprint,
