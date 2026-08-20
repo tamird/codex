@@ -409,31 +409,12 @@ async fn repair_before_access(
             (
                 None,
                 Some(
-                    match codex_rollout::try_acquire_rollout_maintenance_read_lock(
+                    codex_rollout::acquire_rollout_maintenance_read(
                         store.config.codex_home.as_path(),
+                        thread_id,
                     )
-                    .map_err(thread_store_io_error)?
-                    {
-                        Some(guard) => guard,
-                        None => {
-                            let _waiting = codex_rollout::RolloutMaintenanceRequestScope::new(
-                                codex_rollout::RolloutMaintenanceRequestStatus::WaitingForMaintenance {
-                                    thread_id: Some(thread_id),
-                                    owner: match codex_rollout::read_rollout_maintenance_status(
-                                        store.config.codex_home.as_path(),
-                                    ) {
-                                        Ok(codex_rollout::RolloutMaintenanceStatus::Busy { owner }) => owner,
-                                        Ok(codex_rollout::RolloutMaintenanceStatus::Idle) | Err(_) => None,
-                                    },
-                                },
-                            );
-                            codex_rollout::acquire_rollout_maintenance_read_lock(
-                                store.config.codex_home.as_path(),
-                            )
-                            .await
-                            .map_err(thread_store_io_error)?
-                        }
-                    },
+                    .await
+                    .map_err(thread_store_io_error)?,
                 ),
             )
         };

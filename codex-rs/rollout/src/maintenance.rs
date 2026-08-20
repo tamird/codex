@@ -317,13 +317,10 @@ pub fn try_acquire_rollout_maintenance_read_lock(
 pub async fn acquire_rollout_maintenance_read_lock(
     codex_home: &Path,
 ) -> io::Result<RolloutMaintenanceReadGuard> {
-    let _foreground = acquire_foreground_intent(codex_home).await?;
-    loop {
-        if let Some(guard) = try_acquire_rollout_maintenance_read_lock(codex_home)? {
-            return Ok(guard);
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-    }
+    acquire_inner(codex_home, /*activity*/ None, |home, _foreground| {
+        try_acquire_rollout_maintenance_read_lock(home)
+    })
+    .await
 }
 
 /// Try to serialize a migration without excluding unrelated clean readers.
@@ -370,13 +367,28 @@ fn try_acquire_foreground_job(
 pub async fn acquire_rollout_maintenance_job_lock(
     codex_home: &Path,
 ) -> io::Result<RolloutMaintenanceJobGuard> {
-    let foreground = acquire_foreground_intent(codex_home).await?;
-    loop {
-        if let Some(guard) = try_acquire_foreground_job(codex_home, Arc::clone(&foreground))? {
-            return Ok(guard);
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-    }
+    acquire_inner(
+        codex_home,
+        /*activity*/ None,
+        try_acquire_foreground_job,
+    )
+    .await
+}
+
+/// Report contention for clean access without claiming it performs history repair.
+pub async fn acquire_rollout_maintenance_read(
+    codex_home: &Path,
+    thread_id: ThreadId,
+) -> io::Result<RolloutMaintenanceReadGuard> {
+    acquire_inner(
+        codex_home,
+        Some(RolloutMaintenanceActivity::new(
+            crate::maintenance_status::RolloutMaintenanceOperation::HistoryRepair,
+            Some(thread_id),
+        )),
+        |home, _foreground| try_acquire_rollout_maintenance_read_lock(home),
+    )
+    .await
 }
 
 async fn acquire_foreground_intent(codex_home: &Path) -> io::Result<Arc<MaintenanceFileLock>> {
@@ -420,7 +432,10 @@ pub fn try_acquire_rollout_maintenance(
 pub async fn acquire_rollout_maintenance_lock(
     codex_home: &Path,
 ) -> io::Result<RolloutMaintenanceGuard> {
-    acquire_inner(codex_home, /*activity*/ None).await
+    acquire_inner(codex_home, /*activity*/ None, |home, _foreground| {
+        try_acquire_rollout_maintenance_lock(home)
+    })
+    .await
 }
 
 /// Wait for maintenance while reporting actual contention to the current request.
@@ -428,24 +443,27 @@ pub async fn acquire_rollout_maintenance(
     codex_home: &Path,
     activity: RolloutMaintenanceActivity,
 ) -> io::Result<RolloutMaintenanceGuard> {
-    acquire_inner(codex_home, Some(activity)).await
+    Ok(
+        acquire_inner(codex_home, Some(activity), |home, _foreground| {
+            try_acquire_rollout_maintenance_lock(home)
+        })
+        .await?
+        .with_activity(codex_home, activity),
+    )
 }
 
-async fn acquire_inner(
+async fn acquire_inner<T>(
     codex_home: &Path,
     activity: Option<RolloutMaintenanceActivity>,
-) -> io::Result<RolloutMaintenanceGuard> {
-    let _foreground = acquire_foreground_intent(codex_home).await?;
+    try_acquire: impl Fn(&Path, Arc<MaintenanceFileLock>) -> io::Result<Option<T>>,
+) -> io::Result<T> {
+    let foreground = acquire_foreground_intent(codex_home).await?;
     let mut delay = std::time::Duration::from_millis(25);
     let mut previous = None;
     let mut waiting: Option<RolloutMaintenanceRequestScope> = None;
     loop {
-        if let Some(guard) = try_acquire_rollout_maintenance_lock(codex_home)? {
-            drop(waiting);
-            return Ok(match activity {
-                Some(activity) => guard.with_activity(codex_home, activity),
-                None => guard,
-            });
+        if let Some(guard) = try_acquire(codex_home, Arc::clone(&foreground))? {
+            return Ok(guard);
         }
         if let Some(activity) = activity {
             let owner = match read_rollout_maintenance_status(codex_home) {

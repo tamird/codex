@@ -120,6 +120,7 @@ pub use maintenance::acquire_rollout_maintenance;
 pub use maintenance::acquire_rollout_maintenance_intent;
 pub use maintenance::acquire_rollout_maintenance_job_lock;
 pub use maintenance::acquire_rollout_maintenance_lock;
+pub use maintenance::acquire_rollout_maintenance_read;
 pub use maintenance::acquire_rollout_maintenance_read_lock;
 pub use maintenance::read_rollout_maintenance_status;
 pub use maintenance::try_acquire_rollout_maintenance;
