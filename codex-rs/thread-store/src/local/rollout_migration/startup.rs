@@ -72,16 +72,64 @@ const MAINTENANCE_RETRY_DELAY: Duration = Duration::from_secs(1);
 mod recent_failures;
 
 /// Bounds migration workers and joins concurrent loads of the same thread.
-#[derive(Default)]
 pub(crate) struct StartupMigrationCoordinator {
     enabled: AtomicBool,
     state: Mutex<CoordinatorState>,
     ready: Notify,
+    activity: watch::Sender<RolloutMaintenanceRequestStatus>,
     #[cfg(test)]
     processed: Mutex<Vec<ThreadId>>,
     /// Tests pause after durable journal creation without holding a coordinator mutex.
     #[cfg(test)]
     pub(super) journal_barriers: Mutex<HashMap<ThreadId, Arc<tokio::sync::Barrier>>>,
+}
+
+impl Default for StartupMigrationCoordinator {
+    fn default() -> Self {
+        Self {
+            enabled: AtomicBool::new(false),
+            state: Mutex::new(CoordinatorState::default()),
+            ready: Notify::new(),
+            activity: watch::channel(RolloutMaintenanceRequestStatus::Idle).0,
+            #[cfg(test)]
+            processed: Mutex::new(Vec::new()),
+            #[cfg(test)]
+            journal_barriers: Mutex::new(HashMap::new()),
+        }
+    }
+}
+
+impl StartupMigrationCoordinator {
+    pub(crate) fn subscribe(&self) -> watch::Receiver<RolloutMaintenanceRequestStatus> {
+        self.activity.subscribe()
+    }
+
+    fn publish_activity(&self, state: &CoordinatorState) {
+        // A finished job must not clear another independent job's current activity.
+        self.activity.send_if_modified(|current| {
+            let status = state
+                .entries
+                .values()
+                .find_map(|entry| match &*entry.completion.borrow() {
+                    MigrationCompletion::Progress(status) => Some(*status),
+                    MigrationCompletion::Pending | MigrationCompletion::Complete(_) => None,
+                })
+                .or_else(|| {
+                    state.entries.iter().find_map(|(thread_id, entry)| {
+                        matches!(*entry.completion.borrow(), MigrationCompletion::Pending)
+                            .then_some(RolloutMaintenanceRequestStatus::QueuedForMigration {
+                                thread_id: *thread_id,
+                            })
+                    })
+                })
+                .unwrap_or(RolloutMaintenanceRequestStatus::Idle);
+            if *current == status {
+                return false;
+            }
+            *current = status;
+            true
+        });
+    }
 }
 
 #[derive(Default)]
@@ -429,10 +477,15 @@ async fn run_worker(store: LocalThreadStore) {
             .await
             .push(work.thread_id);
         let completion = work.completion.clone();
+        let activity = store.rollout_migration_coordinator.activity.clone();
         let result = with_rollout_maintenance_observer(
             Arc::new(move |status| {
                 if status != RolloutMaintenanceRequestStatus::Idle {
-                    completion.send_replace(MigrationCompletion::Progress(status));
+                    // Serialize the per-thread update and representative snapshot together.
+                    activity.send_modify(|current| {
+                        completion.send_replace(MigrationCompletion::Progress(status));
+                        *current = status;
+                    });
                 }
             }),
             store.migrate_rollout_path_on_demand(
@@ -535,6 +588,7 @@ async fn run_worker(store: LocalThreadStore) {
             {
                 state.entries.remove(&work.thread_id);
             }
+            store.rollout_migration_coordinator.publish_activity(&state);
         }
         store.rollout_migration_coordinator.ready.notify_one();
     }
@@ -576,14 +630,16 @@ async fn next_work(store: &LocalThreadStore) -> Option<MigrationWork> {
                 let entry = state.entries.get_mut(&thread_id)?;
                 entry.status = MigrationEntryStatus::Running;
                 entry.completion.send_replace(MigrationCompletion::Pending);
-                return Some(MigrationWork {
+                let work = MigrationWork {
                     thread_id,
                     completion: entry.completion.clone(),
                     path: entry.path.clone(),
                     rollout_id: entry.rollout_id,
                     source_fingerprint: entry.source_fingerprint,
                     admission: entry.admission.clone(),
-                });
+                };
+                store.rollout_migration_coordinator.publish_activity(&state);
+                return Some(work);
             }
             let next = state
                 .entries

@@ -75,6 +75,15 @@ pub trait ThreadStore: Any + Send + Sync {
     /// Return this store as [`Any`] for implementation-owned escape hatches.
     fn as_any(&self) -> &dyn Any;
 
+    /// Subscribe to this store's automatic migration worker, when supported.
+    ///
+    /// This is a bounded latest-value activity stream, separate from cross-process lock ownership.
+    fn subscribe_rollout_migration(
+        &self,
+    ) -> Option<tokio::sync::watch::Receiver<codex_rollout::RolloutMaintenanceRequestStatus>> {
+        None
+    }
+
     /// Returns the history mode to use when history does not carry a persisted mode.
     ///
     /// The default is legacy so existing stores stay compatible. Stores whose durable contract is

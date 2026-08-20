@@ -3,8 +3,14 @@ use std::collections::BTreeMap;
 use anyhow::Result;
 use app_test_support::MockResponsesConfig;
 use app_test_support::TestAppServer;
+use codex_app_server_protocol::ClientRequest;
 use codex_app_server_protocol::ExperimentalFeatureEnablementSetParams;
 use codex_app_server_protocol::ExperimentalFeatureEnablementSetResponse;
+use codex_app_server_protocol::RolloutMaintenanceLockStatus;
+use codex_app_server_protocol::RolloutMaintenanceRequestStatus;
+use codex_app_server_protocol::RolloutMaintenanceSnapshot;
+use codex_app_server_protocol::RolloutMaintenanceStatusChangedNotification;
+use codex_app_server_protocol::RolloutMaintenanceStatusReadResponse;
 use codex_app_server_protocol::SortDirection;
 use codex_app_server_protocol::ThreadHistoryMode;
 use codex_app_server_protocol::ThreadItem;
@@ -1077,12 +1083,28 @@ async fn automatic_migration_keeps_list_nonblocking_and_gates_resume() -> Result
     .await??;
     timeout(DEFAULT_READ_TIMEOUT, primary.shutdown_gracefully()).await??;
 
-    let maintenance_guard = codex_rollout::try_acquire_rollout_maintenance_lock(codex_home.path())?
-        .expect("hold rollout maintenance while app-server starts");
+    let owner = codex_rollout::RolloutMaintenanceActivity::new(
+        codex_rollout::RolloutMaintenanceOperation::ManualMigration,
+        /*thread_id*/ None,
+    );
+    let maintenance_guard =
+        codex_rollout::try_acquire_rollout_maintenance(codex_home.path(), owner)?
+            .expect("hold rollout maintenance while app-server starts");
     let mut secondary = TestAppServer::builder()
         .with_codex_home(codex_home.path())
+        .with_args(&["-c", "features.background_paginated_rollout_migration=true"])
         .build_initialized()
         .await?;
+    let lock = RolloutMaintenanceLockStatus::Busy {
+        owner: Some(owner.into()),
+    };
+    let initial_status: RolloutMaintenanceStatusReadResponse = secondary
+        .request(|request_id| ClientRequest::RolloutMaintenanceStatusRead {
+            request_id,
+            params: None,
+        })
+        .await?;
+    assert_eq!(initial_status.status.lock, lock);
     let list_id = secondary
         .send_thread_list_request(ThreadListParams {
             cursor: None,
@@ -1129,6 +1151,16 @@ async fn automatic_migration_keeps_list_nonblocking_and_gates_resume() -> Result
     } = timeout(DEFAULT_READ_TIMEOUT, &mut resumed).await??;
     assert_eq!(resumed_thread.history_mode, ThreadHistoryMode::Paginated);
     drop(resumed);
+    wait_for_maintenance_update(
+        &mut secondary,
+        RolloutMaintenanceStatusChangedNotification::Snapshot {
+            status: RolloutMaintenanceSnapshot {
+                lock: RolloutMaintenanceLockStatus::Idle,
+                background_migration: Some(RolloutMaintenanceRequestStatus::Idle),
+            },
+        },
+    )
+    .await?;
 
     timeout(DEFAULT_READ_TIMEOUT, secondary.shutdown_gracefully()).await??;
     Ok(())
@@ -1510,4 +1542,35 @@ fn file_sha256(path: &Path) -> Result<String> {
         hasher.update(&buffer[..read]);
     }
     Ok(format!("{:x}", hasher.finalize()))
+}
+
+async fn wait_for_maintenance_update(
+    server: &mut TestAppServer,
+    expected: RolloutMaintenanceStatusChangedNotification,
+) -> Result<()> {
+    let notification = timeout(
+        DEFAULT_READ_TIMEOUT,
+        server.read_stream_until_matching_notification(
+            "expected rollout maintenance transition",
+            |notification| {
+                notification.method == "rolloutMaintenance/status/changed"
+                    && notification.params.as_ref().is_some_and(|params| {
+                        serde_json::from_value::<RolloutMaintenanceStatusChangedNotification>(
+                            params.clone(),
+                        )
+                        .is_ok_and(|status| status == expected)
+                    })
+            },
+        ),
+    )
+    .await??;
+    assert_eq!(
+        serde_json::from_value::<RolloutMaintenanceStatusChangedNotification>(
+            notification
+                .params
+                .expect("maintenance notification parameters"),
+        )?,
+        expected
+    );
+    Ok(())
 }

@@ -76,6 +76,8 @@ use codex_app_server_protocol::ItemCompletedNotification;
 use codex_app_server_protocol::JSONRPCErrorError;
 use codex_app_server_protocol::RequestId;
 use codex_app_server_protocol::Result;
+use codex_app_server_protocol::RolloutMaintenanceRequestStatus;
+use codex_app_server_protocol::RolloutMaintenanceStatusChangedNotification;
 use codex_app_server_protocol::ServerNotification;
 use codex_app_server_protocol::ServerRequest;
 use codex_app_server_protocol::ThreadItem;
@@ -108,6 +110,18 @@ pub const DEFAULT_IN_PROCESS_CHANNEL_CAPACITY: usize = CHANNEL_CAPACITY;
 type PendingClientRequestResponse = std::result::Result<Result, JSONRPCErrorError>;
 
 fn server_notification_requires_delivery(notification: &ServerNotification) -> bool {
+    if let ServerNotification::RolloutMaintenanceStatusChanged(notification) = notification {
+        return match notification {
+            // The final RPC response clears request progress. Advisory updates must not delay it.
+            RolloutMaintenanceStatusChangedNotification::Request { .. } => false,
+            RolloutMaintenanceStatusChangedNotification::Snapshot { status } => {
+                matches!(
+                    status.background_migration.as_ref(),
+                    None | Some(RolloutMaintenanceRequestStatus::Idle)
+                )
+            }
+        };
+    }
     matches!(
         notification,
         ServerNotification::TurnCompleted(_)

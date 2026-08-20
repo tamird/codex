@@ -1110,6 +1110,12 @@ client_request_definitions! {
         serialization: global_shared_read("remote-control"),
         response: v2::RemoteControlStatusReadResponse,
     },
+    #[experimental("rolloutMaintenance/status/read")]
+    RolloutMaintenanceStatusRead => "rolloutMaintenance/status/read" {
+        params: #[ts(type = "undefined")] #[serde(skip_serializing_if = "Option::is_none")] Option<()>,
+        serialization: None,
+        response: v2::RolloutMaintenanceStatusReadResponse,
+    },
     #[experimental("remoteControl/pairing/start")]
     RemoteControlPairingStart => "remoteControl/pairing/start" {
         params: v2::RemoteControlPairingStartParams,
@@ -1941,6 +1947,8 @@ server_notification_definitions! {
     AccountRateLimitsUpdated => "account/rateLimits/updated" (v2::AccountRateLimitsUpdatedNotification),
     AppListUpdated => "app/list/updated" (v2::AppListUpdatedNotification),
     RemoteControlStatusChanged => "remoteControl/status/changed" (v2::RemoteControlStatusChangedNotification),
+    #[experimental("rolloutMaintenance/status/changed")]
+    RolloutMaintenanceStatusChanged => "rolloutMaintenance/status/changed" (v2::RolloutMaintenanceStatusChangedNotification),
     ExternalAgentConfigImportProgress => "externalAgentConfig/import/progress" (v2::ExternalAgentConfigImportProgressNotification),
     ExternalAgentConfigImportCompleted => "externalAgentConfig/import/completed" (v2::ExternalAgentConfigImportCompletedNotification),
     FsChanged => "fs/changed" (v2::FsChangedNotification),

@@ -3719,6 +3719,324 @@
       },
       "type": "object"
     },
+    "RolloutMaintenanceActivity": {
+      "description": "Content-free activity details; counts describe only their named phase.",
+      "properties": {
+        "ioBytes": {
+          "description": "Observed bytes handled, including repeated passes; not physical I/O or overall progress.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "operation": {
+          "$ref": "#/definitions/RolloutMaintenanceOperation"
+        },
+        "operationId": {
+          "type": "string"
+        },
+        "phase": {
+          "$ref": "#/definitions/RolloutMaintenancePhase"
+        },
+        "processId": {
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "progress": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/RolloutMaintenanceProgress"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "threadId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "ioBytes",
+        "operation",
+        "operationId",
+        "phase",
+        "processId"
+      ],
+      "type": "object"
+    },
+    "RolloutMaintenanceLockStatus": {
+      "description": "The operating-system lock is authoritative; older owners may provide no details.",
+      "oneOf": [
+        {
+          "properties": {
+            "type": {
+              "enum": [
+                "idle"
+              ],
+              "title": "IdleRolloutMaintenanceLockStatusType",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "title": "IdleRolloutMaintenanceLockStatus",
+          "type": "object"
+        },
+        {
+          "properties": {
+            "owner": {
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/RolloutMaintenanceActivity"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "type": {
+              "enum": [
+                "busy"
+              ],
+              "title": "BusyRolloutMaintenanceLockStatusType",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "title": "BusyRolloutMaintenanceLockStatus",
+          "type": "object"
+        }
+      ]
+    },
+    "RolloutMaintenanceOperation": {
+      "enum": [
+        "manualMigration",
+        "backgroundMigration",
+        "compression",
+        "historyRepair"
+      ],
+      "type": "string"
+    },
+    "RolloutMaintenancePhase": {
+      "enum": [
+        "starting",
+        "inventory",
+        "planning",
+        "validating",
+        "waitingForWriter",
+        "staging",
+        "projecting",
+        "publishing",
+        "verifying",
+        "recovering"
+      ],
+      "type": "string"
+    },
+    "RolloutMaintenanceProgress": {
+      "properties": {
+        "completed": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "total": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "unit": {
+          "$ref": "#/definitions/RolloutMaintenanceProgressUnit"
+        }
+      },
+      "required": [
+        "completed",
+        "unit"
+      ],
+      "type": "object"
+    },
+    "RolloutMaintenanceProgressUnit": {
+      "enum": [
+        "paths",
+        "segments",
+        "bytes"
+      ],
+      "type": "string"
+    },
+    "RolloutMaintenanceRequestStatus": {
+      "description": "Request-local activity. Running does not imply ownership of the global lock.",
+      "oneOf": [
+        {
+          "properties": {
+            "type": {
+              "enum": [
+                "idle"
+              ],
+              "title": "IdleRolloutMaintenanceRequestStatusType",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "title": "IdleRolloutMaintenanceRequestStatus",
+          "type": "object"
+        },
+        {
+          "properties": {
+            "thread_id": {
+              "type": "string"
+            },
+            "type": {
+              "enum": [
+                "queuedForMigration"
+              ],
+              "title": "QueuedForMigrationRolloutMaintenanceRequestStatusType",
+              "type": "string"
+            }
+          },
+          "required": [
+            "thread_id",
+            "type"
+          ],
+          "title": "QueuedForMigrationRolloutMaintenanceRequestStatus",
+          "type": "object"
+        },
+        {
+          "properties": {
+            "owner": {
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/RolloutMaintenanceActivity"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "thread_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "type": {
+              "enum": [
+                "waitingForMaintenance"
+              ],
+              "title": "WaitingForMaintenanceRolloutMaintenanceRequestStatusType",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "title": "WaitingForMaintenanceRolloutMaintenanceRequestStatus",
+          "type": "object"
+        },
+        {
+          "properties": {
+            "activity": {
+              "$ref": "#/definitions/RolloutMaintenanceActivity"
+            },
+            "type": {
+              "enum": [
+                "running"
+              ],
+              "title": "RunningRolloutMaintenanceRequestStatusType",
+              "type": "string"
+            }
+          },
+          "required": [
+            "activity",
+            "type"
+          ],
+          "title": "RunningRolloutMaintenanceRequestStatus",
+          "type": "object"
+        }
+      ]
+    },
+    "RolloutMaintenanceSnapshot": {
+      "description": "Current cross-process lock ownership and this server's automatic migration activity.",
+      "properties": {
+        "backgroundMigration": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/RolloutMaintenanceRequestStatus"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Null when this thread store does not expose an automatic migration worker."
+        },
+        "lock": {
+          "$ref": "#/definitions/RolloutMaintenanceLockStatus"
+        }
+      },
+      "required": [
+        "lock"
+      ],
+      "type": "object"
+    },
+    "RolloutMaintenanceStatusChangedNotification": {
+      "description": "Global snapshots and progress for one request on the receiving connection.",
+      "oneOf": [
+        {
+          "properties": {
+            "status": {
+              "$ref": "#/definitions/RolloutMaintenanceSnapshot"
+            },
+            "type": {
+              "enum": [
+                "snapshot"
+              ],
+              "title": "SnapshotRolloutMaintenanceStatusChangedNotificationType",
+              "type": "string"
+            }
+          },
+          "required": [
+            "status",
+            "type"
+          ],
+          "title": "SnapshotRolloutMaintenanceStatusChangedNotification",
+          "type": "object"
+        },
+        {
+          "properties": {
+            "request_id": {
+              "$ref": "#/definitions/RequestId"
+            },
+            "status": {
+              "$ref": "#/definitions/RolloutMaintenanceRequestStatus"
+            },
+            "type": {
+              "enum": [
+                "request"
+              ],
+              "title": "RequestRolloutMaintenanceStatusChangedNotificationType",
+              "type": "string"
+            }
+          },
+          "required": [
+            "request_id",
+            "status",
+            "type"
+          ],
+          "title": "RequestRolloutMaintenanceStatusChangedNotification",
+          "type": "object"
+        }
+      ]
+    },
     "SandboxPolicy": {
       "oneOf": [
         {
@@ -7721,6 +8039,26 @@
         "params"
       ],
       "title": "RemoteControl/status/changedNotification",
+      "type": "object"
+    },
+    {
+      "properties": {
+        "method": {
+          "enum": [
+            "rolloutMaintenance/status/changed"
+          ],
+          "title": "RolloutMaintenance/status/changedNotificationMethod",
+          "type": "string"
+        },
+        "params": {
+          "$ref": "#/definitions/RolloutMaintenanceStatusChangedNotification"
+        }
+      },
+      "required": [
+        "method",
+        "params"
+      ],
+      "title": "RolloutMaintenance/status/changedNotification",
       "type": "object"
     },
     {

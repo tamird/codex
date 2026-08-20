@@ -126,6 +126,7 @@ mod realtime_event_handling;
 mod realtime_history;
 mod request_processors;
 mod request_serialization;
+mod rollout_maintenance;
 mod server_request_error;
 mod skills_watcher;
 mod thread_state;

@@ -1114,6 +1114,12 @@ impl LocalThreadStore {
 }
 
 impl ThreadStore for LocalThreadStore {
+    fn subscribe_rollout_migration(
+        &self,
+    ) -> Option<tokio::sync::watch::Receiver<codex_rollout::RolloutMaintenanceRequestStatus>> {
+        Some(self.rollout_migration_coordinator.subscribe())
+    }
+
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }

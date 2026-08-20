@@ -196,6 +196,7 @@ pub(super) fn server_notification_thread_target(
         | ServerNotification::EnvironmentConnected(_)
         | ServerNotification::EnvironmentDisconnected(_)
         | ServerNotification::RemoteControlStatusChanged(_)
+        | ServerNotification::RolloutMaintenanceStatusChanged(_)
         | ServerNotification::ExternalAgentConfigImportProgress(_)
         | ServerNotification::ExternalAgentConfigImportCompleted(_)
         | ServerNotification::DeprecationNotice(_)

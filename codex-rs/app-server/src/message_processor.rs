@@ -50,6 +50,7 @@ use crate::request_processors::read_server_diagnostics;
 use crate::request_serialization::QueuedInitializedRequest;
 use crate::request_serialization::RequestSerializationQueueKey;
 use crate::request_serialization::RequestSerializationQueues;
+use crate::rollout_maintenance::RolloutMaintenanceProcessor;
 use crate::skills_watcher::SkillsWatcher;
 use crate::thread_state::ConnectionCapabilities;
 use crate::thread_state::ThreadStateManager;
@@ -156,6 +157,7 @@ pub(crate) struct MessageProcessor {
     plugin_processor: PluginRequestProcessor,
     project_processor: ProjectRequestProcessor,
     remote_control_processor: RemoteControlRequestProcessor,
+    rollout_maintenance: RolloutMaintenanceProcessor,
     search_processor: SearchRequestProcessor,
     goal_scheduler: Option<GoalSchedulerHandle>,
     thread_goal_processor: ThreadGoalRequestProcessor,
@@ -293,6 +295,11 @@ impl MessageProcessor {
         // affect per-thread behavior, but they must not move newly started,
         // resumed, or forked threads to a different persistence backend/root.
         let thread_store = codex_core::thread_store_from_config(config.as_ref(), state_db.clone());
+        let rollout_maintenance = RolloutMaintenanceProcessor::new(
+            config.codex_home.to_path_buf(),
+            thread_store.subscribe_rollout_migration(),
+            Arc::clone(&outgoing),
+        );
         // Queue persistence requires SQLite, so in-memory thread stores and
         // app servers without a state database do not have a queue backend.
         let queue_store: Option<Arc<dyn QueueStore>> = match &config.experimental_thread_store {
@@ -596,6 +603,7 @@ impl MessageProcessor {
             plugin_processor,
             project_processor,
             remote_control_processor,
+            rollout_maintenance,
             search_processor,
             goal_scheduler,
             thread_goal_processor,
@@ -611,6 +619,7 @@ impl MessageProcessor {
         self.account_processor.clear_external_auth();
         self.apps_processor.shutdown();
         self.models_refresh_worker.shutdown();
+        self.rollout_maintenance.shutdown();
         self.skills_watcher.shutdown();
         if let Some(goal_scheduler) = self.goal_scheduler.as_ref() {
             goal_scheduler.stop();
@@ -756,6 +765,9 @@ impl MessageProcessor {
         self.initialize_processor
             .send_initialize_notifications_to_connection(connection_id)
             .await;
+        self.rollout_maintenance
+            .send_snapshot(&[connection_id])
+            .await;
     }
 
     pub(crate) async fn connection_initialized(
@@ -777,6 +789,7 @@ impl MessageProcessor {
         self.initialize_processor
             .send_initialize_notifications()
             .await;
+        self.rollout_maintenance.send_snapshot(&[]).await;
     }
 
     pub(crate) async fn try_attach_thread_listener(
@@ -1051,6 +1064,10 @@ impl MessageProcessor {
                 .map(|response| Some(response.into())),
             ClientRequest::RemoteControlStatusRead { .. } => self
                 .remote_control_processor
+                .status_read()
+                .map(|response| Some(response.into())),
+            ClientRequest::RolloutMaintenanceStatusRead { .. } => self
+                .rollout_maintenance
                 .status_read()
                 .map(|response| Some(response.into())),
             ClientRequest::RemoteControlPairingStart { params, .. } => self
