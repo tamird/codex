@@ -9,6 +9,7 @@ use crate::branch_summary;
 use crate::chatwidget::limit_label_for_window;
 use crate::chatwidget::rate_limits::get_limits_duration;
 use crate::legacy_core::config::Config;
+use crate::performance::SLOW_TUI_OPERATION_THRESHOLD;
 use crate::status::format_credit_micros;
 use crate::status::format_estimated_usd_micros;
 use crate::status::format_tokens_compact;
@@ -239,50 +240,71 @@ impl ChatWidget {
         Ok(())
     }
 
-    /// Renders and applies the terminal title for one parsed selection snapshot.
+    /// Renders and applies the terminal title for one parsed item selection.
     ///
     /// Empty selections clear the managed title. Non-empty selections render the
     /// current values in configured order, skip unavailable segments, and cache
     /// the last successfully written title so redundant OSC writes are avoided.
-    /// Animated titles record their next refresh for the foreground loop, independently
-    /// of full TUI redraws.
-    fn refresh_terminal_title_from_selections(&mut self, selections: &StatusSurfaceSelections) {
+    /// The app event loop advances animated titles independently of full TUI redraws.
+    fn refresh_terminal_title_from_items(&mut self, items: &[TerminalTitleItem]) {
+        let started_at = Instant::now();
         self.last_terminal_title_requires_action =
-            self.terminal_title_shows_action_required_with_selections(selections);
-        let now = Instant::now();
-        self.terminal_title_next_refresh = self
-            .terminal_title_animation_interval_with_selections(selections)
-            .map(|interval| now + interval);
-        if selections.terminal_title_items.is_empty() {
-            if let Err(err) = self.clear_managed_terminal_title() {
-                tracing::debug!(error = %err, "failed to clear terminal title");
-            }
-            return;
-        }
-
-        let title = self.terminal_title_text_for_selections(selections, now);
-        if self.last_terminal_title == title {
-            return;
-        }
-        match title {
-            Some(title) => match set_terminal_title(&title) {
-                Ok(SetTerminalTitleResult::Applied) => {
-                    self.last_terminal_title = Some(title);
+            self.terminal_title_requires_action() && items.contains(&TerminalTitleItem::Spinner);
+        // Every refresh advances or clears the deadline, including unchanged and empty titles.
+        let animation_interval =
+            if self.config.animations && items.contains(&TerminalTitleItem::Spinner) {
+                if self.last_terminal_title_requires_action {
+                    Some(TERMINAL_TITLE_ACTION_REQUIRED_INTERVAL)
+                } else if self.terminal_title_has_active_progress() {
+                    Some(TERMINAL_TITLE_SPINNER_INTERVAL)
+                } else {
+                    None
                 }
-                Ok(SetTerminalTitleResult::NoVisibleContent) => {
-                    if let Err(err) = self.clear_managed_terminal_title() {
-                        tracing::debug!(error = %err, "failed to clear terminal title");
+            } else {
+                None
+            };
+        self.terminal_title_next_refresh = animation_interval.map(|interval| started_at + interval);
+        let title = self.terminal_title_text_for_items(items, started_at);
+        let emit_started_at = Instant::now();
+        let outcome = if self.last_terminal_title == title {
+            "unchanged"
+        } else {
+            let result = match title {
+                Some(title) => match set_terminal_title(&title) {
+                    Ok(SetTerminalTitleResult::Applied) => {
+                        self.last_terminal_title = Some(title);
+                        Ok(())
                     }
-                }
+                    Ok(SetTerminalTitleResult::NoVisibleContent) => {
+                        self.clear_managed_terminal_title()
+                    }
+                    Err(err) => Err(err),
+                },
+                None => self.clear_managed_terminal_title(),
+            };
+            match result {
+                Ok(()) => "ok",
                 Err(err) => {
-                    tracing::debug!(error = %err, "failed to set terminal title");
-                }
-            },
-            None => {
-                if let Err(err) = self.clear_managed_terminal_title() {
-                    tracing::debug!(error = %err, "failed to clear terminal title");
+                    tracing::debug!(error = %err, "failed to update terminal title");
+                    "error"
                 }
             }
+        };
+        let completed_at = Instant::now();
+        let duration = completed_at.duration_since(started_at);
+        if duration >= SLOW_TUI_OPERATION_THRESHOLD
+            && let Some(thread_id) = self.thread_id
+        {
+            tracing::debug!(
+                target: "codex.performance",
+                thread_id = %thread_id,
+                operation = "tui.terminal_title",
+                outcome,
+                prepare_duration_us = emit_started_at.duration_since(started_at).as_micros(),
+                emit_duration_us = completed_at.duration_since(emit_started_at).as_micros(),
+                duration_us = duration.as_micros(),
+                "slow terminal title refresh"
+            );
         }
     }
 
@@ -298,7 +320,7 @@ impl ChatWidget {
         self.warn_invalid_terminal_title_items_once(&selections.invalid_terminal_title_items);
         self.sync_status_surface_shared_state(&selections);
         self.refresh_status_line_from_selections(&selections);
-        self.refresh_terminal_title_from_selections(&selections);
+        self.refresh_terminal_title_from_items(&selections.terminal_title_items);
     }
 
     /// Recomputes and emits the terminal title from config and runtime state.
@@ -306,7 +328,13 @@ impl ChatWidget {
         let selections = self.status_surface_selections();
         self.warn_invalid_terminal_title_items_once(&selections.invalid_terminal_title_items);
         self.sync_status_surface_shared_state(&selections);
-        self.refresh_terminal_title_from_selections(&selections);
+        self.refresh_terminal_title_from_items(&selections.terminal_title_items);
+    }
+
+    /// Advances title animation using cached status values without refreshing the footer.
+    pub(crate) fn refresh_terminal_title_frame(&mut self) {
+        let (items, _) = self.terminal_title_items_with_invalids();
+        self.refresh_terminal_title_from_items(&items);
     }
 
     fn terminal_title_requires_action(&self) -> bool {
@@ -317,18 +345,17 @@ impl ChatWidget {
         self.terminal_title_requires_action() && self.terminal_title_uses_activity()
     }
 
-    fn terminal_title_text_for_selections(
+    fn terminal_title_text_for_items(
         &mut self,
-        selections: &StatusSurfaceSelections,
+        items: &[TerminalTitleItem],
         now: Instant,
     ) -> Option<String> {
-        if self.terminal_title_shows_action_required_with_selections(selections) {
-            return Some(self.action_required_terminal_title_text(selections, now));
+        if self.last_terminal_title_requires_action {
+            return Some(self.action_required_terminal_title_text(items, now));
         }
 
         let mut previous = None;
-        let title = selections
-            .terminal_title_items
+        let title = items
             .iter()
             .copied()
             .filter_map(|item| {
@@ -346,12 +373,12 @@ impl ChatWidget {
 
     fn action_required_terminal_title_text(
         &mut self,
-        selections: &StatusSurfaceSelections,
+        items: &[TerminalTitleItem],
         now: Instant,
     ) -> String {
         crate::bottom_pane::build_action_required_title_text(
             self.action_required_terminal_title_prefix_at(now),
-            selections.terminal_title_items.iter().copied(),
+            items.iter().copied(),
             &[TerminalTitleItem::Status],
             |item| self.terminal_title_value_for_item(item, now),
         )
@@ -369,30 +396,6 @@ impl ChatWidget {
         } else {
             TERMINAL_TITLE_ACTION_REQUIRED_PREFIX_HIDDEN
         }
-    }
-
-    fn terminal_title_shows_action_required_with_selections(
-        &self,
-        selections: &StatusSurfaceSelections,
-    ) -> bool {
-        self.terminal_title_requires_action()
-            && selections
-                .terminal_title_items
-                .contains(&TerminalTitleItem::Spinner)
-    }
-
-    fn terminal_title_animation_interval_with_selections(
-        &self,
-        selections: &StatusSurfaceSelections,
-    ) -> Option<Duration> {
-        if self.config.animations
-            && self.terminal_title_shows_action_required_with_selections(selections)
-        {
-            return Some(TERMINAL_TITLE_ACTION_REQUIRED_INTERVAL);
-        }
-
-        self.should_animate_terminal_title_spinner_with_selections(selections)
-            .then_some(TERMINAL_TITLE_SPINNER_INTERVAL)
     }
 
     pub(super) fn request_status_line_branch_refresh(&mut self) {
@@ -844,7 +847,8 @@ impl ChatWidget {
         item: TerminalTitleItem,
         now: Instant,
     ) -> Option<String> {
-        match item {
+        let started_at = Instant::now();
+        let value = match item {
             TerminalTitleItem::AppName => Some("codex".to_string()),
             TerminalTitleItem::Project => self.terminal_title_project_name(),
             TerminalTitleItem::CurrentDir => Some(Self::truncate_terminal_title_part(
@@ -908,7 +912,21 @@ impl ChatWidget {
                 /*max_chars*/ 32,
             )),
             TerminalTitleItem::TaskProgress => self.terminal_title_task_progress(),
+        };
+        let duration = started_at.elapsed();
+        if duration >= SLOW_TUI_OPERATION_THRESHOLD
+            && let Some(thread_id) = self.thread_id
+        {
+            tracing::debug!(
+                target: "codex.performance",
+                %thread_id,
+                operation = "tui.terminal_title.item",
+                title_item = %item,
+                duration_us = duration.as_micros(),
+                "slow terminal title item preparation"
+            );
         }
+        value
     }
 
     fn reasoning_display_name(&self) -> String {
@@ -992,27 +1010,6 @@ impl ChatWidget {
         }
 
         self.mcp_startup_status.is_some() || self.bottom_pane.is_task_running()
-    }
-
-    pub(super) fn should_animate_terminal_title_spinner(&self) -> bool {
-        self.config.animations
-            && self.terminal_title_uses_activity()
-            && self.terminal_title_has_active_progress()
-    }
-
-    pub(super) fn should_animate_terminal_title_action_required(&self) -> bool {
-        self.config.animations && self.terminal_title_shows_action_required()
-    }
-
-    fn should_animate_terminal_title_spinner_with_selections(
-        &self,
-        selections: &StatusSurfaceSelections,
-    ) -> bool {
-        self.config.animations
-            && selections
-                .terminal_title_items
-                .contains(&TerminalTitleItem::Spinner)
-            && self.terminal_title_has_active_progress()
     }
 
     /// Formats the last `update_plan` progress snapshot for terminal-title display.

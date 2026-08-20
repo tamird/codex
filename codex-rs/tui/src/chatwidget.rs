@@ -1267,12 +1267,7 @@ impl ChatWidget {
         }
         self.refresh_goal_status_indicator_for_time_tick();
         if self.terminal_title_shows_action_required() != self.last_terminal_title_requires_action {
-            self.refresh_terminal_title();
-        }
-        if self.should_animate_terminal_title_spinner()
-            || self.should_animate_terminal_title_action_required()
-        {
-            self.refresh_terminal_title();
+            self.refresh_terminal_title_frame();
         }
         self.refresh_status_line_if_workspace_headline_due();
         self.refresh_thread_usage_if_settlement_due();

@@ -5,6 +5,85 @@ use crate::bottom_pane::goal_status_indicator_line;
 use pretty_assertions::assert_eq;
 
 #[tokio::test]
+async fn terminal_title_animation_does_not_request_full_frame_redraws() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    chat.has_codex_backend_auth = true;
+    chat.config.tui_status_line = Some(vec!["workspace-headline".to_string()]);
+    chat.refresh_status_surfaces();
+    let request_id = match rx.try_recv() {
+        Ok(AppEvent::RefreshStatusLineWorkspaceHeadline { request_id }) => request_id,
+        event => panic!("expected workspace headline refresh, got {event:?}"),
+    };
+    assert!(chat.set_status_line_workspace_headline(
+        request_id,
+        Ok(
+            crate::workspace_messages::WorkspaceHeadlineFetchResult::Available(Some(
+                "Cached headline".to_string(),
+            ))
+        ),
+    ));
+    chat.status_line_workspace_headline_last_requested_at =
+        Some(Instant::now() - crate::workspace_messages::WORKSPACE_HEADLINE_REFRESH_INTERVAL);
+    chat.bottom_pane.set_task_running(/*running*/ true);
+    let (frame_requester, mut draw_rx) = FrameRequester::test_channel();
+    chat.frame_requester = frame_requester;
+    chat.last_terminal_title = None;
+    // Keep the visible spinner frame fixed while checking unchanged-title deadline renewal.
+    chat.terminal_title_animation_origin = Instant::now() + Duration::from_secs(/*secs*/ 60);
+
+    chat.refresh_terminal_title_frame();
+
+    assert_eq!(
+        (
+            chat.last_terminal_title_requires_action,
+            chat.terminal_title_next_refresh.is_some(),
+        ),
+        (false, true)
+    );
+    assert!(
+        chat.last_terminal_title
+            .as_ref()
+            .is_some_and(|title| title.contains("project"))
+    );
+    assert!(matches!(
+        draw_rx.try_recv(),
+        Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+    ));
+    assert!(matches!(
+        rx.try_recv(),
+        Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+    ));
+
+    let title = chat.last_terminal_title.clone();
+    let before_refresh = Instant::now();
+    chat.terminal_title_next_refresh = Some(before_refresh - Duration::from_secs(/*secs*/ 1));
+    chat.refresh_terminal_title_frame();
+    assert_eq!(chat.last_terminal_title, title);
+    assert!(
+        chat.terminal_title_next_refresh
+            .is_some_and(|next| next > before_refresh)
+    );
+
+    for (animations, title_items) in [(false, None), (true, Some(Vec::new()))] {
+        chat.config.animations = true;
+        chat.config.tui_terminal_title = None;
+        chat.refresh_terminal_title_frame();
+        assert!(chat.terminal_title_next_refresh.is_some());
+        chat.config.animations = animations;
+        chat.config.tui_terminal_title = title_items;
+        chat.refresh_terminal_title_frame();
+        assert!(chat.terminal_title_next_refresh.is_none());
+    }
+
+    chat.refresh_status_surfaces();
+
+    assert!(matches!(
+        rx.try_recv(),
+        Ok(AppEvent::RefreshStatusLineWorkspaceHeadline { .. })
+    ));
+}
+
+#[tokio::test]
 async fn goal_clock_refresh_redraws_only_when_elapsed_label_changes() {
     let (frame_requester, mut draw_rx) = FrameRequester::test_channel();
     let (mut chat, _rx, _op_rx) = make_chatwidget_manual_with_auth(
@@ -113,7 +192,13 @@ async fn terminal_title_shows_action_required_while_exec_approval_is_pending() {
         chat.last_terminal_title,
         Some("[ ! ] Action Required | project".to_string())
     );
-    assert!(!chat.should_animate_terminal_title_spinner());
+    assert_eq!(
+        (
+            chat.last_terminal_title_requires_action,
+            chat.terminal_title_next_refresh.is_some(),
+        ),
+        (true, true)
+    );
 
     chat.handle_key_event(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
     chat.pre_draw_tick();
@@ -124,7 +209,13 @@ async fn terminal_title_shows_action_required_while_exec_approval_is_pending() {
         .expect("terminal title should be restored after approval");
     assert!(title.contains("project"));
     assert!(!title.contains("Action Required"));
-    assert!(chat.should_animate_terminal_title_spinner());
+    assert_eq!(
+        (
+            chat.last_terminal_title_requires_action,
+            chat.terminal_title_next_refresh.is_some(),
+        ),
+        (false, true)
+    );
 
     for (animations, title_items) in [(false, None), (true, Some(Vec::new()))] {
         chat.config.animations = true;
@@ -166,7 +257,13 @@ async fn terminal_title_action_required_respects_spinner_setting() {
     chat.pre_draw_tick();
 
     assert_eq!(chat.last_terminal_title, Some("project".to_string()));
-    assert!(!chat.should_animate_terminal_title_action_required());
+    assert_eq!(
+        (
+            chat.last_terminal_title_requires_action,
+            chat.terminal_title_next_refresh.is_some(),
+        ),
+        (false, false)
+    );
 }
 
 #[tokio::test]
@@ -200,7 +297,13 @@ async fn terminal_title_action_required_blinks_when_animations_are_enabled() {
         chat.last_terminal_title,
         Some("[ . ] Action Required | project".to_string())
     );
-    assert!(chat.should_animate_terminal_title_action_required());
+    assert_eq!(
+        (
+            chat.last_terminal_title_requires_action,
+            chat.terminal_title_next_refresh.is_some(),
+        ),
+        (true, true)
+    );
 }
 
 #[tokio::test]
@@ -212,7 +315,13 @@ async fn terminal_title_activity_indicators_do_not_animate_when_animations_are_d
     chat.refresh_terminal_title();
 
     assert_eq!(chat.last_terminal_title, Some("project".to_string()));
-    assert!(!chat.should_animate_terminal_title_spinner());
+    assert_eq!(
+        (
+            chat.last_terminal_title_requires_action,
+            chat.terminal_title_next_refresh.is_some(),
+        ),
+        (false, false)
+    );
 
     let request = ExecApprovalRequestEvent {
         kind: Default::default(),
@@ -237,5 +346,11 @@ async fn terminal_title_activity_indicators_do_not_animate_when_animations_are_d
         chat.last_terminal_title,
         Some("[ ! ] Action Required | project".to_string())
     );
-    assert!(!chat.should_animate_terminal_title_action_required());
+    assert_eq!(
+        (
+            chat.last_terminal_title_requires_action,
+            chat.terminal_title_next_refresh.is_some(),
+        ),
+        (true, false)
+    );
 }

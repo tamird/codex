@@ -70,6 +70,7 @@ use crate::multi_agents::previous_agent_shortcut_matches;
 use crate::multi_agents::sub_agent_activity_display;
 use crate::pager_overlay::Overlay;
 use crate::performance::PerformanceWindow;
+use crate::performance::SLOW_TUI_OPERATION_THRESHOLD;
 use crate::render::highlight::highlight_bash_to_lines;
 use crate::render::renderable::Renderable;
 use crate::resume_picker::SessionSelection;
@@ -449,9 +450,6 @@ fn managed_filesystem_sandbox_is_restricted(permission_profile: &PermissionProfi
 /// Smooth-mode streaming drains one line per tick, so this interval controls
 /// perceived typing speed for non-backlogged output.
 const COMMIT_ANIMATION_TICK: Duration = tui::TARGET_FRAME_INTERVAL;
-
-/// Report operations that take at least two redraw intervals.
-const SLOW_TUI_OPERATION_THRESHOLD: Duration = tui::TARGET_FRAME_INTERVAL.saturating_mul(2);
 
 #[derive(Debug, Clone)]
 pub struct AppExitInfo {

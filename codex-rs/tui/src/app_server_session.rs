@@ -1304,38 +1304,39 @@ impl AppServerSession {
         let request_id = self.next_request_id();
         let (sandbox_policy, permissions) =
             turn_permissions_overrides(permissions_override, cwd.as_path())?;
-        self.client
-            .request_typed(ClientRequest::TurnStart {
-                request_id,
-                params: TurnStartParams {
-                    thread_id: thread_id.to_string(),
-                    turn_trigger: None,
-                    client_user_message_id: None,
-                    input: items,
-                    tool_output: None,
-                    responsesapi_client_metadata: None,
-                    additional_context: None,
-                    environments: None,
-                    cwd: Some(cwd),
-                    runtime_workspace_roots: Some(workspace_roots.to_vec()),
-                    approval_policy: Some(approval_policy),
-                    approvals_reviewer: Some(approvals_reviewer.into()),
-                    sandbox_policy,
-                    permissions,
-                    model: Some(model),
-                    service_tier,
-                    service_tier_for_turn: None,
-                    effort,
-                    summary,
-                    personality,
-                    output_schema,
-                    collaboration_mode,
-                    multi_agent_mode: None,
-                    cyber_access_program: None,
-                },
-            })
-            .await
-            .wrap_err("turn/start failed in TUI")
+        let request = ClientRequest::TurnStart {
+            request_id,
+            params: TurnStartParams {
+                thread_id: thread_id.to_string(),
+                turn_trigger: None,
+                client_user_message_id: None,
+                input: items,
+                tool_output: None,
+                responsesapi_client_metadata: None,
+                additional_context: None,
+                environments: None,
+                cwd: Some(cwd),
+                runtime_workspace_roots: Some(workspace_roots.to_vec()),
+                approval_policy: Some(approval_policy),
+                approvals_reviewer: Some(approvals_reviewer.into()),
+                sandbox_policy,
+                permissions,
+                model: Some(model),
+                service_tier,
+                service_tier_for_turn: None,
+                effort,
+                summary,
+                personality,
+                output_schema,
+                collaboration_mode,
+                multi_agent_mode: None,
+                cyber_access_program: None,
+            },
+        };
+        let started_at = Instant::now();
+        let result = self.client.request_typed(request).await;
+        crate::performance::record_turn_request(thread_id, "turn/start", started_at, &result);
+        result.wrap_err("turn/start failed in TUI")
     }
 
     pub(crate) async fn turn_interrupt(
@@ -1371,19 +1372,21 @@ impl AppServerSession {
         items: Vec<UserInput>,
     ) -> std::result::Result<TurnSteerResponse, TypedRequestError> {
         let request_id = self.next_request_id();
-        self.client
-            .request_typed(ClientRequest::TurnSteer {
-                request_id,
-                params: TurnSteerParams {
-                    thread_id: thread_id.to_string(),
-                    client_user_message_id: None,
-                    input: items,
-                    responsesapi_client_metadata: None,
-                    additional_context: None,
-                    expected_turn_id: turn_id,
-                },
-            })
-            .await
+        let request = ClientRequest::TurnSteer {
+            request_id,
+            params: TurnSteerParams {
+                thread_id: thread_id.to_string(),
+                client_user_message_id: None,
+                input: items,
+                responsesapi_client_metadata: None,
+                additional_context: None,
+                expected_turn_id: turn_id,
+            },
+        };
+        let started_at = Instant::now();
+        let result = self.client.request_typed(request).await;
+        crate::performance::record_turn_request(thread_id, "turn/steer", started_at, &result);
+        result
     }
 
     pub(crate) async fn thread_set_name(

@@ -17,6 +17,8 @@ use codex_skills::system_cache_root_dir;
 use crate::image_url::REMOTE_IMAGE_URL_ERROR;
 use crate::image_url::is_remote_image_url;
 
+const SLOW_TURN_START_THRESHOLD: Duration = Duration::from_millis(100);
+
 pub(super) fn validate_user_input_image_urls(
     input: &[V2UserInput],
 ) -> Result<(), JSONRPCErrorError> {
@@ -503,6 +505,7 @@ impl TurnRequestProcessor {
         app_server_client_name: Option<String>,
         app_server_client_version: Option<String>,
     ) -> Result<TurnStartResponse, JSONRPCErrorError> {
+        let started_at = Instant::now();
         let (thread_id, thread) =
             self.load_thread(&params.thread_id)
                 .await
@@ -559,6 +562,7 @@ impl TurnRequestProcessor {
         .inspect_err(|error| {
             self.track_error_response(&request_id, error, /*error_type*/ None);
         })?;
+        let admitted_at = Instant::now();
         let runtime_workspace_roots = params
             .runtime_workspace_roots
             .map(resolve_runtime_workspace_roots);
@@ -623,28 +627,25 @@ impl TurnRequestProcessor {
             self.seal_realtime_transcript_before_user_input(thread_id, content)
                 .await?;
         }
-
-        let submission = thread
-            .start_or_steer_turn(
-                TurnInputRequest::new(input)
-                    .with_thread_settings(thread_settings)
-                    .on_start(TurnStartOptions {
-                        turn_trigger: params.turn_trigger,
-                        final_output_json_schema: params.output_schema,
-                        service_tier: params.service_tier_for_turn,
-                        cyber_access_program: params.cyber_access_program.map(Into::into),
-                        ..Default::default()
-                    })
-                    .with_additional_context(additional_context)
-                    .with_responses_metadata(params.responsesapi_client_metadata)
-                    .with_trace(self.request_trace_context(&request_id).await),
-            )
-            .await
-            .map_err(|err| {
-                let error = internal_error(format!("failed to submit turn input: {err}"));
-                self.track_error_response(&request_id, &error, /*error_type*/ None);
-                error
-            })?;
+        let input = TurnInputRequest::new(input)
+            .with_thread_settings(thread_settings)
+            .on_start(TurnStartOptions {
+                turn_trigger: params.turn_trigger,
+                final_output_json_schema: params.output_schema,
+                service_tier: params.service_tier_for_turn,
+                cyber_access_program: params.cyber_access_program.map(Into::into),
+                ..Default::default()
+            })
+            .with_additional_context(additional_context)
+            .with_responses_metadata(params.responsesapi_client_metadata)
+            .with_trace(self.request_trace_context(&request_id).await);
+        let submit_started_at = Instant::now();
+        let submission = thread.start_or_steer_turn(input).await.map_err(|err| {
+            let error = internal_error(format!("failed to submit turn input: {err}"));
+            self.track_error_response(&request_id, &error, /*error_type*/ None);
+            error
+        })?;
+        let submitted_at = Instant::now();
         let (turn_id, started) = match submission {
             TurnInputSubmission::Started { turn_id } => (turn_id, true),
             TurnInputSubmission::Steered { turn_id } => (turn_id, false),
@@ -654,7 +655,6 @@ impl TurnRequestProcessor {
                 return Err(error);
             }
         };
-
         if turn_has_input && started {
             let config_snapshot = thread.config_snapshot().await;
             if config_snapshot.is_primary_environment_configured() {
@@ -683,6 +683,23 @@ impl TurnRequestProcessor {
             completed_at: None,
             duration_ms: None,
         };
+
+        let completed_at = Instant::now();
+        let duration = completed_at.duration_since(started_at);
+        if duration >= SLOW_TURN_START_THRESHOLD {
+            tracing::debug!(
+                target: "codex.performance",
+                thread_id = %thread_id,
+                operation = "app_server.turn_start",
+                started,
+                admission_duration_us = admitted_at.duration_since(started_at).as_micros(),
+                settings_duration_us = submit_started_at.duration_since(admitted_at).as_micros(),
+                submit_duration_us = submitted_at.duration_since(submit_started_at).as_micros(),
+                completion_duration_us = completed_at.duration_since(submitted_at).as_micros(),
+                duration_us = duration.as_micros(),
+                "slow app-server turn start"
+            );
+        }
 
         Ok(TurnStartResponse { turn })
     }

@@ -22,6 +22,32 @@ const BUILD_REVISION_ENV: &str = "FRANKENDEX_BUILD_REVISION";
 const BUILD_COHORT_ENV: &str = "FRANKENDEX_BUILD_COHORT";
 const PERFORMANCE_WINDOW_INTERVAL: Duration = Duration::from_secs(30);
 
+/// Report operations that take at least two redraw intervals.
+pub(crate) const SLOW_TUI_OPERATION_THRESHOLD: Duration =
+    crate::tui::TARGET_FRAME_INTERVAL.saturating_mul(2);
+
+/// Records slow turn requests without retaining their inputs or response bodies.
+pub(crate) fn record_turn_request<T, E>(
+    thread_id: impl std::fmt::Display,
+    method: &'static str,
+    started_at: Instant,
+    result: &Result<T, E>,
+) {
+    let duration = started_at.elapsed();
+    if duration >= SLOW_TUI_OPERATION_THRESHOLD {
+        let outcome = if result.is_ok() { "ok" } else { "error" };
+        tracing::debug!(
+            target: "codex.performance",
+            thread_id = %thread_id,
+            operation = "tui.turn_request",
+            method,
+            outcome,
+            duration_us = duration.as_micros(),
+            "slow TUI turn request"
+        );
+    }
+}
+
 /// Identifies locally deployed builds without stamping the complete Bazel graph.
 pub(crate) fn record_deployment_start() {
     let Some(deployment) = Deployment::from_environment() else {

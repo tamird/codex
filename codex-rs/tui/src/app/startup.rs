@@ -909,7 +909,7 @@ See the Codex keymap documentation for supported actions and examples."
                     } => {
                         let started_at = Instant::now();
                         app.chat_widget.refresh_goal_status_indicator_for_time_tick();
-                        app.chat_widget.refresh_terminal_title();
+                        app.chat_widget.refresh_terminal_title_frame();
                         (AppRunControl::Continue, "application", Some("TerminalTitleTick"), started_at)
                     }
                     () = async {
@@ -937,8 +937,8 @@ See the Codex keymap documentation for supported actions and examples."
                 {
                     performance_window.report(summary, thread_id);
                 }
-                // Slow redraws already emit their own frame timing.
-                if event_kind != "draw" && duration >= SLOW_TUI_OPERATION_THRESHOLD {
+                // Whole draw events also include preparation and post-render work.
+                if duration >= SLOW_TUI_OPERATION_THRESHOLD {
                     app.session_telemetry.record_duration(
                         "codex.tui.slow_event.duration_ms",
                         duration,
