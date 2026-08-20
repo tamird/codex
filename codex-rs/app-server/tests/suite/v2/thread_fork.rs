@@ -2279,7 +2279,9 @@ async fn paginated_fork_rollout_file_open_count_with_boundary(
 ) -> Result<usize> {
     let server = create_mock_responses_server_repeating_assistant("Done").await;
     let codex_home = TempDir::new()?;
-    MockResponsesConfig::new(&server.uri()).write(codex_home.path())?;
+    MockResponsesConfig::new(&server.uri())
+        .enable_feature(Feature::BackgroundPaginatedRolloutMigration)
+        .write(codex_home.path())?;
     let mut source_thread_id = ThreadId::new();
     let sqlite = codex_state::SqliteConfig::new_for_testing(codex_home.path().abs());
     let state_db = StateRuntime::init(sqlite.clone(), "mock_provider".to_string()).await?;
