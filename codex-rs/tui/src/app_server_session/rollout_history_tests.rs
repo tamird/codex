@@ -254,10 +254,31 @@ async fn rollout_maintenance_contention_disables_cached_legacy_resume_shortcut()
     )?;
     let mut app_server = crate::start_embedded_app_server_for_picker(&config).await?;
     app_server.remember_thread_history_mode(thread_id, ThreadHistoryMode::Legacy);
+    for name in ["before maintenance", "still before maintenance"] {
+        app_server
+            .thread_set_name(thread_id, name.to_string())
+            .await?;
+    }
     let maintenance_guard = codex_rollout::try_acquire_rollout_maintenance_lock(codex_home.path())?
         .expect("acquire rollout maintenance lock");
+    let mut maintenance = app_server.rollout_maintenance();
+    let completed_maintenance = maintenance.clone();
     let release_maintenance = tokio::spawn(async move {
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if maintenance.borrow_and_update().display_text().as_deref()
+                    == Some("Waiting for rollout maintenance…")
+                {
+                    break;
+                }
+                maintenance
+                    .changed()
+                    .await
+                    .expect("maintenance watch stays open");
+            }
+        })
+        .await
+        .expect("resume reports its actual lock wait before completing");
         drop(maintenance_guard);
     });
     let next_request_id = app_server.next_request_id;
@@ -266,6 +287,35 @@ async fn rollout_maintenance_contention_disables_cached_legacy_resume_shortcut()
         .resume_thread(config, thread_id, ResumeModelSettings::RestoreFromThread)
         .await?;
     release_maintenance.await.expect("release maintenance lock");
+
+    assert_eq!(completed_maintenance.borrow().display_text(), None);
+    let names = tokio::time::timeout(Duration::from_secs(5), async {
+        let mut names = Vec::new();
+        while names.len() < 2 {
+            let event = app_server
+                .next_event()
+                .await
+                .expect("app-server event stream");
+            if let codex_app_server_client::AppServerEvent::ServerNotification(notification) = event
+                && let codex_app_server_protocol::ServerNotification::ThreadNameUpdated(
+                    notification,
+                ) = *notification
+                && notification.thread_id == thread_id.to_string()
+            {
+                names.push(notification.thread_name);
+            }
+        }
+        names
+    })
+    .await
+    .expect("unrelated notifications survive the foreground event pump");
+    assert_eq!(
+        names,
+        vec![
+            Some("before maintenance".to_string()),
+            Some("still before maintenance".to_string())
+        ]
+    );
 
     assert_eq!(app_server.next_request_id, next_request_id + 3);
     assert_eq!(resumed.session.thread_id, thread_id);

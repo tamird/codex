@@ -5,7 +5,10 @@
 
 mod fs;
 mod history;
+mod maintenance;
 mod rollout_history;
+
+pub(crate) use maintenance::RolloutMaintenanceState;
 
 pub(crate) use history::HISTORY_ITEM_PAGE_LIMIT;
 pub(crate) use history::HISTORY_ITEM_SCAN_LIMIT;
@@ -292,6 +295,8 @@ pub(crate) struct AppServerBootstrap {
 
 pub(crate) struct AppServerSession {
     client: AppServerClient,
+    pending_events: std::collections::VecDeque<AppServerEvent>,
+    rollout_maintenance: tokio::sync::watch::Sender<RolloutMaintenanceState>,
     next_request_id: i64,
     history_pagination: HashMap<ThreadId, history::ThreadHistoryPagination>,
     task_tool_threads: HashSet<ThreadId>,
@@ -378,8 +383,12 @@ pub(crate) struct UnsupportedLegacyPermissionProfile;
 
 impl AppServerSession {
     pub(crate) fn new(client: AppServerClient, thread_params_mode: ThreadParamsMode) -> Self {
+        let (rollout_maintenance, _) =
+            tokio::sync::watch::channel(RolloutMaintenanceState::default());
         Self {
             client,
+            pending_events: std::collections::VecDeque::new(),
+            rollout_maintenance,
             next_request_id: 1,
             history_pagination: HashMap::new(),
             task_tool_threads: HashSet::new(),
@@ -761,7 +770,12 @@ impl AppServerSession {
     }
 
     pub(crate) async fn next_event(&mut self) -> Option<AppServerEvent> {
-        self.client.next_event().await
+        if let Some(event) = self.pending_events.pop_front() {
+            return Some(event);
+        }
+        let event = self.client.next_event().await?;
+        self.observe_rollout_maintenance(&event);
+        Some(event)
     }
 
     #[cfg(test)]
@@ -957,8 +971,7 @@ impl AppServerSession {
         self.thread_tool_transport()
             .configure_mcp(&mut params.config);
         let response: ThreadForkResponse = match self
-            .client
-            .request_typed(ClientRequest::ThreadFork {
+            .request_with_maintenance(ClientRequest::ThreadFork {
                 request_id,
                 params: params.clone(),
             })
@@ -971,8 +984,7 @@ impl AppServerSession {
                 self.history_support = ThreadHistorySupport::LegacyOnly;
                 params.exclude_turns = false;
                 let request_id = self.next_request_id();
-                self.client
-                    .request_typed(ClientRequest::ThreadFork { request_id, params })
+                self.request_with_maintenance(ClientRequest::ThreadFork { request_id, params })
                     .await
                     .map_err(|err| {
                         bootstrap_request_error("thread/fork failed during TUI bootstrap", err)
@@ -1089,8 +1101,7 @@ impl AppServerSession {
         params: ThreadListParams,
     ) -> Result<ThreadListResponse> {
         let request_id = self.next_request_id();
-        self.client
-            .request_typed(ClientRequest::ThreadList { request_id, params })
+        self.request_with_maintenance(ClientRequest::ThreadList { request_id, params })
             .await
             .wrap_err("thread/list failed during TUI session lookup")
     }
@@ -1118,8 +1129,7 @@ impl AppServerSession {
     ) -> Result<Thread> {
         let request_id = self.next_request_id();
         let response = self
-            .client
-            .request_typed::<ThreadReadResponse>(ClientRequest::ThreadRead {
+            .request_with_maintenance::<ThreadReadResponse>(ClientRequest::ThreadRead {
                 request_id,
                 params: ThreadReadParams {
                     thread_id: thread_id.to_string(),
@@ -1135,16 +1145,15 @@ impl AppServerSession {
                         == "paginated threads do not support thread/read(includeTurns=true)" =>
             {
                 let request_id = self.next_request_id();
-                self.client
-                    .request_typed(ClientRequest::ThreadRead {
-                        request_id,
-                        params: ThreadReadParams {
-                            thread_id: thread_id.to_string(),
-                            include_turns: false,
-                        },
-                    })
-                    .await
-                    .wrap_err("thread/read failed during TUI session lookup")?
+                self.request_with_maintenance(ClientRequest::ThreadRead {
+                    request_id,
+                    params: ThreadReadParams {
+                        thread_id: thread_id.to_string(),
+                        include_turns: false,
+                    },
+                })
+                .await
+                .wrap_err("thread/read failed during TUI session lookup")?
             }
             Err(err) => return Err(err).wrap_err("thread/read failed during TUI session lookup"),
         };

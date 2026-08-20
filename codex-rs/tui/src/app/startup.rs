@@ -126,6 +126,7 @@ impl App {
         }
 
         let startup_started_at = Instant::now();
+        startup_draft.set_rollout_maintenance(app_server.rollout_maintenance());
         let (app_event_tx, mut app_event_rx) = unbounded_channel();
         let app_event_tx = AppEventSender::new(app_event_tx);
         emit_project_config_warnings(&app_event_tx, &config);
@@ -603,6 +604,8 @@ See the Codex keymap documentation for supported actions and examples."
         if !tui.is_terminal_focused() {
             app.recap.note_focus_lost(Instant::now());
         }
+        app.chat_widget
+            .set_rollout_maintenance(app_server.rollout_maintenance().borrow().background_text());
         if start_in_agents_overview {
             app.open_agents_overview(&app_server);
         }

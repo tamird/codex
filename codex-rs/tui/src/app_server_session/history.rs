@@ -121,13 +121,12 @@ impl AppServerSession {
         limit: u32,
     ) -> Result<ThreadItemsListResponse> {
         let request_id = self.next_request_id();
-        self.client
-            .request_typed(ClientRequest::ThreadItemsList {
-                request_id,
-                params: thread_items_page_params(thread_id, turn_id, cursor, limit),
-            })
-            .await
-            .wrap_err("failed to load a bounded thread item page")
+        self.request_with_maintenance(ClientRequest::ThreadItemsList {
+            request_id,
+            params: thread_items_page_params(thread_id, turn_id, cursor, limit),
+        })
+        .await
+        .wrap_err("failed to load a bounded thread item page")
     }
 
     pub(crate) async fn thread_turns_page(
@@ -136,19 +135,18 @@ impl AppServerSession {
         cursor: Option<String>,
     ) -> Result<ThreadTurnsListResponse> {
         let request_id = self.next_request_id();
-        self.client
-            .request_typed(ClientRequest::ThreadTurnsList {
-                request_id,
-                params: ThreadTurnsListParams {
-                    thread_id: thread_id.to_string(),
-                    cursor,
-                    limit: Some(INITIAL_HISTORY_TURN_LIMIT),
-                    sort_direction: Some(SortDirection::Desc),
-                    items_view: Some(TurnItemsView::NotLoaded),
-                },
-            })
-            .await
-            .wrap_err("failed to load a bounded thread history page")
+        self.request_with_maintenance(ClientRequest::ThreadTurnsList {
+            request_id,
+            params: ThreadTurnsListParams {
+                thread_id: thread_id.to_string(),
+                cursor,
+                limit: Some(INITIAL_HISTORY_TURN_LIMIT),
+                sort_direction: Some(SortDirection::Desc),
+                items_view: Some(TurnItemsView::NotLoaded),
+            },
+        })
+        .await
+        .wrap_err("failed to load a bounded thread history page")
     }
 
     async fn merge_thread_item_page(

@@ -146,6 +146,15 @@ impl App {
             self.refresh_agents_overview_threads(app_server_client);
         }
         match &notification {
+            ServerNotification::RolloutMaintenanceStatusChanged(_) => {
+                self.chat_widget.set_rollout_maintenance(
+                    app_server_client
+                        .rollout_maintenance()
+                        .borrow()
+                        .background_text(),
+                );
+                return;
+            }
             ServerNotification::ServerRequestResolved(notification) => {
                 if let Some((_, task)) = self.dynamic_tool_tasks.remove(&notification.request_id) {
                     task.abort();

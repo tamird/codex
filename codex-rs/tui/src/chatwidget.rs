@@ -447,6 +447,7 @@ pub(crate) use self::permissions_menu::cyber_model_approval_reviewer;
 mod protocol;
 mod protocol_requests;
 mod rate_limits;
+mod rollout_maintenance;
 use self::rate_limits::RateLimitErrorKind;
 use self::rate_limits::RateLimitSwitchPromptState;
 use self::rate_limits::RateLimitWarningState;

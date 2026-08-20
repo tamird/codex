@@ -28,6 +28,84 @@ resuming (48 columns):
 
   ? for shortcuts
 ---
+queued (48 columns):
+╭───────────────────────────────────────╮
+│ >_ OpenAI Codex (v<VERSION>)   │
+│                                       │
+│ model:     loading   /model to change │
+│ directory: loading                    │
+╰───────────────────────────────────────╯
+  Waiting for rollout migration …thread
+
+› draft
+
+
+---
+waiting (48 columns):
+╭───────────────────────────────────────╮
+│ >_ OpenAI Codex (v<VERSION>)   │
+│                                       │
+│ model:     loading   /model to change │
+│ directory: loading                    │
+╰───────────────────────────────────────╯
+  Waiting for rollout maintenance…
+
+› draft
+
+
+---
+known owner (120 columns):
+╭───────────────────────────────────────╮
+│ >_ OpenAI Codex (v<VERSION>)   │
+│                                       │
+│ model:     loading   /model to change │
+│ directory: loading                    │
+╰───────────────────────────────────────╯
+  Waiting for PID 123 · Rollout migration …000000000001: validating 3/10 segments · 1.2 GiB handled
+
+› draft
+
+
+---
+byte progress (100 columns):
+╭───────────────────────────────────────╮
+│ >_ OpenAI Codex (v<VERSION>)   │
+│                                       │
+│ model:     loading   /model to change │
+│ directory: loading                    │
+╰───────────────────────────────────────╯
+  Rollout migration …000000000001: staging 16.0 MiB/64.0 MiB · 1.2 GiB handled
+
+› draft
+
+
+---
+phase progress (80 columns):
+╭───────────────────────────────────────╮
+│ >_ OpenAI Codex (v<VERSION>)   │
+│                                       │
+│ model:     loading   /model to change │
+│ directory: loading                    │
+╰───────────────────────────────────────╯
+  Rollout migration …000000000001: validating 3/10 segments · 1.2 GiB handled
+
+› draft
+
+
+---
+request completed (48 columns):
+╭───────────────────────────────────────╮
+│ >_ OpenAI Codex (v<VERSION>)   │
+│                                       │
+│ model:     loading   /model to change │
+│ directory: loading                    │
+╰───────────────────────────────────────╯
+  Resuming session…
+
+› draft
+
+
+---
 forking (48 columns):
 ╭───────────────────────────────────────╮
 │ >_ OpenAI Codex (v<VERSION>)   │

@@ -105,8 +105,7 @@ impl AppServerSession {
         drop(rollout_maintenance_guard);
         let request_id = self.next_request_id();
         let resume_response = self
-            .client
-            .request_typed(ClientRequest::ThreadResume {
+            .request_with_maintenance(ClientRequest::ThreadResume {
                 request_id,
                 params: params.clone(),
             })
@@ -119,8 +118,7 @@ impl AppServerSession {
                 self.history_support = ThreadHistorySupport::LegacyOnly;
                 params.exclude_turns = false;
                 let request_id = self.next_request_id();
-                self.client
-                    .request_typed(ClientRequest::ThreadResume { request_id, params })
+                self.request_with_maintenance(ClientRequest::ThreadResume { request_id, params })
                     .await
                     .map_err(|err| {
                         bootstrap_request_error("thread/resume failed during TUI bootstrap", err)

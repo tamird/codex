@@ -38,48 +38,140 @@ where
         app_event_rx: rx,
         initial_screen: StartupDraftInitialScreen::Composer,
         session_action: StartupDraftSessionAction::New,
+        rollout_maintenance: None,
         pending_paste_newline: None,
     }
 }
 
 #[test]
 fn startup_draft_renders_full_empty_and_multiline_composer_frames() {
+    use codex_app_server_protocol::RolloutMaintenanceActivity;
+    use codex_app_server_protocol::RolloutMaintenanceOperation;
+    use codex_app_server_protocol::RolloutMaintenancePhase;
+    use codex_app_server_protocol::RolloutMaintenanceProgress;
+    use codex_app_server_protocol::RolloutMaintenanceProgressUnit;
+    use codex_app_server_protocol::RolloutMaintenanceRequestStatus as Status;
+
     let mut pump = startup_test_pump(std::iter::empty());
     let mut snapshots = Vec::new();
+    let activity = RolloutMaintenanceActivity {
+        operation_id: "migration".to_string(),
+        process_id: 123,
+        operation: RolloutMaintenanceOperation::ManualMigration,
+        thread_id: Some("01900000-0000-7000-8000-000000000001".to_string()),
+        phase: RolloutMaintenancePhase::Validating,
+        progress: Some(RolloutMaintenanceProgress {
+            completed: 3,
+            total: Some(10),
+            unit: RolloutMaintenanceProgressUnit::Segments,
+        }),
+        io_bytes: 1_288_490_188,
+    };
 
-    for (label, width, text, session_action) in [
-        ("empty", 48, "", StartupDraftSessionAction::New),
-        ("resuming", 48, "", StartupDraftSessionAction::Resume),
+    for (label, width, text, session_action, maintenance) in [
+        ("empty", 48, "", StartupDraftSessionAction::New, None),
+        ("resuming", 48, "", StartupDraftSessionAction::Resume, None),
+        (
+            "queued",
+            48,
+            "draft",
+            StartupDraftSessionAction::Resume,
+            Some(Status::QueuedForMigration {
+                thread_id: "thread".to_string(),
+            }),
+        ),
+        (
+            "waiting",
+            48,
+            "draft",
+            StartupDraftSessionAction::Resume,
+            Some(Status::WaitingForMaintenance {
+                thread_id: None,
+                owner: None,
+            }),
+        ),
+        (
+            "known owner",
+            120,
+            "draft",
+            StartupDraftSessionAction::Resume,
+            Some(Status::WaitingForMaintenance {
+                thread_id: None,
+                owner: Some(activity.clone()),
+            }),
+        ),
+        (
+            "byte progress",
+            100,
+            "draft",
+            StartupDraftSessionAction::Resume,
+            Some(Status::Running {
+                activity: RolloutMaintenanceActivity {
+                    phase: RolloutMaintenancePhase::Staging,
+                    progress: Some(RolloutMaintenanceProgress {
+                        completed: 16_777_216,
+                        total: Some(67_108_864),
+                        unit: RolloutMaintenanceProgressUnit::Bytes,
+                    }),
+                    ..activity.clone()
+                },
+            }),
+        ),
+        (
+            "phase progress",
+            80,
+            "draft",
+            StartupDraftSessionAction::Resume,
+            Some(Status::Running { activity }),
+        ),
+        (
+            "request completed",
+            48,
+            "draft",
+            StartupDraftSessionAction::Resume,
+            Some(Status::Idle),
+        ),
         (
             "forking",
             48,
             "draft while loading",
             StartupDraftSessionAction::Fork,
+            None,
         ),
         (
             "multiline",
             48,
             "first startup line\nsecond startup line",
             StartupDraftSessionAction::New,
+            None,
         ),
         (
             "narrow",
             18,
             "first startup line\nsecond startup line",
             StartupDraftSessionAction::New,
+            None,
         ),
     ] {
         pump.session_action = session_action;
         pump.bottom_pane
             .set_composer_text(text.to_string(), Vec::new(), Vec::new());
-        let renderable =
-            startup_draft_renderable(&pump.header, &pump.bottom_pane, pump.session_action);
+        let maintenance = maintenance
+            .as_ref()
+            .and_then(crate::rollout_maintenance::request_status_text);
+        let renderable = startup_draft_renderable(
+            &pump.header,
+            &pump.bottom_pane,
+            pump.session_action,
+            maintenance.as_deref(),
+        );
         assert_eq!(
             renderable.desired_height(width),
             startup_draft_renderable(
                 &pump.header,
                 &pump.bottom_pane,
                 StartupDraftSessionAction::New,
+                /*maintenance*/ None,
             )
             .desired_height(width),
             "loading status should reuse the existing gap above the composer"
@@ -122,8 +214,12 @@ async fn startup_draft_clears_loading_status_when_starting_fresh() {
     let mut snapshots = Vec::new();
     let render_frame = |pump: &StartupDraftPump| {
         let width = 48;
-        let renderable =
-            startup_draft_renderable(&pump.header, &pump.bottom_pane, pump.session_action);
+        let renderable = startup_draft_renderable(
+            &pump.header,
+            &pump.bottom_pane,
+            pump.session_action,
+            /*maintenance*/ None,
+        );
         let area = Rect::new(
             /*x*/ 0,
             /*y*/ 0,
@@ -214,9 +310,13 @@ async fn startup_draft_hydrates_its_header_without_moving_the_composer() {
         .expect("build startup configuration");
     let mut pump = startup_test_pump(std::iter::empty());
     let width = 80;
-    let initial_height =
-        startup_draft_renderable(&pump.header, &pump.bottom_pane, pump.session_action)
-            .desired_height(width);
+    let initial_height = startup_draft_renderable(
+        &pump.header,
+        &pump.bottom_pane,
+        pump.session_action,
+        /*maintenance*/ None,
+    )
+    .desired_height(width);
 
     assert_eq!(
         pump.header.raw_lines().last().map(ToString::to_string),
@@ -235,8 +335,13 @@ async fn startup_draft_hydrates_its_header_without_moving_the_composer() {
         Some(expected_directory)
     );
     assert_eq!(
-        startup_draft_renderable(&pump.header, &pump.bottom_pane, pump.session_action)
-            .desired_height(width),
+        startup_draft_renderable(
+            &pump.header,
+            &pump.bottom_pane,
+            pump.session_action,
+            /*maintenance*/ None
+        )
+        .desired_height(width),
         initial_height
     );
 }
@@ -681,7 +786,12 @@ async fn startup_draft_waits_for_onboarding_before_accepting_input() {
         .expect("show the composer after onboarding finishes");
     assert!(!tui.terminal.viewport_area.is_empty());
     let area = tui.terminal.viewport_area;
-    let renderable = startup_draft_renderable(&pump.header, &pump.bottom_pane, pump.session_action);
+    let renderable = startup_draft_renderable(
+        &pump.header,
+        &pump.bottom_pane,
+        pump.session_action,
+        /*maintenance*/ None,
+    );
     let mut buffer = Buffer::empty(area);
     renderable.render(area, &mut buffer);
     let visible_frame = (area.top()..area.bottom())

@@ -93,6 +93,8 @@ pub(crate) struct StartupDraftPump {
     app_event_rx: UnboundedReceiver<AppEvent>,
     initial_screen: StartupDraftInitialScreen,
     session_action: StartupDraftSessionAction,
+    rollout_maintenance:
+        Option<tokio::sync::watch::Receiver<crate::app_server_session::RolloutMaintenanceState>>,
     pending_paste_newline: Option<(Instant, String)>,
 }
 
@@ -128,6 +130,7 @@ impl StartupDraft {
                 app_event_rx,
                 initial_screen,
                 session_action,
+                rollout_maintenance: None,
                 pending_paste_newline: None,
             },
         };
@@ -165,6 +168,13 @@ impl StartupDraft {
 }
 
 impl StartupDraftPump {
+    pub(crate) fn set_rollout_maintenance(
+        &mut self,
+        status: tokio::sync::watch::Receiver<crate::app_server_session::RolloutMaintenanceState>,
+    ) {
+        self.rollout_maintenance = Some(status);
+    }
+
     /// Refresh the session header and safe editor shortcuts without enabling modal editing.
     pub(crate) fn apply_config(&mut self, config: &Config) {
         self.header = startup_session_header(Some(config));
@@ -213,6 +223,19 @@ impl StartupDraftPump {
         loop {
             tokio::select! {
                 output = &mut future => return Ok(output),
+                changed = async {
+                    match self.rollout_maintenance.as_mut() {
+                        Some(status) => status.changed().await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    if changed.is_err() {
+                        self.rollout_maintenance = None;
+                    }
+                    if self.initial_screen == StartupDraftInitialScreen::Composer {
+                        self.draw(tui, tui.terminal.last_known_screen_size)?;
+                    }
+                }
                 event = self.events.next() => {
                     let Some(event) = event else {
                         return Err(io::Error::new(
@@ -381,8 +404,16 @@ impl StartupDraftPump {
                 .schedule_frame_in(ChatComposer::recommended_paste_flush_delay());
         }
         self.bottom_pane.pre_draw_tick();
-        let renderable =
-            startup_draft_renderable(&self.header, &self.bottom_pane, self.session_action);
+        let maintenance = self
+            .rollout_maintenance
+            .as_ref()
+            .and_then(|status| status.borrow().display_text());
+        let renderable = startup_draft_renderable(
+            &self.header,
+            &self.bottom_pane,
+            self.session_action,
+            maintenance.as_deref(),
+        );
         let desired_height = renderable.desired_height(screen_size.width);
         tui.draw_with_resize_reflow(desired_height, screen_size, |frame| {
             let area = frame.area();
@@ -474,18 +505,19 @@ fn startup_draft_renderable<'a>(
     header: &'a dyn Renderable,
     bottom_pane: &'a BottomPane,
     session_action: StartupDraftSessionAction,
+    maintenance: Option<&str>,
 ) -> RenderableItem<'a> {
     let mut renderable = FlexRenderable::new();
     renderable.push(/*flex*/ 1, RenderableItem::Borrowed(header));
-    let loading_message = match session_action {
+    let loading_message = maintenance.or(match session_action {
         StartupDraftSessionAction::New => None,
-        StartupDraftSessionAction::Resume => Some("  Resuming session…"),
-        StartupDraftSessionAction::Fork => Some("  Forking session…"),
-    };
+        StartupDraftSessionAction::Resume => Some("Resuming session…"),
+        StartupDraftSessionAction::Fork => Some("Forking session…"),
+    });
     if let Some(loading_message) = loading_message {
         renderable.push(
             /*flex*/ 0,
-            RenderableItem::Owned(Box::new(loading_message.dim())),
+            RenderableItem::Owned(Box::new(format!("  {loading_message}").dim())),
         );
     }
     renderable.push(

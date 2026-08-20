@@ -172,6 +172,7 @@ pub(crate) mod public_widgets;
 mod render;
 mod resize_reflow_cap;
 mod resume_picker;
+mod rollout_maintenance;
 mod selection_list;
 mod service_tier_resolution;
 mod session_archive_commands;
@@ -558,10 +559,10 @@ pub(crate) async fn start_embedded_app_server_for_picker(
         Arc::new(EnvironmentManager::default_for_tests()),
     )
     .await?;
-    Ok(AppServerSession::new(
-        app_server,
-        AppServerTarget::Embedded.thread_params_mode(),
-    ))
+    Ok(
+        AppServerSession::new(app_server, AppServerTarget::Embedded.thread_params_mode())
+            .with_startup_config(config),
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1124,6 +1125,7 @@ async fn run_ratatui_app(
         }
     }
     .with_remote_cwd_override(remote_cwd_override.clone());
+    startup_draft.set_rollout_maintenance(app_server_session.rollout_maintenance());
     if let Some(provider) = manually_selected_oss_provider.as_deref() {
         match startup_draft
             .run_until(
@@ -1758,6 +1760,8 @@ async fn run_ratatui_app(
             }
         },
     };
+
+    startup_draft.set_rollout_maintenance(app_server.rollout_maintenance());
 
     // Persistent app-server resumes may attach to an already-running thread,
     // where resume config overrides are ignored.

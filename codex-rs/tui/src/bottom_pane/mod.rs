@@ -50,6 +50,7 @@ use crossterm::event::KeyEvent;
 use crossterm::event::KeyEventKind;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
+use ratatui::style::Stylize;
 use ratatui::text::Line;
 use std::time::Duration;
 use std::time::Instant;
@@ -248,6 +249,8 @@ pub(crate) struct BottomPane {
     /// When a status row exists, this summary is mirrored inline in that row;
     /// when no status row exists, it renders as its own footer row.
     unified_exec_footer: UnifiedExecFooter,
+    /// App-scoped storage work, independent of the current model turn.
+    rollout_maintenance: Option<String>,
     /// Preview of pending steers and queued drafts shown above the composer.
     pending_input_preview: PendingInputPreview,
     /// Inactive threads with pending approval requests.
@@ -314,6 +317,7 @@ impl BottomPane {
             is_task_running: false,
             status: None,
             unified_exec_footer: UnifiedExecFooter::new(),
+            rollout_maintenance: None,
             pending_input_preview: PendingInputPreview::new(),
             pending_thread_approvals: PendingThreadApprovals::new(),
             esc_backtrack_hint: false,
@@ -327,6 +331,17 @@ impl BottomPane {
     pub fn set_skills(&mut self, skills: Option<Vec<SkillMetadata>>) {
         self.composer.set_skill_mentions(skills);
         self.request_redraw();
+    }
+
+    pub(crate) fn set_rollout_maintenance(&mut self, status: Option<String>) {
+        if self.rollout_maintenance != status {
+            self.rollout_maintenance = status;
+            self.request_redraw();
+        }
+    }
+
+    pub(crate) fn rollout_maintenance(&self) -> Option<&str> {
+        self.rollout_maintenance.as_deref()
     }
 
     /// Update image-paste behavior for the active composer and repaint immediately.
@@ -1837,12 +1852,19 @@ impl BottomPane {
                     RenderableItem::Borrowed(&self.unified_exec_footer),
                 );
             }
+            if let Some(status) = &self.rollout_maintenance {
+                flex.push(
+                    /*flex*/ 0,
+                    RenderableItem::Owned(Box::new(format!("  {status}").dim())),
+                );
+            }
             let has_pending_thread_approvals = !self.pending_thread_approvals.is_empty();
             let has_pending_input = !self.pending_input_preview.queued_messages.is_empty()
                 || !self.pending_input_preview.pending_steers.is_empty()
                 || !self.pending_input_preview.rejected_steers.is_empty();
-            let has_status_or_footer =
-                self.status.is_some() || !self.unified_exec_footer.is_empty();
+            let has_status_or_footer = self.status.is_some()
+                || !self.unified_exec_footer.is_empty()
+                || self.rollout_maintenance.is_some();
             let has_inline_previews = has_pending_thread_approvals || has_pending_input;
             if has_inline_previews && has_status_or_footer {
                 flex.push(/*flex*/ 0, RenderableItem::Owned("".into()));
@@ -2589,6 +2611,25 @@ mod tests {
         let height = pane.desired_height(width);
         let area = Rect::new(0, 0, width, height);
         assert_snapshot!("status_only_snapshot", render_snapshot(&pane, area));
+
+        let original = render_snapshot(&pane, area);
+        pane.set_rollout_maintenance(Some(
+            "Background migration …000000000001: validating 3/10 segments · 1.2 GiB handled"
+                .to_string(),
+        ));
+        let maintenance_width = 80;
+        let maintenance_area = Rect::new(
+            /*x*/ 0,
+            /*y*/ 0,
+            maintenance_width,
+            pane.desired_height(maintenance_width),
+        );
+        assert_snapshot!(
+            "status_with_rollout_maintenance",
+            render_snapshot(&pane, maintenance_area)
+        );
+        pane.set_rollout_maintenance(/*status*/ None);
+        assert_eq!(render_snapshot(&pane, area), original);
     }
 
     #[test]

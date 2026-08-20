@@ -1,0 +1,11 @@
+---
+source: tui/src/bottom_pane/mod.rs
+expression: "render_snapshot(&pane, maintenance_area)"
+---
+• Working (0s • esc to interrupt)                                               
+  Background migration …000000000001: validating 3/10 segments · 1.2 GiB handled
+                                                                                
+                                                                                
+› Ask Codex to do anything                                                      
+                                                                                
+  ? for shortcuts                                            100% context left
