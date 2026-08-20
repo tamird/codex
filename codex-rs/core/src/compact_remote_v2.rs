@@ -881,6 +881,18 @@ mod tests {
     #[test]
     fn build_v2_compacted_history_preserves_retained_metadata_sidecar() {
         let retained = message("user", "keep", /*phase*/ None);
+        let notification_origin = codex_history::CodeModeNotificationOrigin {
+            source_item_id: codex_protocol::ResponseItemId::from_server(
+                "ctco_notification".to_string(),
+            ),
+            call_id: "call-1".to_string(),
+            cell_id: "1".to_string(),
+        };
+        let notification =
+            crate::context::ContextualUserFragment::into(crate::context::CodeModeNotification {
+                origin: &notification_origin,
+                output: "progress",
+            });
         let generated_notice = message(
             "developer",
             "<image_resize_notice>generated</image_resize_notice>",
@@ -905,6 +917,7 @@ mod tests {
                     client.clone(),
                     retained.clone(),
                     generated_notice.clone(),
+                    notification.clone(),
                 ],
                 vec![
                     None,
@@ -914,6 +927,10 @@ mod tests {
                     }),
                     Some(CodexHarnessMetadata::default()),
                     None,
+                    Some(CodexHarnessMetadata {
+                        code_mode_notification: Some(notification_origin.clone()),
+                        ..Default::default()
+                    }),
                 ],
                 output.clone(),
                 enabled,

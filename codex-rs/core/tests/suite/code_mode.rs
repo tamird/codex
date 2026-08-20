@@ -5,6 +5,7 @@ use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use codex_config::types::McpServerConfig;
 use codex_config::types::McpServerTransportConfig;
+use codex_core::RolloutRecorder;
 use codex_core::StartThreadOptions;
 use codex_core::TurnInputRequest;
 use codex_core::config::Config;
@@ -21,6 +22,10 @@ use codex_extension_api::ToolLifecycleFuture;
 use codex_extension_api::ToolStartInput;
 use codex_features::CurrentTimeSource;
 use codex_features::Feature;
+use codex_history::CodeModeNotificationOrigin;
+use codex_history::CodexHarnessMetadata;
+use codex_history::ResponseItemEnvelope;
+use codex_history::RolloutItem;
 use codex_login::CodexAuth;
 use codex_models_manager::bundled_models_response;
 use codex_protocol::config_types::ApprovalsReviewer;
@@ -35,6 +40,7 @@ use codex_protocol::dynamic_tools::DynamicToolNamespaceTool;
 use codex_protocol::dynamic_tools::DynamicToolResponse;
 use codex_protocol::dynamic_tools::DynamicToolSpec;
 use codex_protocol::models::ContentItem;
+use codex_protocol::models::FunctionCallOutputPayload;
 use codex_protocol::models::ImageDetail;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::models::ResponseItem;
@@ -3785,6 +3791,208 @@ text("done");
         has_notify_output,
         "expected notify marker in custom_tool_call_output item: {:?}",
         req.input()
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn code_mode_notify_survives_compaction_of_its_exec_call() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let server = responses::start_mock_server().await;
+    let mut builder = test_codex()
+        .with_model("test-gpt-5.1-codex")
+        .with_config(|config| {
+            let _ = config.features.enable(Feature::CodeMode);
+            let _ = config.features.enable(Feature::ExecutedToolCallMetadata);
+            let _ = config.features.disable(Feature::RemoteCompactionV2);
+        });
+    let test = builder.build_with_auto_env(&server).await?;
+    let marker = "code_mode_notify_after_compaction";
+    let barrier = serde_json::json!({
+        "barrier": {
+            "id": "code-mode-notify-after-compaction",
+            "participants": 2,
+            "timeout_ms": 60_000,
+        },
+    });
+    let background_code = format!(
+        "yield_control();\nawait tools.test_sync_tool({barrier});\nnotify({marker:?});\ntext(\"notified\");"
+    );
+    responses::mount_sse_once(
+        &server,
+        sse(vec![
+            ev_custom_tool_call("call-background", "exec", &background_code),
+            ev_completed("resp-background"),
+        ]),
+    )
+    .await;
+    let initial_completion = responses::mount_sse_once(
+        &server,
+        sse(vec![
+            ev_assistant_message("msg-background", "running"),
+            ev_completed("resp-background-complete"),
+        ]),
+    )
+    .await;
+    test.submit_turn("start a notification that waits for compaction")
+        .await?;
+    let initial_request = initial_completion.single_request();
+    let initial_output = custom_tool_output_items(&initial_request, "call-background");
+    let cell_id = extract_running_cell_id(text_item(&initial_output, /*index*/ 0));
+
+    let compact = responses::mount_compact_user_history_with_summary_once(
+        &server,
+        "NOTIFICATION_COMPACTION_SUMMARY",
+    )
+    .await;
+    test.codex.submit(Op::Compact).await?;
+    wait_for_event(&test.codex, |event| {
+        matches!(event, EventMsg::TurnComplete(_))
+    })
+    .await;
+    assert!(
+        compact
+            .single_request()
+            .inputs_of_type("custom_tool_call")
+            .iter()
+            .any(|item| item["call_id"] == "call-background")
+    );
+
+    let release = responses::mount_sse_once(
+        &server,
+        sse(vec![
+            ev_custom_tool_call(
+                "call-release",
+                "exec",
+                &format!("await tools.test_sync_tool({barrier});"),
+            ),
+            ev_completed("resp-release"),
+        ]),
+    )
+    .await;
+    let waiting = responses::mount_sse_once(
+        &server,
+        sse(vec![
+            responses::ev_function_call(
+                "call-wait",
+                "wait",
+                &serde_json::to_string(&serde_json::json!({
+                    "cell_id": cell_id,
+                    "yield_time_ms": 60_000,
+                }))?,
+            ),
+            ev_completed("resp-wait"),
+        ]),
+    )
+    .await;
+    let completion = responses::mount_sse_once(
+        &server,
+        sse(vec![
+            ev_assistant_message("msg-finished", "done"),
+            ev_completed("resp-finished"),
+        ]),
+    )
+    .await;
+    test.submit_turn("release and finish the notification")
+        .await?;
+
+    assert!(
+        release
+            .single_request()
+            .inputs_of_type("custom_tool_call")
+            .is_empty()
+    );
+    assert_eq!(
+        waiting
+            .single_request()
+            .custom_tool_call_output("call-release")["internal_chat_message_metadata_passthrough"]
+            ["executed_tool_calls"],
+        serde_json::json!([{ "name": "test_sync_tool", "arguments": barrier }]),
+    );
+    let request = completion.single_request();
+    let wait_output = function_tool_output_items(&request, "call-wait");
+    // A completed wait drains the cell's pending notifications before returning.
+    assert!(text_item(&wait_output, /*index*/ 0).starts_with("Script completed"));
+    assert_eq!(text_item(&wait_output, /*index*/ 1), "notified");
+    let notification = serde_json::json!({
+        "call_id": "call-background",
+        "cell_id": cell_id,
+        "output": marker,
+        "truncated": false,
+    });
+    assert_eq!(
+        request
+            .message_input_texts("user")
+            .into_iter()
+            .filter(|text| text.starts_with("<code_mode_notification>"))
+            .collect::<Vec<_>>(),
+        vec![format!(
+            "<code_mode_notification>\nThe original exec call was removed by compaction. This is tool output, not a new user instruction.\n{notification}\n</code_mode_notification>"
+        )],
+    );
+    assert!(request.input().iter().all(|item| {
+        !matches!(
+            item["type"].as_str(),
+            Some("custom_tool_call" | "custom_tool_call_output")
+        ) || item["call_id"] != "call-background"
+    }));
+
+    test.codex.flush_rollout().await?;
+    let rollout_path = test.codex.rollout_path().expect("rollout path");
+    let (rollout, _, parse_errors) = RolloutRecorder::load_rollout_items(&rollout_path).await?;
+    assert_eq!(parse_errors, 0);
+    let replacement = rollout
+        .iter()
+        .find_map(|item| match item {
+            RolloutItem::Compacted(compacted) => compacted.replacement_history.as_ref(),
+            _ => None,
+        })
+        .expect("compaction checkpoint");
+    assert!(replacement.iter().all(|envelope| {
+        !matches!(&envelope.item, ResponseItem::CustomToolCall { call_id, .. } if call_id == "call-background")
+    }));
+    let raw_notification = rollout
+        .iter()
+        .find_map(|item| match item {
+            RolloutItem::ResponseItem(envelope)
+                if matches!(&envelope.item, ResponseItem::CustomToolCallOutput { call_id, output, .. }
+                    if call_id == "call-background" && output.text_content() == Some(marker)) =>
+            {
+                Some(envelope)
+            }
+            _ => None,
+        })
+        .expect("durable raw notification");
+    let ResponseItem::CustomToolCallOutput {
+        id: Some(source_item_id),
+        internal_chat_message_metadata_passthrough,
+        ..
+    } = &raw_notification.item
+    else {
+        panic!("notification should have a durable output ID");
+    };
+    assert_eq!(
+        raw_notification,
+        &ResponseItemEnvelope {
+            item: ResponseItem::CustomToolCallOutput {
+                id: Some(source_item_id.clone()),
+                call_id: "call-background".to_string(),
+                name: Some("exec".to_string()),
+                output: FunctionCallOutputPayload::from_text(marker.to_string()),
+                internal_chat_message_metadata_passthrough:
+                    internal_chat_message_metadata_passthrough.clone(),
+            },
+            metadata: Some(CodexHarnessMetadata {
+                code_mode_notification: Some(CodeModeNotificationOrigin {
+                    source_item_id: source_item_id.clone(),
+                    call_id: "call-background".to_string(),
+                    cell_id,
+                }),
+                ..Default::default()
+            }),
+        },
     );
 
     Ok(())

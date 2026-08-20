@@ -3,6 +3,7 @@ use codex_protocol::items::parse_hook_prompt_fragment;
 use codex_protocol::models::ContentItem;
 
 use super::AdditionalContextUserFragment;
+use super::CodeModeNotification;
 use super::ContextualUserFragment;
 use super::InternalModelContextFragment;
 use super::LegacyApplyPatchExecCommandWarning;
@@ -23,6 +24,7 @@ const CONTEXTUAL_USER_FRAGMENT_MATCHERS: &[fn(&str) -> bool] = &[
     UserShellCommand::matches_text,
     TurnAborted::matches_text,
     SubagentNotification::matches_text,
+    CodeModeNotification::matches_text,
     InternalModelContextFragment::matches_text,
     RecommendedPluginsInstructions::matches_text,
     LegacyUnifiedExecProcessLimitWarning::matches_text,

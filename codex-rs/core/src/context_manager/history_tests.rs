@@ -634,6 +634,57 @@ fn for_prompt_annotated_preserves_metadata_while_normalizing_item() {
 }
 
 #[test]
+fn code_mode_notification_projection_preserves_history_and_retry_identity() {
+    let source_item_id = ResponseItemId::from_server("ctco_notification".to_string());
+    let mut output = custom_tool_call_output("call-1", "progress");
+    output.set_id(Some(source_item_id.clone()));
+    let envelope = ResponseItemEnvelope {
+        item: output,
+        metadata: Some(CodexHarnessMetadata {
+            code_mode_notification: Some(codex_history::CodeModeNotificationOrigin {
+                source_item_id,
+                call_id: "call-1".to_string(),
+                cell_id: "1".to_string(),
+            }),
+            ..Default::default()
+        }),
+    };
+    let mut history = ContextManager::new();
+    history.replace_annotated(vec![envelope.clone()]);
+    let projected = history.clone().for_prompt_annotated(&[InputModality::Text]);
+    assert_eq!(history.annotated_items(), std::slice::from_ref(&envelope));
+    assert_eq!(
+        projected,
+        history.for_prompt_annotated(&[InputModality::Text])
+    );
+    let [notification] = projected.as_slice() else {
+        panic!("one notification")
+    };
+    assert_eq!(notification.metadata, envelope.metadata);
+    assert!(notification.item.id().unwrap().starts_with("msg_"));
+    assert!(!crate::compact_remote::should_keep_compacted_history_item(
+        &notification.item
+    ));
+    let mut paired = ContextManager::new();
+    paired.replace_annotated(vec![
+        ResponseItemEnvelope::new(ResponseItem::CustomToolCall {
+            id: None,
+            status: None,
+            call_id: "call-1".to_string(),
+            name: "exec".to_string(),
+            namespace: None,
+            input: "notify('progress')".to_string(),
+            internal_chat_message_metadata_passthrough: None,
+        }),
+        envelope.clone(),
+    ]);
+    assert_eq!(
+        paired.for_prompt_annotated(&[InputModality::Text]).last(),
+        Some(&envelope)
+    );
+}
+
+#[test]
 fn drop_last_n_user_turns_treats_inter_agent_assistant_messages_as_instruction_turns() {
     let first_turn = user_input_text_msg("first");
     let first_reply = assistant_msg("done");

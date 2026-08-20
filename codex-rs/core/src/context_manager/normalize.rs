@@ -10,6 +10,7 @@ use codex_protocol::openai_models::InputModality;
 use std::collections::HashSet;
 use uuid::Uuid;
 
+use crate::context::CodeModeNotification;
 use crate::context::ContextualUserFragment;
 use crate::context::UnsupportedMedia;
 use crate::util::error_or_panic;
@@ -57,7 +58,7 @@ pub(crate) fn ensure_call_outputs_present(items: &mut Vec<ResponseItemEnvelope>)
                 missing_outputs_to_insert.push((
                     idx,
                     ResponseItemEnvelope::new(ResponseItem::FunctionCallOutput {
-                        id: synthetic_output_id("fco", id.as_deref()),
+                        id: synthetic_item_id("fco", id.as_deref()),
                         call_id: Some(call_id.clone()),
                         name: None,
                         namespace: None,
@@ -75,7 +76,7 @@ pub(crate) fn ensure_call_outputs_present(items: &mut Vec<ResponseItemEnvelope>)
                 missing_outputs_to_insert.push((
                     idx,
                     ResponseItemEnvelope::new(ResponseItem::ToolSearchOutput {
-                        id: synthetic_output_id("tso", id.as_deref()),
+                        id: synthetic_item_id("tso", id.as_deref()),
                         call_id: Some(call_id.clone()),
                         status: "completed".to_string(),
                         execution: "client".to_string(),
@@ -93,7 +94,7 @@ pub(crate) fn ensure_call_outputs_present(items: &mut Vec<ResponseItemEnvelope>)
                 missing_outputs_to_insert.push((
                     idx,
                     ResponseItemEnvelope::new(ResponseItem::CustomToolCallOutput {
-                        id: synthetic_output_id("ctco", id.as_deref()),
+                        id: synthetic_item_id("ctco", id.as_deref()),
                         call_id: call_id.clone(),
                         name: None,
                         output: FunctionCallOutputPayload::from_text("aborted".to_string()),
@@ -113,7 +114,7 @@ pub(crate) fn ensure_call_outputs_present(items: &mut Vec<ResponseItemEnvelope>)
                 missing_outputs_to_insert.push((
                     idx,
                     ResponseItemEnvelope::new(ResponseItem::FunctionCallOutput {
-                        id: synthetic_output_id("fco", id.as_deref()),
+                        id: synthetic_item_id("fco", id.as_deref()),
                         call_id: Some(call_id.clone()),
                         name: None,
                         namespace: None,
@@ -143,7 +144,7 @@ pub(crate) fn ensure_call_outputs_present(items: &mut Vec<ResponseItemEnvelope>)
 /// outputs, so the namespace and name format must remain stable across retries
 /// and resumes to preserve prompt-cache reuse. Returning `None` when the source
 /// call has no ID preserves the legacy behavior for older history items.
-fn synthetic_output_id(prefix: &str, item_id: Option<&str>) -> Option<ResponseItemId> {
+fn synthetic_item_id(prefix: &str, item_id: Option<&str>) -> Option<ResponseItemId> {
     let source_id = item_id.filter(|id| !id.is_empty())?;
     let name = format!("{prefix}:{source_id}");
     Some(ResponseItemId::with_suffix(
@@ -179,6 +180,7 @@ pub(crate) fn remove_orphan_outputs(items: &mut Vec<ResponseItemEnvelope>) {
     }
 
     let mut orphan_positions = Vec::new();
+    let mut notifications = Vec::new();
     for (position, envelope) in items.iter().enumerate() {
         match &envelope.item {
             ResponseItem::FunctionCallOutput {
@@ -190,9 +192,41 @@ pub(crate) fn remove_orphan_outputs(items: &mut Vec<ResponseItemEnvelope>) {
                 ));
                 orphan_positions.push(position);
             }
-            ResponseItem::CustomToolCallOutput { call_id, .. }
-                if !custom_tool_call_ids.contains(call_id.as_str()) =>
-            {
+            ResponseItem::CustomToolCallOutput {
+                id,
+                call_id,
+                output,
+                internal_chat_message_metadata_passthrough,
+                ..
+            } if !custom_tool_call_ids.contains(call_id.as_str()) => {
+                if let Some(origin) = envelope
+                    .metadata
+                    .as_ref()
+                    .and_then(|metadata| metadata.code_mode_notification.as_ref())
+                    && origin.call_id == *call_id
+                    && id.as_ref() == Some(&origin.source_item_id)
+                    && let Some(output) = output.text_content()
+                {
+                    let mut notification = ResponseItem::Message {
+                        id: synthetic_item_id("msg", id.as_deref()),
+                        role: "user".to_string(),
+                        content: Vec::new(),
+                        phase: None,
+                        internal_chat_message_metadata_passthrough:
+                            internal_chat_message_metadata_passthrough.clone(),
+                    };
+                    let _ = set_annotated_content(
+                        &mut notification,
+                        vec![
+                            CodeModeNotification { origin, output }
+                                .render_fragment()
+                                .into_parts()
+                                .1,
+                        ],
+                    );
+                    notifications.push((position, notification));
+                    continue;
+                }
                 error_or_panic(format!(
                     "Orphan custom tool call output for call id: {call_id}"
                 ));
@@ -207,6 +241,12 @@ pub(crate) fn remove_orphan_outputs(items: &mut Vec<ResponseItemEnvelope>) {
                 orphan_positions.push(position);
             }
             _ => {}
+        }
+    }
+
+    for (position, item) in notifications {
+        if let Some(envelope) = items.get_mut(position) {
+            envelope.item = item;
         }
     }
 
