@@ -234,6 +234,7 @@ mod plugin_mentions;
 mod recap;
 mod replay_filter;
 mod resize_reflow;
+mod rollout_maintenance;
 mod safety_buffering;
 mod session_lifecycle;
 mod side;

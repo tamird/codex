@@ -2433,8 +2433,9 @@ async fn open_agent_picker_marks_terminal_read_errors_closed() -> Result<()> {
         /*is_closed*/ false,
     );
 
-    app.refresh_agent_picker_thread_liveness(&mut app_server, thread_id)
-        .await;
+    let mut tui = crate::tui::test_support::make_test_tui()?;
+    app.refresh_agent_picker_thread_liveness(&mut tui, &mut app_server, thread_id)
+        .await?;
     Box::pin(app.open_agent_picker(&mut app_server)).await;
 
     assert_eq!(
@@ -2537,6 +2538,7 @@ fn selected_and_resumed_threads_use_server_capability_for_v1_and_v2_children() -
             format!("{root_session_meta_line}\n"),
         )?;
         let mut child_thread_ids = Vec::new();
+        let mut tui = crate::tui::test_support::make_test_tui()?;
         for (index, multi_agent_version) in [MultiAgentVersion::V1, MultiAgentVersion::V2]
             .into_iter()
             .enumerate()
@@ -2592,7 +2594,7 @@ fn selected_and_resumed_threads_use_server_capability_for_v1_and_v2_children() -
             .zip([MultiAgentVersion::V1, MultiAgentVersion::V2])
         {
             assert!(
-                app.attach_live_thread_for_selection(&mut app_server, child_thread_id)
+                app.attach_live_thread_for_selection(&mut tui, &mut app_server, child_thread_id)
                     .await?
             );
             assert_eq!(
@@ -2633,7 +2635,6 @@ fn selected_and_resumed_threads_use_server_capability_for_v1_and_v2_children() -
         assert!(!app.agent_navigation.is_parent_owned(child_thread_ids[0]));
         assert!(app.agent_navigation.is_parent_owned(child_thread_ids[1]));
 
-        let mut tui = crate::tui::test_support::make_test_tui()?;
         app.select_agent_thread(&mut tui, &mut app_server, child_thread_ids[0])
             .await?;
         while app_event_rx.try_recv().is_ok() {}
@@ -2721,8 +2722,9 @@ fn attach_live_thread_for_selection_rejects_empty_non_ephemeral_fallback_threads
             /*is_closed*/ false,
         );
 
+        let mut tui = crate::tui::test_support::make_test_tui()?;
         let err = app
-            .attach_live_thread_for_selection(&mut app_server, thread_id)
+            .attach_live_thread_for_selection(&mut tui, &mut app_server, thread_id)
             .await
             .expect_err("empty fallback should not attach as a blank replay-only thread");
 
@@ -2761,8 +2763,9 @@ fn attach_live_thread_for_selection_rejects_unmaterialized_fallback_threads() ->
             /*is_closed*/ false,
         );
 
+        let mut tui = crate::tui::test_support::make_test_tui()?;
         let err = app
-            .attach_live_thread_for_selection(&mut app_server, thread_id)
+            .attach_live_thread_for_selection(&mut tui, &mut app_server, thread_id)
             .await
             .expect_err("ephemeral fallback should not attach as a blank live thread");
 
@@ -2817,8 +2820,10 @@ async fn refresh_agent_picker_thread_liveness_prunes_closed_metadata_only_thread
         /*is_closed*/ false,
     );
 
+    let mut tui = crate::tui::test_support::make_test_tui()?;
     let is_available =
-        Box::pin(app.refresh_agent_picker_thread_liveness(&mut app_server, thread_id)).await;
+        Box::pin(app.refresh_agent_picker_thread_liveness(&mut tui, &mut app_server, thread_id))
+            .await?;
 
     assert!(!is_available);
     assert_eq!(app.agent_navigation.get(&thread_id), None);

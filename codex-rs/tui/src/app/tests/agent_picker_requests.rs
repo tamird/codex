@@ -562,6 +562,7 @@ async fn fresh_idle_observations_reject_older_active_picker_snapshots(
         is_running: false,
         is_closed: false,
     };
+    let mut tui = crate::tui::test_support::make_test_tui()?;
     for _ in 0..2 {
         let generation = app
             .agent_navigation
@@ -570,8 +571,12 @@ async fn fresh_idle_observations_reject_older_active_picker_snapshots(
         match observation {
             FreshPickerObservation::ThreadRead => {
                 assert!(
-                    app.refresh_agent_picker_thread_liveness(&mut app_server, child_thread_id)
-                        .await
+                    app.refresh_agent_picker_thread_liveness(
+                        &mut tui,
+                        &mut app_server,
+                        child_thread_id,
+                    )
+                    .await?
                 );
             }
             FreshPickerObservation::LoadedBackfill => {

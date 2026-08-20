@@ -296,14 +296,19 @@ impl App {
 
     pub(super) async fn refresh_agent_picker_thread_liveness(
         &mut self,
+        tui: &mut tui::Tui,
         app_server: &mut AppServerSession,
         thread_id: ThreadId,
-    ) -> bool {
+    ) -> Result<bool> {
         let existing_entry = self.agent_navigation.get(&thread_id).cloned();
         let has_replay_channel = self.thread_event_channels.contains_key(&thread_id);
-        match app_server
-            .thread_read(thread_id, /*include_turns*/ false)
-            .await
+        match self
+            .wait_with_rollout_maintenance(
+                tui,
+                app_server.rollout_maintenance(),
+                app_server.thread_read(thread_id, /*include_turns*/ false),
+            )
+            .await?
         {
             Ok(thread) => {
                 self.agent_navigation.invalidate_pending_picker_snapshots();
@@ -341,12 +346,12 @@ impl App {
                     self.agent_navigation
                         .set_running(thread_id, /*is_running*/ false);
                 }
-                true
+                Ok(true)
             }
             Err(err) => {
                 if Self::is_terminal_thread_read_error(&err) && !has_replay_channel {
                     self.agent_navigation.remove(thread_id);
-                    return false;
+                    return Ok(false);
                 }
                 let is_closed = Self::closed_state_for_thread_read_error(
                     &err,
@@ -367,7 +372,7 @@ impl App {
                 }
                 self.agent_navigation
                     .set_running(thread_id, /*is_running*/ false);
-                true
+                Ok(true)
             }
         }
     }
@@ -380,6 +385,7 @@ impl App {
     /// selects a still-live discovered thread, attach it on demand with a real resumed snapshot.
     pub(super) async fn attach_live_thread_for_selection(
         &mut self,
+        tui: &mut tui::Tui,
         app_server: &mut AppServerSession,
         thread_id: ThreadId,
     ) -> Result<bool> {
@@ -387,13 +393,18 @@ impl App {
             return Ok(true);
         }
 
-        let (session, turns, live_attached) = match app_server
-            .resume_thread(
-                self.config.clone(),
-                thread_id,
-                crate::app_server_session::ResumeModelSettings::PreserveExistingThread,
+        let config = self.config.clone();
+        let (session, turns, live_attached) = match self
+            .wait_with_rollout_maintenance(
+                tui,
+                app_server.rollout_maintenance(),
+                app_server.resume_thread(
+                    config.clone(),
+                    thread_id,
+                    crate::app_server_session::ResumeModelSettings::PreserveExistingThread,
+                ),
             )
-            .await
+            .await?
         {
             Ok(started) => {
                 if started.blocks_direct_input {
@@ -407,18 +418,26 @@ impl App {
                     error = %resume_err,
                     "failed to resume live thread for selection; falling back to thread/read"
                 );
-                let mut thread = app_server
-                    .thread_read(thread_id, /*include_turns*/ false)
-                    .await?;
-                match app_server
-                    .hydrate_initial_thread_history(
-                        &mut thread,
-                        /*turn_cursor*/ None,
-                        /*item_cursor*/ None,
-                        Some(&self.config),
-                        crate::app_server_session::HistoryHydrationScope::Initial,
+                let mut thread = self
+                    .wait_with_rollout_maintenance(
+                        tui,
+                        app_server.rollout_maintenance(),
+                        app_server.thread_read(thread_id, /*include_turns*/ false),
                     )
-                    .await
+                    .await??;
+                match self
+                    .wait_with_rollout_maintenance(
+                        tui,
+                        app_server.rollout_maintenance(),
+                        app_server.hydrate_initial_thread_history(
+                            &mut thread,
+                            /*turn_cursor*/ None,
+                            /*item_cursor*/ None,
+                            Some(&config),
+                            crate::app_server_session::HistoryHydrationScope::Initial,
+                        ),
+                    )
+                    .await?
                 {
                     Ok(()) => {}
                     Err(err) if Self::can_fallback_from_include_turns_error(&err) => {}
@@ -493,8 +512,8 @@ impl App {
         if !(self.side_threads.contains_key(&thread_id)
             && self.thread_event_channels.contains_key(&thread_id)
             || self
-                .refresh_agent_picker_thread_liveness(app_server, thread_id)
-                .await)
+                .refresh_agent_picker_thread_liveness(tui, app_server, thread_id)
+                .await?)
         {
             self.chat_widget
                 .add_error_message(format!("Agent thread {thread_id} is no longer available."));
@@ -507,7 +526,7 @@ impl App {
         let mut attached_replay_only = false;
         if self.should_attach_live_thread_for_selection(thread_id) {
             match self
-                .attach_live_thread_for_selection(app_server, thread_id)
+                .attach_live_thread_for_selection(tui, app_server, thread_id)
                 .await
             {
                 Ok(live_attached) => {
@@ -1227,13 +1246,18 @@ impl App {
         if let Some(history_mode) = target_session.history_mode {
             app_server.remember_thread_history_mode(target_session.thread_id, history_mode);
         }
-        match app_server
-            .resume_thread(
-                resume_config.clone(),
-                target_session.thread_id,
-                self.resume_model_settings(),
+        let model_settings = self.resume_model_settings();
+        match self
+            .wait_with_rollout_maintenance(
+                tui,
+                app_server.rollout_maintenance(),
+                app_server.resume_thread(
+                    resume_config.clone(),
+                    target_session.thread_id,
+                    model_settings,
+                ),
             )
-            .await
+            .await?
         {
             Ok(resumed) => {
                 let resumed_thread_id = resumed.session.thread_id;
