@@ -20,6 +20,8 @@ use crate::maintenance_observer::RolloutMaintenanceRequestScope;
 use crate::maintenance_status::RolloutMaintenanceActivity;
 use crate::maintenance_status::RolloutMaintenanceReporter;
 use crate::maintenance_status::RolloutMaintenanceRequestStatus;
+use crate::maintenance_status::RolloutMaintenanceStatus;
+use crate::maintenance_status::read_owner;
 
 const ROLLOUT_MAINTENANCE_LOCK: &str = "rollout-maintenance.lock";
 const ROLLOUT_MAINTENANCE_JOB_LOCK: &str = "rollout-maintenance-job.lock";
@@ -34,8 +36,8 @@ enum LockMode {
 }
 
 /// Owns a successful lock, including temporary and partially acquired reservations.
-struct MaintenanceFileLock {
-    file: File,
+pub(super) struct MaintenanceFileLock {
+    pub(super) file: File,
 }
 
 impl Drop for MaintenanceFileLock {
@@ -67,9 +69,21 @@ impl RolloutMaintenanceGuard {
         self.reporter.clone()
     }
 
-    fn with_activity(mut self, activity: RolloutMaintenanceActivity) -> Self {
-        self.reporter = Some(RolloutMaintenanceReporter::start(activity));
+    fn with_activity(mut self, codex_home: &Path, activity: RolloutMaintenanceActivity) -> Self {
+        self.reporter = Some(RolloutMaintenanceReporter::start(
+            codex_home.join(".tmp"),
+            "rollout-maintenance".to_string(),
+            activity,
+        ));
         self
+    }
+}
+
+impl Drop for RolloutMaintenanceGuard {
+    fn drop(&mut self) {
+        if let Some(reporter) = &self.reporter {
+            reporter.finish();
+        }
     }
 }
 
@@ -86,7 +100,40 @@ pub struct RolloutMaintenanceJobGuard {
     _foreground: Arc<MaintenanceFileLock>,
     /// Stable lock files are never unlinked: otherwise another process could lock a new inode.
     _dependencies: Vec<MaintenanceFileLock>,
-    _slot: Option<MaintenanceFileLock>,
+    _slot: Option<(usize, MaintenanceFileLock)>,
+    reporter: Option<RolloutMaintenanceReporter>,
+}
+
+impl RolloutMaintenanceJobGuard {
+    pub fn reporter(&self) -> Option<RolloutMaintenanceReporter> {
+        self.reporter.clone()
+    }
+
+    /// Attach reporting to this job's exclusive reservation, never to a shared lock.
+    pub fn with_activity(
+        mut self,
+        codex_home: &Path,
+        activity: RolloutMaintenanceActivity,
+    ) -> Self {
+        let prefix = match &self._slot {
+            Some((slot, _file)) => format!("rollout-migration-slot-{slot}"),
+            None => "rollout-maintenance-job".to_string(),
+        };
+        self.reporter = Some(RolloutMaintenanceReporter::start(
+            codex_home.join(".tmp"),
+            prefix,
+            activity,
+        ));
+        self
+    }
+}
+
+impl Drop for RolloutMaintenanceJobGuard {
+    fn drop(&mut self) {
+        if let Some(reporter) = &self.reporter {
+            reporter.finish();
+        }
+    }
 }
 
 pub async fn acquire_rollout_maintenance_intent(
@@ -150,7 +197,8 @@ pub fn try_acquire_rollout_migration_dependency_lock(
                 _compatibility: compatibility,
                 _foreground: Arc::new(foreground),
                 _dependencies: dependencies,
-                _slot: Some(file),
+                _slot: Some((slot, file)),
+                reporter: None,
             }));
         }
     }
@@ -214,7 +262,14 @@ pub(crate) fn try_acquire_compression_maintenance(
     else {
         return Ok(None);
     };
-    let Some(compatibility) = try_acquire_rollout_maintenance_lock(codex_home)? else {
+    let Some(compatibility) = try_acquire_rollout_maintenance(
+        codex_home,
+        RolloutMaintenanceActivity::new(
+            crate::maintenance_status::RolloutMaintenanceOperation::Compression,
+            /*thread_id*/ None,
+        ),
+    )?
+    else {
         return Ok(None);
     };
     Ok(Some(RolloutCompressionMaintenanceGuard {
@@ -307,6 +362,7 @@ fn try_acquire_foreground_job(
         _foreground: foreground,
         _dependencies: Vec::new(),
         _slot: None,
+        reporter: None,
     }))
 }
 
@@ -352,10 +408,8 @@ pub fn try_acquire_rollout_maintenance(
     codex_home: &Path,
     activity: RolloutMaintenanceActivity,
 ) -> io::Result<Option<RolloutMaintenanceGuard>> {
-    Ok(
-        try_acquire_rollout_maintenance_lock(codex_home)?
-            .map(|guard| guard.with_activity(activity)),
-    )
+    Ok(try_acquire_rollout_maintenance_lock(codex_home)?
+        .map(|guard| guard.with_activity(codex_home, activity)))
 }
 
 /// Wait for exclusive ownership of operations that replace local rollout files.
@@ -383,28 +437,90 @@ async fn acquire_inner(
 ) -> io::Result<RolloutMaintenanceGuard> {
     let _foreground = acquire_foreground_intent(codex_home).await?;
     let mut delay = std::time::Duration::from_millis(25);
+    let mut previous = None;
     let mut waiting: Option<RolloutMaintenanceRequestScope> = None;
     loop {
         if let Some(guard) = try_acquire_rollout_maintenance_lock(codex_home)? {
             drop(waiting);
             return Ok(match activity {
-                Some(activity) => guard.with_activity(activity),
+                Some(activity) => guard.with_activity(codex_home, activity),
                 None => guard,
             });
         }
-        if let Some(activity) = activity
-            && waiting.is_none()
-        {
-            waiting = Some(RolloutMaintenanceRequestScope::new(
-                RolloutMaintenanceRequestStatus::WaitingForMaintenance {
-                    thread_id: activity.thread_id,
-                    owner: None,
-                },
-            ));
+        if let Some(activity) = activity {
+            let owner = match read_rollout_maintenance_status(codex_home) {
+                Ok(RolloutMaintenanceStatus::Busy { owner }) => owner,
+                Ok(RolloutMaintenanceStatus::Idle) | Err(_) => None,
+            };
+            let status = RolloutMaintenanceRequestStatus::WaitingForMaintenance {
+                thread_id: activity.thread_id,
+                owner,
+            };
+            if previous != Some(status) {
+                match &waiting {
+                    Some(waiting) => waiting.update(status),
+                    None => waiting = Some(RolloutMaintenanceRequestScope::new(status)),
+                }
+                previous = Some(status);
+            }
         }
         tokio::time::sleep(delay).await;
         delay = delay
             .saturating_mul(2)
             .min(std::time::Duration::from_millis(500));
+    }
+}
+
+/// Read one current maintenance owner. Independent jobs may have additional owners.
+/// Every reported owner is checked against its own exclusive reservation and reporter lease.
+pub fn read_rollout_maintenance_status(codex_home: &Path) -> io::Result<RolloutMaintenanceStatus> {
+    let directory = codex_home.join(".tmp");
+    for prefix in ["rollout-maintenance", "rollout-maintenance-job"] {
+        let status = read_lock_status(&directory, prefix)?;
+        if status != RolloutMaintenanceStatus::Idle {
+            return Ok(status);
+        }
+    }
+    for slot in 0..MAX_CONCURRENT_ROLLOUT_MIGRATIONS {
+        let status = read_lock_status(&directory, &format!("rollout-migration-slot-{slot}"))?;
+        if status != RolloutMaintenanceStatus::Idle {
+            return Ok(status);
+        }
+    }
+    Ok(RolloutMaintenanceStatus::Idle)
+}
+
+fn read_lock_status(directory: &Path, prefix: &str) -> io::Result<RolloutMaintenanceStatus> {
+    let file = match OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(directory.join(format!("{prefix}.lock")))
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Ok(RolloutMaintenanceStatus::Idle);
+        }
+        Err(error) => return Err(error),
+    };
+    match file.try_lock_shared() {
+        Ok(()) => {
+            let _probe = MaintenanceFileLock { file };
+            Ok(RolloutMaintenanceStatus::Idle)
+        }
+        Err(std::fs::TryLockError::WouldBlock) => {
+            let owner = read_owner(directory, prefix);
+            // A handoff or process exit may have happened while the snapshot was read.
+            match file.try_lock_shared() {
+                Ok(()) => {
+                    let _probe = MaintenanceFileLock { file };
+                    Ok(RolloutMaintenanceStatus::Idle)
+                }
+                Err(std::fs::TryLockError::WouldBlock) => {
+                    Ok(RolloutMaintenanceStatus::Busy { owner })
+                }
+                Err(std::fs::TryLockError::Error(error)) => Err(error),
+            }
+        }
+        Err(std::fs::TryLockError::Error(error)) => Err(error),
     }
 }

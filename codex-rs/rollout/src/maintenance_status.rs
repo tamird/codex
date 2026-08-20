@@ -1,5 +1,12 @@
-//! Bounded, request-local activity reporting for rollout maintenance.
+//! Bounded, advisory status for the process that owns rollout maintenance.
 
+use std::fs::File;
+use std::fs::OpenOptions;
+use std::io;
+use std::io::Read;
+use std::io::Write;
+use std::path::Path;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Duration;
@@ -10,8 +17,11 @@ use serde::Deserialize;
 use serde::Serialize;
 use uuid::Uuid;
 
+use crate::maintenance::MaintenanceFileLock;
 use crate::maintenance_observer::RolloutMaintenanceRequestScope;
 
+const STATUS_VERSION: u32 = 1;
+const MAX_STATUS_BYTES: u64 = 4096;
 const UPDATE_INTERVAL: Duration = Duration::from_millis(250);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -82,10 +92,19 @@ impl RolloutMaintenanceActivity {
     }
 }
 
+/// The OS lock is authoritative. Older processes may own it without reporting details.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RolloutMaintenanceStatus {
+    Idle,
+    Busy {
+        owner: Option<RolloutMaintenanceActivity>,
+    },
+}
+
 /// Activity observed by one request or one local migration run.
 ///
 /// `Running` describes work, not lock ownership: a migration may release maintenance before
-/// rebuilding its projection.
+/// rebuilding its projection. Use [`super::read_rollout_maintenance_status`] for lock ownership.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RolloutMaintenanceRequestStatus {
     Idle,
@@ -101,13 +120,28 @@ pub enum RolloutMaintenanceRequestStatus {
     },
 }
 
+#[derive(Serialize, Deserialize)]
+struct Snapshot {
+    version: u32,
+    generation: Uuid,
+    owner: RolloutMaintenanceActivity,
+}
+
+struct Publication {
+    directory: PathBuf,
+    prefix: String,
+    generation: Uuid,
+    lease: Option<MaintenanceFileLock>,
+}
+
 struct ReporterState {
     activity: RolloutMaintenanceActivity,
+    publication: Option<Publication>,
     last_published: Instant,
     transition: Option<RolloutMaintenanceRequestScope>,
 }
 
-/// A reporting handle cannot prolong the lifetime of the maintenance lock.
+/// A reporting handle cannot prolong the lifetime of either maintenance lock.
 #[derive(Clone)]
 pub struct RolloutMaintenanceReporter(Arc<Mutex<ReporterState>>);
 
@@ -116,29 +150,42 @@ impl RolloutMaintenanceReporter {
     pub fn new(activity: RolloutMaintenanceActivity) -> Self {
         Self(Arc::new(Mutex::new(ReporterState {
             activity,
+            publication: None,
             last_published: Instant::now(),
             transition: None,
         })))
     }
 
-    pub(super) fn start(owner: RolloutMaintenanceActivity) -> Self {
+    pub(super) fn start(
+        directory: PathBuf,
+        prefix: String,
+        owner: RolloutMaintenanceActivity,
+    ) -> Self {
         let owner = RolloutMaintenanceActivity {
             process_id: std::process::id(),
             ..owner
         };
-        Self(Arc::new(Mutex::new(ReporterState {
+        let mut state = ReporterState {
             activity: owner,
+            publication: Some(Publication {
+                directory,
+                prefix,
+                generation: Uuid::new_v4(),
+                lease: None,
+            }),
             last_published: Instant::now(),
             transition: Some(RolloutMaintenanceRequestScope::new(
                 RolloutMaintenanceRequestStatus::Running { activity: owner },
             )),
-        })))
+        };
+        state.publish();
+        Self(Arc::new(Mutex::new(state)))
     }
 
     pub fn activity(&self) -> RolloutMaintenanceActivity {
         self.0
             .lock()
-            .unwrap_or_else(|error| error.into_inner())
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .activity
     }
 
@@ -163,11 +210,19 @@ impl RolloutMaintenanceReporter {
     }
 
     fn update_inner(&self, update: impl FnOnce(&mut RolloutMaintenanceActivity)) {
-        let mut state = self.0.lock().unwrap_or_else(|error| error.into_inner());
+        let mut state = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let previous = state.activity;
         update(&mut state.activity);
         let owner = state.activity;
-        if previous == owner {
+        if previous == owner
+            && state
+                .publication
+                .as_ref()
+                .is_none_or(|publication| publication.lease.is_some())
+        {
             return;
         }
         let changed_phase = previous.phase != owner.phase || previous.thread_id != owner.thread_id;
@@ -178,6 +233,7 @@ impl RolloutMaintenanceReporter {
         if !changed_phase && !complete && state.last_published.elapsed() < UPDATE_INTERVAL {
             return;
         }
+        state.publish();
         state.last_published = Instant::now();
         let status = RolloutMaintenanceRequestStatus::Running { activity: owner };
         match &state.transition {
@@ -185,4 +241,109 @@ impl RolloutMaintenanceReporter {
             None => state.transition = Some(RolloutMaintenanceRequestScope::new(status)),
         }
     }
+
+    pub(super) fn finish(&self) {
+        let mut state = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Release before the global lock; stale JSON alone never proves a current owner.
+        state.publication.take();
+    }
 }
+
+impl ReporterState {
+    fn publish(&mut self) {
+        let Some(publication) = &mut self.publication else {
+            return;
+        };
+        // Publish before taking the reporter lease. A reader's brief probe may contend with
+        // acquisition; retry on the next permitted update without blocking maintenance.
+        if write_snapshot(
+            &publication.directory,
+            &publication.prefix,
+            publication.generation,
+            self.activity,
+        )
+        .is_ok()
+            && publication.lease.is_none()
+        {
+            publication.lease = open_lock(
+                &publication
+                    .directory
+                    .join(format!("{}-reporter.lock", publication.prefix)),
+            )
+            .ok()
+            .and_then(|file| file.try_lock().ok().map(|()| MaintenanceFileLock { file }));
+        }
+    }
+}
+
+pub(super) fn open_lock(path: &Path) -> io::Result<File> {
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path)
+}
+
+fn write_snapshot(
+    directory: &Path,
+    prefix: &str,
+    generation: Uuid,
+    owner: RolloutMaintenanceActivity,
+) -> io::Result<()> {
+    let bytes = serde_json::to_vec(&Snapshot {
+        version: STATUS_VERSION,
+        generation,
+        owner,
+    })?;
+    if bytes.len() as u64 > MAX_STATUS_BYTES {
+        return Err(io::Error::other("rollout maintenance status is too large"));
+    }
+    let mut temporary = tempfile::NamedTempFile::new_in(directory)?;
+    temporary.write_all(&bytes)?;
+    temporary
+        .persist(directory.join(format!("{prefix}-status.json")))
+        .map_err(|error| error.error)?;
+    Ok(())
+}
+
+fn read_snapshot(directory: &Path, prefix: &str) -> Option<Snapshot> {
+    let mut bytes = Vec::new();
+    File::open(directory.join(format!("{prefix}-status.json")))
+        .ok()?
+        .take(MAX_STATUS_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    if bytes.len() as u64 > MAX_STATUS_BYTES {
+        return None;
+    }
+    let snapshot: Snapshot = serde_json::from_slice(&bytes).ok()?;
+    (snapshot.version == STATUS_VERSION).then_some(snapshot)
+}
+
+pub(super) fn read_owner(directory: &Path, prefix: &str) -> Option<RolloutMaintenanceActivity> {
+    let before = read_snapshot(directory, prefix)?;
+    let lease = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(directory.join(format!("{prefix}-reporter.lock")))
+        .ok()?;
+    // Shared reader probes cannot impersonate the exclusive reporting owner.
+    match lease.try_lock_shared() {
+        Err(std::fs::TryLockError::WouldBlock) => {}
+        Ok(()) => {
+            let _probe = MaintenanceFileLock { file: lease };
+            return None;
+        }
+        Err(std::fs::TryLockError::Error(_)) => return None,
+    }
+    let after = read_snapshot(directory, prefix)?;
+    (before.generation == after.generation).then_some(after.owner)
+}
+
+#[cfg(test)]
+#[path = "maintenance_status_tests.rs"]
+mod tests;

@@ -1,9 +1,187 @@
+use std::io::BufRead;
+use std::io::Read;
+use std::io::Write;
+use std::path::Path;
+use std::process::Child;
+use std::process::Command;
+use std::process::Stdio;
+
 use pretty_assertions::assert_eq;
 
 use super::*;
 use crate::RolloutMaintenanceOperation;
+use crate::RolloutMaintenancePhase;
 use crate::RolloutMaintenanceRequestScope;
 use crate::with_rollout_maintenance_observer;
+
+const CHILD_HOME: &str = "CODEX_ROLLOUT_MAINTENANCE_TEST_HOME";
+const CHILD_MODE: &str = "CODEX_ROLLOUT_MAINTENANCE_TEST_MODE";
+
+fn start_holder(home: &Path, mode: &str) -> Child {
+    let mut child = Command::new(std::env::current_exe().expect("test executable"))
+        .args([
+            "--ignored",
+            "--exact",
+            "maintenance::tests::holder_child",
+            "--nocapture",
+        ])
+        .env(CHILD_HOME, home)
+        .env(CHILD_MODE, mode)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("start lock holder");
+    let mut output = std::io::BufReader::new(child.stdout.take().expect("child stdout"));
+    let mut line = String::new();
+    loop {
+        line.clear();
+        assert_ne!(
+            output.read_line(&mut line).expect("read readiness"),
+            0,
+            "holder exited before readiness"
+        );
+        if line.trim() == "maintenance-ready" {
+            break;
+        }
+    }
+    child.stdout = Some(output.into_inner());
+    child
+}
+
+#[test]
+#[ignore = "subprocess fixture for owner handoff"]
+fn holder_child() {
+    let home = std::env::var_os(CHILD_HOME).expect("child home");
+    let home = Path::new(&home);
+    let reported = std::env::var(CHILD_MODE).expect("child mode") == "reported";
+    let guard = if reported {
+        try_acquire_rollout_maintenance(
+            home,
+            RolloutMaintenanceActivity {
+                phase: RolloutMaintenancePhase::Staging,
+                ..RolloutMaintenanceActivity::new(
+                    RolloutMaintenanceOperation::BackgroundMigration,
+                    /*thread_id*/ None,
+                )
+            },
+        )
+    } else {
+        try_acquire_rollout_maintenance_lock(home)
+    }
+    .expect("acquire lock")
+    .expect("available lock");
+    println!("maintenance-ready");
+    std::io::stdout().flush().expect("flush readiness");
+    let _ = std::io::stdin().read_exact(&mut [0_u8]);
+    if reported {
+        std::process::exit(0);
+    }
+    drop(guard);
+}
+
+#[test]
+fn current_owner_requires_a_live_reporter_lease() {
+    let home = tempfile::tempdir().expect("temporary home");
+    let mut reported = start_holder(home.path(), "reported");
+    let RolloutMaintenanceStatus::Busy { owner: Some(owner) } =
+        read_rollout_maintenance_status(home.path()).expect("reported status")
+    else {
+        panic!("reported process must own maintenance")
+    };
+    assert_eq!(
+        (owner.process_id, owner.operation, owner.phase),
+        (
+            reported.id(),
+            RolloutMaintenanceOperation::BackgroundMigration,
+            RolloutMaintenancePhase::Staging
+        )
+    );
+    // Process death leaves a valid snapshot behind, but releases both kernel locks.
+    drop(reported.stdin.take());
+    assert!(reported.wait().expect("reap owner").success());
+    assert_eq!(
+        read_rollout_maintenance_status(home.path()).expect("idle status"),
+        RolloutMaintenanceStatus::Idle
+    );
+
+    let mut legacy = start_holder(home.path(), "legacy");
+    let reader = crate::maintenance_status::open_lock(
+        &home.path().join(".tmp/rollout-maintenance-reporter.lock"),
+    )
+    .expect("open concurrent reporter reader");
+    reader
+        .try_lock_shared()
+        .expect("hold shared reporter probe");
+    assert_eq!(
+        read_rollout_maintenance_status(home.path()).expect("legacy status"),
+        RolloutMaintenanceStatus::Busy { owner: None }
+    );
+    drop(reader);
+    drop(legacy.stdin.take());
+    assert!(legacy.wait().expect("reap legacy owner").success());
+    assert_eq!(
+        read_rollout_maintenance_status(home.path()).expect("finished status"),
+        RolloutMaintenanceStatus::Idle
+    );
+    let idle_reader =
+        crate::maintenance_status::open_lock(&home.path().join(".tmp/rollout-maintenance.lock"))
+            .expect("open concurrent maintenance reader");
+    idle_reader
+        .try_lock_shared()
+        .expect("hold shared maintenance probe");
+    assert_eq!(
+        read_rollout_maintenance_status(home.path()).expect("concurrent idle status"),
+        RolloutMaintenanceStatus::Idle
+    );
+    drop(idle_reader);
+
+    let probe = crate::maintenance_status::open_lock(
+        &home.path().join(".tmp/rollout-maintenance-reporter.lock"),
+    )
+    .expect("open reporter probe");
+    probe.try_lock_shared().expect("hold reporter probe");
+    let previous_snapshot: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(home.path().join(".tmp/rollout-maintenance-status.json"))
+            .expect("previous snapshot"),
+    )
+    .expect("decode previous snapshot");
+    let guard = try_acquire_rollout_maintenance(home.path(), owner)
+        .expect("acquire while probe is active")
+        .expect("maintenance is available");
+    let next_snapshot: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(home.path().join(".tmp/rollout-maintenance-status.json"))
+            .expect("next snapshot"),
+    )
+    .expect("decode next snapshot");
+    assert_ne!(
+        previous_snapshot["generation"], next_snapshot["generation"],
+        "reusing an activity must not reuse its lock-acquisition generation"
+    );
+    let reporter = guard.reporter().expect("reporter");
+    assert_eq!(reporter.activity().process_id, std::process::id());
+    assert_eq!(
+        read_rollout_maintenance_status(home.path()).expect("contended reporter"),
+        RolloutMaintenanceStatus::Busy { owner: None }
+    );
+    drop(probe);
+    let mut next = reporter.activity();
+    next.phase = RolloutMaintenancePhase::Projecting;
+    reporter.update(next);
+    assert_eq!(
+        read_rollout_maintenance_status(home.path()).expect("retried reporter"),
+        RolloutMaintenanceStatus::Busy { owner: Some(next) }
+    );
+    drop(guard);
+    let _legacy = try_acquire_rollout_maintenance_lock(home.path())
+        .expect("raw lock")
+        .expect("available");
+    next.phase = RolloutMaintenancePhase::Verifying;
+    reporter.update(next);
+    assert_eq!(
+        read_rollout_maintenance_status(home.path()).expect("released reporter"),
+        RolloutMaintenanceStatus::Busy { owner: None }
+    );
+}
 
 #[tokio::test]
 async fn canceled_wait_and_last_reporter_clear_only_their_own_status() {
@@ -166,6 +344,7 @@ fn migration_release_does_not_wait_for_inherited_descriptors() -> std::io::Resul
         job._slot
             .as_ref()
             .expect("migration slot")
+            .1
             .file
             .try_clone()?,
     ];
@@ -232,22 +411,48 @@ fn independent_migrations_overlap_but_shared_ancestors_and_capacity_do_not() -> 
     let [second, parent] = dependencies;
     let first = ThreadId::new();
     let unrelated = ThreadId::new();
+    let first_activity = RolloutMaintenanceActivity::new(
+        RolloutMaintenanceOperation::BackgroundMigration,
+        Some(first),
+    );
+    let second_activity = RolloutMaintenanceActivity::new(
+        RolloutMaintenanceOperation::BackgroundMigration,
+        Some(second),
+    );
     let first_job = try_acquire_rollout_migration_dependency_lock(home.path(), &[first, parent])?
-        .expect("first lineage");
+        .expect("first lineage")
+        .with_activity(home.path(), first_activity);
     assert!(
         try_acquire_rollout_migration_dependency_lock(home.path(), &[second, parent])?.is_none()
     );
     // The unsuccessful multi-lock attempt released second's partial reservation.
     let second_job = try_acquire_rollout_migration_dependency_lock(home.path(), &[second])?
-        .expect("independent lineage");
+        .expect("independent lineage")
+        .with_activity(home.path(), second_activity);
+    assert_eq!(
+        read_rollout_maintenance_status(home.path())?,
+        RolloutMaintenanceStatus::Busy {
+            owner: Some(first_activity),
+        }
+    );
     assert!(try_acquire_rollout_migration_dependency_lock(home.path(), &[unrelated])?.is_none());
     assert!(try_acquire_rollout_maintenance_job_lock(home.path())?.is_none());
     assert!(try_acquire_rollout_maintenance_lock(home.path())?.is_none());
     assert!(try_acquire_compression_maintenance(home.path())?.is_none());
     assert!(try_acquire_rollout_maintenance_read_lock(home.path())?.is_some());
     drop(first_job);
+    assert_eq!(
+        read_rollout_maintenance_status(home.path())?,
+        RolloutMaintenanceStatus::Busy {
+            owner: Some(second_activity),
+        }
+    );
     assert!(try_acquire_rollout_migration_dependency_lock(home.path(), &[unrelated])?.is_some());
     drop(second_job);
+    assert_eq!(
+        read_rollout_maintenance_status(home.path())?,
+        RolloutMaintenanceStatus::Idle
+    );
     assert!(try_acquire_rollout_maintenance_job_lock(home.path())?.is_some());
     Ok(())
 }

@@ -419,7 +419,12 @@ async fn repair_before_access(
                             let _waiting = codex_rollout::RolloutMaintenanceRequestScope::new(
                                 codex_rollout::RolloutMaintenanceRequestStatus::WaitingForMaintenance {
                                     thread_id: Some(thread_id),
-                                    owner: None,
+                                    owner: match codex_rollout::read_rollout_maintenance_status(
+                                        store.config.codex_home.as_path(),
+                                    ) {
+                                        Ok(codex_rollout::RolloutMaintenanceStatus::Busy { owner }) => owner,
+                                        Ok(codex_rollout::RolloutMaintenanceStatus::Idle) | Err(_) => None,
+                                    },
                                 },
                             );
                             codex_rollout::acquire_rollout_maintenance_read_lock(
