@@ -292,7 +292,13 @@ async fn maybe_start_supervisor_checkin_locked(
 
     invalidate_supervisor_wakeup(session).await;
     *session.goal_supervisor_runtime.snoozed_until.lock().await = None;
-    let helper_id = spawn_supervisor_helper(session, goal).await?;
+    let helper_id = match spawn_supervisor_helper(session, goal).await {
+        Ok(helper_id) => helper_id,
+        Err(err) => {
+            schedule_supervisor_failure_retry_locked(session, goal_id, &err.to_string()).await;
+            return Err(err);
+        }
+    };
     *session
         .goal_supervisor_runtime
         .active_helper_id
@@ -379,6 +385,23 @@ async fn defer_failed_supervisor_helper_locked(
         return finish_supervisor_helper_locked(session, helper_thread_id).await;
     };
 
+    let finish_result = finish_supervisor_helper_locked(session, helper_thread_id).await;
+    schedule_supervisor_failure_retry_locked(
+        session,
+        active_goal_id.as_str(),
+        &supervisor_terminal_status_description(&terminal_status),
+    )
+    .await;
+    finish_result
+}
+
+// Both startup failures and terminal helpers use the same goal-scoped retry policy. In
+// particular, a failed spawn has no helper whose completion could schedule a later check-in.
+async fn schedule_supervisor_failure_retry_locked(
+    session: &Arc<Session>,
+    goal_id: &str,
+    failure: &str,
+) {
     let retry_active_goal = if let Some(state_db) = session.services.state_db.as_ref() {
         match state_db
             .thread_goals()
@@ -386,14 +409,13 @@ async fn defer_failed_supervisor_helper_locked(
             .await
         {
             Ok(Some(goal)) => {
-                goal.goal_id == active_goal_id
-                    && goal.status == codex_state::ThreadGoalStatus::Active
+                goal.goal_id == goal_id && goal.status == codex_state::ThreadGoalStatus::Active
             }
             Ok(None) => false,
             Err(err) => {
                 warn!(
                     thread_id = %session.thread_id,
-                    goal_id = %active_goal_id,
+                    goal_id,
                     "failed to verify active goal before scheduling supervisor retry: {err}"
                 );
                 true
@@ -406,10 +428,10 @@ async fn defer_failed_supervisor_helper_locked(
         invalidate_supervisor_wakeup(session).await;
         *session.goal_supervisor_runtime.snoozed_until.lock().await = None;
         reset_failure_backoff(session).await;
-        return finish_supervisor_helper_locked(session, helper_thread_id).await;
+        return;
     }
 
-    let retry = next_failure_retry(session, active_goal_id.as_str()).await;
+    let retry = next_failure_retry(session, goal_id).await;
     let retry_delay_ms = i64::try_from(retry.delay.as_millis()).unwrap_or(i64::MAX);
     let persisted_deadline_ms = Utc::now().timestamp_millis().saturating_add(retry_delay_ms);
     if let Some(state_db) = session.services.state_db.as_ref()
@@ -417,24 +439,23 @@ async fn defer_failed_supervisor_helper_locked(
             .thread_goals()
             .set_thread_goal_supervisor_snoozed_until_ms(
                 session.thread_id,
-                active_goal_id.as_str(),
+                goal_id,
                 Some(persisted_deadline_ms),
             )
             .await
     {
         warn!(
             thread_id = %session.thread_id,
-            goal_id = %active_goal_id,
+            goal_id,
             "failed to persist goal supervisor failure retry deadline: {err}"
         );
     }
     let wake = SupervisorWakeDeadline {
-        goal_id: active_goal_id.clone(),
+        goal_id: goal_id.to_string(),
         deadline: Instant::now() + retry.delay,
     };
     *session.goal_supervisor_runtime.snoozed_until.lock().await = Some(wake.clone());
 
-    let finish_result = finish_supervisor_helper_locked(session, helper_thread_id).await;
     schedule_supervisor_wakeup(session, wake).await;
     if retry.should_warn {
         session
@@ -442,15 +463,13 @@ async fn defer_failed_supervisor_helper_locked(
                 id: format!("goal-supervisor-retry-{}", ThreadId::new()),
                 msg: EventMsg::Warning(WarningEvent {
                     message: format!(
-                        "Goal supervisor check-in failed: {}. Retrying in {}.",
-                        supervisor_terminal_status_description(&terminal_status),
+                        "Goal supervisor check-in failed: {failure}. Retrying in {}.",
                         format_retry_duration(retry.delay),
                     ),
                 }),
             })
             .await;
     }
-    finish_result
 }
 
 pub(crate) async fn finish_supervisor_helper(

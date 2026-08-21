@@ -7323,28 +7323,45 @@ async fn goal_supervisor_execution_settings_change_restarts_running_helper_inner
 
 #[test]
 fn failed_goal_supervisor_waits_for_one_persisted_retry() -> anyhow::Result<()> {
-    run_goal_supervisor_test(
-        "failed_goal_supervisor_waits_for_one_persisted_retry",
-        failed_goal_supervisor_waits_for_one_persisted_retry_inner(),
-    )
+    for phase in [
+        SupervisorFailurePhase::Startup,
+        SupervisorFailurePhase::Running,
+    ] {
+        run_goal_supervisor_test(
+            "failed_goal_supervisor_waits_for_one_persisted_retry",
+            failed_goal_supervisor_waits_for_one_persisted_retry_inner(phase),
+        )?;
+    }
+    Ok(())
 }
 
-async fn failed_goal_supervisor_waits_for_one_persisted_retry_inner() -> anyhow::Result<()> {
+#[derive(Clone, Copy)]
+enum SupervisorFailurePhase {
+    Startup,
+    Running,
+}
+
+async fn failed_goal_supervisor_waits_for_one_persisted_retry_inner(
+    phase: SupervisorFailurePhase,
+) -> anyhow::Result<()> {
+    let (initial_requests, retry_requests, expected_failure) = match phase {
+        SupervisorFailurePhase::Startup => {
+            (0, 1, "agent path `/root/goal_supervisor` already exists")
+        }
+        SupervisorFailurePhase::Running => (1, 2, "saved model unavailable"),
+    };
     let server = start_mock_server().await;
     let request_log = mount_sse_sequence(
         &server,
-        vec![
-            sse_failed(
-                "supervisor-failure-1",
-                "model_not_found",
-                "saved model unavailable",
-            ),
-            sse_failed(
-                "supervisor-failure-2",
-                "model_not_found",
-                "saved model unavailable",
-            ),
-        ],
+        (0..retry_requests)
+            .map(|index| {
+                sse_failed(
+                    &format!("supervisor-failure-{index}"),
+                    "model_not_found",
+                    "saved model unavailable",
+                )
+            })
+            .collect(),
     )
     .await;
     let (home, mut config) = test_config().await;
@@ -7375,12 +7392,51 @@ async fn failed_goal_supervisor_waits_for_one_persisted_retry_inner() -> anyhow:
     )
     .await?;
 
-    crate::goal_supervisor::maybe_start_supervisor_checkin(
+    // Reserve in the parent's registry; the harness control owns a separate agent tree.
+    let parent_control = &parent_thread.session.services.agent_control;
+    let blocking_agent_id = match phase {
+        SupervisorFailurePhase::Startup => {
+            let agent_id = ThreadId::new();
+            parent_control
+                .state
+                .reserve_spawn_slot(/*max_threads*/ None)
+                .expect("blocking agent should reserve a slot")
+                .commit(AgentMetadata {
+                    agent_id: Some(agent_id),
+                    parent_thread_id: Some(parent_thread_id),
+                    depth: Some(1),
+                    agent_path: Some(
+                        AgentPath::root()
+                            .join("goal_supervisor")
+                            .expect("supervisor path"),
+                    ),
+                    agent_nickname: None,
+                    agent_role: Some("worker".to_string()),
+                    last_task_message: None,
+                    lifecycle: Arc::default(),
+                });
+            Some(agent_id)
+        }
+        SupervisorFailurePhase::Running => None,
+    };
+    let start_result = crate::goal_supervisor::maybe_start_supervisor_checkin(
         &parent_thread.session,
         goal_id.as_str(),
         &goal,
     )
-    .await?;
+    .await;
+    match phase {
+        SupervisorFailurePhase::Startup => assert!(
+            start_result
+                .expect_err("occupied path should prevent supervisor startup")
+                .to_string()
+                .contains(expected_failure)
+        ),
+        SupervisorFailurePhase::Running => start_result?,
+    }
+    if let Some(agent_id) = blocking_agent_id {
+        parent_control.state.release_spawned_thread(agent_id);
+    }
 
     let first_deadline_ms = timeout(Duration::from_secs(5), async {
         loop {
@@ -7397,7 +7453,7 @@ async fn failed_goal_supervisor_waits_for_one_persisted_retry_inner() -> anyhow:
         }
     })
     .await??;
-    assert_eq!(request_log.requests().len(), 1);
+    assert_eq!(request_log.requests().len(), initial_requests);
     assert_eq!(
         crate::goal_supervisor::supervisor_failure_count_for_test(&parent_thread.session).await,
         1
@@ -7431,7 +7487,7 @@ async fn failed_goal_supervisor_waits_for_one_persisted_retry_inner() -> anyhow:
     })
     .await
     .expect("failed supervisor should warn the user");
-    assert!(warning.contains("saved model unavailable"));
+    assert!(warning.contains(expected_failure));
     assert!(warning.contains("Retrying in"));
 
     let scheduled_generation =
@@ -7450,7 +7506,7 @@ async fn failed_goal_supervisor_waits_for_one_persisted_retry_inner() -> anyhow:
     }
     assert_eq!(
         request_log.requests().len(),
-        1,
+        initial_requests,
         "idle signals before the deadline must not replace the failed helper"
     );
     assert_eq!(
@@ -7481,7 +7537,7 @@ async fn failed_goal_supervisor_waits_for_one_persisted_retry_inner() -> anyhow:
     }
     timeout(Duration::from_secs(5), async {
         loop {
-            if request_log.requests().len() == 2
+            if request_log.requests().len() == retry_requests
                 && harness.manager.list_thread_ids().await == vec![parent_thread_id]
                 // Removing the helper precedes the parent's persisted retry update.
                 && crate::goal_supervisor::supervisor_failure_count_for_test(&parent_thread.session).await == 2
@@ -7496,14 +7552,14 @@ async fn failed_goal_supervisor_waits_for_one_persisted_retry_inner() -> anyhow:
     let requests_after_retry = request_log.requests();
     assert_eq!(
         requests_after_retry.len(),
-        2,
+        retry_requests,
         "one failure retry should run after the in-memory deadline; loaded threads: {:?}; captured ops: {:?}",
         harness.manager.list_thread_ids().await,
         harness.manager.captured_ops(),
     );
     assert_eq!(
         request_log.requests().len(),
-        2,
+        retry_requests,
         "duplicate idle signals must still produce exactly one retry"
     );
     assert_eq!(
