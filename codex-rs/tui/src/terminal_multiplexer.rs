@@ -147,6 +147,7 @@ pub(crate) fn fork_command_parts(
     thread_id: &ThreadId,
     config: &Config,
     additional_writable_roots: &[PathBuf],
+    handoff_socket: &Path,
 ) -> Vec<String> {
     pane_child_command_parts(
         PaneChildKind::Fork,
@@ -154,6 +155,7 @@ pub(crate) fn fork_command_parts(
         thread_id,
         config,
         additional_writable_roots,
+        handoff_socket,
     )
 }
 
@@ -162,6 +164,7 @@ pub(crate) fn standalone_side_command_parts(
     thread_id: &ThreadId,
     config: &Config,
     additional_writable_roots: &[PathBuf],
+    handoff_socket: &Path,
 ) -> Vec<String> {
     pane_child_command_parts(
         PaneChildKind::StandaloneSide,
@@ -169,6 +172,7 @@ pub(crate) fn standalone_side_command_parts(
         thread_id,
         config,
         additional_writable_roots,
+        handoff_socket,
     )
 }
 
@@ -178,11 +182,14 @@ fn pane_child_command_parts(
     thread_id: &ThreadId,
     config: &Config,
     additional_writable_roots: &[PathBuf],
+    handoff_socket: &Path,
 ) -> Vec<String> {
     let mut args = vec![
         "env".to_string(),
         format!("CODEX_HOME={}", config.codex_home.display()),
         exe.display().to_string(),
+        "--internal-fork-handoff".to_string(),
+        handoff_socket.display().to_string(),
     ];
     if kind == PaneChildKind::Fork {
         args.push("fork".to_string());
@@ -369,6 +376,7 @@ fn pane_spawn_config(
     additional_writable_roots: &[PathBuf],
     placement: Option<ForkPanePlacement>,
     tmux_pane: Option<&str>,
+    handoff_socket: &Path,
 ) -> Result<MultiplexerSpawnConfig, String> {
     #[cfg(windows)]
     {
@@ -381,14 +389,21 @@ fn pane_spawn_config(
             additional_writable_roots,
             placement,
             tmux_pane,
+            handoff_socket,
         );
         return Err(WINDOWS_FORK_PANE_UNSUPPORTED_MESSAGE.to_string());
     }
 
     #[cfg(not(windows))]
     {
-        let command =
-            pane_child_command_parts(kind, exe, thread_id, config, additional_writable_roots);
+        let command = pane_child_command_parts(
+            kind,
+            exe,
+            thread_id,
+            config,
+            additional_writable_roots,
+            handoff_socket,
+        );
         match multiplexer {
             Multiplexer::Zellij { .. } => Ok(MultiplexerSpawnConfig {
                 program: PathBuf::from("zellij"),
@@ -489,6 +504,7 @@ pub(crate) async fn spawn_fork_in_new_pane(
     config: &Config,
     additional_writable_roots: &[PathBuf],
     placement: Option<ForkPanePlacement>,
+    handoff_socket: &Path,
 ) -> ForkPaneSpawnResult {
     spawn_pane_child_in_new_pane(
         multiplexer,
@@ -497,6 +513,7 @@ pub(crate) async fn spawn_fork_in_new_pane(
         config,
         additional_writable_roots,
         placement,
+        handoff_socket,
     )
     .await
 }
@@ -507,6 +524,7 @@ pub(crate) async fn spawn_standalone_side_in_new_pane(
     config: &Config,
     additional_writable_roots: &[PathBuf],
     placement: ForkPanePlacement,
+    handoff_socket: &Path,
 ) -> ForkPaneSpawnResult {
     spawn_pane_child_in_new_pane(
         multiplexer,
@@ -515,6 +533,7 @@ pub(crate) async fn spawn_standalone_side_in_new_pane(
         config,
         additional_writable_roots,
         Some(placement),
+        handoff_socket,
     )
     .await
 }
@@ -526,6 +545,7 @@ async fn spawn_pane_child_in_new_pane(
     config: &Config,
     additional_writable_roots: &[PathBuf],
     placement: Option<ForkPanePlacement>,
+    handoff_socket: &Path,
 ) -> ForkPaneSpawnResult {
     if let Err(err) = validate_fork_placement_for_multiplexer(multiplexer, placement, kind) {
         return ForkPaneSpawnResult::InvalidPlacement(err);
@@ -542,6 +562,7 @@ async fn spawn_pane_child_in_new_pane(
         additional_writable_roots,
         placement,
         tmux_pane.as_deref(),
+        handoff_socket,
     ) {
         Ok(spawn_config) => spawn_config,
         Err(err) => return ForkPaneSpawnResult::Failed(err),
@@ -686,6 +707,7 @@ mod tests {
             &[],
             Some(ForkPanePlacement::Right),
             Some("%42"),
+            Path::new("/tmp/fork-handoff.sock"),
         )
         .expect("tmux spawn config");
 
@@ -727,6 +749,7 @@ mod tests {
                 &[],
                 Some(ForkPanePlacement::Right),
                 tmux_pane,
+                Path::new("/tmp/fork-handoff.sock"),
             )
             .expect_err("invalid tmux pane must fail closed");
 
@@ -756,6 +779,7 @@ mod tests {
             &[],
             Some(ForkPanePlacement::Right),
             /*tmux_pane*/ None,
+            Path::new("/tmp/fork-handoff.sock"),
         )
         .expect("zellij spawn config");
 
@@ -790,6 +814,7 @@ mod tests {
             &[],
             Some(ForkPanePlacement::Right),
             /*tmux_pane*/ None,
+            Path::new("/tmp/fork-handoff.sock"),
         )
         .expect("zellij standalone side spawn config");
 
@@ -842,6 +867,7 @@ mod tests {
                 &[],
                 Some(ForkPanePlacement::Right),
                 /*tmux_pane*/ None,
+                Path::new("/tmp/fork-handoff.sock"),
             )
             .expect("zellij spawn config");
 
@@ -953,6 +979,7 @@ mod tests {
             &ThreadId::new(),
             &config,
             &[PathBuf::from("/extra")],
+            Path::new("/tmp/fork-handoff.sock"),
         );
         let thread_id = command.last().expect("thread id").clone();
 
@@ -962,6 +989,8 @@ mod tests {
                 "env".to_string(),
                 format!("CODEX_HOME={}", codex_home.path().display()),
                 "/bin/codex".to_string(),
+                "--internal-fork-handoff".to_string(),
+                "/tmp/fork-handoff.sock".to_string(),
                 "fork".to_string(),
                 "-C".to_string(),
                 expected_cwd,
@@ -1014,6 +1043,7 @@ mod tests {
             &thread_id,
             &config,
             &[PathBuf::from("/extra")],
+            Path::new("/tmp/fork-handoff.sock"),
         );
 
         assert_eq!(
@@ -1022,6 +1052,8 @@ mod tests {
                 "env".to_string(),
                 format!("CODEX_HOME={}", codex_home.path().display()),
                 "/bin/codex".to_string(),
+                "--internal-fork-handoff".to_string(),
+                "/tmp/fork-handoff.sock".to_string(),
                 "-C".to_string(),
                 "/repo".to_string(),
                 "-a".to_string(),
@@ -1069,7 +1101,13 @@ mod tests {
             .set_legacy_sandbox_policy(SandboxPolicy::new_read_only_policy())
             .expect("sandbox policy");
 
-        let command = fork_command_parts(Path::new("/bin/codex"), &ThreadId::new(), &config, &[]);
+        let command = fork_command_parts(
+            Path::new("/bin/codex"),
+            &ThreadId::new(),
+            &config,
+            &[],
+            Path::new("/tmp/fork-handoff.sock"),
+        );
         let thread_id = command.last().expect("thread id").clone();
 
         assert_eq!(
@@ -1078,6 +1116,8 @@ mod tests {
                 "env".to_string(),
                 format!("CODEX_HOME={}", codex_home.path().display()),
                 "/bin/codex".to_string(),
+                "--internal-fork-handoff".to_string(),
+                "/tmp/fork-handoff.sock".to_string(),
                 "fork".to_string(),
                 "-C".to_string(),
                 expected_cwd,

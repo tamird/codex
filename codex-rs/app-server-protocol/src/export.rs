@@ -20,6 +20,8 @@ use crate::protocol::common::EXPERIMENTAL_CLIENT_METHODS;
 use crate::protocol::common::EXPERIMENTAL_SERVER_METHOD_PARAM_TYPES;
 use crate::protocol::common::EXPERIMENTAL_SERVER_METHOD_RESPONSE_TYPES;
 use crate::protocol::common::EXPERIMENTAL_SERVER_METHODS;
+use crate::protocol::common::STABLE_CLIENT_METHOD_TYPES;
+use crate::protocol::common::STABLE_SERVER_METHOD_TYPES;
 use anyhow::Context;
 use anyhow::Result;
 use anyhow::anyhow;
@@ -565,15 +567,21 @@ fn filter_experimental_json_files(out_dir: &Path) -> Result<()> {
 
 fn experimental_method_types() -> HashSet<String> {
     let mut type_names = HashSet::new();
-    collect_experimental_type_names(EXPERIMENTAL_CLIENT_METHOD_PARAM_TYPES, &mut type_names);
-    collect_experimental_type_names(EXPERIMENTAL_CLIENT_METHOD_RESPONSE_TYPES, &mut type_names);
-    collect_experimental_type_names(EXPERIMENTAL_CLIENT_METHOD_DEPENDENCY_TYPES, &mut type_names);
-    collect_experimental_type_names(EXPERIMENTAL_SERVER_METHOD_PARAM_TYPES, &mut type_names);
-    collect_experimental_type_names(EXPERIMENTAL_SERVER_METHOD_RESPONSE_TYPES, &mut type_names);
+    collect_type_names(EXPERIMENTAL_CLIENT_METHOD_PARAM_TYPES, &mut type_names);
+    collect_type_names(EXPERIMENTAL_CLIENT_METHOD_RESPONSE_TYPES, &mut type_names);
+    collect_type_names(EXPERIMENTAL_CLIENT_METHOD_DEPENDENCY_TYPES, &mut type_names);
+    collect_type_names(EXPERIMENTAL_SERVER_METHOD_PARAM_TYPES, &mut type_names);
+    collect_type_names(EXPERIMENTAL_SERVER_METHOD_RESPONSE_TYPES, &mut type_names);
+    // Experimental methods may reuse stable request/response shapes. Only remove types that
+    // belong exclusively to experimental methods, or stable references would become dangling.
+    let mut stable_type_names = HashSet::new();
+    collect_type_names(STABLE_CLIENT_METHOD_TYPES, &mut stable_type_names);
+    collect_type_names(STABLE_SERVER_METHOD_TYPES, &mut stable_type_names);
+    type_names.retain(|name| !stable_type_names.contains(name));
     type_names
 }
 
-fn collect_experimental_type_names(entries: &[&str], out: &mut HashSet<String>) {
+fn collect_type_names(entries: &[&str], out: &mut HashSet<String>) {
     for entry in entries {
         let trimmed = entry.trim();
         if trimmed.is_empty() {

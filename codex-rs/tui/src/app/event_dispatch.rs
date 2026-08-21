@@ -400,12 +400,21 @@ impl App {
                             tui.frame_requester().schedule_frame();
                             return Ok(AppRunControl::Continue);
                         }
+                        let handoff = match app_server.prepare_fork_handoff(fork_config.clone(), thread_id).await {
+                            Ok(path) => path,
+                            Err(error) => {
+                                self.chat_widget.add_error_message(format!("Failed to open a new pane for /fork: {error:#}"));
+                                tui.frame_requester().schedule_frame();
+                                return Ok(AppRunControl::Continue);
+                            }
+                        };
                         match spawn_fork_in_new_pane(
                             multiplexer,
                             &thread_id,
                             &fork_config,
                             &self.harness_overrides.additional_writable_roots,
                             placement,
+                            &handoff,
                         )
                         .await
                         {
@@ -436,11 +445,20 @@ impl App {
                             tui.frame_requester().schedule_frame();
                             return Ok(AppRunControl::Continue);
                         }
+                        let handoff = match app_server.prepare_fork_handoff(fork_config.clone(), thread_id).await {
+                            Ok(path) => path,
+                            Err(error) => {
+                                self.chat_widget.add_error_message(format!("Failed to open a new pane for /fork: {error:#}"));
+                                tui.frame_requester().schedule_frame();
+                                return Ok(AppRunControl::Continue);
+                            }
+                        };
                         match spawn_fork_in_ghostty_split(
                             &thread_id,
                             &fork_config,
                             &self.harness_overrides.additional_writable_roots,
                             placement,
+                            &handoff,
                         )
                         .await
                         {
@@ -2711,8 +2729,15 @@ impl App {
                 parent_thread_id,
                 placement,
             } => {
+                let terminal_info = codex_terminal_detection::terminal_info();
                 return self
-                    .handle_start_placed_side(tui, parent_thread_id, placement)
+                    .handle_start_placed_side(
+                        tui,
+                        app_server,
+                        parent_thread_id,
+                        placement,
+                        &terminal_info,
+                    )
                     .await;
             }
             AppEvent::OpenSkillsList => {

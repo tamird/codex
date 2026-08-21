@@ -486,6 +486,8 @@ Cursor anchors retain millisecond precision. Continue with the same sort options
 existing position cursors remain supported. Pagination is a live view, so concurrent
 activity can move projects across a cursor.
 
+For an independent local app-server, experimental `thread/fork/prepare` accepts the same parameters but requires a loaded `threadId`, latest history (no turn boundary or `path`), `excludeTurns: true`, and no `deferGoalContinuation`. Request it from the source-owning server, then pass the returned `socketPath` to `thread/fork/import` on the receiving server. Preparation starts no runtime; import initializes the child once and returns `ThreadForkResponse`. The private one-shot socket expires after 120 seconds, carries at most 64 MiB, and each source server permits two pending handoffs. The source can continue writing while the receiver initializes. Durable forks retain complete reference-backed history, with deletion protection until the child reference is durable; `ephemeral: true` transfers only bounded context and creates no child rollout.
+
 ### Example: List threads (with pagination & filters)
 
 `thread/list` lets you render a history UI. Results default to `createdAt` (newest first) descending.

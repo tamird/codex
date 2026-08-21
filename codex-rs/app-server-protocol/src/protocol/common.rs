@@ -125,6 +125,16 @@ macro_rules! experimental_type_entry {
     };
 }
 
+#[cfg(test)]
+macro_rules! stable_type_entry {
+    (#[experimental($reason:expr)] $ty:ty) => {
+        ""
+    };
+    ($ty:ty) => {
+        stringify!($ty)
+    };
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ClientRequestSerializationScope {
     Global(&'static str),
@@ -425,6 +435,13 @@ macro_rules! client_request_definitions {
                 experimental_type_entry!($(#[experimental($reason)])? $response),
             )*
         ];
+        #[cfg(test)]
+        pub(crate) const STABLE_CLIENT_METHOD_TYPES: &[&str] = &[
+            $(
+                stable_type_entry!($(#[experimental($reason)])? $params),
+                stable_type_entry!($(#[experimental($reason)])? $response),
+            )*
+        ];
 
         #[cfg(test)]
         pub fn export_client_responses(
@@ -527,6 +544,21 @@ client_request_definitions! {
         params: v2::ThreadForkParams,
         inspect_params: true,
         serialization: thread_or_path(params.thread_id, params.path),
+        response: v2::ThreadForkResponse,
+    },
+    #[experimental("thread/fork/prepare")]
+    /// Freeze a loaded source for initialization by another local app-server.
+    ThreadForkPrepare => "thread/fork/prepare" {
+        params: v2::ThreadForkParams,
+        serialization: thread_or_path(params.thread_id, params.path),
+        response: v2::ThreadForkPrepareResponse,
+    },
+    #[experimental("thread/fork/import")]
+    /// Claim a local one-shot fork snapshot and initialize its independent runtime.
+    ThreadForkImport => "thread/fork/import" {
+        params: v2::ThreadForkImportParams,
+        serialization: None,
+        manual_payload_conversion: manual,
         response: v2::ThreadForkResponse,
     },
     ThreadArchive => "thread/archive" {
@@ -1531,6 +1563,13 @@ macro_rules! server_request_definitions {
         pub(crate) const EXPERIMENTAL_SERVER_METHOD_RESPONSE_TYPES: &[&str] = &[
             $(
                 experimental_type_entry!($(#[experimental($reason)])? $response),
+            )*
+        ];
+        #[cfg(test)]
+        pub(crate) const STABLE_SERVER_METHOD_TYPES: &[&str] = &[
+            $(
+                stable_type_entry!($(#[experimental($reason)])? $params),
+                stable_type_entry!($(#[experimental($reason)])? $response),
             )*
         ];
 

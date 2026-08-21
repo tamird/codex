@@ -69,6 +69,11 @@ pub struct Cli {
     )]
     pub side_session_id: Option<String>,
 
+    /// Internal: claim a parent-prepared fork without reopening its live source.
+    #[arg(long = "internal-fork-handoff", value_name = "SOCKET", hide = true,
+        conflicts_with_all = ["prompt", "images"])]
+    pub fork_handoff_socket: Option<std::path::PathBuf>,
+
     #[clap(flatten)]
     pub shared: TuiSharedCliOptions,
 

@@ -66,11 +66,20 @@ fn standalone_side_starts_real_legacy_fork_and_returns_blank_replay() -> color_e
 async fn standalone_side_starts_real_fork_and_returns_blank_replay_inner(
     history_mode: ThreadHistoryMode,
 ) -> color_eyre::Result<()> {
+    #[cfg(unix)]
+    let codex_home = tempfile::tempdir_in("/tmp")?;
+    #[cfg(not(unix))]
     let codex_home = tempdir()?;
-    let config = ConfigBuilder::default()
+    let mut config = ConfigBuilder::default()
         .codex_home(codex_home.path().to_path_buf())
         .build()
         .await?;
+    if history_mode == ThreadHistoryMode::Legacy {
+        // Preserve the Legacy fixture instead of testing its automatic conversion on resume.
+        config
+            .features
+            .disable(Feature::BackgroundPaginatedRolloutMigration)?;
+    }
     let mut app_server = crate::start_embedded_app_server_for_picker(&config).await?;
     let parent_thread_id = match history_mode {
         ThreadHistoryMode::Paginated => app_server.start_thread(&config).await?.session.thread_id,
@@ -118,12 +127,22 @@ async fn standalone_side_starts_real_fork_and_returns_blank_replay_inner(
         thread_id: parent_thread_id,
         history_mode: None,
     };
-    let side = App::start_standalone_side(
-        &mut app_server,
-        App::standalone_side_config(&config),
-        &target,
-    )
-    .await?;
+    let side_config = App::standalone_side_config(&config);
+    let mut handoff = match history_mode {
+        ThreadHistoryMode::Paginated => Some((
+            app_server
+                .prepare_fork_handoff(side_config.clone(), parent_thread_id)
+                .await?,
+            crate::start_embedded_app_server_for_picker(&config).await?,
+        )),
+        ThreadHistoryMode::Legacy => None,
+    };
+    let (side_server, handoff_socket) = match handoff.as_mut() {
+        Some((socket, receiver)) => (receiver, Some(socket.as_path())),
+        None => (&mut app_server, None),
+    };
+    let side =
+        App::start_standalone_side(side_server, side_config, &target, handoff_socket).await?;
     let child_thread_id = side.session.thread_id;
 
     assert!(side.turns.is_empty());
@@ -133,9 +152,10 @@ async fn standalone_side_starts_real_fork_and_returns_blank_replay_inner(
     // A successful return proves the real embedded app-server accepted the typed boundary
     // injection. Ephemeral threads deliberately reject includeTurns, so boundary role/content
     // are covered by the fragment test while exact ordering is owned by start_standalone_side.
-    let stored_child = app_server
+    let stored_child = side_server
         .thread_read(child_thread_id, /*include_turns*/ false)
         .await?;
+    side_server.thread_unsubscribe(child_thread_id).await?;
     let stored_parent = app_server
         .thread_read(parent_thread_id, /*include_turns*/ false)
         .await?;
@@ -151,7 +171,9 @@ async fn standalone_side_starts_real_fork_and_returns_blank_replay_inner(
     assert_eq!(stored_child.path, None);
     assert!(stored_child.turns.is_empty());
 
-    app_server.thread_unsubscribe(child_thread_id).await?;
+    if let Some((_socket, receiver)) = handoff {
+        receiver.shutdown().await?;
+    }
     app_server.shutdown().await?;
     Ok(())
 }

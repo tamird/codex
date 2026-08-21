@@ -1,6 +1,7 @@
 mod archive_thread;
 mod create_thread;
 mod delete_thread;
+mod fork_handoff;
 mod goal_supervisor_history_repair;
 mod goal_supervisor_runtime_repair;
 #[cfg(test)]
@@ -739,6 +740,50 @@ impl LocalThreadStore {
         )
     }
 
+    /// Keeps a prepared source alive across processes without transferring write authority.
+    /// The caller must already retain its `PreparedFork` lifecycle reservation. Only the process
+    /// owning the live source may admit fork readers; ordinary writers still require exclusivity.
+    pub async fn reserve_exported_fork(
+        &self,
+        thread_id: ThreadId,
+    ) -> ThreadStoreResult<impl std::fmt::Debug + Send + 'static> {
+        let _writer = self.live_writer_locks.lock(thread_id).await;
+        let (recorder, _, _, _) = live_writer::live_writer_parts(self, thread_id).await?;
+        // Drain even commands left behind by a cancelled append before a fallible conversion.
+        recorder
+            .flush()
+            .await
+            .map_err(|error| ThreadStoreError::Internal {
+                message: format!(
+                    "failed to flush fork source before sharing its reservation: {error}"
+                ),
+            })?;
+        let mut recorders = self.live_recorders.lock().await;
+        let entry = recorders
+            .get_mut(&thread_id)
+            .ok_or(ThreadStoreError::ThreadNotFound { thread_id })?;
+        let result = entry.writer_lock.share_for_fork();
+        if !entry.writer_lock.is_reserved() {
+            // A failed lock conversion cannot leave an active recorder authorized to write.
+            recorders.remove(&thread_id);
+        }
+        result?;
+        self.writer_lock_coordinator.acquire_fork_reader(thread_id)
+    }
+
+    /// Acquires independent deletion protection before validating an imported immutable snapshot.
+    /// The returned lease must survive until the new child's history reference has been flushed.
+    pub async fn reserve_imported_fork(
+        &self,
+        thread_id: ThreadId,
+    ) -> ThreadStoreResult<impl std::fmt::Debug + Send + 'static> {
+        let lifecycle = self.reserve_thread_lifecycle(thread_id).await;
+        let reader = self
+            .writer_lock_coordinator
+            .acquire_fork_reader(thread_id)?;
+        Ok((lifecycle, reader))
+    }
+
     pub(crate) async fn live_persistence_mode(
         &self,
         thread_id: ThreadId,
@@ -774,6 +819,35 @@ impl LocalThreadStore {
             writer_locks.push(self.writer_lock_coordinator.acquire(thread_id)?);
         }
         Ok(writer_locks)
+    }
+
+    async fn acquire_destructive_writer_locks(
+        &self,
+        thread_ids: &[ThreadId],
+    ) -> ThreadStoreResult<Vec<WriterLockGuard>> {
+        for &thread_id in thread_ids {
+            let recorder = match live_writer::live_writer_parts(self, thread_id).await {
+                Ok((recorder, _, _, _)) => recorder,
+                Err(ThreadStoreError::ThreadNotFound { thread_id: _ }) => continue,
+                Err(error) => return Err(error),
+            };
+            recorder
+                .flush()
+                .await
+                .map_err(|error| ThreadStoreError::Internal {
+                    message: format!("failed to flush thread before exclusive deletion: {error}"),
+                })?;
+            let mut recorders = self.live_recorders.lock().await;
+            let entry = recorders
+                .get_mut(&thread_id)
+                .ok_or(ThreadStoreError::ThreadNotFound { thread_id })?;
+            let result = entry.writer_lock.require_exclusive();
+            if !entry.writer_lock.is_reserved() {
+                recorders.remove(&thread_id);
+            }
+            result?;
+        }
+        self.acquire_writer_locks(thread_ids).await
     }
 
     async fn reserve_rollout_writers(

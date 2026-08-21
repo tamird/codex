@@ -1,8 +1,7 @@
 //! Startup support for side conversations that run in a separate TUI process.
 //!
-//! This mode deliberately owns only the child process. It forks the persisted parent through the
-//! child's embedded app-server, makes that fork ephemeral, and hides inherited history from the
-//! child UI. It does not attach to or control the parent process.
+//! A placed side imports the parent-prepared bounded context into its own runtime and hides
+//! inherited history from the child UI. It never attaches to or controls the parent runtime.
 
 use super::*;
 use crate::chatwidget::InterruptedTurnNoticeMode;
@@ -19,8 +18,6 @@ const STANDALONE_SIDE_RENAME_BLOCK_MESSAGE: &str =
 
 impl App {
     pub(super) fn standalone_side_config(config: &Config) -> Config {
-        // The caller owns projection of live parent settings into `config`. Slice 15b will build
-        // that launch config; this foundation preserves it while adding only side semantics.
         let mut side_config = config.clone();
         side_config.ephemeral = true;
         side_config.developer_instructions =
@@ -37,16 +34,22 @@ impl App {
         app_server: &mut AppServerSession,
         config: Config,
         target_session: &SessionTarget,
+        handoff_socket: Option<&Path>,
     ) -> Result<AppServerStartedThread> {
-        let mut side = app_server
-            .fork_side_thread(config, target_session.thread_id)
-            .await
-            .wrap_err_with(|| {
-                format!(
-                    "Failed to start standalone side conversation from {}",
-                    target_session.display_label()
-                )
-            })?;
+        let mut side = match handoff_socket {
+            Some(path) => app_server.import_fork_handoff(config, path).await,
+            None => {
+                app_server
+                    .fork_side_thread(config, target_session.thread_id)
+                    .await
+            }
+        }
+        .wrap_err_with(|| {
+            format!(
+                "Failed to start standalone side conversation from {}",
+                target_session.display_label()
+            )
+        })?;
         let child_thread_id = side.session.thread_id;
         if let Err(err) = app_server
             .thread_inject_items(

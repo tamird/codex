@@ -53,6 +53,7 @@ codex-goal-extension = { workspace = true }
 codex-git-attribution = { workspace = true }
 codex-guardian-v2 = { workspace = true }
 codex-git-utils = { workspace = true }
+codex-history = { workspace = true }
 codex-file-watcher = { workspace = true }
 codex-hooks = { workspace = true }
 codex-history-notes-extension = { workspace = true }
@@ -87,6 +88,7 @@ codex-sandboxing = { workspace = true }
 codex-state = { workspace = true }
 codex-thread-store = { workspace = true }
 codex-tools = { workspace = true }
+codex-uds = { workspace = true }
 codex-utils-absolute-path = { workspace = true }
 codex-utils-json-to-toml = { workspace = true }
 codex-utils-path-uri = { workspace = true }

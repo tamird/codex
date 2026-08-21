@@ -1315,6 +1315,22 @@ async fn run_ratatui_app(
     let use_fork = cli.fork_picker || cli.fork_last || cli.fork_session_id.is_some();
     let session_selection = if cli.agents_overview {
         resume_picker::SessionSelection::AgentsOverview
+    } else if cli.fork_handoff_socket.is_some() {
+        let id = cli
+            .side_session_id
+            .as_deref()
+            .or(cli.fork_session_id.as_deref())
+            .ok_or_else(|| color_eyre::eyre::eyre!("fork handoff requires a source session id"))?;
+        let target = resume_picker::SessionTarget {
+            path: None,
+            thread_id: ThreadId::from_string(id)?,
+            history_mode: None,
+        };
+        if cli.side_session_id.is_some() {
+            resume_picker::SessionSelection::Side(target)
+        } else {
+            resume_picker::SessionSelection::Fork(target)
+        }
     } else if let Some(id_str) = cli.side_session_id.as_deref() {
         let Some(startup_app_server) = app_server.as_mut() else {
             unreachable!("app server should be initialized for an internal side session");
@@ -1537,39 +1553,43 @@ async fn run_ratatui_app(
     }
 
     let current_cwd = config.cwd.clone();
-    let fallback_cwd = match resolve_startup_resume_or_fork_cwd(
-        &mut tui,
-        &config,
-        state_db.as_deref(),
-        &session_selection,
-        cli.cwd.as_deref(),
-        uses_remote_workspace,
-        uses_remote_workspace_or_environment(&app_server_target, &environment_manager),
-    )
-    .await
-    {
-        Ok(ResolveCwdOutcome::Continue(cwd)) => cwd,
-        Ok(ResolveCwdOutcome::ContinueAfterPrompt(cwd)) => {
-            // Another daemon client can change authentication while this prompt is open.
-            startup_account = None;
-            Some(cwd)
-        }
-        Ok(ResolveCwdOutcome::Exit) => {
-            terminal_restore_guard.restore_silently();
-            session_log::log_session_end();
-            return Ok(AppExitInfo {
-                token_usage: crate::token_usage::TokenUsage::default(),
-                thread_id: None,
-                resume_hint: None,
-                disconnect_info: None,
-                update_action: None,
-                exit_reason: ExitReason::UserRequested,
-            });
-        }
-        Err(err) => {
-            terminal_restore_guard.restore_silently();
-            session_log::log_session_end();
-            return Err(err);
+    let fallback_cwd = if cli.fork_handoff_socket.is_some() {
+        None
+    } else {
+        match resolve_startup_resume_or_fork_cwd(
+            &mut tui,
+            &config,
+            state_db.as_deref(),
+            &session_selection,
+            cli.cwd.as_deref(),
+            uses_remote_workspace,
+            uses_remote_workspace_or_environment(&app_server_target, &environment_manager),
+        )
+        .await
+        {
+            Ok(ResolveCwdOutcome::Continue(cwd)) => cwd,
+            Ok(ResolveCwdOutcome::ContinueAfterPrompt(cwd)) => {
+                // Another daemon client can change authentication while this prompt is open.
+                startup_account = None;
+                Some(cwd)
+            }
+            Ok(ResolveCwdOutcome::Exit) => {
+                terminal_restore_guard.restore_silently();
+                session_log::log_session_end();
+                return Ok(AppExitInfo {
+                    token_usage: crate::token_usage::TokenUsage::default(),
+                    thread_id: None,
+                    resume_hint: None,
+                    disconnect_info: None,
+                    update_action: None,
+                    exit_reason: ExitReason::UserRequested,
+                });
+            }
+            Err(err) => {
+                terminal_restore_guard.restore_silently();
+                session_log::log_session_end();
+                return Err(err);
+            }
         }
     };
 
@@ -1659,6 +1679,7 @@ async fn run_ratatui_app(
     #[cfg(not(target_os = "windows"))]
     let should_prompt_windows_sandbox_nux_at_startup = false;
 
+    let fork_handoff_socket = cli.fork_handoff_socket;
     let Cli {
         prompt,
         shared,
@@ -1790,6 +1811,7 @@ async fn run_ratatui_app(
         prompt,
         images,
         session_selection,
+        fork_handoff_socket,
         feedback,
         should_show_trust_screen, // Proxy to: is it a first run in this directory?
         should_prompt_windows_sandbox_nux_at_startup,

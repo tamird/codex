@@ -1564,6 +1564,27 @@ impl TestAppServer {
         tokio::time::timeout(DEFAULT_REQUEST_TIMEOUT, self.read_response(request_id)).await?
     }
 
+    /// Sends a typed request whose error response is the expected test result.
+    pub async fn request_error(
+        &mut self,
+        make_request: impl FnOnce(RequestId) -> ClientRequest,
+    ) -> anyhow::Result<JSONRPCError> {
+        let request_id = self.next_request_id.fetch_add(1, Ordering::Relaxed);
+        let request = make_request(RequestId::Integer(request_id));
+        ensure!(
+            request.id() == &RequestId::Integer(request_id),
+            "typed request must use the supplied request ID"
+        );
+        let request = serde_json::from_value::<JSONRPCRequest>(serde_json::to_value(request)?)?;
+        self.send_jsonrpc_message(JSONRPCMessage::Request(request))
+            .await?;
+        tokio::time::timeout(
+            DEFAULT_REQUEST_TIMEOUT,
+            self.read_stream_until_error_message(RequestId::Integer(request_id)),
+        )
+        .await?
+    }
+
     pub async fn send_request(
         &mut self,
         method: &str,

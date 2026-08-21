@@ -1251,6 +1251,34 @@ impl ThreadManager {
             .multi_agent_version()
             .unwrap_or(MultiAgentVersion::V1);
         let source_history_mode = fork_source.config_snapshot().await.history_mode;
+        if !self.state.thread_store.as_any().is::<LocalThreadStore>() {
+            fork_source.ensure_rollout_materialized().await;
+            fork_source.flush_rollout().await?;
+            let stored_thread = fork_source
+                .read_thread(
+                    /*include_archived*/ true, /*include_history*/ true,
+                )
+                .await
+                .map_err(|err| {
+                    CodexErr::Fatal(format!(
+                        "failed to read subagent fork source {forked_from_thread_id}: {err}"
+                    ))
+                })?;
+            let history =
+                stored_thread_to_initial_history(stored_thread, fork_source.rollout_path())?;
+            options.initial_history = fork_history_from_snapshot(
+                ForkSnapshot::Interrupted,
+                history,
+                InterruptedTurnHistoryMarker::from_config_and_version(
+                    &options.config,
+                    inherited_multi_agent_version,
+                ),
+            );
+            return self
+                .start_thread_inner(options, Some(forked_from_thread_id), agent_control)
+                .await;
+        }
+
         let (initial_history, _response_history, source_reservation) = self
             .state
             .reference_backed_snapshot_history(
@@ -1664,7 +1692,9 @@ impl ThreadManager {
         };
         model_history_override.extend_from_slice(synthesized_suffix);
         let shared_model_response_items = prepared.shared_model_response_items.clone();
-        let mut shared_model_state = if let Some(items) = &shared_model_response_items {
+        let mut shared_model_state = if let Some(items) = &shared_model_response_items
+            && prepared.model_state_origin == codex_thread_store::ForkModelStateOrigin::LoadedSource
+        {
             if let Ok(source) = self.state.get_thread(source_thread_id).await {
                 Some(
                     source
@@ -1769,32 +1799,41 @@ impl ThreadManager {
             InterruptedTurnHistoryMarker::from_config_and_version(&config, multi_agent_version);
         let (history, response_history, source_reservation) = if let Some(snapshot) = snapshot {
             if let Some(source_thread_id) = source_thread_id {
-                let expected_source_items = match snapshot {
-                    ForkSnapshot::Interrupted => None,
-                    ForkSnapshot::TruncateBeforeNthUserMessage(_) => {
-                        Some(history.get_rollout_items().to_vec())
-                    }
-                };
-                let (history, response_history, reservation) = self
-                    .state
-                    .reference_backed_snapshot_history(
-                        source_thread_id,
-                        config.codex_home.as_path(),
-                        history
-                            .get_rollout_items()
-                            .iter()
-                            .find_map(|item| match item {
-                                RolloutItem::SessionMeta(meta) => Some(meta.meta.history_mode),
-                                _ => None,
-                            })
-                            .unwrap_or_default(),
-                        snapshot,
-                        interrupted_marker,
-                        expected_source_items,
-                        expected_source_rollout_id,
-                    )
-                    .await?;
-                (history, response_history, Some(reservation))
+                if self.state.thread_store.as_any().is::<LocalThreadStore>() {
+                    // Interrupted forks linearize at the store freeze because the source turn can
+                    // append after app-server reads its history. Rollback keeps the equality check
+                    // because its user-message boundary was derived from that earlier history.
+                    let expected_source_items = match snapshot {
+                        ForkSnapshot::Interrupted => None,
+                        ForkSnapshot::TruncateBeforeNthUserMessage(_) => {
+                            Some(history.get_rollout_items().to_vec())
+                        }
+                    };
+                    let (history, response_history, reservation) = self
+                        .state
+                        .reference_backed_snapshot_history(
+                            source_thread_id,
+                            config.codex_home.as_path(),
+                            history
+                                .get_rollout_items()
+                                .iter()
+                                .find_map(|item| match item {
+                                    RolloutItem::SessionMeta(meta) => Some(meta.meta.history_mode),
+                                    _ => None,
+                                })
+                                .unwrap_or_default(),
+                            snapshot,
+                            interrupted_marker,
+                            expected_source_items,
+                            expected_source_rollout_id,
+                        )
+                        .await?;
+                    (history, response_history, Some(reservation))
+                } else {
+                    let history = fork_history_from_snapshot(snapshot, history, interrupted_marker);
+                    let response_history = Arc::new(history.get_rollout_items().to_vec());
+                    (history, response_history, None)
+                }
             } else {
                 let history = match &history {
                     InitialHistory::New | InitialHistory::Cleared => {

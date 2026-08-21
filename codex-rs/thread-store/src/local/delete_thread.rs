@@ -42,7 +42,7 @@ pub(super) async fn delete_thread(
     let thread_id = params.thread_id;
     let _lifecycle_guard = store.live_writer_locks.lock_lifecycle(thread_id).await;
     let _live_writer_guard = store.live_writer_locks.lock(thread_id).await;
-    let mut writer_guards = store.acquire_writer_locks(&[thread_id]).await?;
+    let mut writer_guards = store.acquire_destructive_writer_locks(&[thread_id]).await?;
     let owned_rollouts = owned_rollouts_for_thread(store, thread_id).await?;
     let reference_index = scan_reference_index(store).await?;
     let targeted_rollout_ids = owned_rollouts
@@ -113,7 +113,9 @@ where
     for &thread_id in &lock_thread_ids {
         _live_writer_guards.push(store.live_writer_locks.lock(thread_id).await);
     }
-    let mut writer_guards = store.acquire_writer_locks(&lock_thread_ids).await?;
+    let mut writer_guards = store
+        .acquire_destructive_writer_locks(&lock_thread_ids)
+        .await?;
 
     let mut owned_rollouts_by_thread = HashMap::new();
     let mut targeted_rollout_ids = HashSet::new();

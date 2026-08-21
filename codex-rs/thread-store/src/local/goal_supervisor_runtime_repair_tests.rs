@@ -1191,8 +1191,7 @@ async fn repaired_history_remains_writer_reserved_until_access_is_dropped() {
     let conflict = competing
         .writer_lock_coordinator
         .acquire(thread_id)
-        .err()
-        .expect("repair access retains cross-process writer lock");
+        .expect_err("repair access retains cross-process writer lock");
     assert!(conflict.to_string().contains("active writer"));
     drop(access);
     competing

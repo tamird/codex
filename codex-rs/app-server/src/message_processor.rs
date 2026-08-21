@@ -118,7 +118,7 @@ fn reject_obsolete_request_fields(request: &JSONRPCRequest) -> Result<(), JSONRP
 fn reject_removed_permission_profile(request: &JSONRPCRequest) -> Result<(), JSONRPCErrorError> {
     if matches!(
         request.method.as_str(),
-        "thread/start" | "thread/resume" | "thread/fork" | "turn/start"
+        "thread/start" | "thread/resume" | "thread/fork" | "thread/fork/prepare" | "turn/start"
     ) && request
         .params
         .as_ref()
@@ -1174,6 +1174,28 @@ impl MessageProcessor {
             ClientRequest::ThreadFork { params, .. } => {
                 self.thread_processor
                     .thread_fork(
+                        request_id.clone(),
+                        params,
+                        app_server_client_name.clone(),
+                        client_version.clone(),
+                        client_mcp_extensions.clone(),
+                    )
+                    .await
+            }
+            ClientRequest::ThreadForkPrepare {
+                params,
+                request_id: _,
+            } => {
+                self.thread_processor
+                    .thread_fork_prepare(request_id.clone(), params)
+                    .await
+            }
+            ClientRequest::ThreadForkImport {
+                params,
+                request_id: _,
+            } => {
+                self.thread_processor
+                    .thread_fork_import(
                         request_id.clone(),
                         params,
                         app_server_client_name.clone(),

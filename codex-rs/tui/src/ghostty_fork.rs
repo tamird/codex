@@ -109,6 +109,7 @@ pub(crate) async fn spawn_fork_in_ghostty_split(
     config: &Config,
     additional_writable_roots: &[PathBuf],
     placement: ForkPanePlacement,
+    handoff_socket: &Path,
 ) -> ForkPaneSpawnResult {
     if SplitDirection::from_placement(placement).is_none() {
         return ForkPaneSpawnResult::InvalidPlacement(
@@ -125,6 +126,7 @@ pub(crate) async fn spawn_fork_in_ghostty_split(
         config,
         additional_writable_roots,
         placement,
+        handoff_socket,
     ) {
         Ok(spawn_config) => spawn_config,
         Err(err) => return ForkPaneSpawnResult::Failed(err),
@@ -137,6 +139,7 @@ pub(crate) async fn spawn_standalone_side_in_ghostty_split(
     config: &Config,
     additional_writable_roots: &[PathBuf],
     placement: ForkPanePlacement,
+    handoff_socket: &Path,
 ) -> ForkPaneSpawnResult {
     if SplitDirection::from_placement(placement).is_none() {
         return ForkPaneSpawnResult::InvalidPlacement(
@@ -153,6 +156,7 @@ pub(crate) async fn spawn_standalone_side_in_ghostty_split(
         config,
         additional_writable_roots,
         placement,
+        handoff_socket,
     ) {
         Ok(spawn_config) => spawn_config,
         Err(err) => return ForkPaneSpawnResult::Failed(err),
@@ -166,8 +170,15 @@ fn build_ghostty_spawn_config(
     config: &Config,
     additional_writable_roots: &[PathBuf],
     placement: ForkPanePlacement,
+    handoff_socket: &Path,
 ) -> Result<GhosttySpawnConfig, String> {
-    let command = fork_command_parts(exe, thread_id, config, additional_writable_roots);
+    let command = fork_command_parts(
+        exe,
+        thread_id,
+        config,
+        additional_writable_roots,
+        handoff_socket,
+    );
     build_ghostty_spawn_config_for_command(command, config, placement)
 }
 
@@ -177,8 +188,15 @@ fn build_standalone_side_ghostty_spawn_config(
     config: &Config,
     additional_writable_roots: &[PathBuf],
     placement: ForkPanePlacement,
+    handoff_socket: &Path,
 ) -> Result<GhosttySpawnConfig, String> {
-    let command = standalone_side_command_parts(exe, thread_id, config, additional_writable_roots);
+    let command = standalone_side_command_parts(
+        exe,
+        thread_id,
+        config,
+        additional_writable_roots,
+        handoff_socket,
+    );
     build_ghostty_spawn_config_for_command(command, config, placement)
 }
 

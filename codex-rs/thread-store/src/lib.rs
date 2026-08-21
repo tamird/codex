@@ -76,6 +76,7 @@ pub use types::DeleteThreadsOutcome;
 pub use types::DeleteThreadsParams;
 pub use types::ExtraConfig;
 pub use types::ForkBoundary;
+pub use types::ForkModelStateOrigin;
 pub use types::FreezeRolloutSegmentParams;
 pub use types::FrozenRolloutSegment;
 pub use types::GitInfoPatch;

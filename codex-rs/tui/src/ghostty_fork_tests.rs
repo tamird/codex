@@ -129,6 +129,7 @@ async fn ghostty_spawn_config_passes_command_and_cwd_as_argv() {
         &config,
         &[PathBuf::from("/extra dir;$(not-run)")],
         ForkPanePlacement::Right,
+        Path::new("/tmp/fork-handoff.sock"),
     )
     .expect("Ghostty spawn config");
 
@@ -140,11 +141,13 @@ async fn ghostty_spawn_config_passes_command_and_cwd_as_argv() {
     let cwd = spawn_config.args.last().expect("fork cwd");
     let parsed = shlex::split(command).expect("valid shell command");
     assert_eq!(
-        &parsed[..4],
+        &parsed[..6],
         [
             "env".to_string(),
             format!("CODEX_HOME={}", config.codex_home.display()),
             "/Applications/Frodex Bin/codex".to_string(),
+            "--internal-fork-handoff".to_string(),
+            "/tmp/fork-handoff.sock".to_string(),
             "fork".to_string(),
         ]
     );
@@ -173,6 +176,7 @@ async fn ghostty_standalone_side_spawn_config_uses_hidden_child_startup() {
         &config,
         &[],
         ForkPanePlacement::Right,
+        Path::new("/tmp/fork-handoff.sock"),
     )
     .expect("Ghostty standalone side spawn config");
 
@@ -215,6 +219,7 @@ async fn ghostty_spawn_config_rejects_float_and_unquotable_arguments() {
             &config,
             &[],
             ForkPanePlacement::Float,
+            Path::new("/tmp/fork-handoff.sock"),
         )
         .expect_err("float must fail closed"),
         GHOSTTY_FLOAT_UNSUPPORTED_MESSAGE
@@ -226,6 +231,7 @@ async fn ghostty_spawn_config_rejects_float_and_unquotable_arguments() {
         &config,
         &[PathBuf::from("bad\0root")],
         ForkPanePlacement::Right,
+        Path::new("/tmp/fork-handoff.sock"),
     )
     .expect_err("NUL must fail shell quoting");
     assert!(err.contains("failed to quote fork command for Ghostty"));

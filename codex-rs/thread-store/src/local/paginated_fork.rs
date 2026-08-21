@@ -464,6 +464,28 @@ async fn prepare_with_response_history(
         frozen_before_projection = Some(frozen);
         trace_fork_stage("froze_latest_prefix_before_projection");
     }
+    if matches!(boundary, ForkBoundary::Latest)
+        && matches!(response_history, ForkResponseHistory::ModelContext)
+        && !lineage.requires_copied_history()
+        && let Some(context) = prepared_same_thread_model_context.as_ref()
+    {
+        // The reserved lineage already reconstructed authoritative model context. Old Paginated
+        // rollouts may retain legacy presentation events that a stateless UI projection cannot
+        // represent; a context-only fork must not require that unrelated projection.
+        let history_base = frozen_before_projection
+            .as_ref()
+            .and_then(|frozen| frozen.history_base);
+        return Ok(PreparedFork::new(
+            thread_id,
+            history_base,
+            frozen_before_projection,
+            Arc::clone(context),
+            Arc::clone(context),
+            Arc::clone(context),
+            /*interrupt_if_open*/ true,
+            source_reservation,
+        ));
+    }
     let source_segment = lineage
         .segments()
         .last()

@@ -141,6 +141,7 @@ use color_eyre::eyre::Result;
 use color_eyre::eyre::WrapErr;
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -858,6 +859,66 @@ impl AppServerSession {
         .await
     }
 
+    pub(crate) async fn prepare_fork_handoff(
+        &mut self,
+        config: Config,
+        thread_id: ThreadId,
+    ) -> Result<PathBuf> {
+        let mut params = thread_fork_params_from_config(
+            self.session_config_with_effective_service_tier(&config),
+            thread_id,
+            self.thread_params_mode(),
+            self.remote_cwd_override.as_deref(),
+        );
+        params.exclude_turns = true;
+        let request_id = self.next_request_id();
+        let response: codex_app_server_protocol::ThreadForkPrepareResponse = self
+            .client
+            .request_typed(ClientRequest::ThreadForkPrepare { request_id, params })
+            .await
+            .map_err(|err| bootstrap_request_error("thread/fork/prepare failed in TUI", err))?;
+        response
+            .socket_path
+            .to_inferred_path_uri()
+            .ok_or_else(|| color_eyre::eyre::eyre!("fork handoff returned an invalid socket path"))?
+            .to_abs_path()
+            .map(AbsolutePathBuf::into_path_buf)
+            .map_err(Into::into)
+    }
+
+    pub(crate) async fn import_fork_handoff(
+        &mut self,
+        config: Config,
+        socket_path: &Path,
+    ) -> Result<AppServerStartedThread> {
+        let request_id = self.next_request_id();
+        let response: ThreadForkResponse = self
+            .client
+            .request_typed(ClientRequest::ThreadForkImport {
+                request_id,
+                params: codex_app_server_protocol::ThreadForkImportParams {
+                    socket_path: codex_utils_path_uri::LegacyAppPathString::from_path(socket_path),
+                },
+            })
+            .await
+            .map_err(|err| {
+                bootstrap_request_error("thread/fork/import failed during TUI bootstrap", err)
+            })?;
+        let presentation = if config.ephemeral {
+            ForkPresentation::SideConversation
+        } else {
+            ForkPresentation::Regular
+        };
+        let parent_title = (!config.ephemeral)
+            .then(|| response.thread.name.clone())
+            .flatten();
+        let mut started = self
+            .finish_fork_response(response, &config, presentation)
+            .await?;
+        started.session.fork_parent_title = parent_title;
+        Ok(started)
+    }
+
     async fn fork_thread_at_with_presentation(
         &mut self,
         config: Config,
@@ -915,6 +976,12 @@ impl AppServerSession {
                     .await
                     .map_err(|err| {
                         bootstrap_request_error("thread/fork failed during TUI bootstrap", err)
+                    })
+                    .wrap_err_with(|| {
+                        format!(
+                            "paginated thread/fork was rejected before the legacy retry: {}",
+                            source.message
+                        )
                     })?
             }
             Err(err) => {
@@ -924,7 +991,23 @@ impl AppServerSession {
                 ));
             }
         };
-        let mut response = response;
+        let mut started = self
+            .finish_fork_response(response, &config, presentation)
+            .await?;
+        started.session.fork_parent_title = fork_parent.and_then(|thread| thread.name);
+        if self.task_tools_available(thread_id) {
+            started.task_tools_available = true;
+            self.remember_task_tool_thread(started.session.thread_id);
+        }
+        Ok(started)
+    }
+
+    async fn finish_fork_response(
+        &mut self,
+        mut response: ThreadForkResponse,
+        config: &Config,
+        presentation: ForkPresentation,
+    ) -> Result<AppServerStartedThread> {
         if presentation == ForkPresentation::Regular
             && !response.thread.ephemeral
             && let Err(error) = self
@@ -932,7 +1015,7 @@ impl AppServerSession {
                     &mut response.thread,
                     /*turn_cursor*/ None,
                     /*item_cursor*/ None,
-                    Some(&config),
+                    Some(config),
                     HistoryHydrationScope::Initial,
                 )
                 .await
@@ -943,14 +1026,7 @@ impl AppServerSession {
                 "preserving the created fork after bounded history hydration failed"
             );
         }
-        let mut started =
-            started_thread_from_fork_response(response, &config, self.thread_params_mode()).await?;
-        started.session.fork_parent_title = fork_parent.and_then(|thread| thread.name);
-        if self.task_tools_available(thread_id) {
-            started.task_tools_available = true;
-            self.remember_task_tool_thread(started.session.thread_id);
-        }
-        Ok(started)
+        started_thread_from_fork_response(response, config, self.thread_params_mode()).await
     }
 
     pub(crate) fn thread_params_mode(&self) -> ThreadParamsMode {

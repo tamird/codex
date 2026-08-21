@@ -793,8 +793,12 @@ mod tests {
     use codex_app_server_protocol::ExternalAgentConfigImportCompletedNotification;
     use codex_app_server_protocol::InitializeCapabilities;
     use codex_app_server_protocol::SessionSource as ApiSessionSource;
+    use codex_app_server_protocol::ThreadDeleteParams;
+    use codex_app_server_protocol::ThreadForkImportParams;
     use codex_app_server_protocol::ThreadForkParams;
+    use codex_app_server_protocol::ThreadForkPrepareResponse;
     use codex_app_server_protocol::ThreadForkResponse;
+    use codex_app_server_protocol::ThreadInjectItemsParams;
     use codex_app_server_protocol::ThreadQueueChangedNotification;
     use codex_app_server_protocol::ThreadStartParams;
     use codex_app_server_protocol::ThreadStartResponse;
@@ -835,7 +839,7 @@ mod tests {
         let codex_home = TempDir::new().expect("temp dir");
         let config = Arc::new(build_test_config(codex_home.path()).await);
         start_test_client_with_config_loader(
-            codex_home,
+            Some(codex_home),
             config,
             Arc::new(codex_config::NoopThreadConfigLoader),
             session_source,
@@ -846,7 +850,7 @@ mod tests {
     }
 
     async fn start_test_client_with_config_loader(
-        codex_home: TempDir,
+        codex_home: Option<TempDir>,
         config: Arc<Config>,
         thread_config_loader: Arc<dyn ThreadConfigLoader>,
         session_source: SessionSource,
@@ -885,7 +889,7 @@ mod tests {
             channel_capacity,
         };
         let mut client = start(args).await.expect("in-process runtime should start");
-        client._test_codex_home = Some(codex_home);
+        client._test_codex_home = codex_home;
         client
     }
 
@@ -1024,8 +1028,19 @@ mod tests {
         const ROLLBACK_APPEND: &str = "append before rollback fork freeze";
         const ROLLBACK_TURN_ID: &str = "rollback-boundary";
 
+        // Darwin's socket path limit includes CODEX_HOME; use the existing short temp root.
+        #[cfg(unix)]
+        let codex_home = TempDir::new_in("/tmp").expect("short socket temp dir");
+        #[cfg(not(unix))]
         let codex_home = TempDir::new().expect("temp dir");
-        let config = Arc::new(build_test_config(codex_home.path()).await);
+        let mut config = build_test_config(codex_home.path()).await;
+        // This fixture appends unordinalized records at the config barrier to test Legacy's
+        // later freeze. Automatic migration freezes Paginated history before that barrier.
+        config
+            .features
+            .disable(codex_features::Feature::BackgroundPaginatedRolloutMigration)
+            .expect("keep the config-barrier fixture Legacy");
+        let config = Arc::new(config);
         let model_provider = config.model_provider_id.as_str();
         let interrupted_thread_id = app_test_support::create_fake_rollout(
             codex_home.path(),
@@ -1079,8 +1094,8 @@ mod tests {
 
         let config_loader = Arc::new(GatedThreadConfigLoader::default());
         let client = start_test_client_with_config_loader(
-            codex_home,
-            config,
+            Some(codex_home),
+            Arc::clone(&config),
             config_loader.clone(),
             SessionSource::Cli,
             DEFAULT_IN_PROCESS_CHANNEL_CAPACITY,
@@ -1233,6 +1248,172 @@ mod tests {
             "unexpected rollback fork error: {}",
             rollback_error.message
         );
+
+        let child_config_loader = Arc::new(GatedThreadConfigLoader::default());
+        let receiver = start_test_client_with_config_loader(
+            /*codex_home*/ None,
+            config,
+            child_config_loader.clone(),
+            SessionSource::Cli,
+            DEFAULT_IN_PROCESS_CHANNEL_CAPACITY,
+            /*experimental_api*/ true,
+        )
+        .await;
+        let start_params = ThreadStartParams {
+            history_mode: Some(codex_app_server_protocol::ThreadHistoryMode::Paginated),
+            ..Default::default()
+        };
+        let response = client
+            .request(ClientRequest::ThreadStart {
+                request_id: RequestId::Integer(100),
+                params: start_params,
+            })
+            .await
+            .expect("start transport")
+            .expect("start paginated source");
+        let paginated: ThreadStartResponse =
+            serde_json::from_value(response).expect("source response");
+        for source_id in [interrupted_fork.thread.id, paginated.thread.id] {
+            client.request(ClientRequest::ThreadInjectItems {
+                request_id: RequestId::Integer(101),
+                params: ThreadInjectItemsParams {
+                    thread_id: source_id.clone(),
+                    items: vec![serde_json::json!({"type":"message","role":"assistant","content":[{"type":"output_text","text":"captured handoff context"}]})],
+                },
+            }).await.expect("inject transport").expect("append source context");
+            for ephemeral in [true, false] {
+                let params = ThreadForkParams {
+                    thread_id: source_id.clone(),
+                    ephemeral,
+                    exclude_turns: true,
+                    ..Default::default()
+                };
+                let response = client
+                    .request(ClientRequest::ThreadForkPrepare {
+                        request_id: RequestId::Integer(102),
+                        params,
+                    })
+                    .await
+                    .expect("prepare transport")
+                    .expect("prepare from the loaded owner");
+                let handoff: ThreadForkPrepareResponse =
+                    serde_json::from_value(response).expect("handoff response");
+                child_config_loader.arm();
+                let sender = receiver.sender();
+                let importing = tokio::spawn(async move {
+                    sender
+                        .request(ClientRequest::ThreadForkImport {
+                            request_id: RequestId::Integer(103),
+                            params: ThreadForkImportParams {
+                                socket_path: handoff.socket_path,
+                            },
+                        })
+                        .await
+                });
+                timeout(SHUTDOWN_TIMEOUT, child_config_loader.wait_until_entered())
+                    .await
+                    .expect("receiver should claim the snapshot before loading config");
+                if !ephemeral {
+                    client.request(ClientRequest::ThreadInjectItems {
+                        request_id: RequestId::Integer(104),
+                        params: ThreadInjectItemsParams {
+                            thread_id: source_id.clone(),
+                            items: vec![serde_json::json!({"type":"message","role":"assistant","content":[{"type":"output_text","text":"after captured handoff"}]})],
+                        },
+                    }).await.expect("source append transport").expect("shared lifetime lease must permit source writes");
+                    let deletion_error = client
+                        .request(ClientRequest::ThreadDelete {
+                            request_id: RequestId::Integer(105),
+                            params: ThreadDeleteParams {
+                                thread_id: source_id.clone(),
+                            },
+                        })
+                        .await
+                        .expect("delete transport")
+                        .expect_err("receiver must protect the unpublished reference");
+                    assert!(
+                        deletion_error.message.contains("active writer")
+                            || deletion_error
+                                .message
+                                .contains("reserved by an initializing fork"),
+                        "unexpected delete failure: {}",
+                        deletion_error.message
+                    );
+                }
+                child_config_loader.release();
+                let response = timeout(SHUTDOWN_TIMEOUT, importing)
+                    .await
+                    .expect("import completes")
+                    .expect("import task joins")
+                    .expect("import transport")
+                    .expect("independent runtime imports snapshot");
+                let imported: ThreadForkResponse =
+                    serde_json::from_value(response).expect("import response");
+                assert_eq!(imported.thread.ephemeral, ephemeral);
+                if ephemeral {
+                    assert_eq!(imported.thread.path, None);
+                } else {
+                    let path = imported.thread.path.expect("durable imported rollout");
+                    let items = codex_rollout::materialize_rollout_items(&codex_home, &path)
+                        .await
+                        .expect("imported complete history");
+                    let transcript = items
+                        .iter()
+                        .filter_map(|item| {
+                            let RolloutItem::ResponseItem(envelope) = item else {
+                                return None;
+                            };
+                            Some(&envelope.item)
+                        })
+                        .collect::<Vec<_>>();
+                    let checkpoint = items
+                        .iter()
+                        .rev()
+                        .find_map(|item| {
+                            let RolloutItem::Compacted(compacted) = item else {
+                                return None;
+                            };
+                            compacted.segment_state_checkpoint.as_ref()?;
+                            compacted.replacement_history.as_ref()
+                        })
+                        .expect(
+                            "imported child should persist a certified model-history checkpoint",
+                        );
+                    let model_history = checkpoint
+                        .iter()
+                        .map(|envelope| &envelope.item)
+                        .collect::<Vec<_>>();
+                    // A checkpoint replaces model history; it is not another transcript message.
+                    for (representation, response_items) in
+                        [("transcript", transcript), ("checkpoint", model_history)]
+                    {
+                        let history = serde_json::to_string(&response_items)
+                            .expect("serialize response items");
+                        assert_eq!(
+                            history.matches("captured handoff context").count(),
+                            1,
+                            "{representation}"
+                        );
+                        assert_eq!(
+                            history.matches("after captured handoff").count(),
+                            0,
+                            "{representation}"
+                        );
+                    }
+                }
+                receiver.request(ClientRequest::ThreadInjectItems {
+                    request_id: RequestId::Integer(106),
+                    params: ThreadInjectItemsParams {
+                        thread_id: imported.thread.id,
+                        items: vec![serde_json::json!({"type":"message","role":"assistant","content":[{"type":"output_text","text":"independent child write"}]})],
+                    },
+                }).await.expect("child append transport").expect("child runtime should own its own writer");
+            }
+        }
+        receiver
+            .shutdown()
+            .await
+            .expect("receiver runtime shuts down");
 
         client
             .shutdown()

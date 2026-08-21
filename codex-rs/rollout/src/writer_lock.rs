@@ -21,16 +21,27 @@ const WRITER_LOCK_DIR: &str = "thread-writer-locks";
 const COORDINATION_LOCK_FILE: &str = ".coordination.lock";
 
 /// Acquires per-thread writer locks and removes stale lock files on first use.
+#[derive(Debug)]
 pub struct RolloutWriterLockCoordinator {
     directory: PathBuf,
     cleanup_attempted: AtomicBool,
 }
 
-/// Exclusive cross-process ownership of one thread's mutable rollout files.
+/// Cross-process ownership of one thread's mutable rollout files or frozen fork history.
+#[derive(Debug)]
 pub struct RolloutWriterLockGuard {
     coordinator: Arc<RolloutWriterLockCoordinator>,
     path: PathBuf,
-    file: Option<File>,
+    state: WriterLockState,
+}
+
+/// A shared lock excludes new writers while the existing owner admits immutable fork readers.
+#[derive(Debug)]
+enum WriterLockState {
+    Exclusive(File),
+    Shared(File),
+    /// A failed lock conversion must not leave the recorder authorized to write.
+    Unreserved,
 }
 
 impl RolloutWriterLockCoordinator {
@@ -90,7 +101,33 @@ impl RolloutWriterLockCoordinator {
         Ok(Some(RolloutWriterLockGuard {
             coordinator: Arc::clone(self),
             path,
-            file: Some(file),
+            state: WriterLockState::Exclusive(file),
+        }))
+    }
+
+    /// Reserves immutable fork history without receiving writer authority. Sharing the existing
+    /// lock inode also excludes compression and older binaries' deletion operations.
+    pub fn try_acquire_fork_reader(
+        self: &Arc<Self>,
+        thread_id: ThreadId,
+    ) -> io::Result<Option<RolloutWriterLockGuard>> {
+        let _coordination = self.lock_coordination()?;
+        let path = self.directory.join(format!("{thread_id}.lock"));
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)?;
+        match file.try_lock_shared() {
+            Ok(()) => {}
+            Err(std::fs::TryLockError::WouldBlock) => return Ok(None),
+            Err(std::fs::TryLockError::Error(error)) => return Err(error),
+        }
+        Ok(Some(RolloutWriterLockGuard {
+            coordinator: Arc::clone(self),
+            path,
+            state: WriterLockState::Shared(file),
         }))
     }
 
@@ -182,6 +219,62 @@ impl RolloutWriterLockCoordinator {
     }
 }
 
+impl RolloutWriterLockGuard {
+    /// Retains the sole logical writer, but admits read-only fork lifetime reservations.
+    /// The coordination lock excludes acquisition and cleanup across the explicit unlock/relock;
+    /// converting an already-locked handle is not portable.
+    pub fn share_for_fork(&mut self) -> io::Result<()> {
+        let _coordination = self.coordinator.lock_coordination()?;
+        match std::mem::replace(&mut self.state, WriterLockState::Unreserved) {
+            WriterLockState::Exclusive(file) => {
+                file.unlock()?;
+                file.try_lock_shared().map_err(io::Error::from)?;
+                self.state = WriterLockState::Shared(file);
+                Ok(())
+            }
+            WriterLockState::Shared(file) => {
+                self.state = WriterLockState::Shared(file);
+                Ok(())
+            }
+            WriterLockState::Unreserved => Err(io::Error::other("writer lock is closed")),
+        }
+    }
+
+    /// Destruction requires exclusive ownership, unlike appending to the mutable source tail.
+    /// Returns WouldBlock if an initializing fork still holds a reader reservation.
+    pub fn require_exclusive(&mut self) -> io::Result<()> {
+        let _coordination = self.coordinator.lock_coordination()?;
+        match std::mem::replace(&mut self.state, WriterLockState::Unreserved) {
+            WriterLockState::Exclusive(file) => {
+                self.state = WriterLockState::Exclusive(file);
+                Ok(())
+            }
+            WriterLockState::Shared(file) => {
+                file.unlock()?;
+                match file.try_lock() {
+                    Ok(()) => {
+                        self.state = WriterLockState::Exclusive(file);
+                        Ok(())
+                    }
+                    Err(error) => {
+                        // Restore exclusion before returning. Failed restoration leaves an
+                        // unreserved guard so the caller can fence its drained recorder.
+                        file.try_lock_shared().map_err(io::Error::from)?;
+                        self.state = WriterLockState::Shared(file);
+                        Err(error.into())
+                    }
+                }
+            }
+            WriterLockState::Unreserved => Err(io::Error::other("writer lock is closed")),
+        }
+    }
+
+    /// Callers must stop using their recorder when a failed conversion loses its reservation.
+    pub fn is_reserved(&self) -> bool {
+        !matches!(self.state, WriterLockState::Unreserved)
+    }
+}
+
 impl Drop for RolloutWriterLockGuard {
     fn drop(&mut self) {
         let coordination_lock = match self.coordinator.lock_coordination() {
@@ -193,7 +286,27 @@ impl Drop for RolloutWriterLockGuard {
         };
 
         // Close the writer lock before deleting it so cleanup works on Windows too.
-        drop(self.file.take());
+        drop(std::mem::replace(
+            &mut self.state,
+            WriterLockState::Unreserved,
+        ));
+        // An imported fork may outlive the source process. Keep its inode so compression and
+        // subsequent writers cannot acquire a different lock file for the same thread.
+        match OpenOptions::new().read(true).write(true).open(&self.path) {
+            Ok(file) => match file.try_lock() {
+                Ok(()) => drop(file),
+                Err(std::fs::TryLockError::WouldBlock) => return,
+                Err(std::fs::TryLockError::Error(error)) => {
+                    warn!("failed to inspect writer lock during cleanup: {error}");
+                    return;
+                }
+            },
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return,
+            Err(error) => {
+                warn!("failed to inspect writer lock during cleanup: {error}");
+                return;
+            }
+        }
         if let Err(err) = fs::remove_file(&self.path)
             && err.kind() != io::ErrorKind::NotFound
         {

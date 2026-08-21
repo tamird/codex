@@ -6,4 +6,4 @@ expression: "[SIDE_NO_STARTED_CONVERSATION_MESSAGE.to_string(),\nREMOTE_SIDE_PAN
 '/side' is unavailable until the current conversation has started. Send a message first, then try /side again.
 Side pane placement is unavailable for remote app-server sessions.
 Side pane placement requires tmux, Zellij, or macOS Ghostty.
-Failed to open a new pane for /side: tmux exited with status 1
+Could not open a side pane: tmux exited with status 1 Opening /side in this terminal instead.
