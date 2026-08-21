@@ -154,6 +154,49 @@ async fn indexed_paginated_reads_trust_current_projection_for_immutable_predeces
 }
 
 #[tokio::test]
+async fn fork_marked_projection_requires_ancestry_without_history_base() {
+    let (home, store, thread_id) = store_with_mode(ThreadHistoryMode::Paginated).await;
+    let active_path =
+        write_projected_same_thread_segments(home.path(), thread_id, /*segment_count*/ 2);
+    let mut lines = codex_rollout::RolloutRecorder::load_rollout_lines(&active_path)
+        .await
+        .expect("read active segment")
+        .0;
+    let RolloutItem::SessionMeta(meta) = &mut lines[0].item else {
+        panic!("active segment must start with metadata");
+    };
+    // Older fork headers lack history_base and must use the ancestry-validating fallback.
+    meta.meta.forked_from_id = Some(ThreadId::new());
+    meta.meta.history_base = None;
+    let predecessor = match &lines[1].item {
+        RolloutItem::RolloutReference(reference) => reference.rollout_path.clone(),
+        _ => panic!("active segment must retain its predecessor reference"),
+    };
+    let mut encoded = Vec::new();
+    for line in &lines {
+        serde_json::to_writer(&mut encoded, line).expect("encode active record");
+        encoded.push(b'\n');
+    }
+    fs::write(&active_path, &encoded).expect("write old fork header");
+    sqlx::query(
+        "INSERT INTO thread_history_projection_state (thread_id, next_rollout_byte_offset, next_rollout_ordinal) VALUES (?, ?, ?)",
+    )
+    .bind(thread_id.to_string())
+    .bind(i64::try_from(encoded.len()).expect("byte offset"))
+    .bind(8_i64)
+    .execute(history_db(&store).await)
+    .await
+    .expect("seed complete projection checkpoint");
+    assert!(store.has_history_projection(thread_id).await.expect("valid ancestry"));
+
+    fs::remove_file(predecessor).expect("remove required predecessor");
+    store
+        .has_history_projection(thread_id)
+        .await
+        .expect_err("a complete fallback checkpoint does not authenticate missing ancestry");
+}
+
+#[tokio::test]
 async fn indexed_paginated_cursor_pages_never_open_projected_predecessors() {
     assert_indexed_cursor_pages_ignore_missing_predecessors(ThreadHistoryMode::Paginated).await;
 }

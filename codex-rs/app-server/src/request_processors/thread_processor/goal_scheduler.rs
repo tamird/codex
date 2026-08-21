@@ -17,8 +17,13 @@ impl ThreadRequestProcessor {
         &self,
         schedule: ActiveGoalSupervisorSchedule,
     ) -> Result<(), JSONRPCErrorError> {
-        let _thread_list_state_permit = self.acquire_thread_list_state_permit().await?;
         let thread_id = schedule.thread_id;
+        let _thread_list_state_permit = self
+            .acquire_thread_resume_permit(&ThreadResumeParams {
+                thread_id: thread_id.to_string(),
+                ..Default::default()
+            })
+            .await?;
         if self
             .pending_thread_unloads
             .lock()

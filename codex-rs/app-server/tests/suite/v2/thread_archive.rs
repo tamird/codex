@@ -54,6 +54,78 @@ fn body_contains(request: &wiremock::Request, text: &str) -> bool {
 }
 
 #[tokio::test]
+async fn thread_archive_indexed_legacy_subtree_does_not_wait_for_migration() -> Result<()> {
+    let server = create_mock_responses_server_repeating_assistant("Done").await;
+    let home = TempDir::new()?;
+    MockResponsesConfig::new(&server.uri()).write(home.path())?;
+    let state_db = StateRuntime::init(
+        codex_state::SqliteConfig::new_for_testing(home.path().abs()),
+        "mock_provider".to_string(),
+    )
+    .await?;
+    let mut sources = Vec::new();
+    for preview in ["parent", "child"] {
+        let id = create_fake_rollout(
+            home.path(),
+            "2025-01-01T00-00-00",
+            "2025-01-01T00:00:00Z",
+            preview,
+            Some("mock_provider"),
+            /*git_info*/ None,
+        )?;
+        let thread_id = ThreadId::from_string(&id)?;
+        let path = find_thread_path_by_id_str(home.path(), &id, /*state_db_ctx*/ None)
+            .await?
+            .expect("fixture rollout");
+        let mut metadata = codex_state::ThreadMetadataBuilder::new(
+            thread_id,
+            path.clone(),
+            chrono::Utc::now(),
+            codex_protocol::protocol::SessionSource::Cli,
+        )
+        .build("mock_provider");
+        metadata.history_mode = codex_protocol::protocol::ThreadHistoryMode::Legacy;
+        state_db.upsert_thread(&metadata).await?;
+        sources.push((thread_id, std::fs::read(&path)?));
+    }
+    state_db
+        .upsert_thread_spawn_edge(
+            sources[0].0,
+            sources[1].0,
+            DirectionalThreadSpawnEdgeStatus::Open,
+        )
+        .await?;
+    let job = codex_rollout::try_acquire_rollout_maintenance_job_lock(home.path())?
+        .expect("held migration job");
+    let mut app = TestAppServer::builder()
+        .with_codex_home(home.path())
+        .build_initialized()
+        .await?;
+    let request = app
+        .send_thread_archive_request(ThreadArchiveParams {
+            thread_id: sources[0].0.to_string(),
+        })
+        .await?;
+    let _: ThreadArchiveResponse =
+        timeout(DEFAULT_READ_TIMEOUT, app.read_response(request)).await??;
+    for (thread_id, source_bytes) in sources {
+        let metadata = state_db
+            .get_thread(thread_id)
+            .await?
+            .expect("archived metadata");
+        assert!(metadata.archived_at.is_some());
+        assert_eq!(
+            metadata.history_mode,
+            codex_protocol::protocol::ThreadHistoryMode::Legacy
+        );
+        assert_eq!(std::fs::read(metadata.rollout_path)?, source_bytes);
+    }
+    drop(job);
+    app.shutdown_gracefully().await?;
+    Ok(())
+}
+
+#[tokio::test]
 async fn thread_archive_rejects_owned_unmaterialized_paginated_descendant() -> Result<()> {
     let server = create_mock_responses_server_repeating_assistant("Done").await;
     let codex_home = TempDir::new()?;

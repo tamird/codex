@@ -1,43 +1,144 @@
 //! Coordinates maintenance jobs that replace local rollout files.
 //!
-//! New migration jobs serialize with each other while clean history readers retain shared
-//! ownership of the original maintenance lock. Old binaries and history repair still acquire
-//! that original lock exclusively. Compression yields when a reader or migration is waiting.
+//! Migrations with reserved dependencies may overlap. Unknown ancestry and older migration
+//! implementations retain exclusive job ownership. Clean history readers share the original
+//! maintenance lock; old binaries and history repair acquire it exclusively. Compression yields
+//! when a reader or migration is waiting.
 //!
 //! This is separate from per-thread writer locks, which protect live rollout appenders. It is also
 //! separate from compression's durable run marker, which throttles how often compression scans.
 
+use codex_protocol::ThreadId;
 use std::fs;
 use std::fs::File;
 use std::fs::OpenOptions;
 use std::io;
 use std::path::Path;
+use std::sync::Arc;
 
 const ROLLOUT_MAINTENANCE_LOCK: &str = "rollout-maintenance.lock";
 const ROLLOUT_MAINTENANCE_JOB_LOCK: &str = "rollout-maintenance-job.lock";
 const ROLLOUT_MAINTENANCE_FOREGROUND_LOCK: &str = "rollout-maintenance-foreground.lock";
 
+/// Bounds migration memory and SQLite contention across processes sharing one Codex home.
+pub const MAX_CONCURRENT_ROLLOUT_MIGRATIONS: usize = 2;
+
+enum LockMode {
+    Shared,
+    Exclusive,
+}
+
+/// Owns a successful lock, including temporary and partially acquired reservations.
+struct MaintenanceFileLock {
+    file: File,
+}
+
+impl Drop for MaintenanceFileLock {
+    fn drop(&mut self) {
+        // Closing this descriptor alone leaves flock ownership with a dup or pre-exec child.
+        if let Err(error) = self.file.unlock() {
+            tracing::warn!("failed to release rollout maintenance lock: {error}");
+        }
+    }
+}
+
+/// Keeps compression aware of queued migrations even between nonblocking lock attempts.
+pub struct RolloutMaintenanceIntentGuard {
+    _file: Arc<MaintenanceFileLock>,
+}
+
 /// Holds exclusive ownership of operations that replace local rollout files.
 pub struct RolloutMaintenanceGuard {
-    _file: File,
+    _file: MaintenanceFileLock,
 }
 
 /// Excludes old maintenance implementations and exclusive history repair, but permits clean
 /// readers and new maintenance jobs to coexist. Per-thread writer locks protect mutable files.
 pub struct RolloutMaintenanceReadGuard {
-    _file: File,
+    _file: MaintenanceFileLock,
 }
 
-/// Serializes new migration and compression jobs without excluding unrelated clean readers.
+/// Reserves a migration against compression and incompatible maintenance implementations.
 pub struct RolloutMaintenanceJobGuard {
-    _job: File,
+    _job: MaintenanceFileLock,
     _compatibility: RolloutMaintenanceReadGuard,
-    _foreground: File,
+    _foreground: Arc<MaintenanceFileLock>,
+    /// Stable lock files are never unlinked: otherwise another process could lock a new inode.
+    _dependencies: Vec<MaintenanceFileLock>,
+    _slot: Option<MaintenanceFileLock>,
+}
+
+pub async fn acquire_rollout_maintenance_intent(
+    codex_home: &Path,
+) -> io::Result<RolloutMaintenanceIntentGuard> {
+    Ok(RolloutMaintenanceIntentGuard {
+        _file: acquire_foreground_intent(codex_home).await?,
+    })
+}
+
+/// Try to admit a migration whose complete dependency identities the caller will revalidate.
+/// Busy dependencies or capacity return immediately and release every partial reservation.
+pub fn try_acquire_rollout_migration_dependency_lock(
+    codex_home: &Path,
+    thread_ids: &[ThreadId],
+) -> io::Result<Option<RolloutMaintenanceJobGuard>> {
+    if thread_ids.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "empty migration dependency set",
+        ));
+    }
+    let Some(foreground) = try_open_lock(
+        codex_home,
+        ROLLOUT_MAINTENANCE_FOREGROUND_LOCK,
+        LockMode::Shared,
+    )?
+    else {
+        return Ok(None);
+    };
+    let Some(job) = try_open_lock(codex_home, ROLLOUT_MAINTENANCE_JOB_LOCK, LockMode::Shared)?
+    else {
+        return Ok(None);
+    };
+    let Some(compatibility) = try_acquire_rollout_maintenance_read_lock(codex_home)? else {
+        return Ok(None);
+    };
+    let mut ids = thread_ids.to_vec();
+    ids.sort_unstable_by_key(ThreadId::to_string);
+    ids.dedup();
+    let mut dependencies = Vec::with_capacity(ids.len());
+    for thread_id in ids {
+        let Some(file) = try_open_lock(
+            codex_home,
+            &format!("rollout-migration-{thread_id}.lock"),
+            LockMode::Exclusive,
+        )?
+        else {
+            return Ok(None);
+        };
+        dependencies.push(file);
+    }
+    for slot in 0..MAX_CONCURRENT_ROLLOUT_MIGRATIONS {
+        if let Some(file) = try_open_lock(
+            codex_home,
+            &format!("rollout-migration-slot-{slot}.lock"),
+            LockMode::Exclusive,
+        )? {
+            return Ok(Some(RolloutMaintenanceJobGuard {
+                _job: job,
+                _compatibility: compatibility,
+                _foreground: Arc::new(foreground),
+                _dependencies: dependencies,
+                _slot: Some(file),
+            }));
+        }
+    }
+    Ok(None)
 }
 
 /// Retains compression's original exclusive protocol while foreground waiters ask it to stop.
 pub(crate) struct RolloutCompressionMaintenanceGuard {
-    _job: File,
+    _job: MaintenanceFileLock,
     _compatibility: RolloutMaintenanceGuard,
     home: std::path::PathBuf,
     /// Once interrupted, this run must not publish or persist its six-hour marker.
@@ -65,29 +166,33 @@ impl RolloutCompressionMaintenanceGuard {
 }
 
 pub(crate) fn foreground_maintenance_waiting(home: &Path) -> io::Result<bool> {
-    let file = open_lock(home, ROLLOUT_MAINTENANCE_FOREGROUND_LOCK)?;
-    match file.try_lock() {
-        Ok(()) => Ok(false),
-        Err(std::fs::TryLockError::WouldBlock) => Ok(true),
-        Err(std::fs::TryLockError::Error(error)) => Err(error),
-    }
+    let lock = try_open_lock(
+        home,
+        ROLLOUT_MAINTENANCE_FOREGROUND_LOCK,
+        LockMode::Exclusive,
+    )?;
+    Ok(lock.is_none())
 }
 
 pub(crate) fn try_acquire_compression_maintenance(
     codex_home: &Path,
 ) -> io::Result<Option<RolloutCompressionMaintenanceGuard>> {
-    let priority = open_lock(codex_home, ROLLOUT_MAINTENANCE_FOREGROUND_LOCK)?;
-    match priority.try_lock() {
-        Ok(()) => {}
-        Err(std::fs::TryLockError::WouldBlock) => return Ok(None),
-        Err(std::fs::TryLockError::Error(error)) => return Err(error),
-    }
-    let job = open_lock(codex_home, ROLLOUT_MAINTENANCE_JOB_LOCK)?;
-    match job.try_lock() {
-        Ok(()) => {}
-        Err(std::fs::TryLockError::WouldBlock) => return Ok(None),
-        Err(std::fs::TryLockError::Error(error)) => return Err(error),
-    }
+    let Some(_priority) = try_open_lock(
+        codex_home,
+        ROLLOUT_MAINTENANCE_FOREGROUND_LOCK,
+        LockMode::Exclusive,
+    )?
+    else {
+        return Ok(None);
+    };
+    let Some(job) = try_open_lock(
+        codex_home,
+        ROLLOUT_MAINTENANCE_JOB_LOCK,
+        LockMode::Exclusive,
+    )?
+    else {
+        return Ok(None);
+    };
     let Some(compatibility) = try_acquire_rollout_maintenance_lock(codex_home)? else {
         return Ok(None);
     };
@@ -100,27 +205,36 @@ pub(crate) fn try_acquire_compression_maintenance(
     }))
 }
 
-fn open_lock(codex_home: &Path, name: &str) -> io::Result<File> {
+fn try_open_lock(
+    codex_home: &Path,
+    name: &str,
+    mode: LockMode,
+) -> io::Result<Option<MaintenanceFileLock>> {
     let directory = codex_home.join(".tmp");
     fs::create_dir_all(&directory)?;
-    OpenOptions::new()
+    let file = OpenOptions::new()
         .read(true)
         .write(true)
         .create(true)
         .truncate(false)
-        .open(directory.join(name))
+        .open(directory.join(name))?;
+    let acquired = match mode {
+        LockMode::Shared => file.try_lock_shared(),
+        LockMode::Exclusive => file.try_lock(),
+    };
+    match acquired {
+        Ok(()) => Ok(Some(MaintenanceFileLock { file })),
+        Err(std::fs::TryLockError::WouldBlock) => Ok(None),
+        Err(std::fs::TryLockError::Error(error)) => Err(error),
+    }
 }
 
 /// Try to reserve clean history access against old maintenance and exclusive repair.
 pub fn try_acquire_rollout_maintenance_read_lock(
     codex_home: &Path,
 ) -> io::Result<Option<RolloutMaintenanceReadGuard>> {
-    let file = open_lock(codex_home, ROLLOUT_MAINTENANCE_LOCK)?;
-    match file.try_lock_shared() {
-        Ok(()) => Ok(Some(RolloutMaintenanceReadGuard { _file: file })),
-        Err(std::fs::TryLockError::WouldBlock) => Ok(None),
-        Err(std::fs::TryLockError::Error(error)) => Err(error),
-    }
+    let lock = try_open_lock(codex_home, ROLLOUT_MAINTENANCE_LOCK, LockMode::Shared)?;
+    Ok(lock.map(|file| RolloutMaintenanceReadGuard { _file: file }))
 }
 
 /// Wait for clean history access, asking interruptible compression to yield.
@@ -140,25 +254,29 @@ pub async fn acquire_rollout_maintenance_read_lock(
 pub fn try_acquire_rollout_maintenance_job_lock(
     codex_home: &Path,
 ) -> io::Result<Option<RolloutMaintenanceJobGuard>> {
-    let foreground = open_lock(codex_home, ROLLOUT_MAINTENANCE_FOREGROUND_LOCK)?;
-    match foreground.try_lock_shared() {
-        Ok(()) => {}
-        Err(std::fs::TryLockError::WouldBlock) => return Ok(None),
-        Err(std::fs::TryLockError::Error(error)) => return Err(error),
-    }
-    try_acquire_foreground_job(codex_home, foreground)
+    let Some(foreground) = try_open_lock(
+        codex_home,
+        ROLLOUT_MAINTENANCE_FOREGROUND_LOCK,
+        LockMode::Shared,
+    )?
+    else {
+        return Ok(None);
+    };
+    try_acquire_foreground_job(codex_home, Arc::new(foreground))
 }
 
 fn try_acquire_foreground_job(
     codex_home: &Path,
-    foreground: File,
+    foreground: Arc<MaintenanceFileLock>,
 ) -> io::Result<Option<RolloutMaintenanceJobGuard>> {
-    let job = open_lock(codex_home, ROLLOUT_MAINTENANCE_JOB_LOCK)?;
-    match job.try_lock() {
-        Ok(()) => {}
-        Err(std::fs::TryLockError::WouldBlock) => return Ok(None),
-        Err(std::fs::TryLockError::Error(error)) => return Err(error),
-    }
+    let Some(job) = try_open_lock(
+        codex_home,
+        ROLLOUT_MAINTENANCE_JOB_LOCK,
+        LockMode::Exclusive,
+    )?
+    else {
+        return Ok(None);
+    };
     let Some(compatibility) = try_acquire_rollout_maintenance_read_lock(codex_home)? else {
         return Ok(None);
     };
@@ -166,6 +284,8 @@ fn try_acquire_foreground_job(
         _job: job,
         _compatibility: compatibility,
         _foreground: foreground,
+        _dependencies: Vec::new(),
+        _slot: None,
     }))
 }
 
@@ -175,20 +295,21 @@ pub async fn acquire_rollout_maintenance_job_lock(
 ) -> io::Result<RolloutMaintenanceJobGuard> {
     let foreground = acquire_foreground_intent(codex_home).await?;
     loop {
-        if let Some(guard) = try_acquire_foreground_job(codex_home, foreground.try_clone()?)? {
+        if let Some(guard) = try_acquire_foreground_job(codex_home, Arc::clone(&foreground))? {
             return Ok(guard);
         }
         tokio::time::sleep(std::time::Duration::from_millis(25)).await;
     }
 }
 
-async fn acquire_foreground_intent(codex_home: &Path) -> io::Result<File> {
+async fn acquire_foreground_intent(codex_home: &Path) -> io::Result<Arc<MaintenanceFileLock>> {
     loop {
-        let file = open_lock(codex_home, ROLLOUT_MAINTENANCE_FOREGROUND_LOCK)?;
-        match file.try_lock_shared() {
-            Ok(()) => return Ok(file),
-            Err(std::fs::TryLockError::WouldBlock) => {}
-            Err(std::fs::TryLockError::Error(error)) => return Err(error),
+        if let Some(file) = try_open_lock(
+            codex_home,
+            ROLLOUT_MAINTENANCE_FOREGROUND_LOCK,
+            LockMode::Shared,
+        )? {
+            return Ok(Arc::new(file));
         }
         tokio::time::sleep(std::time::Duration::from_millis(25)).await;
     }
@@ -198,13 +319,8 @@ async fn acquire_foreground_intent(codex_home: &Path) -> io::Result<File> {
 pub fn try_acquire_rollout_maintenance_lock(
     codex_home: &Path,
 ) -> io::Result<Option<RolloutMaintenanceGuard>> {
-    let file = open_lock(codex_home, ROLLOUT_MAINTENANCE_LOCK)?;
-
-    match file.try_lock() {
-        Ok(()) => Ok(Some(RolloutMaintenanceGuard { _file: file })),
-        Err(std::fs::TryLockError::WouldBlock) => Ok(None),
-        Err(std::fs::TryLockError::Error(error)) => Err(error),
-    }
+    let lock = try_open_lock(codex_home, ROLLOUT_MAINTENANCE_LOCK, LockMode::Exclusive)?;
+    Ok(lock.map(|file| RolloutMaintenanceGuard { _file: file }))
 }
 
 #[cfg(test)]

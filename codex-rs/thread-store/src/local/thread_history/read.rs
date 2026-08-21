@@ -621,7 +621,7 @@ async fn indexed_turn_cursor_to_legacy(
     .map_err(super::thread_history_error)
 }
 
-pub(super) async fn validate_thread_for_paginated_reads(
+pub(in crate::local) async fn validate_thread_for_paginated_reads(
     store: &LocalThreadStore,
     thread_id: ThreadId,
     include_archived: bool,

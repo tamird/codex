@@ -30,6 +30,8 @@ use codex_protocol::protocol::ThreadHistoryMode;
 use codex_rollout::ReverseJsonlScanner;
 use codex_rollout::ScanOutcome;
 use codex_thread_store::PersistContext;
+use codex_thread_store::ReadThreadsParams;
+use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::fs::File;
 use std::sync::LazyLock;
@@ -2005,42 +2007,50 @@ impl ThreadRequestProcessor {
             })?;
         let subtree_thread_ids = current_agent_membership.candidate_thread_ids().to_vec();
 
-        let mut archive_thread_ids = Vec::new();
-        let mut already_archived_thread_ids = Vec::new();
-        match self
+        let mut indexed_threads = match self
             .thread_store
-            .read_thread(StoreReadThreadParams {
-                thread_id,
-                include_archived: true,
-                include_history: false,
+            .read_threads(ReadThreadsParams {
+                thread_ids: subtree_thread_ids.clone(),
             })
             .await
         {
-            Ok(thread) => {
-                if thread.archived_at.is_some() {
-                    already_archived_thread_ids.push(thread_id);
-                } else {
-                    archive_thread_ids.push(thread_id);
-                }
+            Ok(threads) => threads
+                .into_iter()
+                .map(|thread| (thread.thread_id, thread))
+                .collect::<HashMap<_, _>>(),
+            Err(err) => {
+                warn!("failed to batch archive metadata for {thread_id}: {err}");
+                HashMap::new()
             }
-            Err(err) => return Err(thread_store_mutation_error("archive", err)),
-        }
-        for descendant_thread_id in subtree_thread_ids.iter().copied().skip(1) {
-            match self
-                .thread_store
-                .read_thread(StoreReadThreadParams {
-                    thread_id: descendant_thread_id,
-                    include_archived: true,
-                    include_history: false,
-                })
-                .await
-            {
+        };
+        let mut archive_thread_ids = Vec::new();
+        let mut already_archived_thread_ids = Vec::new();
+        for descendant_thread_id in
+            std::iter::once(thread_id).chain(subtree_thread_ids.iter().copied().skip(1))
+        {
+            // Archive needs current metadata, not migration of every descendant's history.
+            let thread = match indexed_threads.remove(&descendant_thread_id) {
+                Some(thread) => Ok(thread),
+                None => {
+                    self.thread_store
+                        .read_thread(StoreReadThreadParams {
+                            thread_id: descendant_thread_id,
+                            include_archived: true,
+                            include_history: false,
+                        })
+                        .await
+                }
+            };
+            match thread {
                 Ok(thread) => {
                     if thread.archived_at.is_some() {
                         already_archived_thread_ids.push(descendant_thread_id);
                     } else {
                         archive_thread_ids.push(descendant_thread_id);
                     }
+                }
+                Err(err) if descendant_thread_id == thread_id => {
+                    return Err(thread_store_mutation_error("archive", err));
                 }
                 Err(ThreadStoreError::ThreadNotFound { .. }) => {}
                 Err(err) => {
@@ -5102,13 +5112,30 @@ impl ThreadRequestProcessor {
         let redact_resume_payloads =
             should_redact_thread_resume_payloads(app_server_client_name.as_deref());
 
-        let _thread_list_state_permit = match self.acquire_thread_list_state_permit().await {
+        let _thread_list_state_permit = match self.acquire_thread_resume_permit(&params).await {
             Ok(permit) => permit,
             Err(error) => {
                 self.outgoing.send_error(request_id, error).await;
                 return Ok(());
             }
         };
+        if let Ok(thread_id) = ThreadId::from_string(&params.thread_id)
+            && self
+                .pending_thread_unloads
+                .lock()
+                .await
+                .contains(&thread_id)
+        {
+            self.outgoing
+                .send_error(
+                    request_id,
+                    invalid_request(format!(
+                        "thread {thread_id} is closing; retry thread/resume after the thread is closed"
+                    )),
+                )
+                .await;
+            return Ok(());
+        }
         let stored_thread_from_running_probe = match self
             .resume_running_thread(
                 &request_id,
@@ -8514,6 +8541,7 @@ fn build_thread_from_loaded_snapshot(
 }
 
 mod goal_scheduler;
+mod resume_preparation;
 
 #[cfg(test)]
 #[path = "thread_processor_tests.rs"]

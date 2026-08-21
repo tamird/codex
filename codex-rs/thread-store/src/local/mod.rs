@@ -414,8 +414,18 @@ impl LocalThreadStore {
         {
             return Ok(false);
         }
-        // A completed or interrupted turn can legitimately have no visible items. The
-        // checkpoint, not the newest turn's presentation, certifies projection completeness.
+        // The root checkpoint covers same-thread predecessors. Other histories still need their
+        // cross-thread ancestry authenticated, even when the selected file is fully projected.
+        thread_history::validate_thread_for_paginated_reads(
+            self,
+            thread_id,
+            /*include_archived*/ true,
+            "has_history_projection",
+        )
+        .await?;
+        self.resolve_rollout_lineage(thread_id).await?;
+        // A complete turn can contain only tool or reasoning items, so its display summary
+        // may legitimately be empty. Completeness comes from the durable projection boundary.
         Ok(true)
     }
 

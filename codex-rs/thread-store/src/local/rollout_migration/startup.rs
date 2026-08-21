@@ -20,6 +20,7 @@ use std::collections::VecDeque;
 use std::ffi::OsString;
 use std::path::Path;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
@@ -31,6 +32,7 @@ use codex_rollout::StateDbHandle;
 use codex_state::RolloutMigrationCursor;
 use codex_state::RolloutMigrationSkippedRollout;
 use tokio::sync::Mutex;
+use tokio::sync::Notify;
 use tokio::sync::watch;
 use tracing::warn;
 
@@ -39,6 +41,8 @@ use super::RolloutMigrationMode;
 use super::RolloutMigrationOptions;
 use super::RolloutMigrationReport;
 use super::RolloutMigrationStatus;
+use super::dependencies::MigrationAdmission;
+use super::dependencies::discover_dependencies;
 use super::find_all_rollout_paths;
 use super::lineage::contains_convertible_rollout_reference;
 use super::lineage::has_leading_filtered_rollout_reference;
@@ -61,20 +65,30 @@ const NATIVE_OR_COMPATIBLE_REASON: &str = "native_or_compatible";
 const CURSOR_LOOKBACK_SECONDS: i64 = 48 * 60 * 60;
 const MAINTENANCE_RETRY_DELAY: Duration = Duration::from_secs(1);
 
-/// Serializes requested automatic migrations and joins concurrent loads of the same thread.
+#[path = "recent_failures.rs"]
+mod recent_failures;
+
+/// Bounds migration workers and joins concurrent loads of the same thread.
 #[derive(Default)]
 pub(crate) struct StartupMigrationCoordinator {
     enabled: AtomicBool,
     state: Mutex<CoordinatorState>,
+    ready: Notify,
     #[cfg(test)]
     processed: Mutex<Vec<ThreadId>>,
+    /// Tests pause after durable journal creation without holding a coordinator mutex.
+    #[cfg(test)]
+    pub(super) journal_barriers: Mutex<HashMap<ThreadId, Arc<tokio::sync::Barrier>>>,
 }
 
 #[derive(Default)]
 struct CoordinatorState {
-    worker_running: bool,
+    workers: usize,
+    /// Retain compression priority even while every conflicting attempt is waiting to retry.
+    foreground: Option<Arc<codex_rollout::RolloutMaintenanceIntentGuard>>,
     priority: VecDeque<ThreadId>,
     entries: HashMap<ThreadId, MigrationEntry>,
+    recent_failures: recent_failures::RecentFailures,
 }
 
 struct MigrationEntry {
@@ -84,6 +98,8 @@ struct MigrationEntry {
     modified_at: SystemTime,
     status: MigrationEntryStatus,
     completion: watch::Sender<MigrationCompletion>,
+    admission: MigrationAdmission,
+    not_before: tokio::time::Instant,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -104,6 +120,7 @@ struct MigrationWork {
     path: PathBuf,
     rollout_id: codex_protocol::RolloutId,
     source_fingerprint: RolloutFingerprint,
+    admission: MigrationAdmission,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -151,6 +168,9 @@ pub(super) async fn await_thread_migration(
     let mut receiver = if let Some(receiver) = existing_receiver {
         receiver
     } else {
+        if recent_failures::should_defer_retry(store, thread_id).await {
+            return Ok(());
+        }
         let Some(mut resolved) =
             thread_rollout_resolver::resolve_current_including_archived(store, thread_id).await?
         else {
@@ -203,6 +223,20 @@ pub(super) async fn await_thread_migration(
                 }
             }
         };
+        if matches!(
+            inspection,
+            StartupInspection::Legacy | StartupInspection::ReferenceBacked
+        ) && let Some(_migration_guard) =
+            codex_rollout::try_acquire_rollout_migration_dependency_lock(
+                &store.config.codex_home,
+                &[thread_id],
+            )
+            .map_err(migration_error)?
+        {
+            // With migration excluded for this task, a busy writer belongs to an active session,
+            // not a competing converter. Report that conflict instead of retrying indefinitely.
+            drop(store.writer_lock_coordinator.acquire(thread_id)?);
+        }
         let mut native_history_ready = match inspection {
             StartupInspection::Paginated => {
                 complete_native_root || store.has_history_projection(thread_id).await?
@@ -238,14 +272,14 @@ pub(super) async fn await_thread_migration(
                     native_history_ready = store.has_history_projection(thread_id).await?;
                 }
                 result => {
-                    let work = MigrationWork {
+                    native_history_ready = retained_selected_source_is_unchanged(
+                        store,
                         thread_id,
-                        path: resolved.path.clone(),
-                        rollout_id: resolved.rollout_id,
-                        source_fingerprint: before,
-                    };
-                    native_history_ready =
-                        retained_selected_source_is_unchanged(store, &work).await?;
+                        &resolved.path,
+                        resolved.rollout_id,
+                        before,
+                    )
+                    .await?;
                     if native_history_ready && let Err(error) = result {
                         warn!(
                             thread_id = %thread_id,
@@ -270,6 +304,14 @@ pub(super) async fn await_thread_migration(
                     current.rollout_id == resolved.rollout_id && current.path == resolved.path
                 });
         let modified_at = rollout_modified_at(resolved.path.as_path()).await?;
+        let admission = if already_native {
+            MigrationAdmission::Exclusive
+        } else {
+            match discover_dependencies(&store.config.codex_home, &resolved.path).await {
+                Ok(Some(dependencies)) => MigrationAdmission::Shared(Arc::new(dependencies)),
+                Ok(None) | Err(_) => MigrationAdmission::Exclusive,
+            }
+        };
         let mut state = store.rollout_migration_coordinator.state.lock().await;
         if let Some(receiver) = subscribe_to_existing(&mut state, thread_id) {
             receiver
@@ -287,13 +329,15 @@ pub(super) async fn await_thread_migration(
                     modified_at,
                     status: MigrationEntryStatus::Pending,
                     completion,
+                    admission,
+                    not_before: tokio::time::Instant::now(),
                 },
             );
             state.priority.push_back(thread_id);
             receiver
         }
     };
-    ensure_worker(store).await;
+    ensure_worker(store).await?;
 
     loop {
         let completion = receiver.borrow().clone();
@@ -333,25 +377,38 @@ async fn rollout_modified_at(path: &Path) -> ThreadStoreResult<SystemTime> {
         .map_err(migration_error)
 }
 
-async fn ensure_worker(store: &LocalThreadStore) {
-    let should_spawn = {
+async fn ensure_worker(store: &LocalThreadStore) -> ThreadStoreResult<()> {
+    let foreground = Arc::new(
+        codex_rollout::acquire_rollout_maintenance_intent(&store.config.codex_home)
+            .await
+            .map_err(migration_error)?,
+    );
+    let count = {
         let mut state = store.rollout_migration_coordinator.state.lock().await;
-        if state.worker_running {
-            false
-        } else {
-            state.worker_running = true;
-            true
+        state.foreground.get_or_insert(foreground);
+        let pending = state
+            .entries
+            .values()
+            .filter(|entry| entry.status == MigrationEntryStatus::Pending)
+            .count();
+        let count = pending.min(codex_rollout::MAX_CONCURRENT_ROLLOUT_MIGRATIONS - state.workers);
+        state.workers += count;
+        if state.workers == 0 {
+            state.foreground = None;
         }
+        count
     };
-    if should_spawn {
+    store.rollout_migration_coordinator.ready.notify_one();
+    for _ in 0..count {
         let store = store.clone();
         tokio::spawn(async move { run_worker(store).await });
     }
+    Ok(())
 }
 
 async fn run_worker(store: LocalThreadStore) {
     loop {
-        let Some(work) = next_work(&store).await else {
+        let Some(mut work) = next_work(&store).await else {
             return;
         };
         #[cfg(test)]
@@ -362,7 +419,7 @@ async fn run_worker(store: LocalThreadStore) {
             .await
             .push(work.thread_id);
         let result = store
-            .migrate_rollout_path_on_demand(work.thread_id, work.path.clone())
+            .migrate_rollout_path_on_demand(work.thread_id, work.path.clone(), &mut work.admission)
             .await;
         let result = match result {
             Ok(Some(outcome)) if outcome.status == RolloutMigrationStatus::Failed => {
@@ -372,7 +429,15 @@ async fn run_worker(store: LocalThreadStore) {
                         work.path.display()
                     )
                 });
-                match retained_selected_source_is_unchanged(&store, &work).await {
+                match retained_selected_source_is_unchanged(
+                    &store,
+                    work.thread_id,
+                    &work.path,
+                    work.rollout_id,
+                    work.source_fingerprint,
+                )
+                .await
+                {
                     Ok(true) => {
                         warn!(
                             thread_id = %work.thread_id,
@@ -406,110 +471,146 @@ async fn run_worker(store: LocalThreadStore) {
                 "failed to record automatic rollout migration fingerprint: {error}"
             );
         }
-        let retry_delay = {
+        {
             let mut state = store.rollout_migration_coordinator.state.lock().await;
+            if matches!(&result, Ok(Some(outcome)) if outcome.status == RolloutMigrationStatus::Failed)
+            {
+                state.recent_failures.record(&work);
+            }
             let Some(entry) = state.entries.get_mut(&work.thread_id) else {
                 continue;
             };
+            entry.admission = work.admission;
             match result {
                 Ok(Some(outcome)) if outcome.status == RolloutMigrationStatus::SkippedBusy => {
                     entry.status = MigrationEntryStatus::Pending;
+                    entry.not_before =
+                        tokio::time::Instant::now() + std::time::Duration::from_millis(50);
                     state.priority.push_back(work.thread_id);
-                    Some(std::time::Duration::from_millis(50))
                 }
                 Ok(Some(_)) => {
                     finish_entry(entry, Ok(()));
-                    None
                 }
                 Ok(None) => {
                     finish_entry(entry, Ok(()));
-                    None
                 }
                 Err(crate::ThreadStoreError::Conflict { .. }) => {
                     entry.status = MigrationEntryStatus::Pending;
+                    entry.not_before =
+                        tokio::time::Instant::now() + std::time::Duration::from_millis(250);
                     state.priority.push_back(work.thread_id);
-                    Some(std::time::Duration::from_millis(250))
                 }
                 Err(error) => {
                     finish_entry(entry, Err(error.to_string()));
-                    None
                 }
             }
-        };
-        if let Some(delay) = retry_delay {
-            tokio::time::sleep(delay).await;
+            // Receivers retain the terminal watch value. Do not cache completed attempts forever:
+            // a repaired or replaced source must be inspected on its next request.
+            if state
+                .entries
+                .get(&work.thread_id)
+                .is_some_and(|entry| entry.status == MigrationEntryStatus::Complete)
+            {
+                state.entries.remove(&work.thread_id);
+            }
         }
+        store.rollout_migration_coordinator.ready.notify_one();
     }
 }
 
 async fn next_work(store: &LocalThreadStore) -> Option<MigrationWork> {
-    let mut state = store.rollout_migration_coordinator.state.lock().await;
-    let mut priority_thread = None;
-    while let Some(thread_id) = state.priority.pop_front() {
-        if state
-            .entries
-            .get(&thread_id)
-            .is_some_and(|entry| entry.status == MigrationEntryStatus::Pending)
-        {
-            priority_thread = Some(thread_id);
-            break;
+    loop {
+        let retry_at = {
+            let mut state = store.rollout_migration_coordinator.state.lock().await;
+            let mut priority_thread = None;
+            for _ in 0..state.priority.len() {
+                let thread_id = state.priority.pop_front()?;
+                if state.entries.get(&thread_id).is_some_and(|entry| {
+                    entry.status == MigrationEntryStatus::Pending
+                        && entry.not_before <= tokio::time::Instant::now()
+                }) {
+                    priority_thread = Some(thread_id);
+                    break;
+                }
+                state.priority.push_back(thread_id);
+            }
+            let thread_id = priority_thread.or_else(|| {
+                state
+                    .entries
+                    .iter()
+                    .filter(|(_, entry)| {
+                        entry.status == MigrationEntryStatus::Pending
+                            && entry.not_before <= tokio::time::Instant::now()
+                    })
+                    .max_by(|left, right| {
+                        left.1
+                            .modified_at
+                            .cmp(&right.1.modified_at)
+                            .then_with(|| right.1.path.cmp(&left.1.path))
+                    })
+                    .map(|(thread_id, _)| *thread_id)
+            });
+            if let Some(thread_id) = thread_id {
+                let entry = state.entries.get_mut(&thread_id)?;
+                entry.status = MigrationEntryStatus::Running;
+                return Some(MigrationWork {
+                    thread_id,
+                    path: entry.path.clone(),
+                    rollout_id: entry.rollout_id,
+                    source_fingerprint: entry.source_fingerprint,
+                    admission: entry.admission.clone(),
+                });
+            }
+            let next = state
+                .entries
+                .values()
+                .filter(|entry| entry.status == MigrationEntryStatus::Pending)
+                .map(|entry| entry.not_before)
+                .min();
+            if let Some(next) = next {
+                next
+            } else {
+                state.workers -= 1;
+                if state.workers == 0 {
+                    state.foreground = None;
+                }
+                return None;
+            }
+        };
+        tokio::select! {
+            _ = tokio::time::sleep_until(retry_at) => {},
+            _ = store.rollout_migration_coordinator.ready.notified() => {},
         }
     }
-    let thread_id = priority_thread.or_else(|| {
-        state
-            .entries
-            .iter()
-            .filter(|(_, entry)| entry.status == MigrationEntryStatus::Pending)
-            .max_by(|left, right| {
-                left.1
-                    .modified_at
-                    .cmp(&right.1.modified_at)
-                    .then_with(|| right.1.path.cmp(&left.1.path))
-            })
-            .map(|(thread_id, _)| *thread_id)
-    });
-    let Some(thread_id) = thread_id else {
-        state.worker_running = false;
-        return None;
-    };
-    let entry = state.entries.get_mut(&thread_id)?;
-    entry.status = MigrationEntryStatus::Running;
-    Some(MigrationWork {
-        thread_id,
-        path: entry.path.clone(),
-        rollout_id: entry.rollout_id,
-        source_fingerprint: entry.source_fingerprint,
-    })
 }
 
 /// A failed conversion may fall back only when no publication or recovery state escaped.
 async fn retained_selected_source_is_unchanged(
     store: &LocalThreadStore,
-    work: &MigrationWork,
+    thread_id: ThreadId,
+    path: &Path,
+    rollout_id: codex_protocol::RolloutId,
+    source_fingerprint: RolloutFingerprint,
 ) -> ThreadStoreResult<bool> {
-    let journal = migration_journal_path(&store.config.codex_home, work.thread_id);
+    let journal = migration_journal_path(&store.config.codex_home, thread_id);
     if tokio::fs::try_exists(&journal)
         .await
         .map_err(migration_error)?
     {
         return Ok(false);
     }
-    if rollout_fingerprint(&work.path).await? != work.source_fingerprint {
+    if rollout_fingerprint(path).await? != source_fingerprint {
         return Ok(false);
     }
     let selected =
-        thread_rollout_resolver::resolve_current_including_archived(store, work.thread_id).await?;
-    if !selected
-        .is_some_and(|current| current.rollout_id == work.rollout_id && current.path == work.path)
-    {
+        thread_rollout_resolver::resolve_current_including_archived(store, thread_id).await?;
+    if !selected.is_some_and(|current| current.rollout_id == rollout_id && current.path == path) {
         return Ok(false);
     }
-    Ok(
-        rollout_fingerprint(&work.path).await? == work.source_fingerprint
-            && !tokio::fs::try_exists(&journal)
-                .await
-                .map_err(migration_error)?,
-    )
+    Ok(rollout_fingerprint(path).await? == source_fingerprint
+        && !tokio::fs::try_exists(&journal)
+            .await
+            .map_err(migration_error)?)
 }
 
 fn finish_entry(entry: &mut MigrationEntry, result: Result<(), String>) {
@@ -551,7 +652,7 @@ pub(super) async fn processed_thread_ids(store: &LocalThreadStore) -> Vec<Thread
 #[cfg(test)]
 pub(super) async fn automatic_migration_idle(store: &LocalThreadStore) -> bool {
     let state = store.rollout_migration_coordinator.state.lock().await;
-    !state.worker_running
+    state.workers == 0
         && state.entries.values().all(|entry| {
             !matches!(
                 entry.status,

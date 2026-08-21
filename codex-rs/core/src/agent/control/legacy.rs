@@ -2,6 +2,7 @@ use super::*;
 use crate::codex_thread::CodexThread;
 use codex_protocol::error::CodexErrorDetails;
 use codex_thread_store::PersistContext;
+use std::collections::HashMap;
 use std::time::Duration;
 
 const INTERNAL_HELPER_TURN_END_TIMEOUT: Duration = Duration::from_secs(10);
@@ -158,10 +159,28 @@ impl AgentControl {
             }
         }
 
+        // Identifying supervisor helpers needs source metadata, not migration of every child.
+        let indexed_metadata = if let Some(state_db) = state.state_db().await {
+            state_db
+                .get_threads_valid(&candidate_ids)
+                .await
+                .map_err(|err| {
+                    CodexErr::Fatal(format!(
+                        "failed to read persisted supervisor metadata for {parent_thread_id}: {err}"
+                    ))
+                })?
+        } else {
+            HashMap::new()
+        };
         let mut running_supervisor = None;
         for thread_id in candidate_ids {
             if !self
-                .is_goal_supervisor_for_parent(&state, thread_id, parent_thread_id)
+                .is_goal_supervisor_for_parent(
+                    &state,
+                    thread_id,
+                    parent_thread_id,
+                    indexed_metadata.get(&thread_id),
+                )
                 .await
             {
                 continue;
@@ -196,32 +215,27 @@ impl AgentControl {
         state: &Arc<ThreadManagerState>,
         thread_id: ThreadId,
         parent_thread_id: ThreadId,
+        indexed_metadata: Option<&codex_state::ThreadMetadata>,
     ) -> bool {
-        if let Some(snapshot) = self.get_agent_config_snapshot(thread_id).await
-            && matches!(
-                snapshot.session_source,
-                SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
-                    parent_thread_id: source_parent_thread_id,
-                    agent_role: Some(ref agent_role),
-                    ..
-                }) if source_parent_thread_id == parent_thread_id
-                    && agent_role == crate::goal_supervisor::GOAL_SUPERVISOR_ROLE_NAME
-            )
-        {
-            return true;
-        }
-        let Ok(stored_thread) = state
-            .read_stored_thread(ReadThreadParams {
-                thread_id,
-                include_archived: true,
-                include_history: false,
-            })
-            .await
-        else {
-            return false;
+        let source = if let Some(snapshot) = self.get_agent_config_snapshot(thread_id).await {
+            snapshot.session_source
+        } else if let Some(metadata) = indexed_metadata {
+            serde_json::from_str(&metadata.source).unwrap_or(SessionSource::Unknown)
+        } else {
+            let Ok(stored_thread) = state
+                .read_stored_thread(ReadThreadParams {
+                    thread_id,
+                    include_archived: true,
+                    include_history: false,
+                })
+                .await
+            else {
+                return false;
+            };
+            stored_thread.source
         };
         matches!(
-            stored_thread.source,
+            source,
             SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
                 parent_thread_id: source_parent_thread_id,
                 agent_role: Some(ref agent_role),

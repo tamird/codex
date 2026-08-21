@@ -38,6 +38,8 @@ use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::SubAgentSource;
 use codex_protocol::protocol::ThreadHistoryMode;
 use codex_protocol::protocol::ThreadRolledBackEvent;
+use codex_protocol::protocol::TurnAbortReason;
+use codex_protocol::protocol::TurnAbortedEvent;
 use codex_protocol::protocol::TurnCompleteEvent;
 use codex_protocol::protocol::TurnContextItem;
 use codex_protocol::protocol::TurnStartedEvent;
@@ -2362,16 +2364,30 @@ async fn migration_rewrites_paginated_reference_lineage_deeper_than_desktop_boun
                 predecessor_segment_id,
             ));
         }
-        items.extend([
-            turn_started(turn_id.as_str()),
-            completed_user_message(
-                thread_id,
-                turn_id.as_str(),
-                format!("user-{index}").as_str(),
-                format!("question-{index}").as_str(),
-            ),
-            turn_complete(turn_id.as_str()),
-        ]);
+        items.push(turn_started(turn_id.as_str()));
+        if index == 3 {
+            // A valid interrupted turn can have items without a display-summary message.
+            items.extend([
+                item_completed(turn_id.as_str(), "reasoning-3"),
+                RolloutItem::EventMsg(EventMsg::TurnAborted(TurnAbortedEvent {
+                    turn_id: Some(turn_id.clone()),
+                    reason: TurnAbortReason::Interrupted,
+                    started_at: None,
+                    completed_at: None,
+                    duration_ms: None,
+                })),
+            ]);
+        } else {
+            items.extend([
+                completed_user_message(
+                    thread_id,
+                    turn_id.as_str(),
+                    format!("user-{index}").as_str(),
+                    format!("question-{index}").as_str(),
+                ),
+                turn_complete(turn_id.as_str()),
+            ]);
+        }
         next_ordinal = write_paginated_segment(
             path.as_path(),
             home.path(),
@@ -2416,7 +2432,7 @@ async fn migration_rewrites_paginated_reference_lineage_deeper_than_desktop_boun
         .await
         .expect("materialize deep native lineage");
     let materialized = serde_json::to_string(&materialized).expect("serialize native lineage");
-    for index in 0..4 {
+    for index in 0..3 {
         assert_eq!(
             materialized
                 .matches(format!("question-{index}").as_str())
@@ -2446,6 +2462,30 @@ async fn migration_rewrites_paginated_reference_lineage_deeper_than_desktop_boun
         .await
         .expect("read first migrated lineage page");
     assert_eq!(first_page.turns.len(), 2);
+    let newest_turn = &first_page.turns[0];
+    assert_eq!(newest_turn.status, crate::StoredTurnStatus::Interrupted);
+    assert!(newest_turn.items.is_empty());
+    let items = store
+        .list_items(ListItemsParams {
+            thread_id,
+            turn_id: Some(newest_turn.turn_id.clone()),
+            include_archived: false,
+            cursor: None,
+            page_size: 2,
+            sort_direction: SortDirection::Asc,
+            sort_key: ItemSortKey::CreatedAtOrdinal,
+            after_updated_at_ordinal: None,
+        })
+        .await
+        .expect("read interrupted turn items");
+    assert_eq!(
+        items
+            .items
+            .iter()
+            .map(|item| item.item_id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["reasoning-3"]
+    );
     let second_page = store
         .list_turns(ListTurnsParams {
             thread_id,
@@ -5045,18 +5085,109 @@ async fn migration_recovers_same_thread_lineage_from_every_durable_phase() {
         drop(store);
 
         let restarted = indexed_store(home.path()).await;
-        let recovered = restarted
-            .migrate_rollouts(apply_options())
-            .await
-            .expect("recover lineage migration");
-        assert_eq!(recovered.outcomes.len(), 1, "phase {phase:?}");
-        assert_eq!(
-            recovered.outcomes[0].status,
-            RolloutMigrationStatus::Migrated,
-            "phase {phase:?}: {:?}",
-            recovered.outcomes[0].message
+        if phase == LineageMigrationPhase::Selected {
+            let writer_guard = restarted
+                .writer_lock_coordinator
+                .acquire(thread_id)
+                .expect("hold selected lineage writer lock");
+            let journal = fs::read(&journal_path).expect("read pending lineage journal");
+            let busy = restarted
+                .migrate_rollouts(apply_options())
+                .await
+                .expect("skip busy lineage recovery");
+            assert_eq!(busy.outcomes.len(), 1);
+            assert_eq!(busy.outcomes[0].status, RolloutMigrationStatus::SkippedBusy);
+            assert_eq!(
+                fs::read(&journal_path).expect("reread pending lineage journal"),
+                journal
+            );
+            assert_eq!(
+                [
+                    fs::read(&immutable).expect("reread immutable source"),
+                    fs::read(&active).expect("reread active source"),
+                ],
+                source_bytes
+            );
+            drop(writer_guard);
+        }
+        let independent_id = ThreadId::new();
+        write_rollout(
+            home.path(),
+            independent_id,
+            SessionSource::Cli,
+            vec![user_message("independent")],
         );
+        restarted.start_automatic_rollout_migration();
+        let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(2));
+        restarted
+            .rollout_migration_coordinator
+            .journal_barriers
+            .lock()
+            .await
+            .insert(independent_id, barrier.clone());
+        let other_store = restarted.clone();
+        let independent = tokio::spawn(async move {
+            other_store
+                .await_automatic_rollout_migration(independent_id)
+                .await
+        });
+        let independent_journal = migration_journal_path(home.path(), independent_id);
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while restarted
+                .rollout_migration_coordinator
+                .journal_barriers
+                .lock()
+                .await
+                .contains_key(&independent_id)
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("independent migration journal");
+        let other_journal_bytes = fs::read(&independent_journal).expect("independent journal");
+        let recovery_store = restarted.clone();
+        let recovery = tokio::spawn(async move {
+            recovery_store
+                .await_automatic_rollout_migration(thread_id)
+                .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while !super::startup::processed_thread_ids(&restarted)
+                .await
+                .contains(&thread_id)
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("recovery queued");
+        assert!(
+            !recovery.is_finished(),
+            "recovery requires exclusive admission"
+        );
+        assert_eq!(
+            fs::read(&independent_journal).expect("retained other journal"),
+            other_journal_bytes
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(5), barrier.wait())
+            .await
+            .expect("release independent migration");
+        for request in [independent, recovery] {
+            tokio::time::timeout(std::time::Duration::from_secs(5), request)
+                .await
+                .expect("migration completes")
+                .expect("join")
+                .expect("migration");
+        }
         assert!(!journal_path.exists());
+        assert!(!independent_journal.exists());
+        assert!(
+            restarted
+                .has_history_projection(independent_id)
+                .await
+                .expect("independent projection")
+        );
         let selected = restarted
             .state_db
             .as_ref()
@@ -8361,6 +8492,59 @@ async fn migration_retries_a_rollout_moved_after_path_discovery() {
 }
 
 #[tokio::test]
+async fn migration_name_promotion_reuses_a_completed_batch_lookup() {
+    for batch_lookup_completed in [false, true] {
+        let home = TempDir::new().expect("create Codex home");
+        let thread_id = ThreadId::new();
+        let path = write_rollout(
+            home.path(),
+            thread_id,
+            SessionSource::Cli,
+            vec![user_message("question")],
+        );
+        let store = indexed_store(home.path()).await;
+        let names = std::collections::HashMap::new();
+        codex_rollout::append_thread_name(home.path(), thread_id, "indexed name")
+            .await
+            .expect("append name after batch lookup");
+
+        if batch_lookup_completed {
+            store
+                .promote_legacy_name(thread_id, &names)
+                .await
+                .expect("promote name from completed batch");
+        } else {
+            let outcome = store
+                .migrate_rollout_path_on_demand(
+                    thread_id,
+                    path,
+                    &mut super::dependencies::MigrationAdmission::Exclusive,
+                )
+                .await
+                .expect("migrate requested thread")
+                .expect("requested migration outcome");
+            assert_eq!(outcome.status, RolloutMigrationStatus::Migrated);
+        }
+
+        let metadata = store
+            .state_db
+            .as_ref()
+            .expect("state db")
+            .get_thread(thread_id)
+            .await
+            .expect("read metadata")
+            .expect("thread");
+        assert_eq!(
+            (metadata.history_mode, metadata.name),
+            (
+                ThreadHistoryMode::Paginated,
+                (!batch_lookup_completed).then(|| "indexed name".to_string()),
+            ),
+        );
+    }
+}
+
+#[tokio::test]
 async fn migration_preserves_legacy_displayed_thread_names() {
     let home = TempDir::new().expect("create Codex home");
     let title_thread_id = ThreadId::new();
@@ -8674,10 +8858,39 @@ async fn migration_recovers_a_published_rollout_with_missing_projection() {
         .expect("defer busy journal-less repair");
     assert_eq!(busy.outcomes[0].status, RolloutMigrationStatus::SkippedBusy);
     drop(writer);
-    let repaired = store
-        .migrate_rollouts(apply_options())
+    let pause = crate::local::projection_rebuild::inject_projection_rebuild_pause(thread_id);
+    let repair_store = store.clone();
+    let repair = tokio::spawn(async move { repair_store.migrate_rollouts(apply_options()).await });
+    tokio::time::timeout(Duration::from_secs(5), pause.entered.notified())
         .await
-        .expect("repair published rollout without a journal");
+        .expect("migration reaches projection rebuild");
+    // Repair holds a lifecycle reader while waiting for exclusive maintenance. A queued archive
+    // writer then prevents projection from acquiring another reader until repair can finish.
+    let repair_lifecycle =
+        crate::local::segment::history_repair_publication::reserve_history_repair_lifecycle(
+            &store, thread_id,
+        )
+        .await;
+    let mut archive_lifecycle = Box::pin(store.live_writer_locks.lock_lifecycle(thread_id));
+    assert!(futures::poll!(archive_lifecycle.as_mut()).is_pending());
+    pause.release.notify_one();
+    let repaired = tokio::time::timeout(Duration::from_secs(5), async {
+        let maintenance =
+            crate::local::segment::history_repair_publication::acquire_history_repair_maintenance(
+                &store,
+            )
+            .await
+            .expect("repair acquires maintenance while migration rebuilds its projection");
+        drop(maintenance);
+        drop(repair_lifecycle);
+        drop(archive_lifecycle.await);
+        repair
+            .await
+            .expect("join projection repair")
+            .expect("repair published rollout without a journal")
+    })
+    .await
+    .expect("migration must not deadlock with repair and a queued lifecycle writer");
     assert_eq!(
         repaired.outcomes[0].status,
         RolloutMigrationStatus::AlreadyPaginated,

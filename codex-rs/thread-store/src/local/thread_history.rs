@@ -24,6 +24,7 @@ pub(super) use read::list_items;
 pub(super) use read::list_segmented_legacy_items;
 pub(super) use read::list_segmented_legacy_turns;
 pub(super) use read::list_turns;
+pub(super) use read::validate_thread_for_paginated_reads;
 pub(super) use realtime::list_timeline;
 pub(super) use search::search_thread_occurrences;
 pub(super) use turn_lookup::find_projected_turn;

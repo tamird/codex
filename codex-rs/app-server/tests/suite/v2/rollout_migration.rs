@@ -76,8 +76,21 @@ struct LegacyMigrationFixture {
     total_item_count: usize,
 }
 
+/// Lookup forms that can reach one stored conversation through different RPC queue keys.
+#[derive(Clone, Copy)]
+enum MigrationResumeSource {
+    Id,
+    Path,
+    OverridingPath,
+}
+
+#[test_case::test_case(MigrationResumeSource::Id; "id")]
+#[test_case::test_case(MigrationResumeSource::Path; "path")]
+#[test_case::test_case(MigrationResumeSource::OverridingPath; "overriding_path")]
 #[tokio::test]
-async fn native_thread_remains_interactive_during_an_unrelated_migration() -> Result<()> {
+async fn native_thread_remains_interactive_during_an_unrelated_migration(
+    migration_source: MigrationResumeSource,
+) -> Result<()> {
     let server = responses::start_mock_server().await;
     responses::mount_sse_once(
         &server,
@@ -125,12 +138,54 @@ async fn native_thread_remains_interactive_during_an_unrelated_migration() -> Re
         vec![legacy_user_message("unrelated migration".to_string())],
     )?;
     let legacy_bytes = fs::read(&legacy_path)?;
-    let job = codex_rollout::try_acquire_rollout_maintenance_job_lock(home.path())?
-        .expect("hold unrelated migration job");
+    let lock_directory = home.path().join(".tmp");
+    fs::create_dir_all(&lock_directory)?;
+    // Hold only the job lock so foreground intent below is evidence of the server's migration.
+    let job = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(lock_directory.join("rollout-maintenance-job.lock"))?;
+    job.lock()?;
     let mut app = TestAppServer::builder()
         .with_codex_home(home.path())
         .build_initialized()
         .await?;
+    let legacy_resume = app
+        .send_thread_resume_request(ThreadResumeParams {
+            thread_id: match migration_source {
+                MigrationResumeSource::Id => legacy_id.to_string(),
+                MigrationResumeSource::Path => String::new(),
+                MigrationResumeSource::OverridingPath => ThreadId::new().to_string(),
+            },
+            path: match migration_source {
+                MigrationResumeSource::Id => None,
+                MigrationResumeSource::Path | MigrationResumeSource::OverridingPath => {
+                    Some(legacy_path.clone())
+                }
+            },
+            exclude_turns: true,
+            ..Default::default()
+        })
+        .await?;
+    let foreground = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(lock_directory.join("rollout-maintenance-foreground.lock"))?;
+    timeout(DEFAULT_READ_TIMEOUT, async {
+        loop {
+            match foreground.try_lock() {
+                Ok(()) => foreground.unlock()?,
+                Err(std::fs::TryLockError::WouldBlock) => return Ok::<(), std::io::Error>(()),
+                Err(std::fs::TryLockError::Error(error)) => return Err(error),
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await??;
     let read_id = app
         .send_thread_read_request(ThreadReadParams {
             thread_id: native_id.to_string(),
@@ -163,6 +218,12 @@ async fn native_thread_remains_interactive_during_an_unrelated_migration() -> Re
     .await??;
     assert_eq!(fs::read(&legacy_path)?, legacy_bytes);
     drop(job);
+    let legacy_response: ThreadResumeResponse =
+        timeout(DEFAULT_READ_TIMEOUT, app.read_response(legacy_resume)).await??;
+    assert_eq!(
+        legacy_response.thread.history_mode,
+        ThreadHistoryMode::Paginated
+    );
     timeout(DEFAULT_READ_TIMEOUT, app.shutdown_gracefully()).await??;
 
     let mut restarted = TestAppServer::builder()

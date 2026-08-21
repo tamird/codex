@@ -49,7 +49,7 @@ pub(crate) enum StateMigrationStep {
 
 fn ensure_transactional_migrations(migrator: &Migrator) -> anyhow::Result<()> {
     if migrator.no_tx || migrator.migrations.iter().any(|migration| migration.no_tx) {
-        anyhow::bail!("state migrations must all support the startup transaction");
+        anyhow::bail!("database schema migrations must all support the startup transaction");
     }
     Ok(())
 }
@@ -64,7 +64,7 @@ fn is_sqlite_writer_contention(error: &sqlx::Error) -> bool {
         .is_some_and(|code| matches!(code & 0xff, 5 | 6))
 }
 
-async fn begin_state_migration_transaction<F>(
+async fn begin_runtime_migration_transaction<F>(
     pool: &SqlitePool,
     mut on_contention: F,
 ) -> anyhow::Result<Transaction<'static, Sqlite>>
@@ -95,7 +95,7 @@ where
 {
     ensure_transactional_migrations(migrator)?;
 
-    let mut transaction = begin_state_migration_transaction(pool, on_contention).await?;
+    let mut transaction = begin_runtime_migration_transaction(pool, on_contention).await?;
     let migration_result = async {
         repair_frodex_goal_supervisor_state_migration(&mut transaction).await?;
         after_step(StateMigrationStep::GoalSupervisorCompatibility)?;
@@ -379,7 +379,7 @@ impl SqliteConfig {
         let pool_result = loop {
             match self.open_read_write_pool(&path).await {
                 Err(error)
-                    if matches!(spec.kind, DbKind::State)
+                    if matches!(spec.kind, DbKind::State | DbKind::ThreadHistory)
                         && is_sqlite_writer_contention(&error) =>
                 {
                     tokio::time::sleep(Duration::from_millis(25)).await;
@@ -401,6 +401,16 @@ impl SqliteConfig {
         let migrate_result = async {
             if matches!(spec.kind, DbKind::State) {
                 migrate_state_database(&pool, migrator).await
+            } else if matches!(spec.kind, DbKind::ThreadHistory) {
+                // Read applied versions only after reserving SQLite's writer. Otherwise two
+                // app-servers can both decide migration 1 must create thread_turns.
+                ensure_transactional_migrations(migrator)?;
+                let mut transaction = begin_runtime_migration_transaction(&pool, || {}).await?;
+                migrator
+                    .run_direct(/*target*/ None, &mut *transaction, /*skip*/ false)
+                    .await?;
+                transaction.commit().await?;
+                Ok(())
             } else {
                 migrator.run(&pool).await.map_err(anyhow::Error::from)
             }
@@ -458,3 +468,7 @@ impl SqliteConfig {
             .await
     }
 }
+
+#[cfg(test)]
+#[path = "thread_history_migration_tests.rs"]
+mod thread_history_migration_tests;
