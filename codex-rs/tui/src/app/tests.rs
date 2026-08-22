@@ -1436,7 +1436,16 @@ async fn replay_thread_snapshot_requires_confirmed_idle_to_submit_queued_input()
             )
             .await;
         }
-        assert!(snapshot.events.is_empty());
+        if refresh_without_terminal_notification {
+            assert!(snapshot.events.is_empty());
+        } else {
+            assert_matches!(snapshot.events.as_slice(), [ThreadBufferedEvent::Notification(notification)] => {
+                assert_matches!(notification.as_ref(), ServerNotification::TurnCompleted(completed) => {
+                    assert_eq!(completed.turn.id, "turn-1");
+                    assert!(completed.turn.items.is_empty());
+                });
+            });
+        }
 
         app.replay_thread_snapshot(snapshot, /*resume_restored_queue*/ true);
 

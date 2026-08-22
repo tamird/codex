@@ -1477,6 +1477,7 @@ impl App {
         for _ in 0..64 {
             match rx.try_recv() {
                 Ok(event) => {
+                    self.acknowledge_live_terminal(&event).await;
                     self.handle_thread_event_now_recovering_file_changes(event)
                         .await
                 }
@@ -1836,6 +1837,7 @@ impl App {
             None
         };
         let had_active_view = self.chat_widget.has_active_view();
+        self.acknowledge_live_terminal(&event).await;
         self.handle_thread_event_now_recovering_file_changes(event)
             .await;
         if let Some(user_message) = automatic_title_user_message {

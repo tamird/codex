@@ -6,7 +6,11 @@
 //! together with the replay behavior that consumes them.
 
 use super::thread_cache::json_bytes;
+use super::thread_cache_eviction::TerminalDelivery;
+use super::thread_cache_eviction::TerminalNotification;
 use super::*;
+use codex_app_server_protocol::TurnCompletedNotification;
+use codex_app_server_protocol::TurnItemsView;
 use std::borrow::Cow;
 
 #[derive(Debug, Clone)]
@@ -54,6 +58,7 @@ pub(super) struct ThreadEventStore {
     recap_progress: recap::RecapProgress,
     pub(super) buffered_payload_bytes: usize,
     pub(super) turn_payload_bytes: usize,
+    pub(super) terminal_notification: Option<TerminalNotification>,
 }
 
 impl ThreadEventStore {
@@ -85,6 +90,7 @@ impl ThreadEventStore {
             recap_progress: recap::RecapProgress::default(),
             buffered_payload_bytes: 0,
             turn_payload_bytes: 0,
+            terminal_notification: None,
         }
     }
 
@@ -150,6 +156,7 @@ impl ThreadEventStore {
             .note_server_notification(notification.as_ref());
         match notification.as_ref() {
             ServerNotification::TurnStarted(turn) => {
+                self.terminal_notification = None;
                 self.active_turn_id = Some(turn.turn.id.clone());
                 if !self.active
                     && let Some(input_state) = self.input_state.as_mut()
@@ -160,6 +167,40 @@ impl ThreadEventStore {
             ServerNotification::TurnCompleted(turn) => {
                 if matches!(turn.turn.status, TurnStatus::Completed) {
                     self.recap_progress.completed_turns += 1;
+                }
+                // A late completion for another turn must not supersede the live turn's state.
+                if self.active_turn_id.as_deref() == Some(turn.turn.id.as_str())
+                    || (self.active_turn_id.is_none() && self.terminal_notification.is_none())
+                {
+                    self.terminal_notification = Some(TerminalNotification::Completed {
+                        delivery: if self.active {
+                            TerminalDelivery::PendingLive
+                        } else {
+                            TerminalDelivery::Applied
+                        },
+                        notification: Box::new(TurnCompletedNotification {
+                            thread_id: turn.thread_id.clone(),
+                            turn: Turn {
+                                id: turn.turn.id.clone(),
+                                items: Vec::new(),
+                                items_view: TurnItemsView::NotLoaded,
+                                status: turn.turn.status.clone(),
+                                // Preserve the bounded stop classification independently of text.
+                                error: turn.turn.error.as_ref().filter(|error| {
+                                    error.codex_error_info
+                                        == Some(AppServerCodexErrorInfo::MisalignmentPolicyViolation)
+                                }).map(|error| codex_app_server_protocol::TurnError {
+                                    message: String::new(),
+                                    codex_error_info: error.codex_error_info.clone(),
+                                    additional_details: None,
+                                    misalignment: None,
+                                }),
+                                started_at: turn.turn.started_at,
+                                completed_at: turn.turn.completed_at,
+                                duration_ms: turn.turn.duration_ms,
+                            },
+                        }),
+                    });
                 }
                 if self.active_turn_id.as_deref() == Some(turn.turn.id.as_str()) {
                     self.active_turn_id = None;
@@ -173,7 +214,8 @@ impl ThreadEventStore {
                     self.pending_interrupt_turn_id = None;
                 }
             }
-            ServerNotification::ThreadClosed(_) => {
+            ServerNotification::ThreadClosed(closed) => {
+                self.terminal_notification = Some(TerminalNotification::Closed(closed.clone()));
                 self.active_turn_id = None;
                 self.pending_interrupt_turn_id = None;
                 if !self.active
@@ -260,6 +302,7 @@ impl ThreadEventStore {
                     | ThreadBufferedEvent::FeedbackSubmission(_) => true,
                 })
                 .cloned()
+                .chain(self.terminal_replay_event())
                 .collect(),
             input_state: self.input_state.clone(),
         }
