@@ -2696,7 +2696,7 @@ async fn resolver_requires_the_referenced_physical_rollout_id() -> io::Result<()
     };
     assert_eq!(
         resolve_rollout_reference_path(home.path(), &reference).await?,
-        referenced_path
+        fs::canonicalize(&referenced_path)?
     );
 
     fs::remove_file(referenced_path)?;
@@ -2745,7 +2745,7 @@ async fn resolver_uses_validated_rotated_compressed_segment() -> io::Result<()> 
     };
     assert_eq!(
         resolve_rollout_reference_path(home.path(), &reference).await?,
-        compressed_path
+        fs::canonicalize(compressed_path)?
     );
     Ok(())
 }
@@ -2770,7 +2770,7 @@ async fn legacy_reference_accepts_matching_recorded_path() -> io::Result<()> {
 
     assert_eq!(
         resolve_rollout_reference_path(home.path(), &reference).await?,
-        recorded_path
+        fs::canonicalize(recorded_path)?
     );
     Ok(())
 }
@@ -2809,7 +2809,7 @@ async fn legacy_reference_uses_initial_after_stable_path_is_replaced() -> io::Re
     };
     assert_eq!(
         resolve_rollout_reference_path(home.path(), &reference).await?,
-        initial_path
+        fs::canonicalize(initial_path)?
     );
     Ok(())
 }
@@ -2870,7 +2870,7 @@ async fn legacy_reference_resolves_archived_initial_segment() -> io::Result<()> 
 
     assert_eq!(
         resolve_rollout_reference_path(home.path(), &reference).await?,
-        archived_path
+        fs::canonicalize(archived_path)?
     );
     Ok(())
 }

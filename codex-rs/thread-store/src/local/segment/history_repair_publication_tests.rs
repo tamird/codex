@@ -980,7 +980,7 @@ async fn publication_failure_is_old_before_commit_and_visible_unknown_after_comm
     PRECOMMIT_FAILURES
         .lock()
         .expect("precommit mutex")
-        .insert(path.clone());
+        .insert(std::fs::canonicalize(&path).expect("resolve precommit injection path"));
     let error =
         publish_history_repair_replacement(home.path(), path.as_path(), replacement.as_slice())
             .await
@@ -994,7 +994,7 @@ async fn publication_failure_is_old_before_commit_and_visible_unknown_after_comm
     POSTCOMMIT_SYNC_FAILURES
         .lock()
         .expect("postcommit mutex")
-        .insert(path.clone());
+        .insert(std::fs::canonicalize(&path).expect("resolve postcommit injection path"));
     let publication =
         publish_history_repair_replacement(home.path(), path.as_path(), replacement.as_slice())
             .await
@@ -1130,7 +1130,10 @@ async fn publication_rechecks_source_identity_immediately_before_commit() {
     SOURCE_REPLACEMENTS
         .lock()
         .expect("source replacement mutex")
-        .insert(path.clone(), concurrent.clone());
+        .insert(
+            std::fs::canonicalize(&path).expect("resolve source replacement path"),
+            concurrent.clone(),
+        );
 
     let error =
         publish_history_repair_replacement(home.path(), path.as_path(), replacement.as_slice())
@@ -1277,7 +1280,10 @@ async fn compressed_publication_reports_unknown_after_visible_replacement() {
     POSTCOMMIT_SYNC_FAILURES
         .lock()
         .expect("postcommit mutex")
-        .insert(compressed_path.clone());
+        .insert(
+            std::fs::canonicalize(&compressed_path)
+                .expect("resolve compressed postcommit injection path"),
+        );
 
     let publication = publish_compressed_history_repair_replacement(
         home.path(),
@@ -1318,7 +1324,10 @@ async fn compressed_publication_retry_recognizes_the_visible_repair() {
     POSTCOMMIT_SYNC_FAILURES
         .lock()
         .expect("postcommit mutex")
-        .insert(compressed_path.clone());
+        .insert(
+            std::fs::canonicalize(&compressed_path)
+                .expect("resolve compressed postcommit injection path"),
+        );
 
     let first = publish_compressed_history_repair_replacement(
         home.path(),
@@ -1378,7 +1387,11 @@ async fn compressed_publication_preserves_a_source_replaced_before_exchange() {
     SOURCE_REPLACEMENTS
         .lock()
         .expect("compressed replacement mutex")
-        .insert(compressed_path.clone(), concurrent_compressed.clone());
+        .insert(
+            std::fs::canonicalize(&compressed_path)
+                .expect("resolve compressed source replacement path"),
+            concurrent_compressed.clone(),
+        );
 
     let error = publish_compressed_history_repair_replacement(
         home.path(),
@@ -1420,7 +1433,10 @@ async fn active_publication_reports_unknown_if_the_published_name_is_replaced() 
     PUBLISHED_REPLACEMENTS
         .lock()
         .expect("published replacement mutex")
-        .insert(path.clone(), concurrent.clone());
+        .insert(
+            std::fs::canonicalize(&path).expect("resolve published replacement path"),
+            concurrent.clone(),
+        );
 
     let publication =
         publish_history_repair_replacement(home.path(), path.as_path(), replacement.as_slice())

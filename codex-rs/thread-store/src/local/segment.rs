@@ -323,6 +323,9 @@ async fn discover_mutable_reference_owners(
     buffered_items: &[RolloutItem],
     reservation: &RolloutWriterReservation,
 ) -> ThreadStoreResult<Vec<ThreadId>> {
+    let canonical_home = fs::canonicalize(store.config.codex_home.as_path())
+        .await
+        .ok();
     let mut owners = Vec::new();
     let mut pending = vec![source_path.to_path_buf()];
     let mut pending_references = buffered_items
@@ -370,6 +373,7 @@ async fn discover_mutable_reference_owners(
                 })?;
         let recorded_immutable = reference_has_valid_recorded_immutable_candidate(
             store,
+            canonical_home.as_deref(),
             &reference,
             referenced_thread_id,
         )
@@ -386,6 +390,7 @@ async fn discover_mutable_reference_owners(
         .map_err(thread_store_io_error)?;
         let immutable = is_immutable_segment_path(
             store.config.codex_home.as_path(),
+            canonical_home.as_deref(),
             resolved.as_path(),
             referenced_thread_id,
             reference.segment_id,
@@ -405,9 +410,13 @@ async fn discover_mutable_reference_owners(
 
 async fn reference_has_valid_recorded_immutable_candidate(
     store: &LocalThreadStore,
+    canonical_home: Option<&Path>,
     reference: &RolloutReferenceItem,
     thread_id: ThreadId,
 ) -> bool {
+    let Some(canonical_home) = canonical_home else {
+        return false;
+    };
     let Some(candidate) =
         codex_rollout::existing_rollout_path(reference.rollout_path.as_path()).await
     else {
@@ -415,16 +424,14 @@ async fn reference_has_valid_recorded_immutable_candidate(
     };
     if !is_immutable_segment_path(
         store.config.codex_home.as_path(),
+        Some(canonical_home),
         candidate.as_path(),
         thread_id,
         reference.segment_id,
     ) {
         return false;
     }
-    let (Ok(canonical_home), Ok(canonical_candidate)) = (
-        fs::canonicalize(store.config.codex_home.as_path()).await,
-        fs::canonicalize(candidate.as_path()).await,
-    ) else {
+    let Ok(canonical_candidate) = fs::canonicalize(candidate.as_path()).await else {
         return false;
     };
     let expected_directory = canonical_home
@@ -1561,6 +1568,9 @@ async fn freeze_prepared_paginated_prefix_reserved_inner(
             ),
         });
     }
+    let canonical_home = fs::canonicalize(store.config.codex_home.as_path())
+        .await
+        .ok();
     for line in prefix_lines.iter_mut().skip(1) {
         let RolloutItem::RolloutReference(reference) = &mut line.item else {
             continue;
@@ -1570,8 +1580,13 @@ async fn freeze_prepared_paginated_prefix_reserved_inner(
             && reference
                 .compacted_replacement_history_filter_texts
                 .is_none()
-            && reference_has_valid_recorded_immutable_candidate(store, reference, prefix_thread_id)
-                .await
+            && reference_has_valid_recorded_immutable_candidate(
+                store,
+                canonical_home.as_deref(),
+                reference,
+                prefix_thread_id,
+            )
+            .await
         {
             continue;
         }
@@ -1721,6 +1736,9 @@ async fn freeze_paginated_prefix_reserved_inner(
             ),
         });
     }
+    let canonical_home = fs::canonicalize(store.config.codex_home.as_path())
+        .await
+        .ok();
     for line in prefix_lines.iter_mut().skip(1) {
         let RolloutItem::RolloutReference(reference) = &mut line.item else {
             continue;
@@ -1731,8 +1749,13 @@ async fn freeze_paginated_prefix_reserved_inner(
             && reference
                 .compacted_replacement_history_filter_texts
                 .is_none()
-            && reference_has_valid_recorded_immutable_candidate(store, reference, prefix_thread_id)
-                .await
+            && reference_has_valid_recorded_immutable_candidate(
+                store,
+                canonical_home.as_deref(),
+                reference,
+                prefix_thread_id,
+            )
+            .await
         {
             continue;
         }
@@ -1825,9 +1848,13 @@ async fn stabilize_rollout_reference_iteratively(
     depth: usize,
     reservation: &RolloutWriterReservation,
 ) -> ThreadStoreResult<RolloutReferenceItem> {
+    let canonical_home = fs::canonicalize(store.config.codex_home.as_path())
+        .await
+        .ok();
     let mut frames = vec![
         load_stabilization_frame(
             store,
+            canonical_home.as_deref(),
             reference,
             active_references,
             inserted_references,
@@ -1863,6 +1890,7 @@ async fn stabilize_rollout_reference_iteratively(
             frames.push(
                 load_stabilization_frame(
                     store,
+                    canonical_home.as_deref(),
                     nested_reference,
                     active_references,
                     inserted_references,
@@ -1882,6 +1910,7 @@ async fn stabilize_rollout_reference_iteratively(
         let stabilized = if !completed.nested_reference_changed
             && is_immutable_segment_path(
                 &store.config.codex_home,
+                canonical_home.as_deref(),
                 completed.resolved_path.as_path(),
                 completed.thread_id,
                 completed.reference.segment_id,
@@ -1939,6 +1968,7 @@ async fn stabilize_rollout_reference_iteratively(
 
 async fn load_stabilization_frame(
     store: &LocalThreadStore,
+    canonical_home: Option<&Path>,
     reference: RolloutReferenceItem,
     active_references: &mut HashSet<(ThreadId, RolloutId, Option<SegmentId>)>,
     inserted_references: &mut Vec<(ThreadId, RolloutId, Option<SegmentId>)>,
@@ -1981,6 +2011,7 @@ async fn load_stabilization_frame(
             .map_err(thread_store_io_error)?;
     if !is_immutable_segment_path(
         store.config.codex_home.as_path(),
+        canonical_home,
         resolved_path.as_path(),
         thread_id,
         reference.segment_id,
@@ -2027,27 +2058,25 @@ async fn load_stabilization_frame(
 
 fn is_immutable_segment_path(
     codex_home: &Path,
+    canonical_home: Option<&Path>,
     path: &Path,
     thread_id: ThreadId,
     segment_id: Option<SegmentId>,
 ) -> bool {
-    if path.starts_with(
-        codex_home
-            .join(codex_rollout::SESSIONS_SUBDIR)
-            .join(codex_rollout::ROLLOUT_SEGMENTS_SUBDIR),
-    ) {
-        return true;
-    }
-    path.starts_with(
-        codex_home
-            .join(codex_rollout::ROTATED_ROLLOUT_SEGMENTS_SUBDIR)
-            .join(thread_id.to_string())
-            .join(
-                segment_id
-                    .map(|segment_id| segment_id.to_string())
-                    .unwrap_or_else(|| "initial".to_string()),
-            ),
-    )
+    let native_directory =
+        Path::new(codex_rollout::SESSIONS_SUBDIR).join(codex_rollout::ROLLOUT_SEGMENTS_SUBDIR);
+    let rotated_directory = Path::new(codex_rollout::ROTATED_ROLLOUT_SEGMENTS_SUBDIR)
+        .join(thread_id.to_string())
+        .join(
+            segment_id
+                .map(|segment_id| segment_id.to_string())
+                .unwrap_or_else(|| "initial".to_string()),
+        );
+    let is_immutable = |home: &Path| {
+        path.starts_with(home.join(&native_directory))
+            || path.starts_with(home.join(&rotated_directory))
+    };
+    is_immutable(codex_home) || canonical_home.is_some_and(is_immutable)
 }
 
 fn rollout_references_equal(left: &RolloutReferenceItem, right: &RolloutReferenceItem) -> bool {

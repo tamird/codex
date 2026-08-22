@@ -13,6 +13,8 @@ pub(crate) mod metadata;
 mod model_context;
 mod ordinal;
 pub use ordinal::rollout_ordinal_from_slice;
+mod path_identity;
+pub use path_identity::rollout_paths_match;
 mod persistence_metrics;
 pub(crate) mod policy;
 pub(crate) mod recorder;

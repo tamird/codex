@@ -54,7 +54,7 @@ pub(crate) fn inject_history_repair_postcommit_sync_failure(path: PathBuf) {
     POSTCOMMIT_SYNC_FAILURES
         .lock()
         .expect("postcommit sync failure mutex")
-        .insert(path);
+        .insert(std::fs::canonicalize(path).expect("resolve postcommit injection path"));
 }
 #[cfg(test)]
 static SOURCE_REPLACEMENTS: LazyLock<Mutex<std::collections::HashMap<PathBuf, Vec<u8>>>> =
@@ -339,6 +339,7 @@ impl ConfinedRepairAuthority {
     fn bind_path(&self, path: &Path) -> ThreadStoreResult<PathBuf> {
         let relative = path
             .strip_prefix(self.lexical_home.as_path())
+            .or_else(|_| path.strip_prefix(self.canonical_home.as_path()))
             .map_err(|_| ThreadStoreError::Conflict {
                 message: format!(
                     "rollout {} is outside CODEX_HOME {}",

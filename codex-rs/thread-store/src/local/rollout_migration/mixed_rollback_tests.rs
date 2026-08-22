@@ -534,9 +534,20 @@ async fn mixed_rollback_case(
             journal
                 .advance(LineageMigrationPhase::ProjectionDurable)
                 .expect("old projection phase");
-            super::lineage_publish::publish_lineage_targets(&journal_path, &mut journal)
-                .await
-                .expect("publish old targets");
+            let selected_path = journal
+                .targets
+                .iter()
+                .find(|target| target.selected)
+                .expect("selected target")
+                .path
+                .clone();
+            super::lineage_publish::publish_lineage_targets(
+                &journal_path,
+                &mut journal,
+                &selected_path,
+            )
+            .await
+            .expect("publish old targets");
             preserved.extend(journal.targets.iter().map(|target| {
                 (
                     target.path.clone(),

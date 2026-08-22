@@ -70,7 +70,10 @@ pub(crate) fn inject_crash_boundary(path: &Path, boundary: ConfinedCrashBoundary
     CRASH_BOUNDARIES
         .lock()
         .expect("confined crash boundary mutex")
-        .insert(path.to_path_buf(), boundary);
+        .insert(
+            std::fs::canonicalize(path).expect("resolve confined crash injection path"),
+            boundary,
+        );
 }
 
 #[cfg(test)]
@@ -78,8 +81,9 @@ fn take_crash_boundary(path: &Path, boundary: ConfinedCrashBoundary) -> bool {
     let mut boundaries = CRASH_BOUNDARIES
         .lock()
         .expect("confined crash boundary mutex");
-    if boundaries.get(path) == Some(&boundary) {
-        boundaries.remove(path);
+    let path = std::fs::canonicalize(path).expect("resolve confined crash injection path");
+    if boundaries.get(&path) == Some(&boundary) {
+        boundaries.remove(&path);
         true
     } else {
         false
@@ -549,7 +553,8 @@ mod platform {
             let result = unsafe {
                 // `RENAME_EXCHANGE` atomically leaves the displaced source at `staged_name`, so
                 // the caller can verify the exact inode that was replaced.
-                libc::renameat2(
+                libc::syscall(
+                    libc::SYS_renameat2,
                     self.parent.as_raw_fd(),
                     staged_name.as_ptr(),
                     self.parent.as_raw_fd(),
@@ -557,7 +562,11 @@ mod platform {
                     libc::RENAME_EXCHANGE,
                 )
             };
-            cvt(result).map(|_| ())
+            if result == -1 {
+                Err(io::Error::last_os_error())
+            } else {
+                Ok(())
+            }
         }
 
         #[cfg(target_os = "macos")]

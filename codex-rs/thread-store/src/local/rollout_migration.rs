@@ -69,6 +69,7 @@ mod reference_header_tests;
 mod rollback;
 mod rollback_plan;
 mod rollback_replay;
+mod selection;
 mod single_manifest;
 mod startup;
 mod subagent;
@@ -665,12 +666,14 @@ impl LocalThreadStore {
                 .get_thread(thread_id)
                 .await
                 .map_err(migration_error)?
-            && codex_rollout::plain_rollout_path(selected.rollout_path.as_path())
-                != codex_rollout::plain_rollout_path(path.as_path())
         {
-            // A stable thread can retain older physical rollouts after a revert. Migrating one of
-            // those files would overwrite the selected thread's history mode and migration journal.
-            return Ok(None);
+            let selection =
+                selection::classify_selected_path(&selected.rollout_path, &path).await?;
+            if matches!(selection, selection::RolloutSelection::Other) {
+                // A stable thread can retain older physical rollouts after a revert. Migrating one
+                // would overwrite the selected thread's history mode and migration journal.
+                return Ok(None);
+            }
         }
         let is_memory_consolidation = matches!(
             metadata.meta.source,
@@ -716,10 +719,36 @@ impl LocalThreadStore {
                     > 0;
                 let recovery = if lineage_journal {
                     match self.writer_lock_coordinator.acquire(thread_id) {
-                        Ok(_writer_guard) => {
+                        Ok(_writer_guard) => async {
+                            let locked_metadata = selection::read_locked_metadata(
+                                &self.config.codex_home,
+                                &mut path,
+                            )
+                            .await?;
+                            if locked_metadata.meta.id != thread_id
+                                || locked_metadata.meta.history_mode != ThreadHistoryMode::Paginated
+                            {
+                                return Err(migration_error(
+                                    "published rollout metadata changed while waiting for the writer lock",
+                                ));
+                            }
+                            if let Some(state_db) = &self.state_db
+                                && let Some(selected) = state_db
+                                    .get_thread(thread_id)
+                                    .await
+                                    .map_err(migration_error)?
+                            {
+                                selection::reconcile_selected_path(
+                                    state_db,
+                                    thread_id,
+                                    &selected.rollout_path,
+                                    &path,
+                                )
+                                .await?;
+                            }
                             self.recover_legacy_lineage(&journal_path, legacy_names, limiter)
                                 .await
-                        }
+                        }.await,
                         Err(error) => Err(error),
                     }
                 } else {
@@ -751,10 +780,43 @@ impl LocalThreadStore {
                         error,
                     )),
                 }
-            } else {
-                if options.mode == RolloutMigrationMode::Apply {
+            } else if options.mode == RolloutMigrationMode::Apply {
+                let result = async {
+                    let _live_writer_guard = if matches!(admission, MigrationAdmission::Manual) {
+                        self.live_writer_locks.lock(thread_id).await
+                    } else {
+                        self.live_writer_locks.try_lock(thread_id).await?
+                    };
+                    let _writer_guard = self.writer_lock_coordinator.acquire(thread_id)?;
+                    let locked_metadata =
+                        selection::read_locked_metadata(&self.config.codex_home, &mut path).await?;
+                    if locked_metadata.meta.id != thread_id
+                        || locked_metadata.meta.history_mode != ThreadHistoryMode::Paginated
+                    {
+                        return Err(migration_error(
+                            "published rollout metadata changed while waiting for the writer lock",
+                        ));
+                    }
+                    if let Some(state_db) = &self.state_db
+                        && let Some(selected) = state_db
+                            .get_thread(thread_id)
+                            .await
+                            .map_err(migration_error)?
+                    {
+                        selection::reconcile_selected_path(
+                            state_db,
+                            thread_id,
+                            &selected.rollout_path,
+                            &path,
+                        )
+                        .await?;
+                    }
                     self.promote_legacy_name(thread_id, legacy_names).await?;
+                    Ok(RolloutMigrationStatus::AlreadyPaginated)
                 }
+                .await;
+                with_failure_reason(result, RolloutMigrationFailureReason::RolloutPublishFailed)
+            } else {
                 Ok(RolloutMigrationStatus::AlreadyPaginated)
             };
             // Repair takes lifecycle before exclusive maintenance. A job's shared maintenance
@@ -895,29 +957,8 @@ impl LocalThreadStore {
                 )));
             }
         };
-        // SessionMeta gives us the writer-lock id, so archiving can win between that read and
-        // lock acquisition. Once the lock is ours, follow the same rollout to its current path.
-        if !tokio::fs::try_exists(&path)
-            .await
-            .map_err(migration_error)?
-            && let Some(current_path) =
-                find_current_rollout_path(&self.config.codex_home, &path).await?
-        {
-            path = current_path;
-        }
-        let locked_metadata = codex_rollout::read_session_meta_line(&path)
-            .await
-            .map_err(migration_error)?;
-        if let Some(state_db) = &self.state_db
-            && let Some(selected) = state_db
-                .get_thread(thread_id)
-                .await
-                .map_err(migration_error)?
-            && codex_rollout::plain_rollout_path(selected.rollout_path.as_path())
-                != codex_rollout::plain_rollout_path(path.as_path())
-        {
-            return Ok(None);
-        }
+        let locked_metadata =
+            selection::read_locked_metadata(&self.config.codex_home, &mut path).await?;
         let locked_reference_lineage = locked_metadata.meta.history_mode
             == ThreadHistoryMode::Paginated
             && contains_convertible_rollout_reference(
@@ -938,6 +979,29 @@ impl LocalThreadStore {
                 )),
                 /*bytes_processed*/ 0,
             )));
+        }
+        if let Some(state_db) = &self.state_db
+            && let Some(selected) = state_db
+                .get_thread(thread_id)
+                .await
+                .map_err(migration_error)?
+        {
+            match selection::reconcile_selected_path(
+                state_db,
+                thread_id,
+                &selected.rollout_path,
+                &path,
+            )
+            .await
+            {
+                Ok(()) => {}
+                Err(ThreadStoreError::Conflict { message }) => {
+                    return Ok(Some(skipped_busy_outcome(
+                        thread_id, path, message, /*bytes_processed*/ 0,
+                    )));
+                }
+                Err(error) => return Err(error),
+            }
         }
         let lineage_plan = with_failure_reason(
             legacy_lineage_migration_plan(self, &path, &locked_metadata).await,
@@ -1487,9 +1551,10 @@ impl LocalThreadStore {
         limiter: &mut RolloutMigrationRateLimiter,
     ) -> ThreadStoreResult<PathBuf> {
         let _writer_guard = self.writer_lock_coordinator.acquire(thread_id)?;
-        let locked_metadata = codex_rollout::read_session_meta_line(rollout_path)
-            .await
-            .map_err(migration_error)?;
+        let mut rollout_path = rollout_path.to_path_buf();
+        let locked_metadata =
+            selection::read_locked_metadata(&self.config.codex_home, &mut rollout_path).await?;
+        let rollout_path = rollout_path.as_path();
         if locked_metadata.meta.id != thread_id
             || locked_metadata.meta.history_mode != ThreadHistoryMode::Paginated
         {
@@ -1507,13 +1572,13 @@ impl LocalThreadStore {
                         "thread {thread_id} is missing its SQLite metadata during recovery"
                     ))
                 })?;
-            if codex_rollout::plain_rollout_path(selected.rollout_path.as_path())
-                != codex_rollout::plain_rollout_path(rollout_path)
-            {
-                return Err(migration_error(
-                    "selected rollout changed while waiting for published migration recovery",
-                ));
-            }
+            selection::reconcile_selected_path(
+                state_db,
+                thread_id,
+                &selected.rollout_path,
+                rollout_path,
+            )
+            .await?;
         }
         let decompressed_path = rollout_path_is_compressed(rollout_path)
             .then(|| decompressed_staged_rollout_path(rollout_path))

@@ -197,6 +197,78 @@ async fn resume_rechecks_format_after_same_path_migration_before_writer_ownershi
 }
 
 #[tokio::test]
+async fn resume_compressed_selection_materializes_before_appending() {
+    for requested_is_compressed in [false, true] {
+        let home = tempfile::tempdir().expect("home");
+        let directory = home.path().join("sessions/2025/01/03");
+        std::fs::create_dir_all(&directory).expect("sessions");
+        let thread_id = ThreadId::new();
+        let plain = directory.join(format!("rollout-2025-01-03T12-00-00-{thread_id}.jsonl"));
+        let history = write_rollout(&plain, thread_id, "compressed original history");
+        let original = std::fs::read(&plain).expect("original bytes");
+        let compressed = plain.with_extension("jsonl.zst");
+        std::fs::write(
+            &compressed,
+            zstd::stream::encode_all(original.as_slice(), /*level*/ 0).expect("compress"),
+        )
+        .expect("write compressed rollout");
+        std::fs::remove_file(&plain).expect("remove plain representation");
+        let config = test_config(home.path());
+        let db = codex_state::StateRuntime::init(
+            config.sqlite.clone(),
+            config.default_model_provider_id.clone(),
+        )
+        .await
+        .expect("state database");
+        let mut metadata = codex_state::ThreadMetadataBuilder::new(
+            thread_id,
+            plain.clone(),
+            chrono::Utc::now(),
+            SessionSource::Cli,
+        );
+        metadata.history_mode = ThreadHistoryMode::Paginated;
+        db.upsert_thread(&metadata.build("test-provider"))
+            .await
+            .expect("select logical plain path");
+        let store = LocalThreadStore::new(config, Some(db));
+        store
+            .resume_thread(ResumeThreadParams {
+                thread_id,
+                rollout_path: Some(if requested_is_compressed {
+                    compressed
+                } else {
+                    plain.clone()
+                }),
+                history: Some(Arc::new(history)),
+                include_archived: false,
+                metadata: ThreadPersistenceMetadata {
+                    cwd: Some(home.path().to_path_buf()),
+                    model_provider: "test-provider".to_string(),
+                    memory_mode: ThreadMemoryMode::Enabled,
+                },
+            })
+            .await
+            .expect("resume compressed selection");
+        store
+            .append_items(AppendThreadItemsParams {
+                thread_id,
+                items: vec![output("append after decompression")],
+            })
+            .await
+            .expect("append");
+        store.flush_thread(thread_id).await.expect("flush");
+        store.shutdown_thread(thread_id).await.expect("shutdown");
+        let appended = std::fs::read(&plain).expect("materialized rollout");
+        assert!(appended.starts_with(&original));
+        assert!(
+            String::from_utf8(appended)
+                .expect("JSONL")
+                .contains("append after decompression")
+        );
+    }
+}
+
+#[tokio::test]
 async fn resume_rejects_selection_changed_while_old_rollout_is_retained() {
     let home = tempfile::tempdir().expect("home");
     let directory = home.path().join("sessions/2025/01/03");
@@ -229,6 +301,21 @@ async fn resume_rejects_selection_changed_while_old_rollout_is_retained() {
         .await
         .expect("select first");
     let store = LocalThreadStore::new(config, Some(db));
+    #[cfg(unix)]
+    {
+        let alias = home.path().join("session-alias");
+        std::os::unix::fs::symlink(&directory, &alias).expect("session directory alias");
+        let alias_path = alias.join(first.file_name().expect("rollout filename"));
+        let access = goal_supervisor_runtime_repair::repair_selected_history_before_access(
+            &store,
+            thread_id,
+            &alias_path,
+            goal_supervisor_runtime_repair::RepairAccess::Recent,
+        )
+        .await
+        .expect("directory alias retains the selected rollout");
+        drop(access);
+    }
     let persistence = ThreadPersistenceMetadata {
         cwd: Some(home.path().to_path_buf()),
         model_provider: "test-provider".to_string(),

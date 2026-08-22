@@ -264,7 +264,10 @@ impl ImmutableRolloutCache {
         identity: ReferenceIdentity,
         requested_path: &Path,
     ) -> io::Result<Vec<RolloutLine>> {
-        let rotated_root = codex_home.join(ROTATED_ROLLOUT_SEGMENTS_SUBDIR);
+        let rotated_root = tokio::fs::canonicalize(codex_home)
+            .await?
+            .join(ROTATED_ROLLOUT_SEGMENTS_SUBDIR);
+        let requested_canonical_path = tokio::fs::canonicalize(requested_path).await.ok();
         let cacheable_relative_path =
             path.strip_prefix(&rotated_root)
                 .ok()
@@ -273,10 +276,10 @@ impl ImmutableRolloutCache {
                         .components()
                         .all(|component| matches!(component, Component::Normal(_)))
                 });
-        if path != requested_path
+        if requested_canonical_path.as_deref() != Some(path)
             || !cacheable_relative_path
             || compression::plain_rollout_path(path) != path
-            || tokio::fs::symlink_metadata(path)
+            || tokio::fs::symlink_metadata(requested_path)
                 .await?
                 .file_type()
                 .is_symlink()

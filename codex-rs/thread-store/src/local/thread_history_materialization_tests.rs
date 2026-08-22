@@ -1830,6 +1830,130 @@ async fn referenced_paginated_rollout_projects_inherited_ordinal_range() {
 }
 
 #[tokio::test]
+async fn latest_fork_reads_frozen_ancestor_cutoff_owned_by_another_store() {
+    let home = TempDir::new().expect("temp dir");
+    let parent_store = projection_store(home.path()).await;
+    let parent_id = ThreadId::default();
+    create_paginated_thread(&parent_store, parent_id).await;
+    parent_store
+        .append_items(AppendThreadItemsParams {
+            thread_id: parent_id,
+            items: vec![
+                user_message("inherited message"),
+                user_message("after the inherited boundary"),
+            ],
+        })
+        .await
+        .expect("append parent messages");
+    let frozen = parent_store
+        .freeze_thread_segment(parent_id, FreezeRolloutSegmentParams::rotate(Vec::new()))
+        .await
+        .expect("freeze parent prefix");
+    let frozen_path = frozen.reference.rollout_path.clone();
+    let frozen_bytes = fs::read(&frozen_path).expect("read frozen prefix");
+
+    let middle_id = ThreadId::default();
+    create_paginated_subagent_thread(
+        &parent_store,
+        middle_id,
+        frozen.history_base,
+        /*subagent_history_start_ordinal*/ None,
+    )
+    .await;
+    let mut reference = frozen.reference;
+    reference.nth_user_message = Some(1);
+    parent_store
+        .append_items(AppendThreadItemsParams {
+            thread_id: middle_id,
+            items: vec![
+                RolloutItem::RolloutReference(reference),
+                user_message("middle message"),
+            ],
+        })
+        .await
+        .expect("append old reference and local message");
+    let middle_path = parent_store
+        .live_rollout_path(middle_id)
+        .await
+        .expect("middle path");
+    parent_store
+        .shutdown_thread(middle_id)
+        .await
+        .expect("close middle writer");
+    let (mut lines, _, parse_errors) =
+        codex_rollout::RolloutRecorder::load_rollout_lines(&middle_path)
+            .await
+            .expect("read middle rollout");
+    assert_eq!(parse_errors, 0);
+    let RolloutItem::SessionMeta(meta) = &mut lines[0].item else {
+        panic!("middle rollout must start with metadata");
+    };
+    // Older forks recorded this boundary only in the leading RolloutReference.
+    meta.meta.history_base = None;
+    let encoded = lines
+        .iter()
+        .map(serde_json::to_string)
+        .collect::<Result<Vec<_>, _>>()
+        .expect("encode old reference rollout");
+    fs::write(&middle_path, format!("{}\n", encoded.join("\n")))
+        .expect("write old reference rollout");
+    let middle = parent_store
+        .freeze_thread_segment(middle_id, FreezeRolloutSegmentParams::snapshot())
+        .await
+        .expect("freeze mixed-history prefix");
+    // Separate stores reproduce independent live sessions: the child cannot reserve the
+    // parent's writer, but its immutable snapshot does not depend on that writer.
+    let child_store = projection_store(home.path()).await;
+    let child_id = ThreadId::default();
+    create_paginated_subagent_thread(
+        &child_store,
+        child_id,
+        middle.history_base,
+        /*subagent_history_start_ordinal*/ None,
+    )
+    .await;
+    child_store
+        .append_items(AppendThreadItemsParams {
+            thread_id: child_id,
+            items: vec![user_message("child message")],
+        })
+        .await
+        .expect("append child message");
+    let prepared = prepare_paginated_fork(&child_store, child_id, ForkBoundary::Latest).await;
+    for history in [&prepared.model_context, &prepared.response_history] {
+        assert_eq!(
+            serde_json::to_value(
+                history
+                    .iter()
+                    .filter(|item| matches!(item, RolloutItem::ResponseItem(_)))
+                    .collect::<Vec<_>>()
+            )
+            .expect("serialize inherited messages"),
+            serde_json::to_value([
+                user_message("inherited message"),
+                user_message("middle message"),
+                user_message("child message")
+            ])
+            .expect("serialize expected messages")
+        );
+    }
+    assert_eq!(
+        fs::read(frozen_path).expect("read unchanged prefix"),
+        frozen_bytes
+    );
+    assert_eq!(
+        prepared
+            .frozen_segment
+            .as_ref()
+            .expect("frozen child prefix")
+            .source_session_meta
+            .meta
+            .id,
+        child_id
+    );
+}
+
+#[tokio::test]
 async fn bounded_cross_thread_fork_reserves_every_mutable_lineage_owner_in_uuid_order() {
     let low = ThreadId::from_string("00000000-0000-4000-8000-000000000001").expect("low thread id");
     let high =

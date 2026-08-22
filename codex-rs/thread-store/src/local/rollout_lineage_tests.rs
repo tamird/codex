@@ -422,7 +422,7 @@ async fn fork_lineage_preserves_validated_unordinaled_ancestor_cutoff() {
                 /*next_ordinal*/ 2,
             );
 
-            let expected = store
+            let mut expected = store
                 .resolve_rollout_lineage(child)
                 .await
                 .expect("resolve child lineage with explicit byte cutoff");
@@ -436,6 +436,10 @@ async fn fork_lineage_preserves_validated_unordinaled_ancestor_cutoff() {
                 .await
                 .expect("prepare child lineage for a fork reference");
 
+            for segment in &mut expected.segments {
+                segment.rollout_path = fs::canonicalize(&segment.rollout_path)
+                    .expect("canonical expected rollout path");
+            }
             assert_eq!(prepared.segments, expected.segments);
             assert_eq!(
                 fs::read(&parent_path).expect("read shared ancestor"),
@@ -478,7 +482,7 @@ async fn normalizes_rollout_references_and_same_thread_rotations() {
         vec![
             expected_segment(
                 parent,
-                parent_path.clone(),
+                fs::canonicalize(&parent_path).expect("canonical parent rollout path"),
                 /*start_ordinal*/ 1,
                 Some(history_position(
                     parent_path.as_path(),
@@ -577,7 +581,7 @@ async fn history_base_cutoff_survives_parent_rotation() {
         vec![
             expected_segment(
                 parent,
-                immutable_path,
+                fs::canonicalize(&immutable_path).expect("canonical immutable rollout path"),
                 /*start_ordinal*/ 1,
                 Some(parent_end),
             ),

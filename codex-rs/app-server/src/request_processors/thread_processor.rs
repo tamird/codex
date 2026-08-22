@@ -6308,10 +6308,7 @@ impl ThreadRequestProcessor {
                 .await
                 .map_err(thread_store_resume_read_error)?;
             if let Some(current_path) = current_thread.rollout_path.as_ref()
-                && !path_utils::paths_match_after_normalization(
-                    codex_rollout::plain_rollout_path(requested_path).as_path(),
-                    codex_rollout::plain_rollout_path(current_path).as_path(),
-                )
+                && !codex_rollout::rollout_paths_match(requested_path, current_path).await
             {
                 return Err(invalid_request(format!(
                     "cannot resume paginated thread {} with stale path: requested {}, current {}; omit path and resume by thread id",
@@ -6374,7 +6371,16 @@ impl ThreadRequestProcessor {
             .rollout_path
             .as_deref()
             .map(codex_rollout::plain_rollout_path);
-        if requested_path != selected_path {
+        // The store confines explicit paths to their physical location, while indexed metadata
+        // can retain a directory alias. A different spelling is not a different selection.
+        let same_selection = match (&requested_path, &selected_path) {
+            (Some(requested), Some(selected)) => {
+                codex_rollout::rollout_paths_match(requested, selected).await
+            }
+            (None, None) => true,
+            (Some(_), None) | (None, Some(_)) => false,
+        };
+        if !same_selection {
             return Err(invalid_request(format!(
                 "rollout path does not select the current rollout for thread {}",
                 stored_thread.thread_id

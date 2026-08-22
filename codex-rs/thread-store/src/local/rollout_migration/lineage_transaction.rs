@@ -28,6 +28,7 @@ use super::lineage_journal::LineageMigrationPhase;
 use super::lineage_journal::read_lineage_migration_journal;
 use super::lineage_journal::write_lineage_migration_journal;
 use super::lineage_publish::publish_lineage_targets;
+use super::lineage_publish::resolve_published_selection;
 use super::lineage_publish::verify_published_lineage_targets;
 use super::migration_error;
 use super::publish::decompress_rollout_to_path;
@@ -648,6 +649,10 @@ impl LocalThreadStore {
             )?;
         }
 
+        let selected_target_path = with_failure_reason(
+            resolve_published_selection(self, &journal, selected_source_path).await,
+            InterruptedMigrationRecoveryFailed,
+        )?;
         if journal.phase == LineageMigrationPhase::ProjectionDurable {
             let started = Instant::now();
             with_failure_reason(journal.verify_sources().await, RolloutReadFailed)?;
@@ -671,24 +676,18 @@ impl LocalThreadStore {
                 )
             })?;
             with_failure_reason(
-                publish_lineage_targets(journal_path, &mut journal).await,
+                publish_lineage_targets(journal_path, &mut journal, &selected_target_path).await,
                 RolloutPublishFailed,
             )?;
-            let selected_target = with_failure_reason(
-                journal
-                    .targets
-                    .iter()
-                    .find(|target| target.selected)
-                    .ok_or_else(|| migration_error("lineage journal has no selected target")),
-                InterruptedMigrationRecoveryFailed,
-            )?;
-            if current.rollout_path != selected_target.path {
+            if !codex_rollout::rollout_paths_match(&current.rollout_path, &selected_target_path)
+                .await
+            {
                 let replaced = with_failure_reason(
                     state_db
                         .replace_rollout_path_if_current(
                             journal.selected_thread_id,
                             selected_source_path,
-                            selected_target.path.as_path(),
+                            selected_target_path.as_path(),
                         )
                         .await
                         .map_err(migration_error),
@@ -738,16 +737,8 @@ impl LocalThreadStore {
         if journal.phase == LineageMigrationPhase::Selected {
             let started = Instant::now();
             with_failure_reason(
-                verify_published_lineage_targets(&journal).await,
+                verify_published_lineage_targets(&journal, &selected_target_path).await,
                 RolloutPublishFailed,
-            )?;
-            let selected_target = with_failure_reason(
-                journal
-                    .targets
-                    .iter()
-                    .find(|target| target.selected)
-                    .ok_or_else(|| migration_error("lineage journal has no selected target")),
-                InterruptedMigrationRecoveryFailed,
             )?;
             let state_db = self.state_db.as_ref().ok_or_else(|| {
                 RolloutMigrationFailure::new(
@@ -768,7 +759,9 @@ impl LocalThreadStore {
                     migration_error("selected lineage thread is missing"),
                 )
             })?;
-            if selected.rollout_path != selected_target.path {
+            if !codex_rollout::rollout_paths_match(&selected.rollout_path, &selected_target_path)
+                .await
+            {
                 return Err(RolloutMigrationFailure::new(
                     RolloutPublishFailed,
                     migration_error("selected lineage target does not match SQLite metadata"),
@@ -841,15 +834,6 @@ impl LocalThreadStore {
                 migration_error("lineage migration stopped before completion"),
             ));
         }
-        let selected_path = with_failure_reason(
-            journal
-                .targets
-                .iter()
-                .find(|target| target.selected)
-                .map(|target| target.path.clone())
-                .ok_or_else(|| migration_error("lineage journal has no selected target")),
-            InterruptedMigrationRecoveryFailed,
-        )?;
         let cleanup_result = async {
             if tokio::fs::try_exists(stage_root.as_path())
                 .await
@@ -866,7 +850,7 @@ impl LocalThreadStore {
         }
         .await;
         with_failure_reason(cleanup_result, RolloutPublishFailed)?;
-        Ok(selected_path)
+        Ok(selected_target_path)
     }
 
     async fn restart_preselection_lineage_after_target_upgrade(

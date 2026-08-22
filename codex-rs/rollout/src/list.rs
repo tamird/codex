@@ -1063,10 +1063,14 @@ async fn select_thread_candidates(
         let thread_id =
             ThreadId::from_string(&thread_uuid.to_string()).map_err(io::Error::other)?;
         if let Some(selected_path) = selected_paths.get(&thread_id) {
-            let selected_plain = compression::plain_rollout_path(selected_path.as_path());
-            if let Some(index) = candidates.iter().position(|candidate| {
-                compression::plain_rollout_path(candidate.path.as_path()) == selected_plain
-            }) {
+            let mut selected_index = None;
+            for (index, candidate) in candidates.iter().enumerate() {
+                if crate::rollout_paths_match(&candidate.path, selected_path).await {
+                    selected_index = Some(index);
+                    break;
+                }
+            }
+            if let Some(index) = selected_index {
                 selected.push(candidates.swap_remove(index));
                 continue;
             }

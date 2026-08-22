@@ -2440,9 +2440,13 @@ async fn direct_snapshot_does_not_reserve_a_valid_immutable_referenced_owner() {
         .shutdown_thread(child_id)
         .await
         .expect("release child writer");
+    let canonical_home = tokio::fs::canonicalize(home.path())
+        .await
+        .expect("canonical home");
     assert!(
         super::reference_has_valid_recorded_immutable_candidate(
             &store,
+            Some(canonical_home.as_path()),
             &parent.reference,
             parent_id,
         )

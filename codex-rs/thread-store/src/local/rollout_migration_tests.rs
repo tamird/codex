@@ -5215,6 +5215,266 @@ async fn migration_recovers_same_thread_lineage_from_every_durable_phase() {
 }
 
 #[tokio::test]
+async fn lineage_recovery_authenticates_targets_moved_during_writer_wait() {
+    for phase in [
+        LineageMigrationPhase::ProjectionDurable,
+        LineageMigrationPhase::Selected,
+        LineageMigrationPhase::Verified,
+        LineageMigrationPhase::Complete,
+    ] {
+        for (archived, compressed, altered) in [
+            (true, false, false),
+            (true, true, false),
+            (true, false, true),
+            (true, true, true),
+            (false, true, false),
+            (false, true, true),
+        ] {
+            let home = TempDir::new().expect("create Codex home");
+            let thread_id = ThreadId::new();
+            let segment_ids = [SegmentId::new(), SegmentId::new()];
+            let filename = format!("rollout-2025-01-03T12-00-00-{thread_id}.jsonl");
+            let immutable = home
+                .path()
+                .join(codex_rollout::ROTATED_ROLLOUT_SEGMENTS_SUBDIR)
+                .join(thread_id.to_string())
+                .join(segment_ids[0].to_string())
+                .join(&filename);
+            write_legacy_segment(
+                &immutable,
+                home.path(),
+                thread_id,
+                segment_ids[0],
+                vec![user_message("immutable marker")],
+            );
+            let active = home.path().join("sessions/2025/01/03").join(filename);
+            write_legacy_segment(
+                &active,
+                home.path(),
+                thread_id,
+                segment_ids[1],
+                vec![
+                    segment_reference(immutable.clone(), thread_id, segment_ids[0]),
+                    user_message("active marker"),
+                ],
+            );
+            let source_bytes = [
+                fs::read(&immutable).expect("immutable source"),
+                fs::read(&active).expect("active source"),
+            ];
+            let store = indexed_store(home.path()).await;
+            let plan = plan_legacy_lineage(home.path(), &active)
+                .await
+                .expect("plan lineage");
+            let journal_path = migration_journal_path(home.path(), thread_id);
+            let mut limiter =
+                RolloutMigrationRateLimiter::new(/*max_mib_per_second*/ None).expect("limiter");
+            let error = store
+                .migrate_legacy_lineage_until_phase_for_test(
+                    &active,
+                    &journal_path,
+                    plan,
+                    &mut limiter,
+                    phase,
+                )
+                .await
+                .expect_err("stop at durable phase");
+            assert!(
+                error
+                    .to_string()
+                    .contains("injected lineage migration stop")
+            );
+            let mut journal = read_lineage_migration_journal(&journal_path)
+                .await
+                .expect("read journal");
+            let target_path = journal
+                .targets
+                .iter()
+                .find(|target| target.selected)
+                .expect("selected target")
+                .path
+                .clone();
+            let state_db = store.state_db.as_ref().expect("state db");
+            if phase == LineageMigrationPhase::ProjectionDurable {
+                // Selection can be durable before its phase transition is recorded.
+                super::lineage_publish::publish_lineage_targets(
+                    &journal_path,
+                    &mut journal,
+                    &target_path,
+                )
+                .await
+                .expect("publish targets before phase update");
+                assert!(
+                    state_db
+                        .replace_rollout_path_if_current(thread_id, &active, &target_path)
+                        .await
+                        .expect("select target before phase update")
+                );
+                assert!(
+                    state_db
+                        .mark_thread_paginated(thread_id, /*legacy_name*/ None)
+                        .await
+                        .expect("mark selected target")
+                );
+            }
+            let journal_before = fs::read(&journal_path).expect("retained manifest");
+            let coordination = store.live_writer_locks.coordination(thread_id).await;
+            let writer_guard = store.live_writer_locks.lock(thread_id).await;
+            let writer_references = std::sync::Arc::strong_count(&coordination.writer);
+            let migration_store = store.clone();
+            let discovered_path = target_path.clone();
+            let migration = tokio::spawn(async move {
+                migration_store
+                    .migrate_rollouts_with_progress_for_trigger(
+                        apply_options(),
+                        |_| {},
+                        RolloutMigrationTrigger::Manual,
+                        RolloutMigrationPaths::Known(vec![discovered_path]),
+                    )
+                    .await
+            });
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while std::sync::Arc::strong_count(&coordination.writer) == writer_references {
+                    assert!(
+                        !migration.is_finished(),
+                        "recovery must reach the writer wait"
+                    );
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("published recovery waits for writer ownership");
+            let archived_path = if archived {
+                move_to_archived(home.path(), target_path.clone())
+            } else {
+                target_path.clone()
+            };
+            if altered {
+                let contents = fs::read_to_string(&archived_path).expect("read moved target");
+                assert!(contents.contains("active marker"));
+                fs::write(
+                    &archived_path,
+                    contents.replace("active marker", "forged marker"),
+                )
+                .expect("alter target while preserving its owner and byte count");
+            }
+            let archived_path = if compressed {
+                compress_rollout(&archived_path)
+            } else {
+                archived_path
+            };
+            let target_bytes = fs::read(&archived_path).expect("moved target bytes");
+            assert_eq!(
+                fs::read(&journal_path).expect("manifest before release"),
+                journal_before
+            );
+            drop(writer_guard);
+
+            let report = tokio::time::timeout(Duration::from_secs(5), migration)
+                .await
+                .expect("recovery completes")
+                .expect("join recovery")
+                .expect("recover moved target");
+            if altered {
+                assert_eq!(
+                    report
+                        .outcomes
+                        .iter()
+                        .map(|outcome| (outcome.status, outcome.failure_reason))
+                        .collect::<Vec<_>>(),
+                    vec![(
+                        RolloutMigrationStatus::Failed,
+                        Some(RolloutMigrationFailureReason::InterruptedMigrationRecoveryFailed)
+                    )]
+                );
+                assert_eq!(
+                    fs::read(&journal_path).expect("retain failed recovery manifest"),
+                    journal_before
+                );
+                assert_eq!(
+                    fs::read(&archived_path).expect("retain altered target"),
+                    target_bytes
+                );
+                assert!(!target_path.exists());
+                continue;
+            }
+            assert_eq!(
+                report
+                    .outcomes
+                    .iter()
+                    .map(|outcome| (outcome.status, &outcome.rollout_path))
+                    .collect::<Vec<_>>(),
+                vec![(RolloutMigrationStatus::Migrated, &archived_path)],
+                "phase {phase:?}, compressed {compressed}"
+            );
+            let selected = state_db
+                .get_thread(thread_id)
+                .await
+                .expect("read selected target")
+                .expect("selected metadata");
+            assert_eq!(
+                (selected.rollout_path, selected.history_mode),
+                (
+                    if archived {
+                        archived_path.clone()
+                    } else {
+                        target_path.clone()
+                    },
+                    ThreadHistoryMode::Paginated
+                )
+            );
+            assert!(
+                !target_path.exists(),
+                "recovery must not recreate the old target"
+            );
+            assert!(!journal_path.exists());
+            assert_eq!(
+                fs::read(&archived_path).expect("target after recovery"),
+                target_bytes
+            );
+            assert_eq!(
+                [
+                    fs::read(&immutable).expect("immutable after recovery"),
+                    fs::read(&active).expect("active after recovery")
+                ],
+                source_bytes
+            );
+            let turns = store
+                .list_turns(ListTurnsParams {
+                    thread_id,
+                    include_archived: true,
+                    cursor: None,
+                    page_size: 10,
+                    sort_direction: SortDirection::Asc,
+                    items_view: StoredTurnItemsView::Summary,
+                })
+                .await
+                .expect("read relocated lineage through public history API");
+            assert_eq!(turns.turns.len(), 2);
+            let items = turns
+                .turns
+                .into_iter()
+                .flat_map(|turn| turn.items)
+                .map(|item| {
+                    serde_json::from_slice::<serde_json::Value>(&item.item_json)
+                        .expect("decode public history item")
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(items.len(), 2);
+            let items_json =
+                serde_json::to_string(&items).expect("serialize decoded history items");
+            assert_eq!(
+                (
+                    items_json.matches("immutable marker").count(),
+                    items_json.matches("active marker").count()
+                ),
+                (1, 1)
+            );
+        }
+    }
+}
+
+#[tokio::test]
 async fn native_history_base_migration_recovers_from_every_durable_phase() {
     for phase in [
         LineageMigrationPhase::Planned,
@@ -8462,33 +8722,201 @@ async fn migration_migrates_archived_rollouts_without_unarchiving_them() {
 
 #[tokio::test]
 async fn migration_retries_a_rollout_moved_after_path_discovery() {
-    let home = TempDir::new().expect("create Codex home");
-    let thread_id = ThreadId::new();
-    let active_path = write_rollout(
-        home.path(),
-        thread_id,
-        SessionSource::Cli,
-        vec![user_message("question"), agent_message("answer")],
-    );
-    let store = indexed_store(home.path()).await;
-    let archived_path = move_to_archived(home.path(), active_path.clone());
+    for (already_paginated, pending_journal) in [(false, false), (true, false), (true, true)] {
+        let home = TempDir::new().expect("create Codex home");
+        let thread_id = ThreadId::new();
+        let active_path = write_rollout(
+            home.path(),
+            thread_id,
+            SessionSource::Cli,
+            vec![user_message("question"), agent_message("answer")],
+        );
+        let store = indexed_store(home.path()).await;
+        if already_paginated {
+            store
+                .migrate_rollouts(apply_options())
+                .await
+                .expect("publish paginated rollout before moving it");
+        }
+        if pending_journal {
+            thread_history::delete_thread(&store, thread_id)
+                .await
+                .expect("remove projection before recovery");
+            write_migration_journal(&migration_journal_path(home.path(), thread_id))
+                .await
+                .expect("retain pending published migration");
+        }
+        let archived_path = move_to_archived(home.path(), active_path.clone());
 
-    let report = store
-        .migrate_rollouts_with_progress_for_trigger(
-            apply_options(),
-            |_| {},
-            RolloutMigrationTrigger::Startup,
-            RolloutMigrationPaths::Known(vec![active_path]),
-        )
-        .await
-        .expect("migrate moved rollout");
+        let report = store
+            .migrate_rollouts_with_progress_for_trigger(
+                apply_options(),
+                |_| {},
+                RolloutMigrationTrigger::Startup,
+                RolloutMigrationPaths::Known(vec![active_path]),
+            )
+            .await
+            .expect("migrate moved rollout");
+        let expected_status = if already_paginated && !pending_journal {
+            RolloutMigrationStatus::AlreadyPaginated
+        } else {
+            RolloutMigrationStatus::Migrated
+        };
+        assert_eq!(
+            report
+                .outcomes
+                .iter()
+                .map(|outcome| outcome.status)
+                .collect::<Vec<_>>(),
+            vec![expected_status],
+        );
+        let selected = store
+            .state_db
+            .as_ref()
+            .expect("state db")
+            .get_thread(thread_id)
+            .await
+            .expect("read selected metadata")
+            .expect("selected thread");
+        assert_eq!(
+            (selected.rollout_path, selected.history_mode),
+            (archived_path, ThreadHistoryMode::Paginated),
+        );
+        let turns = store
+            .list_turns(ListTurnsParams {
+                thread_id,
+                include_archived: true,
+                cursor: None,
+                page_size: 10,
+                sort_direction: SortDirection::Asc,
+                items_view: StoredTurnItemsView::Summary,
+            })
+            .await
+            .expect("read history through relocated SQLite selection");
+        assert_eq!(
+            turns
+                .turns
+                .iter()
+                .map(|turn| turn.items.len())
+                .collect::<Vec<_>>(),
+            vec![2]
+        );
+    }
+}
 
-    assert_eq!(report.outcomes[0].status, RolloutMigrationStatus::Migrated);
-    assert!(matches!(
-        &read_rollout(&archived_path)[0].item,
-        RolloutItem::SessionMeta(metadata)
-            if metadata.meta.history_mode == ThreadHistoryMode::Paginated
-    ));
+#[tokio::test]
+async fn migration_follows_archive_moves_while_waiting_for_writer() {
+    for (already_paginated, pending_journal) in [(false, false), (true, false), (true, true)] {
+        for compressed in [false, true] {
+            let home = TempDir::new().expect("create Codex home");
+            let thread_id = ThreadId::new();
+            let active_path = write_rollout(
+                home.path(),
+                thread_id,
+                SessionSource::Cli,
+                vec![user_message("question"), agent_message("answer")],
+            );
+            let store = indexed_store(home.path()).await;
+            if already_paginated {
+                store
+                    .migrate_rollouts(apply_options())
+                    .await
+                    .expect("publish rollout before racing archive");
+            }
+            if pending_journal {
+                thread_history::delete_thread(&store, thread_id)
+                    .await
+                    .expect("remove projection before recovery");
+                write_migration_journal(&migration_journal_path(home.path(), thread_id))
+                    .await
+                    .expect("retain pending published migration");
+            }
+            let coordination = store.live_writer_locks.coordination(thread_id).await;
+            let writer_guard = store.live_writer_locks.lock(thread_id).await;
+            let writer_references = std::sync::Arc::strong_count(&coordination.writer);
+            let migration_store = store.clone();
+            let discovered_path = active_path.clone();
+            let migration = tokio::spawn(async move {
+                migration_store
+                    .migrate_rollouts_with_progress_for_trigger(
+                        apply_options(),
+                        |_| {},
+                        RolloutMigrationTrigger::Manual,
+                        RolloutMigrationPaths::Known(vec![discovered_path]),
+                    )
+                    .await
+            });
+            tokio::time::timeout(Duration::from_secs(5), async {
+                // lock_owned clones this Arc only after the initial metadata and selection reads.
+                while std::sync::Arc::strong_count(&coordination.writer) == writer_references {
+                    assert!(
+                        !migration.is_finished(),
+                        "migration must wait for writer ownership"
+                    );
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("migration reaches its writer wait");
+            let archived_path = move_to_archived(home.path(), active_path);
+            let archived_path = if compressed {
+                compress_rollout(&archived_path)
+            } else {
+                archived_path
+            };
+            drop(writer_guard);
+
+            let report = tokio::time::timeout(Duration::from_secs(5), migration)
+                .await
+                .expect("migration completes after writer release")
+                .expect("join migration")
+                .expect("follow archive move under writer ownership");
+            let expected_status = if already_paginated && !pending_journal {
+                RolloutMigrationStatus::AlreadyPaginated
+            } else {
+                RolloutMigrationStatus::Migrated
+            };
+            assert_eq!(
+                report
+                    .outcomes
+                    .iter()
+                    .map(|outcome| (outcome.status, &outcome.rollout_path))
+                    .collect::<Vec<_>>(),
+                vec![(expected_status, &archived_path)],
+            );
+            let selected = store
+                .state_db
+                .as_ref()
+                .expect("state db")
+                .get_thread(thread_id)
+                .await
+                .expect("read selection")
+                .expect("selected thread");
+            assert_eq!(
+                (selected.rollout_path, selected.history_mode),
+                (archived_path, ThreadHistoryMode::Paginated),
+            );
+            let turns = store
+                .list_turns(ListTurnsParams {
+                    thread_id,
+                    include_archived: true,
+                    cursor: None,
+                    page_size: 10,
+                    sort_direction: SortDirection::Asc,
+                    items_view: StoredTurnItemsView::Summary,
+                })
+                .await
+                .expect("read history through the repaired selection");
+            assert_eq!(
+                turns
+                    .turns
+                    .iter()
+                    .map(|turn| turn.items.len())
+                    .collect::<Vec<_>>(),
+                vec![2]
+            );
+        }
+    }
 }
 
 #[tokio::test]

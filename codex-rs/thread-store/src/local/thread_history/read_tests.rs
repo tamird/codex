@@ -168,8 +168,17 @@ async fn fork_marked_projection_requires_ancestry_without_history_base() {
     // Older fork headers lack history_base and must use the ancestry-validating fallback.
     meta.meta.forked_from_id = Some(ThreadId::new());
     meta.meta.history_base = None;
-    let predecessor = match &lines[1].item {
-        RolloutItem::RolloutReference(reference) => reference.rollout_path.clone(),
+    let predecessor = match &mut lines[1].item {
+        RolloutItem::RolloutReference(reference) => {
+            // The bounded-read fixture uses a placeholder filename because it never resolves
+            // predecessors. This test exercises resolution and needs a canonical rollout name.
+            let path = reference
+                .rollout_path
+                .with_file_name(active_path.file_name().expect("rollout filename"));
+            fs::rename(&reference.rollout_path, &path).expect("name resolvable predecessor");
+            reference.rollout_path = path.clone();
+            path
+        }
         _ => panic!("active segment must retain its predecessor reference"),
     };
     let mut encoded = Vec::new();
@@ -183,11 +192,16 @@ async fn fork_marked_projection_requires_ancestry_without_history_base() {
     )
     .bind(thread_id.to_string())
     .bind(i64::try_from(encoded.len()).expect("byte offset"))
-    .bind(8_i64)
+    .bind(i64::try_from(lines.last().expect("last record").ordinal.expect("ordinal") + 1).expect("next ordinal"))
     .execute(history_db(&store).await)
     .await
     .expect("seed complete projection checkpoint");
-    assert!(store.has_history_projection(thread_id).await.expect("valid ancestry"));
+    assert!(
+        store
+            .has_history_projection(thread_id)
+            .await
+            .expect("valid ancestry")
+    );
 
     fs::remove_file(predecessor).expect("remove required predecessor");
     store

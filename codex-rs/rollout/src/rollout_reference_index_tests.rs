@@ -4,6 +4,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 use std::time::Instant;
 
+use codex_protocol::SegmentId;
 use codex_protocol::ThreadId;
 use codex_protocol::protocol::HistoryPosition;
 use codex_protocol::protocol::RolloutReferenceItem;
@@ -297,6 +298,64 @@ async fn malformed_detached_segment_path_still_pins_mutable_source_rollout() -> 
     assert_eq!(index.reference_count(source_id), 1);
     assert_eq!(
         index.direct_references(child_id),
+        Some(&std::collections::HashSet::from([source_id]))
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn immutable_segment_reference_does_not_count_physical_target() -> anyhow::Result<()> {
+    use std::io::Write;
+
+    let home = TempDir::new()?;
+    let source_id = thread_id(Uuid::from_u128(34))?;
+    let immutable_child_id = thread_id(Uuid::from_u128(35))?;
+    let forged_child_id = thread_id(Uuid::from_u128(36))?;
+    let segment_id = SegmentId::new();
+    let immutable_path = home
+        .path()
+        .join(crate::ROTATED_ROLLOUT_SEGMENTS_SUBDIR)
+        .join(source_id.to_string())
+        .join(segment_id.to_string())
+        .join("frozen.jsonl");
+    fs::create_dir_all(immutable_path.parent().expect("immutable segment parent"))?;
+    fs::write(&immutable_path, "frozen history")?;
+
+    for (child_id, referenced_path) in [
+        (immutable_child_id, immutable_path),
+        (
+            forged_child_id,
+            active_rollout_path(home.path(), Uuid::from_u128(34)),
+        ),
+    ] {
+        let child_path = active_rollout_path(home.path(), Uuid::parse_str(&child_id.to_string())?);
+        write_rollout(child_path.clone(), child_id, /*history_base*/ None)?;
+        let reference = RolloutLine {
+            timestamp: "2025-01-03T12:00:00Z".to_string(),
+            ordinal: Some(1),
+            item: RolloutItem::RolloutReference(RolloutReferenceItem {
+                rollout_path: referenced_path,
+                thread_id: Some(source_id),
+                rollout_id: Some(source_id),
+                rollout_timestamp: None,
+                segment_id: Some(segment_id),
+                max_depth: 2,
+                nth_user_message: None,
+                compacted_replacement_history_filter_texts: None,
+            }),
+        };
+        writeln!(
+            fs::OpenOptions::new().append(true).open(child_path)?,
+            "{}",
+            serde_json::to_string(&reference)?
+        )?;
+    }
+
+    let index = RolloutReferenceIndex::scan(home.path()).await?;
+    assert_eq!(index.reference_count(source_id), 1);
+    assert_eq!(index.direct_references(immutable_child_id), None);
+    assert_eq!(
+        index.direct_references(forged_child_id),
         Some(&std::collections::HashSet::from([source_id]))
     );
     Ok(())

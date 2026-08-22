@@ -79,17 +79,37 @@ pub(super) async fn resume_thread(
     }
     if let Some(requested_path) = params.rollout_path.as_deref()
         && let Some(selected_path) = selected_rollout_path(store, params.thread_id).await?
-        && codex_rollout::plain_rollout_path(requested_path)
-            != codex_rollout::plain_rollout_path(selected_path.as_path())
     {
-        return Err(ThreadStoreError::InvalidRequest {
-            message: format!(
-                "rollout path does not select the current rollout for thread {}: requested {}, selected {}",
-                params.thread_id,
-                requested_path.display(),
-                selected_path.display()
-            ),
-        });
+        let requested_path = codex_rollout::existing_rollout_path(requested_path)
+            .await
+            .unwrap_or_else(|| requested_path.to_path_buf());
+        let selected_path = codex_rollout::existing_rollout_path(&selected_path)
+            .await
+            .unwrap_or(selected_path);
+        if codex_rollout::plain_rollout_path(
+            super::helpers::scoped_rollout_path(
+                store.config.codex_home.clone(),
+                &requested_path,
+                "Codex home",
+            )?
+            .as_path(),
+        ) != codex_rollout::plain_rollout_path(
+            super::helpers::scoped_rollout_path(
+                store.config.codex_home.clone(),
+                selected_path.as_path(),
+                "Codex home",
+            )?
+            .as_path(),
+        ) {
+            return Err(ThreadStoreError::InvalidRequest {
+                message: format!(
+                    "rollout path does not select the current rollout for thread {}: requested {}, selected {}",
+                    params.thread_id,
+                    requested_path.display(),
+                    selected_path.display()
+                ),
+            });
+        }
     }
     let has_supplied_history = params.history.is_some();
     let history_mode = if let Some(history) = params.history.as_deref().filter(|history| {
@@ -140,6 +160,11 @@ pub(super) async fn resume_thread(
                 })?
         }
     };
+    // StoredThread keeps a logical plain name; the checkpoint scanner needs the
+    // physical suffix to choose its compressed reader before append materialization.
+    let rollout_path = codex_rollout::existing_rollout_path(&rollout_path)
+        .await
+        .unwrap_or(rollout_path);
     let supplied_empty_placeholder = has_supplied_history
         && std::fs::metadata(rollout_path.as_path()).is_ok_and(|metadata| metadata.len() == 0);
     #[cfg(test)]
@@ -325,8 +350,7 @@ pub(super) async fn require_selected_rollout_path(
     expected: &std::path::Path,
 ) -> ThreadStoreResult<()> {
     if let Some(selected) = selected_rollout_path(store, thread_id).await?
-        && codex_rollout::plain_rollout_path(expected)
-            != codex_rollout::plain_rollout_path(&selected)
+        && !codex_rollout::rollout_paths_match(expected, &selected).await
     {
         return Err(ThreadStoreError::Conflict {
             message: format!(

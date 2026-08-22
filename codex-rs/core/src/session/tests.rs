@@ -2985,7 +2985,11 @@ fn configured_multi_agent_v2_preserves_persisted_v1_history() {
 async fn empty_reference_prefix_continues_after_physical_metadata_ordinal() {
     let codex_home = tempfile::tempdir().expect("create Codex home");
     let source_thread_id = ThreadId::default();
-    let source_path = codex_home.path().join(format!(
+    let sessions_path = codex_home.path().join("sessions");
+    tokio::fs::create_dir_all(&sessions_path)
+        .await
+        .expect("create approved rollout directory");
+    let source_path = sessions_path.join(format!(
         "rollout-2025-01-01T00-00-00-{source_thread_id}.jsonl"
     ));
     let source_meta = SessionMetaLine {
