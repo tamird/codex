@@ -29,9 +29,9 @@ impl ThreadEventStore {
         {
             previous.delta.push_str(&delta.delta);
             // Only escaped string content is new; the existing notification already owns quotes.
-            self.buffered_payload_bytes = self
-                .buffered_payload_bytes
-                .saturating_add(json_bytes(&delta.delta).saturating_sub(/*rhs*/ 2));
+            let added_bytes = json_bytes(&delta.delta).saturating_sub(/*rhs*/ 2);
+            self.buffered_payload_bytes = self.buffered_payload_bytes.saturating_add(added_bytes);
+            self.buffered_history_bytes = self.buffered_history_bytes.saturating_add(added_bytes);
             self.buffered_agent_message_delta_bytes = self
                 .buffered_agent_message_delta_bytes
                 .saturating_add(delta.delta.len());
@@ -45,9 +45,11 @@ impl ThreadEventStore {
     }
 
     pub(super) fn push_buffered_event(&mut self, event: ThreadBufferedEvent) {
-        self.buffered_payload_bytes = self
-            .buffered_payload_bytes
-            .saturating_add(event.payload_bytes());
+        let bytes = event.payload_bytes();
+        self.buffered_payload_bytes = self.buffered_payload_bytes.saturating_add(bytes);
+        if event.is_transcript() {
+            self.buffered_history_bytes = self.buffered_history_bytes.saturating_add(bytes);
+        }
         if let ThreadBufferedEvent::Notification(notification) = &event
             && let ServerNotification::AgentMessageDelta(delta) = notification.as_ref()
         {
@@ -66,9 +68,11 @@ impl ThreadEventStore {
             let Some(removed) = self.buffer.pop_front() else {
                 break;
             };
-            self.buffered_payload_bytes = self
-                .buffered_payload_bytes
-                .saturating_sub(removed.payload_bytes());
+            let bytes = removed.payload_bytes();
+            self.buffered_payload_bytes = self.buffered_payload_bytes.saturating_sub(bytes);
+            if removed.is_transcript() {
+                self.buffered_history_bytes = self.buffered_history_bytes.saturating_sub(bytes);
+            }
             match removed {
                 ThreadBufferedEvent::Notification(notification) => {
                     if let ServerNotification::AgentMessageDelta(delta) = notification.as_ref() {

@@ -5,6 +5,7 @@
 //! when the visible thread changes.
 
 use super::session_lifecycle::ThreadAttachPresentation;
+use super::thread_cache_eviction::INACTIVE_HISTORY_BUDGET;
 use super::*;
 use crate::app_event::ThreadTitleDestination;
 use crate::chatwidget::ThreadInputStateRestoreMode;
@@ -70,6 +71,7 @@ impl App {
         self.active_thread_id = Some(thread_id);
         self.active_thread_rx = receiver;
         self.refresh_pending_thread_approvals().await;
+        self.trim_thread_cache(INACTIVE_HISTORY_BUDGET);
     }
 
     pub(super) async fn store_active_thread_receiver(&mut self) {
@@ -113,6 +115,7 @@ impl App {
         }
         self.active_thread_rx = None;
         self.refresh_pending_thread_approvals().await;
+        self.trim_thread_cache(INACTIVE_HISTORY_BUDGET);
     }
 
     pub(super) async fn note_thread_outbound_op(&mut self, thread_id: ThreadId, op: &AppCommand) {
@@ -133,6 +136,7 @@ impl App {
         } else {
             self.clear_side_parent_action_status(thread_id);
         }
+        self.trim_thread_cache_after_event(thread_id);
     }
 
     pub(super) async fn note_active_thread_outbound_op(&mut self, op: &AppCommand) {
@@ -1063,6 +1067,7 @@ impl App {
             self.clear_side_parent_action_status(thread_id);
         }
         self.update_pending_thread_approval(thread_id, has_pending_approvals);
+        self.trim_thread_cache_after_event(thread_id);
         Ok(())
     }
 

@@ -5,7 +5,6 @@
 //! pending interactive request replay state, active-turn tracking, and saved composer state close
 //! together with the replay behavior that consumes them.
 
-use super::thread_cache::json_bytes;
 use super::thread_cache_eviction::TerminalDelivery;
 use super::thread_cache_eviction::TerminalNotification;
 use super::*;
@@ -58,6 +57,8 @@ pub(super) struct ThreadEventStore {
     recap_progress: recap::RecapProgress,
     pub(super) buffered_payload_bytes: usize,
     pub(super) turn_payload_bytes: usize,
+    pub(super) buffered_history_bytes: usize,
+    pub(super) history_reload_required: bool,
     pub(super) terminal_notification: Option<TerminalNotification>,
 }
 
@@ -90,6 +91,8 @@ impl ThreadEventStore {
             recap_progress: recap::RecapProgress::default(),
             buffered_payload_bytes: 0,
             turn_payload_bytes: 0,
+            buffered_history_bytes: 0,
+            history_reload_required: false,
             terminal_notification: None,
         }
     }
@@ -114,6 +117,7 @@ impl ThreadEventStore {
     pub(super) fn rebase_buffer_after_session_refresh(&mut self) {
         self.buffer.retain(Self::event_survives_session_refresh);
         self.buffered_agent_message_delta_bytes = 0;
+        self.buffered_history_bytes = 0;
         self.buffered_payload_bytes = self
             .buffer
             .iter()
@@ -122,8 +126,6 @@ impl ThreadEventStore {
     }
 
     pub(super) fn set_turns(&mut self, turns: Vec<Turn>) {
-        self.recap_progress
-            .merge(recap::RecapProgress::from_turns(&turns));
         self.active_turn_id = turns
             .iter()
             .rev()
@@ -136,11 +138,7 @@ impl ThreadEventStore {
                 input_state.finish_running_turn();
             }
         }
-        self.turn_payload_bytes = turns
-            .iter()
-            .map(json_bytes)
-            .fold(/*init*/ 0, usize::saturating_add);
-        self.turns = turns;
+        self.set_history_payload(turns);
     }
 
     pub(super) fn push_notification(&mut self, notification: ServerNotification) {

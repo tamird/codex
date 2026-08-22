@@ -1,11 +1,12 @@
 //! Payload accounting for the TUI's retained transcript caches.
 //!
 //! JSON byte counts estimate payload size, not allocated or resident memory. They exclude saved
-//! input, session metadata, channel copies, transient replay snapshots, and rendered history cells.
+//! input, compact lifecycle/session metadata, channel copies, transient snapshots, and rendered cells.
 //! Count payloads when the cache changes; the activity-window report only reads cached counters.
 
 use super::App;
 use super::ThreadBufferedEvent;
+use super::thread_cache_eviction::INACTIVE_HISTORY_BUDGET;
 use crate::app_event::HistoryLookupResponse;
 use codex_protocol::ThreadId;
 use serde::Serialize;
@@ -72,6 +73,8 @@ struct ThreadCacheSample {
     turn_count: usize,
     active: bool,
     running: bool,
+    reclaimable_bytes: usize,
+    history_evicted: bool,
 }
 
 impl App {
@@ -82,6 +85,8 @@ impl App {
         let mut turn_bytes = 0usize;
         let mut inactive_bytes = 0usize;
         let mut running_bytes = 0usize;
+        let mut reclaimable_bytes = 0usize;
+        let mut pinned_bytes = 0usize;
         let mut event_count = 0usize;
         let mut turn_count = 0usize;
         let mut queued_event_count = self
@@ -104,6 +109,14 @@ impl App {
             if running {
                 running_bytes = running_bytes.saturating_add(bytes);
             }
+            let reclaimable =
+                if !self.side_threads.contains_key(thread_id) && store.can_evict_history() {
+                    store.history_payload_bytes()
+                } else {
+                    0
+                };
+            reclaimable_bytes = reclaimable_bytes.saturating_add(reclaimable);
+            pinned_bytes = pinned_bytes.saturating_add(bytes.saturating_sub(reclaimable));
             queued_event_count = queued_event_count.saturating_add(
                 channel
                     .receiver
@@ -118,6 +131,8 @@ impl App {
                 turn_count: store.turns.len(),
                 active: store.active,
                 running,
+                reclaimable_bytes: reclaimable,
+                history_evicted: store.history_reload_required,
             });
         }
         tracing::debug!(
@@ -131,6 +146,9 @@ impl App {
             turn_payload_json_bytes = turn_bytes,
             inactive_payload_json_bytes = inactive_bytes,
             running_payload_json_bytes = running_bytes,
+            reclaimable_payload_json_bytes = reclaimable_bytes,
+            pinned_payload_json_bytes = pinned_bytes,
+            inactive_history_budget_bytes = INACTIVE_HISTORY_BUDGET,
             queued_event_count,
             transcript_cell_count = self.transcript_cells.len(),
             "TUI retained payload estimates (not heap bytes)"
@@ -149,6 +167,8 @@ impl App {
                 turn_count = sample.turn_count,
                 active = sample.active,
                 running = sample.running,
+                reclaimable_payload_json_bytes = sample.reclaimable_bytes,
+                history_evicted = sample.history_evicted,
                 "TUI retained thread payload estimate (not heap bytes)"
             );
         }

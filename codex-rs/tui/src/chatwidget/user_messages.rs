@@ -150,6 +150,10 @@ pub(crate) struct ThreadInputState {
 }
 
 impl ThreadInputState {
+    pub(crate) fn has_in_flight_input(&self) -> bool {
+        self.user_turn_pending_start || !self.pending_steers.is_empty() || self.task_running
+    }
+
     pub(crate) fn acknowledge_started_turn(&mut self) {
         self.user_turn_pending_start = false;
         self.agent_turn_running = true;

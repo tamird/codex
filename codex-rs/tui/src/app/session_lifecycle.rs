@@ -547,6 +547,15 @@ impl App {
                 .add_error_message(format!("Agent thread {thread_id} is no longer available."));
             return Ok(());
         }
+        if let Err(error) = self
+            .reload_evicted_thread_history(tui, app_server, thread_id)
+            .await
+        {
+            self.chat_widget.add_error_message(format!(
+                "Failed to reload agent thread {thread_id}: {error:#}"
+            ));
+            return Ok(());
+        }
         let previous_thread_id = self.active_thread_id;
         self.store_active_thread_receiver().await;
         self.active_thread_id = None;
@@ -621,6 +630,7 @@ impl App {
             self.chat_widget.add_info_message(message, /*hint*/ None);
         }
         self.refresh_pending_thread_approvals().await;
+        self.trim_thread_cache(super::thread_cache_eviction::INACTIVE_HISTORY_BUDGET);
 
         Ok(())
     }

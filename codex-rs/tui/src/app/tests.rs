@@ -32,6 +32,8 @@ mod session_summary;
 mod startup;
 #[path = "tests/stream_animation_tests.rs"]
 mod stream_animation_tests;
+#[path = "tests/thread_cache_eviction_tests.rs"]
+mod thread_cache_eviction_tests;
 #[path = "tests/thread_usage.rs"]
 mod thread_usage;
 #[path = "tests/turn_submission.rs"]
@@ -3957,6 +3959,16 @@ async fn inactive_thread_file_change_approval_recovers_buffered_changes() {
             grant_root: None,
         },
     };
+
+    {
+        let mut store = app.thread_event_channels[&thread_id].store.lock().await;
+        store.session = Some(test_thread_session(
+            thread_id,
+            test_path_buf("/tmp/project"),
+        ));
+        store.push_request(request.clone());
+    }
+    app.trim_thread_cache(/*budget*/ 0);
 
     let request = app
         .interactive_request_for_thread_request(thread_id, &request)

@@ -2565,6 +2565,146 @@ async fn agents_overview_stop_uses_full_history_after_legacy_negotiation() -> Re
 }
 
 #[tokio::test]
+async fn evicted_history_selection_reloads_without_resuming() -> Result<()> {
+    let (mut app, mut events, _op_rx) = make_test_app_with_channels().await;
+    let codex_home = tempdir()?;
+    app.config.codex_home = codex_home.path().to_path_buf().abs();
+    app.config.sqlite = SqliteConfig::new_for_testing(codex_home.path().abs());
+    let paginated_thread_id = create_history_rollout(
+        &app.config,
+        ThreadHistoryMode::Paginated,
+        "paginated visible history",
+    )?;
+    let (mut app_server, requests, proxy) = start_recording_app_server(
+        &app.config,
+        /*blocked_thread_list*/ None,
+        /*failed_thread_name*/ None,
+    )
+    .await?;
+    let resumed = app_server
+        .resume_thread(
+            app.config.clone(),
+            paginated_thread_id,
+            crate::app_server_session::ResumeModelSettings::RestoreFromThread,
+        )
+        .await?;
+    let resume_requests = recorded_params(&requests, "thread/resume");
+    let saved_input = app.chat_widget.capture_thread_input_state();
+    let later_turn = resumed.turns.last().expect("saved turn").clone();
+    {
+        let channel = app.ensure_thread_channel(paginated_thread_id);
+        channel.mark_replay_only();
+        let mut store = channel.store.lock().await;
+        store.set_session(resumed.session, resumed.turns);
+        store.input_state = saved_input.clone();
+        store.evict_history();
+    }
+    // Notifications received after eviction can already be present in the reloaded history.
+    app.enqueue_thread_notification(
+        paginated_thread_id,
+        turn_started_notification(paginated_thread_id, &later_turn.id),
+    )
+    .await?;
+    for item in later_turn.items {
+        app.enqueue_thread_notification(
+            paginated_thread_id,
+            ServerNotification::ItemCompleted(
+                codex_app_server_protocol::ItemCompletedNotification {
+                    thread_id: paginated_thread_id.to_string(),
+                    turn_id: later_turn.id.clone(),
+                    item,
+                    completed_at_ms: 0,
+                },
+            ),
+        )
+        .await?;
+    }
+    app.enqueue_thread_notification(
+        paginated_thread_id,
+        turn_completed_notification(paginated_thread_id, &later_turn.id, TurnStatus::Completed),
+    )
+    .await?;
+    app_server.thread_unsubscribe(paginated_thread_id).await?;
+    let saved_input = app.thread_event_channels[&paginated_thread_id]
+        .store
+        .lock()
+        .await
+        .input_state
+        .clone();
+    let mut tui = crate::tui::test_support::make_test_tui()?;
+    app.select_agent_thread(&mut tui, &mut app_server, paginated_thread_id)
+        .await?;
+    {
+        let store = app.thread_event_channels[&paginated_thread_id]
+            .store
+            .lock()
+            .await;
+        assert!(!store.history_reload_required);
+        assert!(!store.turns.is_empty());
+        assert_eq!(store.input_state, saved_input);
+    }
+    assert_eq!(app.active_thread_id, Some(paginated_thread_id));
+    let visible = std::iter::from_fn(|| events.try_recv().ok())
+        .filter_map(|event| match event {
+            AppEvent::InsertHistoryCell(cell) => {
+                Some(lines_to_single_string(&cell.display_lines(/*width*/ 200)))
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert_eq!(visible.matches("paginated visible history").count(), 1);
+    assert_eq!(
+        recorded_params(&requests, "thread/resume").len(),
+        resume_requests.len()
+    );
+    let missing_thread_id = ThreadId::from_string("00000000-0000-0000-0000-000000000001")?;
+    {
+        let channel = app.ensure_thread_channel(missing_thread_id);
+        let mut store = channel.store.lock().await;
+        store.set_session(
+            test_thread_session(missing_thread_id, test_path_buf("/tmp/missing")),
+            Vec::new(),
+        );
+        store.evict_history();
+    }
+    app.chat_widget
+        .apply_external_edit("keep draft".to_string());
+    app.select_agent_thread(&mut tui, &mut app_server, missing_thread_id)
+        .await?;
+    assert_eq!(app.active_thread_id, Some(paginated_thread_id));
+    assert_eq!(app.chat_widget.thread_id(), Some(paginated_thread_id));
+    assert_eq!(app.chat_widget.composer_text_with_pending(), "keep draft");
+    assert!(
+        app.thread_event_channels[&missing_thread_id]
+            .store
+            .lock()
+            .await
+            .history_reload_required
+    );
+    let error = std::iter::from_fn(|| events.try_recv().ok())
+        .find_map(|event| match event {
+            AppEvent::InsertHistoryCell(cell) => Some(cell),
+            _ => None,
+        })
+        .expect("reload error");
+    assert_snapshot!(
+        lines_to_single_string(&error.display_lines(/*width*/ 250)),
+        @"■ Failed to reload agent thread 00000000-0000-0000-0000-000000000001: thread/read failed during TUI session lookup: thread/read failed: thread not loaded: 00000000-0000-0000-0000-000000000001 (code -32600)"
+    );
+    assert!(
+        recorded_params(&requests, "thread/read")
+            .iter()
+            .all(|params| params["includeTurns"] != true)
+    );
+    assert!(!recorded_params(&requests, "thread/turns/list").is_empty());
+    assert!(!recorded_params(&requests, "thread/items/list").is_empty());
+    app_server.shutdown().await?;
+    proxy.await??;
+    Ok(())
+}
+
+#[tokio::test]
 async fn cold_paginated_subagent_transcript_excludes_inherited_parent_history() -> Result<()> {
     let (app, codex_home) = make_history_test_app().await?;
     let parent_thread_id = create_history_rollout(

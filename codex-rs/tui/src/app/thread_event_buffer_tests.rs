@@ -102,6 +102,23 @@ fn thread_event_store_coalesces_only_adjacent_matching_agent_message_deltas() {
                     .len())
                 .sum::<usize>()
         );
+        assert_eq!(
+            store.buffered_history_bytes,
+            store
+                .buffer
+                .iter()
+                .filter_map(|event| match event {
+                    ThreadBufferedEvent::Notification(notification) => Some(
+                        serde_json::to_vec(notification)
+                            .expect("notification should serialize")
+                            .len()
+                    ),
+                    ThreadBufferedEvent::Request(_)
+                    | ThreadBufferedEvent::HistoryEntryResponse(_)
+                    | ThreadBufferedEvent::FeedbackSubmission(_) => None,
+                })
+                .sum::<usize>()
+        );
         events
     };
 
