@@ -8210,6 +8210,16 @@ async fn refreshed_snapshot_session_persists_resumed_turns() {
             last_recapped_turn_count: None,
         }
     );
+    assert_eq!(
+        store.turn_payload_bytes,
+        snapshot
+            .turns
+            .iter()
+            .map(|turn| serde_json::to_vec(turn)
+                .expect("turn should serialize")
+                .len())
+            .sum::<usize>()
+    );
 }
 
 #[tokio::test]

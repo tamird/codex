@@ -939,6 +939,7 @@ See the Codex keymap documentation for supported actions and examples."
                 ) && let Some(thread_id) = app.chat_widget.thread_id().or(app.primary_thread_id)
                 {
                     performance_window.report(summary, thread_id);
+                    app.report_thread_cache(thread_id).await;
                 }
                 // Whole draw events also include preparation and post-render work.
                 if duration >= SLOW_TUI_OPERATION_THRESHOLD {

@@ -5,6 +5,7 @@
 //! pending interactive request replay state, active-turn tracking, and saved composer state close
 //! together with the replay behavior that consumes them.
 
+use super::thread_cache::json_bytes;
 use super::*;
 use std::borrow::Cow;
 
@@ -51,6 +52,8 @@ pub(super) struct ThreadEventStore {
     pub(super) active: bool,
     pub(super) buffered_agent_message_delta_bytes: usize,
     recap_progress: recap::RecapProgress,
+    pub(super) buffered_payload_bytes: usize,
+    pub(super) turn_payload_bytes: usize,
 }
 
 impl ThreadEventStore {
@@ -80,6 +83,8 @@ impl ThreadEventStore {
             active: false,
             buffered_agent_message_delta_bytes: 0,
             recap_progress: recap::RecapProgress::default(),
+            buffered_payload_bytes: 0,
+            turn_payload_bytes: 0,
         }
     }
 
@@ -103,6 +108,11 @@ impl ThreadEventStore {
     pub(super) fn rebase_buffer_after_session_refresh(&mut self) {
         self.buffer.retain(Self::event_survives_session_refresh);
         self.buffered_agent_message_delta_bytes = 0;
+        self.buffered_payload_bytes = self
+            .buffer
+            .iter()
+            .map(ThreadBufferedEvent::payload_bytes)
+            .fold(/*init*/ 0, usize::saturating_add);
     }
 
     pub(super) fn set_turns(&mut self, turns: Vec<Turn>) {
@@ -120,6 +130,10 @@ impl ThreadEventStore {
                 input_state.finish_running_turn();
             }
         }
+        self.turn_payload_bytes = turns
+            .iter()
+            .map(json_bytes)
+            .fold(/*init*/ 0, usize::saturating_add);
         self.turns = turns;
     }
 
@@ -742,6 +756,7 @@ mod tests {
     fn thread_event_store_rebase_preserves_hook_notifications() {
         let thread_id = ThreadId::new();
         let mut store = ThreadEventStore::new(/*capacity*/ 8);
+        store.push_notification(turn_started_notification(thread_id, "turn-hook"));
         store.push_notification(hook_started_notification(thread_id, "turn-hook"));
         store.push_notification(hook_completed_notification(thread_id, "turn-hook"));
 
@@ -758,6 +773,15 @@ mod tests {
                 other => panic!("expected buffered hook notification, saw: {other:?}"),
             })
             .collect::<Vec<_>>();
+        assert_eq!(
+            store.buffered_payload_bytes,
+            hook_notifications
+                .iter()
+                .map(|event| serde_json::to_vec(event)
+                    .expect("hook should serialize")
+                    .len())
+                .sum::<usize>()
+        );
         assert_eq!(
             hook_notifications,
             vec![

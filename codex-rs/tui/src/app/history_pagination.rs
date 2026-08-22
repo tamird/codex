@@ -2,6 +2,7 @@
 
 use std::collections::HashSet;
 
+use super::thread_cache::json_bytes;
 use super::*;
 use crate::app_server_session::HISTORY_ITEM_PAGE_LIMIT;
 use crate::app_server_session::thread_items_page_params;
@@ -185,19 +186,35 @@ impl App {
         items.retain(|item| !hidden_item_ids.contains(item.id()));
         {
             let mut store = store.lock().await;
+            let mut added_payload_bytes = 0usize;
             turns.retain_mut(|turn| {
                 let Some(current) = store.turns.iter_mut().find(|current| current.id == turn.id)
                 else {
+                    added_payload_bytes = added_payload_bytes.saturating_add(json_bytes(turn));
                     return true;
                 };
                 let items = std::mem::take(&mut turn.items)
                     .into_iter()
                     .filter(|item| !current.items.iter().any(|known| known.id() == item.id()))
                     .collect::<Vec<_>>();
+                // Charge only the new items and their array separators, not the old turn again.
+                added_payload_bytes = added_payload_bytes
+                    .saturating_add(
+                        items
+                            .iter()
+                            .map(json_bytes)
+                            .fold(/*init*/ 0, usize::saturating_add),
+                    )
+                    .saturating_add(
+                        items
+                            .len()
+                            .saturating_sub(usize::from(current.items.is_empty())),
+                    );
                 current.items.splice(0..0, items);
                 false
             });
             store.turns.splice(0..0, turns);
+            store.turn_payload_bytes = store.turn_payload_bytes.saturating_add(added_payload_bytes);
         }
         let cells = thread_items_to_transcript_cells(
             Some(thread_id),

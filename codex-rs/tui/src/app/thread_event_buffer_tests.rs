@@ -79,7 +79,7 @@ fn thread_event_store_coalesces_only_adjacent_matching_agent_message_deltas() {
         delta: "other thread".to_string(),
     });
     let snapshot_events = |store: &ThreadEventStore| {
-        store
+        let events = store
             .snapshot()
             .events
             .into_iter()
@@ -92,11 +92,21 @@ fn thread_event_store_coalesces_only_adjacent_matching_agent_message_deltas() {
                 }
                 other => panic!("unexpected buffered event: {other:?}"),
             })
-            .collect::<Vec<_>>()
+            .collect::<Vec<_>>();
+        assert_eq!(
+            store.buffered_payload_bytes,
+            events
+                .iter()
+                .map(|event| serde_json::to_vec(event)
+                    .expect("event should serialize")
+                    .len())
+                .sum::<usize>()
+        );
+        events
     };
 
     store.push_notification(delta("turn-1", "item-1", "hello"));
-    store.push_notification_ref(&delta("turn-1", "item-1", " world"));
+    store.push_notification_ref(&delta("turn-1", "item-1", " world\n\""));
     store.push_notification(delta("turn-1", "item-2", "another"));
     store.push_notification(delta("turn-2", "item-2", "next"));
     store.push_notification(other_thread_delta.clone());
@@ -106,7 +116,7 @@ fn thread_event_store_coalesces_only_adjacent_matching_agent_message_deltas() {
     assert_eq!(
         snapshot_events(&store),
         vec![
-            serde_json::to_value(delta("turn-1", "item-1", "hello world"))
+            serde_json::to_value(delta("turn-1", "item-1", "hello world\n\""))
                 .expect("delta should serialize"),
             serde_json::to_value(delta("turn-1", "item-2", "another"))
                 .expect("delta should serialize"),

@@ -3,6 +3,7 @@
 use super::ServerNotification;
 use super::ThreadBufferedEvent;
 use super::ThreadEventStore;
+use super::thread_cache::json_bytes;
 use std::borrow::Cow;
 
 // Keep merged text finite so continued streaming still reaches bounded replay eviction.
@@ -27,6 +28,10 @@ impl ThreadEventStore {
                 <= MAX_COALESCED_AGENT_MESSAGE_DELTA_BYTES
         {
             previous.delta.push_str(&delta.delta);
+            // Only escaped string content is new; the existing notification already owns quotes.
+            self.buffered_payload_bytes = self
+                .buffered_payload_bytes
+                .saturating_add(json_bytes(&delta.delta).saturating_sub(/*rhs*/ 2));
             self.buffered_agent_message_delta_bytes = self
                 .buffered_agent_message_delta_bytes
                 .saturating_add(delta.delta.len());
@@ -40,6 +45,9 @@ impl ThreadEventStore {
     }
 
     pub(super) fn push_buffered_event(&mut self, event: ThreadBufferedEvent) {
+        self.buffered_payload_bytes = self
+            .buffered_payload_bytes
+            .saturating_add(event.payload_bytes());
         if let ThreadBufferedEvent::Notification(notification) = &event
             && let ServerNotification::AgentMessageDelta(delta) = notification.as_ref()
         {
@@ -58,6 +66,9 @@ impl ThreadEventStore {
             let Some(removed) = self.buffer.pop_front() else {
                 break;
             };
+            self.buffered_payload_bytes = self
+                .buffered_payload_bytes
+                .saturating_sub(removed.payload_bytes());
             match removed {
                 ThreadBufferedEvent::Notification(notification) => {
                     if let ServerNotification::AgentMessageDelta(delta) = notification.as_ref() {

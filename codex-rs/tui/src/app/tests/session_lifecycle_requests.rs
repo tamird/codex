@@ -1734,6 +1734,20 @@ async fn older_pagination_reconciles_review_prompts_across_page_boundaries() -> 
     app.handle_older_history_page(&mut tui, &mut app_server, thread_id, &cursor, Ok(page))
         .await?;
 
+    {
+        let store = app.thread_event_channels[&thread_id].store.lock().await;
+        assert_eq!(
+            store.turn_payload_bytes,
+            store
+                .turns
+                .iter()
+                .map(|turn| serde_json::to_vec(turn)
+                    .expect("turn should serialize")
+                    .len())
+                .sum::<usize>()
+        );
+    }
+
     let visible_user_messages = app
         .transcript_cells
         .iter()
