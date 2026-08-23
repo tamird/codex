@@ -91,12 +91,14 @@ async fn projection_store(home: &std::path::Path) -> LocalThreadStore {
 async fn bulk_projection_matches_ordered_sql_for_late_and_duplicate_events() {
     let home = tempfile::tempdir().expect("Codex home");
     let store = projection_store(home.path()).await;
+    let mut legacy_completion = turn("a", TurnStatus::Completed);
+    legacy_completion.changed_turns[0].started_at = None;
     let changes = vec![
         item("a", "user", "userMessage", /*phase*/ None),
         item("a", "unphased", "agentMessage", /*phase*/ None),
         turn("a", TurnStatus::InProgress),
         item("a", "final", "agentMessage", Some("final_answer")),
-        turn("a", TurnStatus::Completed),
+        legacy_completion,
         item("a", "final", "userMessage", /*phase*/ None),
         item("a", "late", "agentMessage", Some("final_answer")),
         turn("a", TurnStatus::Failed),
@@ -158,6 +160,21 @@ async fn bulk_projection_matches_ordered_sql_for_late_and_duplicate_events() {
             .await
             .expect("bulk insert");
         assert_eq!(rows(&store, actual).await, rows(&store, reference).await);
+        for id in [reference, actual] {
+            let started_at = sqlx::query_scalar::<_, Option<i64>>(
+                "SELECT started_at FROM thread_turns WHERE thread_id = ? AND turn_id = 'a'",
+            )
+            .bind(id.to_string())
+            .fetch_one(
+                store
+                    .thread_history_db()
+                    .await
+                    .expect("projection database"),
+            )
+            .await
+            .expect("completed legacy turn");
+            assert_eq!(started_at, Some(1));
+        }
     }
 }
 

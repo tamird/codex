@@ -705,7 +705,7 @@ async fn apply_change_set(
         };
         // The same turn can appear again as it moves from started to completed. Update its latest
         // status, error, and timestamps, but keep the rollout ordinal from the first record that
-        // created it.
+        // created it. Older terminal events omit started_at, so retain the start event's value.
         sqlx::query(
             r#"
 INSERT INTO thread_turns (
@@ -726,7 +726,7 @@ ON CONFLICT(thread_id, turn_id) DO UPDATE SET
     rollout_end_byte_offset = excluded.rollout_end_byte_offset,
     status = excluded.status,
     error_json = excluded.error_json,
-    started_at = excluded.started_at,
+    started_at = COALESCE(excluded.started_at, thread_turns.started_at),
     completed_at = excluded.completed_at,
     duration_ms = excluded.duration_ms
 WHERE thread_turns.rollout_end_ordinal IS NULL

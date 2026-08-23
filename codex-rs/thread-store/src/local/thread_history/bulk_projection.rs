@@ -122,7 +122,10 @@ impl BulkProjection {
                 {
                     turn.end_ordinal = terminal.then_some(ordinal);
                     turn.end_byte_offset = terminal.then_some(end_byte_offset);
+                    // Older terminal events omit the timestamp recorded by TurnStarted.
+                    let started_at = change.started_at.or(turn.change.started_at);
                     turn.change = change.clone();
+                    turn.change.started_at = started_at;
                 }
                 Some(_) => {}
                 None => {
