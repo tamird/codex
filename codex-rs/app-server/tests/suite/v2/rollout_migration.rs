@@ -66,6 +66,9 @@ use tokio::time::timeout;
 const DEFAULT_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 const CONTEXT_DEPENDENT_TURN_ID: &str = "01a007a5-e024-7230-bf4e-922358abba37";
 
+#[path = "rollout_migration/malformed_records.rs"]
+mod malformed_records;
+
 struct LegacyMigrationFixture {
     home: TempDir,
     thread_id: ThreadId,

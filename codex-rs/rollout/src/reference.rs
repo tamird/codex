@@ -181,6 +181,18 @@ impl<'a> BoundedRolloutMaterializer<'a> {
         ordinary_reference_limit: usize,
     ) -> io::Result<BoundedRolloutLines> {
         let lines = load_active_rollout_lines(self.rollout_path).await?;
+        self.materialize_from(lines, ordinary_reference_limit).await
+    }
+
+    /// Expands caller-decoded active records while retaining strict ancestor validation.
+    ///
+    /// Interactive readers can use the recorder's compatibility decoding for a damaged mutable
+    /// root without relaxing validation for immutable references or snapshot publication.
+    pub async fn materialize_from(
+        &mut self,
+        lines: Vec<RolloutLine>,
+        ordinary_reference_limit: usize,
+    ) -> io::Result<BoundedRolloutLines> {
         let mut has_older_reference = false;
         let lines = materialize_rollout_lines_from_with_cache(
             self.codex_home,

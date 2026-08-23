@@ -1315,7 +1315,12 @@ async fn bounded_materializer_rejects_modified_cached_immutable_segment() -> io:
     fs::write(referenced_path, format!("{referenced_meta}\n{{malformed\n"))?;
 
     let error = materializer
-        .materialize(/*ordinary_reference_limit*/ 1)
+        .materialize_from(
+            crate::RolloutRecorder::load_rollout_lines(&root_path)
+                .await?
+                .0,
+            /*ordinary_reference_limit*/ 1,
+        )
         .await
         .err()
         .expect("modified immutable rollout must not use cached records");
@@ -1848,6 +1853,22 @@ async fn materialization_rejects_torn_ordinary_records_in_paginated_root() -> io
     .err()
     .expect("paginated bounded rollout reads must remain strict");
     assert!(bounded_error.to_string().contains("invalid record"));
+
+    // Interactive callers can explicitly supply the recorder's surviving active records without
+    // weakening the strict file-based entry points above.
+    let before = fs::read(&root_path)?;
+    let (lines, _, rejected) = crate::RolloutRecorder::load_rollout_lines(&root_path).await?;
+    assert_eq!(rejected, 1);
+    let mut materializer = BoundedRolloutMaterializer::new(home.path(), &root_path);
+    let visible = materializer
+        .materialize_from(lines, /*ordinary_reference_limit*/ 1)
+        .await?;
+    assert_eq!(
+        event_messages(&visible.lines),
+        vec!["after malformed record"]
+    );
+    assert_eq!(visible.lines.last().unwrap().ordinal, Some(2));
+    assert_eq!(fs::read(&root_path)?, before);
     Ok(())
 }
 

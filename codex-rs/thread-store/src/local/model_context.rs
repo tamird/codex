@@ -411,6 +411,23 @@ fn active_model_context_scan_or_fallback(
             );
             Ok(None)
         }
+        Err(error)
+            if error.kind() == io::ErrorKind::InvalidData
+                && error.get_ref().is_some_and(
+                    <dyn std::error::Error + std::marker::Send + std::marker::Sync + 'static>::is::<
+                        serde_json::Error,
+                    >,
+                ) =>
+        {
+            // A rejected record cannot certify a checkpoint. Preserve the existing reader's
+            // handling of malformed JSON without rewriting the source or hiding I/O failures.
+            tracing::warn!(
+                outcome = "active_checkpoint_parse_rejected",
+                %error,
+                "active checkpoint scan yielded to complete compatibility reconstruction"
+            );
+            Ok(None)
+        }
         Ok(scan) => Ok(scan),
         Err(error) => Err(thread_store_io_error(error)),
     }

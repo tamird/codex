@@ -4811,13 +4811,21 @@ impl ThreadRequestProcessor {
         limit: Option<u32>,
         sort_direction: SortDirection,
     ) -> std::io::Result<LegacyHistoryWindow> {
+        // Resume already tolerates rejected ordinary records in the mutable root. History pages
+        // must use the same records rather than failing while constructing resume cursors.
+        // Reference expansion still validates ancestors; publication readers remain strict.
+        let (active_lines, _, _) =
+            codex_rollout::RolloutRecorder::load_rollout_lines(rollout_path).await?;
         if matches!(sort_direction, SortDirection::Asc) && cursor.is_none() {
             return Ok(LegacyHistoryWindow {
-                items: codex_rollout::materialize_recent_rollout_items(
+                items: codex_rollout::materialize_recent_rollout_lines_from(
                     self.config.codex_home.as_path(),
-                    rollout_path,
+                    active_lines,
                 )
-                .await?,
+                .await?
+                .into_iter()
+                .map(|line| line.item)
+                .collect(),
                 has_older_reference: false,
             });
         }
@@ -4864,7 +4872,10 @@ impl ThreadRequestProcessor {
         let mut partial_before_error = None;
         let mut last_successful_reference_limit: Option<usize> = None;
         loop {
-            let materialized = match materializer.materialize(ordinary_reference_limit).await {
+            let materialized = match materializer
+                .materialize_from(active_lines.clone(), ordinary_reference_limit)
+                .await
+            {
                 Ok(materialized) => materialized,
                 Err(error) => {
                     if cursor.is_some()
@@ -4876,7 +4887,10 @@ impl ThreadRequestProcessor {
                         let mut recovered = None;
                         while lower <= upper {
                             let reference_limit = lower + (upper - lower) / 2;
-                            match materializer.materialize(reference_limit).await {
+                            match materializer
+                                .materialize_from(active_lines.clone(), reference_limit)
+                                .await
+                            {
                                 Ok(materialized) => {
                                     let items = materialized
                                         .lines

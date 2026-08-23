@@ -49,6 +49,46 @@ use crate::local::test_support::write_session_file_with_fork;
 use crate::local::test_support::write_session_file_with_history_mode;
 
 #[tokio::test]
+async fn malformed_active_record_yields_to_compatibility_reader() {
+    let home = TempDir::new().expect("temp dir");
+    let path = write_session_file_with_history_mode(
+        home.path(),
+        "2025-01-03T13-38-00",
+        Uuid::new_v4(),
+        ThreadHistoryMode::Paginated,
+    )
+    .expect("write active rollout");
+    let session_meta = codex_rollout::read_session_meta_line(&path)
+        .await
+        .expect("read metadata");
+    let mut file = OpenOptions::new()
+        .append(true)
+        .open(&path)
+        .expect("open rollout");
+    file.write_all(b"{\"type\":\"response_item\",\"payload\":{\"type\":\"reasoning\",\"encrypted_content\":\"truncated\n")
+        .expect("append malformed record");
+    let before = std::fs::read(&path).expect("read source");
+    let result = scan_projected_active_model_context_blocking(&path, session_meta);
+    assert!(
+        active_model_context_scan_or_fallback(result)
+            .expect("invalid checkpoint scan must yield to compatibility reading")
+            .is_none()
+    );
+    assert_eq!(std::fs::read(&path).expect("read source"), before);
+}
+
+#[test]
+fn active_model_context_io_failure_does_not_yield_to_compatibility_reader() {
+    for kind in [io::ErrorKind::PermissionDenied, io::ErrorKind::InvalidData] {
+        let result =
+            active_model_context_scan_or_fallback(Err(io::Error::new(kind, "failed rollout read")));
+        assert!(
+            matches!(result, Err(ThreadStoreError::Internal { message }) if message.contains("failed rollout read"))
+        );
+    }
+}
+
+#[tokio::test]
 async fn active_model_context_scan_stops_at_the_interactive_byte_limit() {
     let home = TempDir::new().expect("temp dir");
     let uuid = Uuid::from_u128(/*v*/ 2039);
