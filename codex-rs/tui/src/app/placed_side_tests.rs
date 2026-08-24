@@ -1,9 +1,12 @@
 use super::*;
+use crate::app::session_lifecycle::ThreadAttachPresentation;
 use crate::app::test_support::make_test_app;
 use crate::app_server_session::ResumeModelSettings;
 use codex_terminal_detection::Multiplexer;
 use codex_terminal_detection::TerminalName;
+use codex_utils_absolute_path::test_support::PathExt;
 use pretty_assertions::assert_eq;
+use tempfile::TempDir;
 
 #[tokio::test]
 async fn placed_side_launch_config_projects_live_thread_settings() {
@@ -61,12 +64,22 @@ struct SidePaneFixture {
     app: App,
     app_server: AppServerSession,
     parent: ThreadId,
+    _codex_home: TempDir,
 }
 
 impl SidePaneFixture {
-    async fn new() -> Result<Self> {
+    async fn new(tui: &mut tui::Tui) -> Result<Self> {
+        // Darwin's socket path limit includes CODEX_HOME; keep the handoff path short.
+        #[cfg(unix)]
+        let codex_home = TempDir::new_in("/tmp")?;
+        #[cfg(not(unix))]
+        let codex_home = TempDir::new()?;
         let mut app = Box::pin(make_test_app()).await;
-        let config = app.chat_widget.config_ref().clone();
+        let mut config = app.chat_widget.config_ref().clone();
+        config.codex_home = codex_home.path().abs();
+        config.sqlite = codex_state::SqliteConfig::new_for_testing(config.codex_home.clone());
+        config.log_dir = codex_home.path().join("log");
+        app.config = config.clone();
         let parent = ThreadId::from_string(
             &app_test_support::create_fake_rollout(
                 &config.codex_home,
@@ -82,12 +95,18 @@ impl SidePaneFixture {
         let started = app_server
             .resume_thread(config, parent, ResumeModelSettings::RestoreFromThread)
             .await?;
-        app.enqueue_primary_thread_session(started.session, started.turns)
-            .await?;
+        Box::pin(app.replace_chat_widget_with_app_server_thread(
+            tui,
+            started,
+            ThreadAttachPresentation::SessionLineage,
+            /*initial_user_message*/ None,
+        ))
+        .await?;
         Ok(Self {
             app,
             app_server,
             parent,
+            _codex_home: codex_home,
         })
     }
 
@@ -122,12 +141,12 @@ fn terminal(name: TerminalName, multiplexer: Option<Multiplexer>) -> TerminalInf
 
 #[tokio::test]
 async fn unavailable_side_pane_falls_back_and_preserves_parent() -> Result<()> {
-    let mut fixture = Box::pin(SidePaneFixture::new()).await?;
+    let mut tui = crate::tui::test_support::make_test_tui()?;
+    let mut fixture = Box::pin(SidePaneFixture::new(&mut tui)).await?;
     let before = fixture
         .app_server
         .thread_read(fixture.parent, /*include_turns*/ true)
         .await?;
-    let mut tui = crate::tui::test_support::make_test_tui()?;
 
     Box::pin(fixture.app.handle_start_placed_side(
         &mut tui,
@@ -150,7 +169,8 @@ async fn unavailable_side_pane_falls_back_and_preserves_parent() -> Result<()> {
 
 #[tokio::test]
 async fn remote_side_pane_uses_inline_side_without_local_rollout() -> Result<()> {
-    let mut fixture = Box::pin(SidePaneFixture::new()).await?;
+    let mut tui = crate::tui::test_support::make_test_tui()?;
+    let mut fixture = Box::pin(SidePaneFixture::new(&mut tui)).await?;
     fixture.app.app_server_target = crate::AppServerTarget::Remote {
         endpoint: crate::RemoteAppServerEndpoint::WebSocket {
             websocket_url: "ws://127.0.0.1:4500".to_string(),
@@ -165,7 +185,6 @@ async fn remote_side_pane_uses_inline_side_without_local_rollout() -> Result<()>
         .expect("parent session");
     session.rollout_path = None;
     fixture.app.chat_widget.handle_thread_session(session);
-    let mut tui = crate::tui::test_support::make_test_tui()?;
 
     Box::pin(fixture.app.handle_start_placed_side(
         &mut tui,
@@ -184,8 +203,8 @@ async fn remote_side_pane_uses_inline_side_without_local_rollout() -> Result<()>
 #[cfg(not(target_os = "macos"))]
 #[tokio::test]
 async fn ghostty_on_non_macos_uses_inline_side() -> Result<()> {
-    let mut fixture = Box::pin(SidePaneFixture::new()).await?;
     let mut tui = crate::tui::test_support::make_test_tui()?;
+    let mut fixture = Box::pin(SidePaneFixture::new(&mut tui)).await?;
     Box::pin(fixture.app.handle_start_placed_side(
         &mut tui,
         &mut fixture.app_server,
@@ -201,8 +220,8 @@ async fn ghostty_on_non_macos_uses_inline_side() -> Result<()> {
 
 #[tokio::test]
 async fn rejected_side_placement_after_handoff_falls_back() -> Result<()> {
-    let mut fixture = Box::pin(SidePaneFixture::new()).await?;
     let mut tui = crate::tui::test_support::make_test_tui()?;
+    let mut fixture = Box::pin(SidePaneFixture::new(&mut tui)).await?;
 
     // Zellij rejects --up before invoking a process, independently of the host environment.
     Box::pin(fixture.app.handle_start_placed_side(
@@ -224,7 +243,8 @@ async fn rejected_side_placement_after_handoff_falls_back() -> Result<()> {
 
 #[tokio::test]
 async fn failed_side_handoff_preparation_falls_back() -> Result<()> {
-    let mut fixture = Box::pin(SidePaneFixture::new()).await?;
+    let mut tui = crate::tui::test_support::make_test_tui()?;
+    let mut fixture = Box::pin(SidePaneFixture::new(&mut tui)).await?;
     let config = App::standalone_side_config(fixture.app.chat_widget.config_ref());
     for _ in 0..2 {
         fixture
@@ -242,7 +262,6 @@ async fn failed_side_handoff_preparation_falls_back() -> Result<()> {
             .to_string()
             .contains("two fork handoffs are already pending")
     );
-    let mut tui = crate::tui::test_support::make_test_tui()?;
 
     Box::pin(fixture.app.handle_start_placed_side(
         &mut tui,
@@ -263,8 +282,8 @@ async fn failed_side_handoff_preparation_falls_back() -> Result<()> {
 
 #[tokio::test]
 async fn failed_side_spawn_falls_back_but_success_does_not_fork_inline() -> Result<()> {
-    let mut fixture = Box::pin(SidePaneFixture::new()).await?;
     let mut tui = crate::tui::test_support::make_test_tui()?;
+    let mut fixture = Box::pin(SidePaneFixture::new(&mut tui)).await?;
     Box::pin(fixture.app.handle_side_pane_result(
         &mut tui,
         &mut fixture.app_server,
