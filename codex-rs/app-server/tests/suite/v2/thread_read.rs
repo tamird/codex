@@ -568,6 +568,46 @@ async fn paginated_segmented_history_without_index_returns_latest_five_turns() -
         .without_auto_env()
         .build_initialized()
         .await?;
+    let first_ascending_page = read_turns_page(
+        &mut mcp,
+        thread_id,
+        /*cursor*/ None,
+        Some(5),
+        SortDirection::Asc,
+        Some(TurnItemsView::Full),
+    )
+    .await?;
+    assert_eq!(
+        first_ascending_page
+            .data
+            .iter()
+            .map(|turn| turn.id.as_str())
+            .collect::<Vec<_>>(),
+        ["turn-0", "turn-1", "turn-2", "turn-3", "turn-4"]
+    );
+    let second_ascending_page = read_turns_page(
+        &mut mcp,
+        thread_id,
+        Some(
+            first_ascending_page
+                .next_cursor
+                .expect("ascending continuation"),
+        ),
+        Some(5),
+        SortDirection::Asc,
+        Some(TurnItemsView::Full),
+    )
+    .await?;
+    assert_eq!(
+        second_ascending_page
+            .data
+            .iter()
+            .map(|turn| turn.id.as_str())
+            .collect::<Vec<_>>(),
+        ["turn-5", "turn-6", "turn-7"]
+    );
+    assert!(second_ascending_page.next_cursor.is_none());
+
     let first_page = read_turns_page(
         &mut mcp,
         thread_id,

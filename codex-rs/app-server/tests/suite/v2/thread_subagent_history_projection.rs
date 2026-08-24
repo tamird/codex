@@ -72,7 +72,13 @@ async fn legacy_thread_read_filters_subagents_older_than_five_segments() -> Resu
     let turns = read_thread_turns(&mut app_server, fixture.thread_id).await?;
     assert_eq!(turns.len(), 5, "legacy reads retain the newest five turns");
     assert_projection_wiring(&turns, &fixture);
-    let paged_turns = read_all_turn_pages(&mut app_server, fixture.thread_id).await?;
+    let paged_turns = read_all_turn_pages(
+        &mut app_server,
+        fixture.thread_id,
+        /*cursor*/ None,
+        SortDirection::Asc,
+    )
+    .await?;
     assert_eq!(paged_turns.len(), 7, "pagination retains turn envelopes");
     assert_projection_wiring(&paged_turns, &fixture);
     let expected_resume_turns = paged_turns.iter().rev().cloned().collect::<Vec<_>>();
@@ -88,16 +94,27 @@ async fn paginated_thread_history_filters_subagents_without_changing_turn_pages(
     let mut app_server = fixture.app_server().await?;
 
     let read_turns = read_thread_turns(&mut app_server, fixture.thread_id).await?;
-    let paged_turns = read_all_turn_pages(&mut app_server, fixture.thread_id).await?;
+    let paged_turns = read_all_turn_pages(
+        &mut app_server,
+        fixture.thread_id,
+        /*cursor*/ None,
+        SortDirection::Asc,
+    )
+    .await?;
 
     assert_eq!(
-        read_turns.len(),
-        5,
-        "thread reads retain the newest five turns"
+        read_turns
+            .iter()
+            .map(|turn| turn.id.as_str())
+            .collect::<Vec<_>>(),
+        [
+            "turn-0", "turn-1", "turn-2", "turn-3", "turn-4", "turn-5", "turn-6"
+        ],
+        "paginated reads retain every turn envelope"
     );
     assert_projection_wiring(&read_turns, &fixture);
     assert_eq!(paged_turns, read_turns);
-    assert_eq!(paged_turns.len(), 5, "filtering must not remove turns");
+    assert_eq!(paged_turns.len(), 7, "filtering must not remove turns");
     assert_projection_wiring(&paged_turns, &fixture);
     let resume_turns = read_resume_turns(&mut app_server, fixture.thread_id).await?;
     assert_eq!(
@@ -329,16 +346,17 @@ async fn read_thread_turns(
 async fn read_all_turn_pages(
     app_server: &mut TestAppServer,
     thread_id: ThreadId,
+    mut cursor: Option<String>,
+    sort_direction: SortDirection,
 ) -> Result<Vec<Turn>> {
-    let mut cursor = None;
     let mut turns = Vec::new();
-    loop {
+    for _ in 0..7 {
         let request_id = app_server
             .send_thread_turns_list_request(ThreadTurnsListParams {
                 thread_id: thread_id.to_string(),
                 cursor: cursor.clone(),
                 limit: Some(1),
-                sort_direction: Some(SortDirection::Asc),
+                sort_direction: Some(sort_direction),
                 items_view: Some(TurnItemsView::Full),
             })
             .await?;
@@ -355,6 +373,7 @@ async fn read_all_turn_pages(
         assert_ne!(cursor.as_ref(), Some(&next_cursor));
         cursor = Some(next_cursor);
     }
+    anyhow::bail!("pagination exceeded the seven-turn fixture")
 }
 
 async fn read_resume_turns(
@@ -379,9 +398,20 @@ async fn read_resume_turns(
         ..
     } = timeout(READ_TIMEOUT, app_server.read_response(request_id)).await??;
     assert!(thread.turns.is_empty());
-    Ok(initial_turns_page
-        .expect("resume returns the requested full turns page")
-        .data)
+    let page = initial_turns_page.expect("resume returns the requested initial turns page");
+    if page.data.len() < 7 {
+        assert!(
+            page.next_cursor.is_some(),
+            "a bounded initial page must advertise the remaining turns"
+        );
+    }
+    let mut turns = page.data;
+    if let Some(cursor) = page.next_cursor {
+        turns.extend(
+            read_all_turn_pages(app_server, thread_id, Some(cursor), SortDirection::Desc).await?,
+        );
+    }
+    Ok(turns)
 }
 
 fn assert_projection_wiring(turns: &[Turn], fixture: &SubagentHistoryFixture) {

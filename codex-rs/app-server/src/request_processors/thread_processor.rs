@@ -4823,8 +4823,9 @@ impl ThreadRequestProcessor {
         let (active_lines, _, _) =
             codex_rollout::RolloutRecorder::load_rollout_lines(rollout_path).await?;
         if matches!(sort_direction, SortDirection::Asc) && cursor.is_none() {
+            // Start at the oldest turn, not the beginning of the recent replay window.
             return Ok(LegacyHistoryWindow {
-                items: codex_rollout::materialize_recent_rollout_lines_from(
+                items: codex_rollout::materialize_rollout_lines_from(
                     self.config.codex_home.as_path(),
                     active_lines,
                 )
