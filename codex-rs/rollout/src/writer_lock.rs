@@ -285,6 +285,18 @@ impl Drop for RolloutWriterLockGuard {
             }
         };
 
+        // A subprocess can inherit this open file description before exec closes CLOEXEC
+        // descriptors. Closing our descriptor alone would leave its flock held by that child.
+        // Independently opened fork-reader reservations are not released by this unlock.
+        match &self.state {
+            WriterLockState::Exclusive(file) | WriterLockState::Shared(file) => {
+                if let Err(err) = file.unlock() {
+                    warn!("failed to release thread writer lock: {err}");
+                    return;
+                }
+            }
+            WriterLockState::Unreserved => {}
+        }
         // Close the writer lock before deleting it so cleanup works on Windows too.
         drop(std::mem::replace(
             &mut self.state,
@@ -318,3 +330,7 @@ impl Drop for RolloutWriterLockGuard {
         drop(coordination_lock);
     }
 }
+
+#[cfg(all(test, unix))]
+#[path = "writer_lock_tests.rs"]
+mod tests;

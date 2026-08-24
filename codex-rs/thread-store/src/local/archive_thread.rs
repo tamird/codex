@@ -1,5 +1,4 @@
 use super::LocalThreadStore;
-use super::helpers::owned_rollout_paths_from_index;
 use super::helpers::restore_rollout_moves;
 use super::helpers::rollout_path_is_archived;
 use super::helpers::scoped_rollout_path;
@@ -8,7 +7,8 @@ use crate::ArchiveThreadsParams;
 use crate::ThreadStoreError;
 use crate::ThreadStoreResult;
 use chrono::Utc;
-use codex_rollout::RolloutReferenceIndex;
+use codex_rollout::find_all_rollout_paths_by_thread_id;
+use codex_rollout::read_session_meta_line_exact;
 use tracing::warn;
 
 use super::thread_rollout_resolver;
@@ -39,17 +39,23 @@ pub(super) async fn archive_threads(
         }
     }
     let _writer_guards = store.acquire_writer_locks(&lock_thread_ids).await?;
-    let reference_index = RolloutReferenceIndex::scan(store.config.codex_home.as_path())
-        .await
-        .map_err(|err| ThreadStoreError::Internal {
-            message: format!("failed to scan thread rollout files: {err}"),
-        })?;
-
     let parent_thread_id = thread_ids[0];
     let mut archived_thread_ids = Vec::new();
     for thread_id in thread_ids {
-        let rollout_paths = owned_rollout_paths_from_index(&reference_index, thread_id);
-        match archive_thread_with_paths(store, thread_id, rollout_paths).await {
+        // Archive preserves references; it needs owned filenames, not a global reference index
+        // that opens unrelated rollouts and decodes their first history records.
+        let result =
+            match find_all_rollout_paths_by_thread_id(store.config.codex_home.as_path(), thread_id)
+                .await
+            {
+                Ok(paths) => archive_thread_with_paths(store, thread_id, paths).await,
+                Err(err) => Err(ThreadStoreError::Internal {
+                    message: format!(
+                        "failed to enumerate rollout files for thread {thread_id}: {err}"
+                    ),
+                }),
+            };
+        match result {
             Ok(()) => archived_thread_ids.push(thread_id),
             Err(err) if archived_thread_ids.is_empty() => return Err(err),
             Err(err) => warn!(
@@ -94,6 +100,15 @@ async fn archive_thread_with_paths(
             rollout_path.as_path(),
             "sessions",
         )?;
+        // Filenames select candidates, but session metadata determines ownership. Retain the
+        // separately resolved selected path, including SQLite aliases and damaged metadata.
+        if rollout_path != selected_rollout_path
+            && !read_session_meta_line_exact(canonical_rollout_path.as_path())
+                .await
+                .is_ok_and(|meta| meta.meta.id == thread_id)
+        {
+            continue;
+        }
         let file_name =
             validated_rollout_file_name(canonical_rollout_path.as_path(), rollout_path.as_path())?;
         let destination = archive_folder.join(&file_name);
@@ -144,6 +159,14 @@ async fn archive_thread_with_paths(
     }
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "archive_discovery_tests.rs"]
+mod discovery_tests;
+
+#[cfg(all(test, unix))]
+#[path = "archive_inherited_writer_tests.rs"]
+mod inherited_writer_tests;
 
 #[cfg(test)]
 mod tests {
