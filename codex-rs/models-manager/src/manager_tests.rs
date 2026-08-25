@@ -93,6 +93,7 @@ struct TestModelsEndpoint {
     responses: Mutex<VecDeque<Vec<ModelInfo>>>,
     fetch_count: AtomicUsize,
     observed_proxy_policy: Mutex<Option<OutboundProxyPolicy>>,
+    observed_client_versions: Mutex<Vec<String>>,
 }
 
 #[derive(Debug)]
@@ -192,6 +193,7 @@ impl TestModelsEndpoint {
             responses: Mutex::new(responses.into()),
             fetch_count: AtomicUsize::new(0),
             observed_proxy_policy: Mutex::new(None),
+            observed_client_versions: Mutex::new(Vec::new()),
         })
     }
 
@@ -202,6 +204,7 @@ impl TestModelsEndpoint {
             responses: Mutex::new(responses.into()),
             fetch_count: AtomicUsize::new(0),
             observed_proxy_policy: Mutex::new(None),
+            observed_client_versions: Mutex::new(Vec::new()),
         })
     }
 
@@ -271,10 +274,14 @@ impl ModelsEndpointClient for TestModelsEndpoint {
 
     fn list_models<'a>(
         &'a self,
-        _client_version: &'a str,
+        client_version: &'a str,
         http_client_factory: HttpClientFactory,
     ) -> ModelsEndpointFuture<'a, CoreResult<(Vec<ModelInfo>, Option<String>)>> {
         Box::pin(async move {
+            self.observed_client_versions
+                .lock()
+                .expect("observed client versions lock should not be poisoned")
+                .push(client_version.to_string());
             *self
                 .observed_proxy_policy
                 .lock()
@@ -310,7 +317,7 @@ async fn mutate_file_cache_for_test<F>(codex_home: &Path, f: F)
 where
     F: FnOnce(&mut ModelsCacheEntry),
 {
-    let client_version = crate::client_version_to_whole();
+    let client_version = crate::client_version();
     let cache = FileModelsCache::new(codex_home.join(MODEL_CACHE_FILE), DEFAULT_MODEL_CACHE_TTL);
     let mut entry = cache
         .load(&client_version)
@@ -332,7 +339,7 @@ async fn file_cache_implements_models_cache_contract() {
         codex_home.path().join(MODEL_CACHE_FILE),
         DEFAULT_MODEL_CACHE_TTL,
     );
-    let client_version = crate::client_version_to_whole();
+    let client_version = crate::client_version();
     let entry = ModelsCacheEntry {
         fetched_at: Utc::now(),
         etag: Some("file-etag".to_string()),
@@ -362,7 +369,7 @@ async fn file_cache_refresh_ttl_renews_expired_entry_without_serving_it_stale() 
         codex_home.path().join(MODEL_CACHE_FILE),
         DEFAULT_MODEL_CACHE_TTL,
     );
-    let client_version = crate::client_version_to_whole();
+    let client_version = crate::client_version();
     let expired_at = Utc::now() - chrono::Duration::hours(1);
     let entry = ModelsCacheEntry {
         fetched_at: expired_at,
@@ -429,6 +436,13 @@ async fn manager_without_cache_fetches_on_every_refresh() {
     assert_eq!(second_catalog, catalog);
     assert_eq!(manager.get_remote_models().await, remote_models);
     assert_eq!(endpoint.fetch_count(), 2);
+    assert_eq!(
+        *endpoint
+            .observed_client_versions
+            .lock()
+            .expect("observed client versions lock should not be poisoned"),
+        vec![crate::client_version(), crate::client_version()]
+    );
 }
 
 #[tokio::test]
@@ -437,7 +451,7 @@ async fn injected_cache_hit_avoids_remote_fetch() {
     let cache = TestModelsCache::with_entry(ModelsCacheEntry {
         fetched_at: Utc::now(),
         etag: Some("cached-etag".to_string()),
-        client_version: Some(crate::client_version_to_whole()),
+        client_version: Some(crate::client_version()),
         models: cached_models.clone(),
     });
     let endpoint = TestModelsEndpoint::new(vec![vec![remote_model(
@@ -490,7 +504,7 @@ async fn injected_cache_read_error_falls_back_and_persists_remote_models() {
         vec![ModelsCacheEntry {
             fetched_at: stored_entries[0].fetched_at,
             etag: None,
-            client_version: Some(crate::client_version_to_whole()),
+            client_version: Some(crate::client_version()),
             models: remote_models,
         }]
     );
@@ -527,7 +541,7 @@ async fn injected_cache_ttl_refresh_preserves_cached_payload() {
     let cache = TestModelsCache::with_entry(ModelsCacheEntry {
         fetched_at: cached_at,
         etag: Some("cached-etag".to_string()),
-        client_version: Some(crate::client_version_to_whole()),
+        client_version: Some(crate::client_version()),
         models: cached_models.clone(),
     });
     let manager = OpenAiModelsManager::new_with_cache(
@@ -554,7 +568,7 @@ async fn injected_cache_ttl_refresh_preserves_cached_payload() {
     assert_eq!(stored_entries[0].etag.as_deref(), Some("cached-etag"));
     assert_eq!(
         stored_entries[0].client_version,
-        Some(crate::client_version_to_whole())
+        Some(crate::client_version())
     );
     assert_eq!(stored_entries[0].models, cached_models);
 }
@@ -1254,6 +1268,7 @@ async fn refresh_available_models_keeps_merging_for_api_auth() {
         responses: Mutex::new(vec![remote_models.clone()].into()),
         fetch_count: AtomicUsize::new(0),
         observed_proxy_policy: Mutex::new(None),
+        observed_client_versions: Mutex::new(Vec::new()),
     });
     let manager = openai_manager_for_tests_with_auth(
         codex_home.path().to_path_buf(),
@@ -1275,6 +1290,13 @@ async fn refresh_available_models_keeps_merging_for_api_auth() {
 
     assert_eq!(manager.get_remote_models().await, expected);
     assert_eq!(endpoint.fetch_count(), 1, "expected a single model fetch");
+    assert_eq!(
+        *endpoint
+            .observed_client_versions
+            .lock()
+            .expect("observed client versions lock should not be poisoned"),
+        vec![crate::client_version_to_whole()]
+    );
 }
 
 #[tokio::test]
@@ -1363,7 +1385,7 @@ async fn refresh_available_models_refetches_when_version_mismatch() {
         .expect("initial refresh succeeds");
 
     mutate_file_cache_for_test(codex_home.path(), |cache| {
-        let client_version = crate::client_version_to_whole();
+        let client_version = crate::client_version();
         cache.client_version = Some(format!("{client_version}-mismatch"));
     })
     .await;

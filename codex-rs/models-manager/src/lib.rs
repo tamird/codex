@@ -19,7 +19,18 @@ pub fn bundled_models_response()
     serde_json::from_str(include_str!("../models.json"))
 }
 
-/// Convert the client version string to a whole version string (e.g. "1.2.3-alpha.4" -> "1.2.3").
+/// Return the client version used for Codex catalog requests and cache identity.
+pub fn client_version() -> String {
+    let whole = client_version_to_whole();
+    let prerelease = env!("CARGO_PKG_VERSION_PRE");
+    if prerelease.is_empty() {
+        whole
+    } else {
+        format!("{whole}-{prerelease}")
+    }
+}
+
+/// Return only the major, minor, and patch components of the client version.
 pub fn client_version_to_whole() -> String {
     format!(
         "{}.{}.{}",

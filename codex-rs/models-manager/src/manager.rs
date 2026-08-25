@@ -455,7 +455,7 @@ impl OpenAiModelsManager {
         let current_etag = self.get_etag().await;
         if current_etag.clone().is_some() && current_etag.as_deref() == Some(etag.as_str()) {
             if let Some(cache) = self.cache.as_ref()
-                && let Err(err) = cache.refresh_ttl(&crate::client_version_to_whole()).await
+                && let Err(err) = cache.refresh_ttl(&crate::client_version()).await
             {
                 error!("failed to renew cache TTL: {err}");
             }
@@ -511,10 +511,15 @@ impl OpenAiModelsManager {
         &self,
         http_client_factory: &HttpClientFactory,
     ) -> CoreResult<()> {
-        let client_version = crate::client_version_to_whole();
+        let client_version = crate::client_version();
+        let request_client_version = if self.endpoint_client.uses_codex_backend().await {
+            client_version.clone()
+        } else {
+            crate::client_version_to_whole()
+        };
         let (models, etag) = self
             .endpoint_client
-            .list_models(&client_version, http_client_factory.clone())
+            .list_models(&request_client_version, http_client_factory.clone())
             .await?;
         self.apply_remote_models(models.clone()).await;
         *self.etag.write().await = etag.clone();
@@ -579,7 +584,7 @@ impl OpenAiModelsManager {
         };
         let _timer =
             codex_otel::start_global_timer("codex.remote_models.load_cache.duration_ms", &[]);
-        let client_version = crate::client_version_to_whole();
+        let client_version = crate::client_version();
         info!(client_version, "models cache: evaluating cache eligibility");
         // TODO(celia-oai): Include provider identity in cache eligibility so switching
         // providers does not reuse a fresh models_cache.json entry from another provider.

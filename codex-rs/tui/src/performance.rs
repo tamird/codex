@@ -1,7 +1,22 @@
 //! Bounded, deployment-aware performance diagnostics for interactive sessions.
 
+use std::sync::OnceLock;
 use std::time::Duration;
 use std::time::Instant;
+
+use crate::version::CODEX_CLI_VERSION;
+
+static EMBEDDED_BUILD_REVISION: OnceLock<&'static str> = OnceLock::new();
+
+/// Supplies executable-owned provenance without stamping the TUI library.
+///
+/// Call before constructing the CLI or starting the TUI, since version lookups
+/// are cached. Only the first supplied candidate is retained.
+pub fn initialize_build_revision(revision: Option<&'static str>) {
+    if let Some(revision) = revision {
+        let _ = EMBEDDED_BUILD_REVISION.set(revision);
+    }
+}
 
 const BUILD_REVISION_ENV: &str = "FRANKENDEX_BUILD_REVISION";
 const BUILD_COHORT_ENV: &str = "FRANKENDEX_BUILD_COHORT";
@@ -25,17 +40,20 @@ pub(crate) fn record_deployment_start() {
 
 /// Bounded local-build attribution retained alongside each activity window.
 #[derive(Clone, Debug, Eq, PartialEq)]
-struct Deployment {
+pub(crate) struct Deployment {
     revision: String,
     cohort: String,
 }
 
 impl Deployment {
-    fn from_environment() -> Option<Self> {
-        Self::new(
-            std::env::var(BUILD_REVISION_ENV).ok()?,
-            std::env::var(BUILD_COHORT_ENV).ok(),
-        )
+    pub(crate) fn from_environment() -> Option<Self> {
+        let revision = EMBEDDED_BUILD_REVISION
+            .get()
+            .copied()
+            .filter(|revision| valid_build_revision(revision))
+            .map(str::to_string)
+            .or_else(|| std::env::var(BUILD_REVISION_ENV).ok())?;
+        Self::new(revision, std::env::var(BUILD_COHORT_ENV).ok())
     }
 
     fn new(revision: String, cohort: Option<String>) -> Option<Self> {
@@ -47,6 +65,10 @@ impl Deployment {
             .filter(|value| valid_build_cohort(value))
             .unwrap_or_else(|| "default".to_string());
         Some(Self { revision, cohort })
+    }
+
+    pub(crate) fn display_version(&self) -> String {
+        format!("{CODEX_CLI_VERSION}+frankendex.{}", self.revision)
     }
 }
 

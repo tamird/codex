@@ -5,6 +5,7 @@ use super::PerformanceWindow;
 use super::valid_build_cohort;
 use super::valid_build_revision;
 use crate::app_event::AppEvent;
+use crate::version::CODEX_CLI_VERSION;
 use pretty_assertions::assert_eq;
 use std::time::Duration;
 use std::time::Instant;
@@ -74,6 +75,17 @@ fn validates_build_attribution_without_reading_process_environment() {
     assert_eq!(
         Deployment::new("not-a-revision".to_string(), /*cohort*/ None),
         None
+    );
+}
+
+#[test]
+fn identifies_frankendex_revisions_in_displayed_versions() {
+    let deployment = Deployment::new("abcdef012345-dirty".to_string(), /*cohort*/ None)
+        .expect("valid deployment attribution");
+
+    assert_eq!(
+        deployment.display_version(),
+        format!("{CODEX_CLI_VERSION}+frankendex.abcdef012345-dirty"),
     );
 }
 

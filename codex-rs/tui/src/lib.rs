@@ -167,6 +167,7 @@ pub(crate) mod onboarding;
 mod oss_selection;
 mod pager_overlay;
 mod performance;
+pub use performance::initialize_build_revision;
 pub(crate) mod public_widgets;
 mod render;
 mod resize_reflow_cap;
@@ -218,6 +219,7 @@ mod updates;
 #[cfg(any(not(debug_assertions), test))]
 mod updates_cache;
 mod version;
+pub use version::display_version;
 mod width;
 #[cfg(any(target_os = "windows", test))]
 mod windows_sandbox;

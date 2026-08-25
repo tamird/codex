@@ -8,7 +8,7 @@ use chrono::DateTime;
 use chrono::TimeZone;
 use chrono::Utc;
 use codex_login::CodexAuth;
-use codex_models_manager::client_version_to_whole;
+use codex_models_manager::client_version;
 use codex_models_manager::manager::RefreshStrategy;
 use codex_protocol::config_types::CollaborationMode;
 use codex_protocol::config_types::ModeKind;
@@ -294,7 +294,7 @@ async fn uses_cache_when_version_matches() -> Result<()> {
             let mut cache = serde_json::to_value(ModelsCache {
                 fetched_at: Utc::now(),
                 etag: None,
-                client_version: Some(client_version_to_whole()),
+                client_version: Some(client_version()),
                 models: vec![cached_model],
             })
             .expect("serialize cache");
@@ -406,7 +406,7 @@ async fn refreshes_when_cache_version_differs() -> Result<()> {
     let mut builder = test_codex().with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing());
     builder = builder
         .with_pre_build_hook(move |home| {
-            let client_version = client_version_to_whole();
+            let client_version = client_version();
             let cache = ModelsCache {
                 fetched_at: Utc::now(),
                 etag: None,

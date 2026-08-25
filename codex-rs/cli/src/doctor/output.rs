@@ -482,11 +482,15 @@ fn write_footer(out: &mut String, options: HumanOutputOptions) {
 }
 
 fn header_suffix(report: &DoctorReport) -> String {
-    let version = format!("v{}", report.codex_version);
-    report
+    let runtime = report
         .checks
         .iter()
-        .find(|check| check.category == "runtime")
+        .find(|check| check.category == "runtime");
+    let version = runtime
+        .and_then(|check| detail::detail_value(check, "version"))
+        .unwrap_or_else(|| report.codex_version.clone());
+    let version = format!("v{version}");
+    runtime
         .and_then(|check| detail::detail_value(check, "platform"))
         .map_or(version.clone(), |platform| {
             format!("{version} · {platform}")
@@ -1256,6 +1260,26 @@ mod tests {
             codex_version: "0.0.0".to_string(),
             checks,
         }
+    }
+
+    #[test]
+    fn human_header_uses_runtime_display_version_without_changing_package_version() {
+        let mut report = sample_report();
+        let runtime = report
+            .checks
+            .iter_mut()
+            .find(|check| check.category == "runtime")
+            .expect("sample report has a runtime check");
+        runtime
+            .details
+            .push("version: 0.148.0-alpha.20+frankendex.abcdef012345".to_string());
+        runtime.details.push("platform: darwin-arm64".to_string());
+
+        assert_eq!(
+            header_suffix(&report),
+            "v0.148.0-alpha.20+frankendex.abcdef012345 · darwin-arm64"
+        );
+        assert_eq!(report.codex_version, "0.0.0");
     }
 
     #[test]

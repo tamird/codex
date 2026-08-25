@@ -212,7 +212,7 @@ async fn injected_cache_hit_drives_agent_model_selection() -> Result<()> {
         entry: Some(ModelsCacheEntry {
             fetched_at: Utc::now(),
             etag: None,
-            client_version: Some(codex_models_manager::client_version_to_whole()),
+            client_version: Some(codex_models_manager::client_version()),
             models: vec![remote_model(model_slug)],
         }),
         load_error: false,

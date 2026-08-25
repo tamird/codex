@@ -19,6 +19,7 @@ struct TopCli {
 }
 
 fn main() -> anyhow::Result<()> {
+    codex_tui::initialize_build_revision(option_env!("CODEX_BUILD_COMMIT"));
     arg0_dispatch_or_else(|arg0_paths: Arg0DispatchPaths| async move {
         let top_cli = TopCli::parse();
         let mut inner = top_cli.inner;
