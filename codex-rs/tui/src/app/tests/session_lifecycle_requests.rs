@@ -2617,7 +2617,7 @@ async fn changing_directory_preserves_project_trust_permissions_history_and_hook
         fs::create_dir_all(directory.join(".codex"))?;
         fs::write(directory.join(".codex/config.toml"), "")?;
     }
-    let contents = "developer_instructions = \"destination policy\"\nmodel_reasoning_effort = \"high\"\napproval_policy = \"on-request\"\n[tui]\ntheme = \"dracula\"\n[tui.keymap.global]\nopen_transcript = \"f12\"";
+    let contents = "developer_instructions = \"destination policy\"\nmodel_reasoning_effort = \"high\"\napproval_policy = \"on-request\"\n[tui]\ntheme = \"catppuccin-mocha\"\n[tui.keymap.global]\nopen_transcript = \"f12\"";
     fs::write(trusted.join(".codex/config.toml"), contents)?;
     let agents = trusted.join("AGENTS.md");
     fs::write(&agents, "Follow destination project instructions.")?;
@@ -2893,12 +2893,23 @@ async fn changing_directory_preserves_project_trust_permissions_history_and_hook
     requests.lock().expect("request recorder lock").clear();
     app.change_working_directory(&mut tui, &mut server, untrusted.clone().abs())
         .await;
-    assert_eq!(app.config.active_project.trust_level, Some(T::Untrusted));
+    let final_history = history();
+    assert_eq!(
+        app.config.active_project.trust_level,
+        Some(T::Untrusted),
+        "recorded={:?}; history={final_history:?}",
+        requests
+            .lock()
+            .expect("request recorder lock")
+            .iter()
+            .map(|request| request.method.as_str())
+            .collect::<Vec<_>>()
+    );
     let approval = app.config.permissions.approval_policy.value();
     assert_eq!(approval, AskForApproval::UnlessTrusted.to_core());
     assert_eq!(rec(req, "thread/fork")[0]["approvalPolicy"], "untrusted");
     let warning = "Project-local config, hooks, and exec policies are disabled";
-    assert!(history().iter().any(|line| line.contains(warning)));
+    assert!(final_history.iter().any(|line| line.contains(warning)));
     server.shutdown().await?;
     proxy.await??;
     Ok(())

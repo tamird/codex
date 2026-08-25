@@ -308,10 +308,13 @@ impl SessionConfiguration {
             permission_profile: self.materialized_permission_profile(environment_selections),
             active_permission_profile: self.active_permission_profile(),
             cwd: self.legacy_fallback_cwd.clone(),
-            environments: Some(TurnEnvironmentSelections::new(
-                self.legacy_fallback_cwd.clone(),
-                environment_selections.to_vec(),
-            )),
+            environments: Some(
+                TurnEnvironmentSelections::new(
+                    self.legacy_fallback_cwd.clone(),
+                    environment_selections.to_vec(),
+                )
+                .into(),
+            ),
             workspace_roots: Some(ThreadEnvironments::primary_workspace_roots_for(
                 environment_selections,
             )),

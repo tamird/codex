@@ -156,10 +156,13 @@ fn complete_thread_settings() -> ThreadSettingsAppliedEvent {
             permission_profile: PermissionProfile::workspace_write(),
             active_permission_profile: None,
             cwd: serde_json::from_value(json!("/tmp")).expect("absolute test cwd"),
-            environments: Some(TurnEnvironmentSelections::new(
-                serde_json::from_value(json!("/tmp")).expect("absolute test cwd"),
-                Vec::new(),
-            )),
+            environments: Some(
+                TurnEnvironmentSelections::new(
+                    serde_json::from_value(json!("/tmp")).expect("absolute test cwd"),
+                    Vec::new(),
+                )
+                .into(),
+            ),
             workspace_roots: Some(Vec::new()),
             profile_workspace_roots: Some(Vec::new()),
             windows_sandbox_level: Some(

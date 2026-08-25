@@ -10,12 +10,15 @@ use codex_protocol::models::ContentItem;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::AskForApproval;
+use codex_protocol::protocol::EnvironmentConfigState;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::SegmentPreviousTurnSettings;
+use codex_protocol::protocol::SegmentStateCheckpoint;
 use codex_protocol::protocol::SegmentStateCheckpointDisposition;
 use codex_protocol::protocol::ThreadSettingsAppliedEvent;
 use codex_protocol::protocol::ThreadSettingsSnapshot;
 use codex_protocol::protocol::TokenCountEvent;
+use codex_protocol::protocol::TurnEnvironmentSelection;
 use codex_protocol::protocol::TurnEnvironmentSelections;
 use codex_protocol::protocol::WorldStateItem;
 use codex_utils_absolute_path::AbsolutePathBuf;
@@ -59,7 +62,7 @@ fn thread_settings() -> ThreadSettingsAppliedEvent {
             permission_profile: PermissionProfile::workspace_write(),
             active_permission_profile: None,
             cwd: cwd.clone(),
-            environments: Some(TurnEnvironmentSelections::new(cwd, Vec::new())),
+            environments: Some(TurnEnvironmentSelections::new(cwd, Vec::new()).into()),
             workspace_roots: Some(Vec::new()),
             profile_workspace_roots: Some(Vec::new()),
             windows_sandbox_level: Some(WindowsSandboxLevel::Disabled),
@@ -87,49 +90,62 @@ fn token_count() -> TokenCountEvent {
 
 #[test]
 fn cleared_checkpoint_has_canonical_order_and_descriptor() {
+    let mut settings = thread_settings();
+    let cwd = settings.thread_settings.cwd.clone();
+    let mut environment = TurnEnvironmentSelection {
+        environment_id: "owner-environment".to_string(),
+        cwd: cwd.clone().into(),
+        workspace_roots: Vec::new(),
+        config: EnvironmentConfigState::Failed("private owner error".to_string()),
+    };
+    settings.thread_settings.environments =
+        Some(TurnEnvironmentSelections::new(cwd.clone(), vec![environment.clone()]).into());
+    let previous_turn_settings = Some(SegmentPreviousTurnSettings {
+        model: "gpt-test".to_string(),
+        comp_hash: Some("hash".to_string()),
+        realtime_active: Some(false),
+    });
     let checkpoint = CertifiedSegmentStateCheckpoint::new(
         compacted(),
-        Some(SegmentPreviousTurnSettings {
-            model: "gpt-test".to_string(),
-            comp_hash: Some("hash".to_string()),
-            realtime_active: Some(false),
-        }),
+        previous_turn_settings.clone(),
         /*world_state*/ None,
         /*reference_context*/ None,
-        thread_settings(),
+        settings.clone(),
         token_count(),
     )
     .expect("valid checkpoint");
 
-    let [
-        RolloutItem::Compacted(compacted),
-        RolloutItem::EventMsg(_),
-        RolloutItem::EventMsg(_),
-    ] = checkpoint.items()
-    else {
-        panic!("cleared checkpoint should contain compaction and current-state records");
-    };
-    let descriptor = compacted
-        .segment_state_checkpoint
-        .as_ref()
-        .expect("checkpoint descriptor");
+    let mut expected_compacted = compacted();
+    expected_compacted.segment_state_checkpoint = Some(SegmentStateCheckpoint {
+        version: 1,
+        previous_turn_settings,
+        world_state: SegmentStateCheckpointDisposition::Cleared,
+        reference_context: SegmentStateCheckpointDisposition::Cleared,
+    });
     assert_eq!(
-        (
-            descriptor.world_state,
-            descriptor.reference_context,
-            descriptor.previous_turn_settings.clone(),
-        ),
-        (
-            SegmentStateCheckpointDisposition::Cleared,
-            SegmentStateCheckpointDisposition::Cleared,
-            Some(SegmentPreviousTurnSettings {
-                model: "gpt-test".to_string(),
-                comp_hash: Some("hash".to_string()),
-                realtime_active: Some(false),
-            }),
-        )
+        json!(checkpoint.items()),
+        json!([
+            RolloutItem::Compacted(expected_compacted),
+            RolloutItem::EventMsg(EventMsg::ThreadSettingsApplied(settings.clone())),
+            RolloutItem::EventMsg(EventMsg::TokenCount(token_count())),
+        ]),
     );
     checkpoint.validate().expect("checkpoint remains valid");
+
+    let serialized = serde_json::to_string(checkpoint.items()).expect("serialize checkpoint");
+    assert!(!serialized.contains("private owner error"));
+    let restored: Vec<RolloutItem> = serde_json::from_str(&serialized).expect("restore checkpoint");
+    assert_eq!(json!(restored), json!(checkpoint.items()));
+    environment.config = EnvironmentConfigState::Failed(
+        "This persisted environment requires its owner to reattach configuration before it can be used.".to_string(),
+    );
+    assert_eq!(
+        settings
+            .thread_settings
+            .environments
+            .map(TurnEnvironmentSelections::from),
+        Some(TurnEnvironmentSelections::new(cwd, vec![environment])),
+    );
 }
 
 #[test]

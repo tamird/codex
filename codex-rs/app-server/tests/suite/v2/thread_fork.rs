@@ -2087,7 +2087,7 @@ fn certified_indexed_fork_checkpoint(
                 permission_profile: PermissionProfile::workspace_write(),
                 active_permission_profile: None,
                 cwd: cwd.clone(),
-                environments: Some(TurnEnvironmentSelections::new(cwd, Vec::new())),
+                environments: Some(TurnEnvironmentSelections::new(cwd, Vec::new()).into()),
                 workspace_roots: Some(Vec::new()),
                 profile_workspace_roots: Some(Vec::new()),
                 windows_sandbox_level: Some(WindowsSandboxLevel::Disabled),

@@ -138,6 +138,7 @@ fn persisted_thread_environment_selections(
             _ => None,
         })
         .and_then(|settings| settings.environments.clone())
+        .map(codex_protocol::protocol::TurnEnvironmentSelections::from)
         .map(|selections| selections.environments)
 }
 
@@ -1855,13 +1856,20 @@ impl ThreadManager {
             let response_history = Arc::new(history.get_rollout_items().to_vec());
             (history, response_history, None)
         };
-        let environments = settings_history_override
-            .as_deref()
-            .map(|history| persisted_thread_environment_selections(history))
-            .unwrap_or_else(|| match model_history_override.as_deref() {
-                Some(model_history) => persisted_thread_environment_selections(model_history),
-                None => persisted_thread_environment_selections(response_history.as_ref()),
-            });
+        let source_cwd_changed = history.session_cwd().is_some_and(|source_cwd| {
+            !codex_utils_path::paths_match_after_normalization(source_cwd, config.cwd.as_path())
+        });
+        let environments = if source_cwd_changed {
+            None
+        } else {
+            settings_history_override
+                .as_deref()
+                .map(|history| persisted_thread_environment_selections(history))
+                .unwrap_or_else(|| match model_history_override.as_deref() {
+                    Some(model_history) => persisted_thread_environment_selections(model_history),
+                    None => persisted_thread_environment_selections(response_history.as_ref()),
+                })
+        };
         let agent_control = self.agent_control_for_config(&config);
         let options = StartThreadOptions {
             initial_history: history,

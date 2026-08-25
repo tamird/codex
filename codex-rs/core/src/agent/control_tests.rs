@@ -1122,10 +1122,8 @@ async fn persist_thread_environment_for_resume(
         config: codex_protocol::protocol::EnvironmentConfigState::FromThread,
     };
     let mut settings = thread.thread_settings_snapshot().await;
-    settings.environments = Some(TurnEnvironmentSelections::new(
-        cwd,
-        vec![environment.clone()],
-    ));
+    settings.environments =
+        Some(TurnEnvironmentSelections::new(cwd, vec![environment.clone()]).into());
     thread
         .session
         .persist_rollout_items(&[RolloutItem::EventMsg(EventMsg::ThreadSettingsApplied(

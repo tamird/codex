@@ -84,10 +84,9 @@ fn checkpoint_settings_item(
                 permission_profile: PermissionProfile::workspace_write(),
                 active_permission_profile: None,
                 cwd: cwd.clone(),
-                environments: Some(TurnEnvironmentSelections::new(
-                    cwd.clone(),
-                    vec![environment],
-                )),
+                environments: Some(
+                    TurnEnvironmentSelections::new(cwd.clone(), vec![environment]).into(),
+                ),
                 workspace_roots: Some(vec![cwd]),
                 profile_workspace_roots: Some(Vec::new()),
                 windows_sandbox_level: Some(WindowsSandboxLevel::Disabled),

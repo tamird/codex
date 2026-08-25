@@ -110,6 +110,7 @@ pub use crate::permissions::FileSystemSpecialPath;
 pub use crate::permissions::NetworkSandboxPolicy;
 pub use crate::permissions::RawFileSystemSandboxPolicy;
 use crate::permissions::default_read_only_subpaths_for_writable_root;
+pub use crate::persisted_environment::PersistedTurnEnvironmentSelections;
 pub use crate::request_permissions::RequestPermissionsArgs;
 pub use crate::request_user_input::RequestUserInputEvent;
 
@@ -151,22 +152,15 @@ pub fn strip_user_message_prefix(text: &str) -> &str {
 
 // TODO(anp): Replace `TurnEnvironmentSelection` with `PathUri` once path URIs carry environment
 // identifiers.
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, JsonSchema, TS)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct TurnEnvironmentSelection {
     pub environment_id: String,
     pub cwd: PathUri,
     pub workspace_roots: Vec<PathUri>,
-    /// Runtime environment configuration is resolved by the environment owner.
-    ///
-    /// Rollout checkpoints retain the selected environment and roots but must not persist shell
-    /// environment policy values or transient pending and failure states.
-    #[serde(skip, default)]
-    #[schemars(skip)]
-    #[ts(skip)]
     pub config: EnvironmentConfigState,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, JsonSchema, TS)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct TurnEnvironmentSelections {
     pub legacy_fallback_cwd: AbsolutePathBuf,
     pub environments: Vec<TurnEnvironmentSelection>,
@@ -2190,7 +2184,7 @@ pub struct ThreadSettingsSnapshot {
     /// environment selections derived from current configuration.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
-    pub environments: Option<TurnEnvironmentSelections>,
+    pub environments: Option<PersistedTurnEnvironmentSelections>,
     /// Effective workspace roots used to materialize symbolic `:workspace_roots` entries in
     /// `permission_profile`.
     ///
@@ -4619,24 +4613,6 @@ mod tests {
     use std::path::PathBuf;
     use tempfile::NamedTempFile;
     use tempfile::TempDir;
-
-    #[test]
-    fn turn_environment_selection_does_not_persist_runtime_config() -> Result<()> {
-        let cwd = test_path_buf("/workspace").abs();
-        let selection = TurnEnvironmentSelection {
-            environment_id: "remote".to_string(),
-            cwd: PathUri::from_abs_path(&cwd),
-            workspace_roots: vec![PathUri::from_abs_path(&cwd)],
-            config: EnvironmentConfigState::Pending,
-        };
-
-        let value = serde_json::to_value(&selection)?;
-        assert_eq!(value.get("config"), None);
-
-        let decoded: TurnEnvironmentSelection = serde_json::from_value(value)?;
-        assert_eq!(decoded.config, EnvironmentConfigState::FromThread);
-        Ok(())
-    }
 
     #[test]
     fn review_decision_denied_round_trip() -> Result<()> {
