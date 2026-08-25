@@ -69,15 +69,9 @@ impl AgentControl {
             .await
     }
 
-    pub(super) async fn touch_loaded_agent_residency(
-        &self,
-        state: &Arc<ThreadManagerState>,
-        thread_id: ThreadId,
-    ) {
-        if let Ok(thread) = state.get_thread(thread_id).await
-            && is_resident_candidate(thread.as_ref())
-        {
-            self.agent_residency.touch(thread_id);
+    pub(super) fn touch_loaded_agent_residency(&self, thread: &CodexThread) {
+        if is_resident_candidate(thread) {
+            self.agent_residency.touch(thread.session.thread_id);
         }
     }
 
@@ -145,11 +139,16 @@ impl AgentResidency {
             let Some(candidate_thread_id) = self.pop_lru_candidate(protected_thread_id) else {
                 return EvictionResult::Unavailable;
             };
-            let lifecycle = control
+            let registered_lifecycle = control
                 .get_agent_metadata(candidate_thread_id)
-                .map(|metadata| metadata.lifecycle)
-                .unwrap_or_default();
-            let _transition = lifecycle.lock_transition().await;
+                .map(|metadata| metadata.lifecycle);
+            let lifecycle = registered_lifecycle.clone().unwrap_or_default();
+            // Reload can hold a descendant's transition while promotion holds this ancestor's.
+            // Eviction is opportunistic: never invert that lock order by waiting here.
+            let Some(_transition) = lifecycle.try_lock_transition() else {
+                self.touch(candidate_thread_id);
+                continue;
+            };
             let Some(candidate_thread) = manager
                 .get_thread(candidate_thread_id)
                 .await
@@ -158,6 +157,27 @@ impl AgentResidency {
             else {
                 continue;
             };
+            if !Arc::ptr_eq(
+                &control.state,
+                &candidate_thread.session.services.agent_control.state,
+            ) {
+                continue;
+            }
+            // A failed ownership transfer can restore the same control with a new lifecycle.
+            let registration_matches = match (
+                registered_lifecycle,
+                control
+                    .get_agent_metadata(candidate_thread_id)
+                    .map(|metadata| metadata.lifecycle),
+            ) {
+                (Some(previous), Some(current)) => Arc::ptr_eq(&previous, &current),
+                (None, None) => true,
+                (Some(_), None) | (None, Some(_)) => false,
+            };
+            if !registration_matches {
+                self.touch(candidate_thread_id);
+                continue;
+            }
             if !is_unloadable(candidate_thread.as_ref()).await {
                 self.touch(candidate_thread_id);
                 continue;

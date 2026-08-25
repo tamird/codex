@@ -1,4 +1,5 @@
 use super::residency::is_resident_session_source;
+use super::resume::load_agent_model_context;
 use super::*;
 use crate::agent::role::apply_role_to_config;
 use crate::codex_thread::CodexThread;
@@ -126,33 +127,6 @@ fn retain_forked_developer_message(item: &mut ResponseItem, usage_hint_texts: &[
     !content.is_empty() && set_annotated_content(item, content).is_some()
 }
 
-async fn load_agent_model_context(
-    state: &ThreadManagerState,
-    thread_id: ThreadId,
-    history_mode: ThreadHistoryMode,
-) -> CodexResult<Option<Vec<RolloutItem>>> {
-    match history_mode {
-        ThreadHistoryMode::Legacy => Ok(state
-            .read_stored_thread(ReadThreadParams {
-                thread_id,
-                include_archived: true,
-                include_history: true,
-            })
-            .await?
-            .history
-            .map(|history| history.items)),
-        ThreadHistoryMode::Paginated => Ok(Some(
-            state
-                .load_latest_model_context(LoadThreadHistoryParams {
-                    thread_id,
-                    include_archived: true,
-                })
-                .await?
-                .items,
-        )),
-    }
-}
-
 impl AgentControl {
     /// Spawn a new agent thread and submit the initial prompt.
     #[cfg(test)]
@@ -231,44 +205,37 @@ impl AgentControl {
         thread_id: ThreadId,
         parent: Option<Arc<CodexThread>>,
     ) -> CodexResult<()> {
-        if parent.is_none() {
-            return self.ensure_agent_loaded(config, thread_id).await;
-        }
+        let parent = match parent {
+            Some(parent) => parent,
+            None => return self.ensure_agent_loaded(config, thread_id).await,
+        };
         let state = self.upgrade()?;
         let lifecycle = self.ensure_agent_known(thread_id)?.lifecycle;
         let _transition = lifecycle.lock_transition().await;
-        let parent = if let Some(parent) = parent {
-            let parent_thread_id = parent.session.thread_id;
-            let turn = parent.session.new_default_turn().await;
-            config = build_agent_resume_config(&turn).map_err(|_| {
-                CodexErr::InvalidRequest(format!(
-                    "cannot resume multi-agent v2 child {thread_id} with the current parent settings"
-                ))
-            })?;
-            let registered_parent = state.get_thread(parent_thread_id).await.ok();
-            if !registered_parent
-                .as_ref()
-                .is_some_and(|registered| Arc::ptr_eq(registered, &parent))
-                || !parent.is_running()
-                || parent.multi_agent_version() != Some(MultiAgentVersion::V2)
-                || !Arc::ptr_eq(&self.state, &parent.session.services.agent_control.state)
-            {
-                return Err(CodexErr::InvalidRequest(format!(
-                    "cannot resume multi-agent v2 child {thread_id}: parent ownership is unavailable; resume the parent first"
-                )));
-            }
-            Some((parent, turn.environments.clone()))
-        } else {
-            None
-        };
-        let owner_thread_id = parent.as_ref().map(|(parent, _)| parent.session.thread_id);
-        if owner_thread_id.is_none() && state.get_thread(thread_id).await.is_ok() {
-            self.touch_loaded_agent_residency(&state, thread_id).await;
-            return Ok(());
-        }
-        if self.state.agent_metadata_for_thread(thread_id).is_none() {
+        let registered_agent = self.ensure_agent_known(thread_id)?;
+        if !Arc::ptr_eq(&lifecycle, &registered_agent.lifecycle) {
             return Err(CodexErr::ThreadNotFound(thread_id));
         }
+        let parent_thread_id = parent.session.thread_id;
+        let turn = parent.session.new_default_turn().await;
+        config = build_agent_resume_config(&turn).map_err(|_| {
+            CodexErr::InvalidRequest(format!(
+                "cannot resume multi-agent v2 child {thread_id} with the current parent settings"
+            ))
+        })?;
+        let registered_parent = state.get_thread(parent_thread_id).await.ok();
+        if !registered_parent
+            .as_ref()
+            .is_some_and(|registered| Arc::ptr_eq(registered, &parent))
+            || !parent.is_running()
+            || parent.multi_agent_version() != Some(MultiAgentVersion::V2)
+            || !Arc::ptr_eq(&self.state, &parent.session.services.agent_control.state)
+        {
+            return Err(CodexErr::InvalidRequest(format!(
+                "cannot resume multi-agent v2 child {thread_id}: parent ownership is unavailable; resume the parent first"
+            )));
+        }
+        let parent_environments = turn.environments.clone();
         let mut environment_selections = self.state.evicted_environments(thread_id);
 
         let stored_thread = state
@@ -283,10 +250,18 @@ impl AgentControl {
         let stored_reasoning_effort = stored_thread.reasoning_effort.clone();
         let stored_source = stored_thread.source.clone();
         let stored_parent_thread_id = stored_thread.parent_thread_id;
+        if stored_source.parent_thread_id() != Some(parent_thread_id)
+            || stored_parent_thread_id
+                .is_some_and(|recorded_parent| recorded_parent != parent_thread_id)
+        {
+            return Err(CodexErr::InvalidRequest(format!(
+                "cannot resume multi-agent v2 child {thread_id}: recorded parent ownership is inconsistent"
+            )));
+        }
         let history = load_agent_model_context(&state, thread_id, stored_thread.history_mode)
             .await?
             .ok_or(CodexErr::ThreadNotFound(thread_id))?;
-        let initial_history = InitialHistory::Resumed(ResumedHistory {
+        let mut initial_history = InitialHistory::Resumed(ResumedHistory {
             conversation_id: thread_id,
             history: Arc::new(history),
             rollout_path: stored_thread.rollout_path,
@@ -294,26 +269,55 @@ impl AgentControl {
         if initial_history.get_multi_agent_version() != Some(MultiAgentVersion::V2) {
             return Err(CodexErr::ThreadNotFound(thread_id));
         }
-        let (session_source, _) = initial_history
+        let (mut session_source, _) = initial_history
             .get_resumed_session_sources()
-            .unwrap_or((stored_source, None));
-        if let Some(parent_thread_id) = owner_thread_id {
-            if session_source.parent_thread_id() != Some(parent_thread_id)
-                || initial_history
-                    .get_resumed_parent_thread_id()
-                    .is_some_and(|recorded_parent| recorded_parent != parent_thread_id)
-                || stored_parent_thread_id
-                    .is_some_and(|recorded_parent| recorded_parent != parent_thread_id)
-            {
-                return Err(CodexErr::InvalidRequest(format!(
-                    "cannot resume multi-agent v2 child {thread_id}: recorded parent ownership is inconsistent"
-                )));
+            .unwrap_or((stored_source.clone(), None));
+        // Adoption commits persisted ownership before older rollout metadata is rewritten.
+        // Reconcile against that ownership and the locked registry, never the caller's parent ID.
+        if (session_source != stored_source
+            || session_source.get_agent_path() != registered_agent.agent_path)
+            && let SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+                parent_thread_id,
+                depth,
+                agent_path,
+                agent_nickname,
+                agent_role,
+            }) = stored_source
+        {
+            let canonical_source = SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+                parent_thread_id: stored_parent_thread_id.unwrap_or(parent_thread_id),
+                depth,
+                agent_path: registered_agent.agent_path.clone().or(agent_path),
+                agent_nickname: registered_agent.agent_nickname.clone().or(agent_nickname),
+                agent_role: registered_agent.agent_role.clone().or(agent_role),
+            });
+            if let InitialHistory::Resumed(resumed) = &mut initial_history {
+                super::ownership::normalize_resumed_session_metadata(
+                    Arc::make_mut(&mut resumed.history).as_mut_slice(),
+                    thread_id,
+                    &canonical_source,
+                    canonical_source.parent_thread_id(),
+                    Some(&registered_agent),
+                    self.session_id(),
+                )?;
             }
-            if let Ok(thread) = state.get_thread(thread_id).await {
-                self.validate_loaded_v2_child(&thread, parent_thread_id)?;
-                self.touch_loaded_agent_residency(&state, thread_id).await;
-                return Ok(());
-            }
+            session_source = canonical_source;
+        }
+        if session_source.parent_thread_id() != Some(parent_thread_id)
+            || initial_history
+                .get_resumed_parent_thread_id()
+                .is_some_and(|recorded_parent| recorded_parent != parent_thread_id)
+            || stored_parent_thread_id
+                .is_some_and(|recorded_parent| recorded_parent != parent_thread_id)
+        {
+            return Err(CodexErr::InvalidRequest(format!(
+                "cannot resume multi-agent v2 child {thread_id}: recorded parent ownership is inconsistent"
+            )));
+        }
+        if let Ok(thread) = state.get_thread(thread_id).await {
+            self.validate_loaded_v2_child(&thread, parent_thread_id)?;
+            self.touch_loaded_agent_residency(thread.as_ref());
+            return Ok(());
         }
         config.model_reasoning_effort = stored_reasoning_effort;
         if let Some(role_name) = session_source.get_agent_role() {
@@ -368,14 +372,7 @@ impl AgentControl {
                 })?;
             config.model_provider_id = stored_model_provider;
         }
-        let parent_thread_id = owner_thread_id
-            .or_else(|| initial_history.get_resumed_parent_thread_id())
-            .or(stored_parent_thread_id);
-        let (inherited_environments, inherited_exec_policy, client_mcp_extensions) = if let Some(
-            (parent, parent_environments),
-        ) =
-            parent.as_ref()
-        {
+        let (inherited_environments, inherited_exec_policy, client_mcp_extensions) = {
             let parent_config = parent.session.get_config().await;
             if !crate::exec_policy::child_uses_parent_exec_policy(&parent_config, &config) {
                 return Err(CodexErr::InvalidRequest(format!(
@@ -468,14 +465,6 @@ impl AgentControl {
                 Some(Arc::clone(&parent.session.services.exec_policy)),
                 Some(parent.client_mcp_extensions()),
             )
-        } else {
-            (
-                self.inherited_environments_for_source(&state, Some(&session_source))
-                    .await,
-                self.inherited_exec_policy_for_source(&state, Some(&session_source), &config)
-                    .await,
-                None,
-            )
         };
         // Reserving a slot can evict an idle nested parent. Keep its authority captured above.
         let residency_slot = self
@@ -488,7 +477,7 @@ impl AgentControl {
                 initial_history,
                 agent_control: self.clone(),
                 session_source,
-                parent_thread_id,
+                parent_thread_id: Some(parent_thread_id),
                 environment_selections,
                 inherited_environments,
                 inherited_exec_policy,
@@ -498,24 +487,20 @@ impl AgentControl {
             .await
         {
             Ok(reloaded_thread) => {
-                if let Some(parent_thread_id) = owner_thread_id {
-                    self.validate_loaded_v2_child(&reloaded_thread.thread, parent_thread_id)?;
-                }
+                self.validate_loaded_v2_child(&reloaded_thread.thread, parent_thread_id)?;
+                registered_agent.lifecycle.clear_cold_terminal_status();
                 self.state.clear_evicted_environments(thread_id);
-                lifecycle.clear_cold_terminal_status();
                 residency_slot.commit(reloaded_thread.thread_id);
                 state.notify_thread_created(reloaded_thread.thread_id);
                 Ok(())
             }
             Err(err) => {
                 if let Ok(thread) = state.get_thread(thread_id).await {
-                    if let Some(parent_thread_id) = owner_thread_id {
-                        self.validate_loaded_v2_child(&thread, parent_thread_id)?;
-                    }
+                    self.validate_loaded_v2_child(&thread, parent_thread_id)?;
+                    registered_agent.lifecycle.clear_cold_terminal_status();
                     self.state.clear_evicted_environments(thread_id);
-                    lifecycle.clear_cold_terminal_status();
                     drop(residency_slot);
-                    self.touch_loaded_agent_residency(&state, thread_id).await;
+                    self.touch_loaded_agent_residency(thread.as_ref());
                     return Ok(());
                 }
                 Err(err)
@@ -748,7 +733,11 @@ impl AgentControl {
             && notification_source
                 .as_ref()
                 .is_some_and(crate::goal_supervisor::is_goal_supervisor_helper_source);
-        if multi_agent_version != MultiAgentVersion::V2 || is_goal_supervisor_helper {
+        let pathless_multi_agent_child = agent_metadata.agent_path.is_none();
+        if multi_agent_version != MultiAgentVersion::V2
+            || pathless_multi_agent_child
+            || is_goal_supervisor_helper
+        {
             let child_reference = agent_metadata
                 .agent_path
                 .as_ref()

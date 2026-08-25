@@ -28,7 +28,6 @@ use crate::tools::handlers::multi_agents_v2::WaitAgentHandler as WaitAgentHandle
 use crate::turn_diff_tracker::TurnDiffTracker;
 use codex_extension_api::empty_extension_registry;
 use codex_features::Feature;
-use codex_history::InitialHistory;
 use codex_history::RolloutItem;
 use codex_login::AuthManager;
 use codex_login::CodexAuth;
@@ -40,7 +39,6 @@ use codex_protocol::config_types::ApprovalsReviewer;
 use codex_protocol::config_types::ServiceTier;
 use codex_protocol::config_types::ShellEnvironmentPolicy;
 use codex_protocol::items::TurnItem;
-use codex_protocol::mcp::ClientMcpExtensions;
 use codex_protocol::models::BaseInstructions;
 use codex_protocol::models::BaseInstructionsProvenance;
 use codex_protocol::models::ContentItem;
@@ -69,6 +67,7 @@ use codex_protocol::protocol::TurnAbortedEvent;
 use codex_protocol::protocol::TurnCompleteEvent;
 use codex_protocol::user_input::UserInput;
 use codex_state::DirectionalThreadSpawnEdgeStatus;
+use codex_thread_store::ThreadStore;
 use core_test_support::TempDirExt;
 use core_test_support::responses::ev_completed;
 use core_test_support::responses::ev_response_created;
@@ -956,7 +955,7 @@ async fn multi_agent_v2_spawn_rejects_adoption_fields() {
 }
 
 #[tokio::test]
-async fn multi_agent_v2_ownership_transfer_is_disabled_by_default() {
+async fn multi_agent_v2_ownership_transfer_can_be_disabled() {
     let (mut session, mut turn) = make_session_and_context().await;
     let manager = thread_manager(&turn);
     let root = manager
@@ -966,6 +965,7 @@ async fn multi_agent_v2_ownership_transfer_is_disabled_by_default() {
     session.services.agent_control = manager.agent_control();
     session.thread_id = root.thread_id;
     let mut config = (*turn.config).clone();
+    config.multi_agent_v2.enable_thread_adoption = false;
     config
         .features
         .enable(Feature::MultiAgentV2)
@@ -974,7 +974,7 @@ async fn multi_agent_v2_ownership_transfer_is_disabled_by_default() {
     let session = Arc::new(session);
     let turn = Arc::new(turn);
 
-    let Err(adopt_error) = AdoptAgentHandler::new(/*hide_agent_metadata*/ false)
+    let adopt_error = AdoptAgentHandler::new(/*hide_agent_metadata*/ false)
         .handle(invocation(
             session.clone(),
             turn.clone(),
@@ -986,10 +986,9 @@ async fn multi_agent_v2_ownership_transfer_is_disabled_by_default() {
             })),
         ))
         .await
-    else {
-        panic!("existing-thread adoption must be disabled by default");
-    };
-    let Err(promote_error) = PromoteAgentHandler
+        .err()
+        .expect("existing-thread adoption must be disabled");
+    let promote_error = PromoteAgentHandler
         .handle(invocation(
             session,
             turn,
@@ -997,9 +996,8 @@ async fn multi_agent_v2_ownership_transfer_is_disabled_by_default() {
             function_payload(json!({ "target": "worker" })),
         ))
         .await
-    else {
-        panic!("subagent promotion must be disabled by default");
-    };
+        .err()
+        .expect("subagent promotion must be disabled");
 
     let expected = FunctionCallError::RespondToModel(
         "Thread adoption is disabled. Set `[features.multi_agent_v2] enable_thread_adoption = true` in config.toml to enable it."
@@ -3190,13 +3188,13 @@ async fn send_input_accepts_structured_items() {
 async fn send_input_from_subagent_message_uses_inter_agent_communication() {
     let (mut session, mut turn) = make_session_and_context().await;
     let manager = thread_manager(&turn);
-    session.services.agent_control = manager.agent_control();
     let config = turn.config.as_ref().clone();
     let parent = manager
         .start_thread(StartThreadOptions::new(config))
         .await
         .expect("start parent");
     let parent_thread_id = parent.thread_id;
+    session.services.agent_control = parent.thread.session.services.agent_control.clone();
     session
         .services
         .agent_control
@@ -3329,47 +3327,77 @@ async fn resume_agent_noops_for_active_agent() {
 }
 
 #[tokio::test]
-async fn resume_agent_restores_closed_agent_and_accepts_send_input() {
-    let (mut session, turn) = make_session_and_context().await;
-    let manager = thread_manager(&turn);
-    session.services.agent_control = manager.agent_control();
-    let config = turn.config.as_ref().clone();
-    let thread = manager
-        .resume_thread_with_history(
+async fn resume_agent_explicitly_loads_archived_open_agent_and_accepts_send_input() {
+    let (_session, turn) = make_session_and_context().await;
+    let mut config = turn.config.as_ref().clone();
+    config
+        .features
+        .enable(Feature::Sqlite)
+        .expect("test config should allow sqlite");
+    let state_db = init_state_db(&config).await;
+    let auth_manager = AuthManager::from_auth_for_testing(CodexAuth::from_api_key("dummy"));
+    let manager = ThreadManager::new(
+        &config,
+        auth_manager.clone(),
+        crate::thread_manager::build_models_manager(&config, auth_manager),
+        crate::CodexAppsToolsCache::default(),
+        SessionSource::Exec,
+        Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
+        empty_extension_registry(),
+        Arc::new(crate::test_support::EmptyUserInstructionsProvider),
+        /*analytics_events_client*/ None,
+        thread_store_from_config(&config, state_db.clone()),
+        local_agent_graph_store_from_state_db(state_db.as_ref()),
+        "11111111-1111-4111-8111-111111111111".to_string(),
+        /*attestation_provider*/ None,
+        /*external_time_provider*/ None,
+    );
+    let parent = manager
+        .start_thread(StartThreadOptions::new(config.clone()))
+        .await
+        .expect("parent thread should start");
+    let parent_session = parent.thread.session.clone();
+    let agent_id = manager
+        .agent_control()
+        .spawn_agent(
             config.clone(),
-            InitialHistory::Forked(vec![RolloutItem::ResponseItem(
-                ResponseItem::Message {
-                    id: None,
-                    role: "user".to_string(),
-                    content: vec![ContentItem::InputText {
-                        text: "materialized".to_string(),
-                    }],
-                    phase: None,
-                    internal_chat_message_metadata_passthrough: None,
-                }
-                .into(),
-            )]),
-            AuthManager::from_auth_for_testing(CodexAuth::from_api_key("dummy")),
-            /*parent_trace*/ None,
-            ClientMcpExtensions::default(),
+            vec![UserInput::Text {
+                text: "materialized".to_string(),
+                text_elements: Vec::new(),
+            }],
+            Some(SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+                parent_thread_id: parent.thread_id,
+                depth: 1,
+                agent_path: None,
+                agent_nickname: None,
+                agent_role: None,
+            })),
         )
         .await
-        .expect("start thread");
-    let agent_id = thread.thread_id;
+        .expect("open child should start");
     let _ = manager
         .agent_control()
         .shutdown_live_agent(agent_id)
         .await
-        .expect("shutdown agent");
+        .expect("open child should become cold");
+    let store = codex_thread_store::LocalThreadStore::new(
+        codex_thread_store::LocalThreadStoreConfig::from_config(&config),
+        state_db.clone(),
+    );
+    store
+        .archive_thread(codex_thread_store::ArchiveThreadParams {
+            thread_id: agent_id,
+        })
+        .await
+        .expect("open child should archive");
     assert_eq!(
         manager.agent_control().get_status(agent_id).await,
         AgentStatus::NotFound
     );
-    let session = Arc::new(session);
-    let turn = Arc::new(turn);
+    let turn = parent_session.new_default_turn().await;
 
     let resume_invocation = invocation(
-        session.clone(),
+        parent_session.clone(),
         turn.clone(),
         "resume_agent",
         function_payload(json!({"id": agent_id.to_string()})),
@@ -3385,7 +3413,7 @@ async fn resume_agent_restores_closed_agent_and_accepts_send_input() {
     assert_eq!(success, Some(true));
 
     let send_invocation = invocation(
-        session,
+        parent_session,
         turn,
         "send_input",
         function_payload(json!({"target": agent_id.to_string(), "message": "hello"})),
@@ -4579,7 +4607,8 @@ async fn multi_agent_v2_interrupt_agent_accepts_unloaded_task_name_target() {
     let (content, _) = expect_text_output(output);
     let result: ListAgentsResult =
         serde_json::from_str(&content).expect("list_agents result should be json");
-    assert!(result.agents.is_empty());
+    assert_eq!(result.agents.len(), 1);
+    assert_eq!(result.agents[0].agent_name, "/root");
 }
 
 #[tokio::test]
@@ -4806,7 +4835,7 @@ async fn close_agent_submits_shutdown_and_returns_previous_status() {
 }
 
 #[tokio::test]
-async fn tool_handlers_cascade_close_and_resume_and_keep_explicitly_closed_subtrees_closed() {
+async fn tool_handlers_permanently_close_subtree_and_reject_resume() {
     let (_session, turn) = make_session_and_context().await;
     let mut config = turn.config.as_ref().clone();
     config.agent_max_depth = 3;
@@ -4843,23 +4872,6 @@ async fn tool_handlers_cascade_close_and_resume_and_keep_explicitly_closed_subtr
         .expect("parent thread should start");
     let parent_thread_id = parent.thread_id;
     let parent_session = parent.thread.session.clone();
-    let parent_turn = parent_session.new_default_turn().await;
-    let mut owner_config = parent_turn
-        .environments
-        .primary()
-        .expect("parent should have an environment")
-        .config()
-        .clone();
-    let owner_permission_profile = PermissionProfile::read_only();
-    owner_config.permission_profile =
-        PermissionProfileSnapshot::legacy(owner_permission_profile.clone());
-    let parent_environment = parent.thread.environment_selections().await.remove(0);
-    parent
-        .thread
-        .environment_ready(&parent_environment, owner_config)
-        .await
-        .expect("owner environment should be installed");
-
     let child_turn = parent_session.new_default_turn().await;
     let child_spawn_output = SpawnAgentHandler::default()
         .handle(invocation(
@@ -4931,8 +4943,18 @@ async fn tool_handlers_cascade_close_and_resume_and_keep_explicitly_closed_subtr
             .await,
         AgentStatus::NotFound
     );
+    let closed_children = state_db
+        .as_ref()
+        .expect("sqlite state db should initialize")
+        .list_thread_spawn_children_with_status(
+            parent_thread_id,
+            DirectionalThreadSpawnEdgeStatus::Closed,
+        )
+        .await
+        .expect("closed children should load");
+    assert_eq!(closed_children, vec![child_thread_id]);
 
-    let child_resume_output = ResumeAgentHandler
+    let child_resume_error = ResumeAgentHandler
         .handle(invocation(
             parent_session.clone(),
             parent_session.new_default_turn().await,
@@ -4940,49 +4962,12 @@ async fn tool_handlers_cascade_close_and_resume_and_keep_explicitly_closed_subtr
             function_payload(json!({"id": child_thread_id.to_string()})),
         ))
         .await
-        .expect("resume_agent should reopen the child subtree");
-    let (child_resume_content, child_resume_success) = expect_text_output(child_resume_output);
-    let child_resume_result: resume_agent::ResumeAgentResult =
-        serde_json::from_str(&child_resume_content).expect("resume result should be json");
-    assert_ne!(child_resume_result.status, AgentStatus::NotFound);
-    assert_eq!(child_resume_success, Some(true));
-    assert_ne!(
-        manager.agent_control().get_status(child_thread_id).await,
-        AgentStatus::NotFound
-    );
+        .err()
+        .expect("resume_agent must reject a permanently closed subtree");
     assert_eq!(
-        manager
-            .get_thread(child_thread_id)
-            .await
-            .expect("resumed child thread should exist")
-            .config_snapshot()
-            .await
-            .permission_profile,
-        owner_permission_profile
+        child_resume_error,
+        FunctionCallError::RespondToModel(format!("agent with id {child_thread_id} not found"))
     );
-    assert_ne!(
-        manager
-            .agent_control()
-            .get_status(grandchild_thread_id)
-            .await,
-        AgentStatus::NotFound
-    );
-
-    let close_again_output = CloseAgentHandler
-        .handle(invocation(
-            parent_session.clone(),
-            parent_session.new_default_turn().await,
-            "close_agent",
-            function_payload(json!({"target": child_thread_id.to_string()})),
-        ))
-        .await
-        .expect("close_agent should be repeatable for the child subtree");
-    let (close_again_content, close_again_success) = expect_text_output(close_again_output);
-    let close_again_result: close_agent::CloseAgentResult =
-        serde_json::from_str(&close_again_content)
-            .expect("second close_agent result should be json");
-    assert_ne!(close_again_result.previous_status, AgentStatus::NotFound);
-    assert_eq!(close_again_success, Some(true));
     assert_eq!(
         manager.agent_control().get_status(child_thread_id).await,
         AgentStatus::NotFound
@@ -4994,50 +4979,13 @@ async fn tool_handlers_cascade_close_and_resume_and_keep_explicitly_closed_subtr
             .await,
         AgentStatus::NotFound
     );
-
-    let operator = manager
-        .start_thread(StartThreadOptions::new(config.clone()))
-        .await
-        .expect("operator thread should start");
-    let operator_session = operator.thread.session.clone();
-    let _ = manager
-        .agent_control()
-        .shutdown_live_agent(parent_thread_id)
-        .await
-        .expect("parent shutdown should succeed");
-    assert_eq!(
-        manager.agent_control().get_status(parent_thread_id).await,
-        AgentStatus::NotFound
-    );
-
-    let parent_resume_output = ResumeAgentHandler
-        .handle(invocation(
-            operator_session,
-            operator.thread.session.new_default_turn().await,
-            "resume_agent",
-            function_payload(json!({"id": parent_thread_id.to_string()})),
-        ))
-        .await
-        .expect("resume_agent should reopen the parent thread");
-    let (parent_resume_content, parent_resume_success) = expect_text_output(parent_resume_output);
-    let parent_resume_result: resume_agent::ResumeAgentResult =
-        serde_json::from_str(&parent_resume_content).expect("parent resume result should be json");
-    assert_ne!(parent_resume_result.status, AgentStatus::NotFound);
-    assert_eq!(parent_resume_success, Some(true));
-    assert_ne!(
-        manager.agent_control().get_status(parent_thread_id).await,
-        AgentStatus::NotFound
-    );
-    assert_eq!(
-        manager.agent_control().get_status(child_thread_id).await,
-        AgentStatus::NotFound
-    );
-    assert_eq!(
-        manager
-            .agent_control()
-            .get_status(grandchild_thread_id)
-            .await,
-        AgentStatus::NotFound
+    assert!(
+        parent_session
+            .services
+            .agent_control
+            .get_agent_metadata(grandchild_thread_id)
+            .is_none(),
+        "closed grandchild identity must be evicted"
     );
 
     let shutdown_report = manager

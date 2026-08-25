@@ -34,10 +34,14 @@ impl AgentControl {
         if thread.session.active_turn.lock().await.is_some() {
             return Ok(());
         }
-        let config = thread.session.get_config().await;
-        let multi_agent_version = thread
-            .multi_agent_version()
-            .unwrap_or_else(|| config.multi_agent_version_from_features());
+        let multi_agent_version = match thread.multi_agent_version() {
+            Some(multi_agent_version) => multi_agent_version,
+            None => thread
+                .session
+                .get_config()
+                .await
+                .multi_agent_version_from_features(),
+        };
         self.ensure_execution_capacity(multi_agent_version, &thread.session_source)
     }
 

@@ -95,6 +95,10 @@ impl AgentLifecycle {
         Arc::clone(&self.transition).lock_owned().await
     }
 
+    pub(crate) fn try_lock_transition(self: &Arc<Self>) -> Option<OwnedMutexGuard<()>> {
+        Arc::clone(&self.transition).try_lock_owned().ok()
+    }
+
     pub(crate) fn completion_watcher_active(&self) -> bool {
         self.completion_watcher_active.load(Ordering::Acquire)
     }

@@ -9,6 +9,7 @@ use crate::config::test_config;
 use crate::context::ContextualUserFragment;
 use crate::context::SubagentNotification;
 use crate::thread_manager::ThreadManagerState;
+use assert_matches::assert_matches;
 use codex_features::Feature;
 use codex_login::CodexAuth;
 use codex_protocol::ThreadId;
@@ -61,6 +62,102 @@ async fn residency_slot_reservation_unloads_oldest_idle_v1_agent() {
     assert_residency_slot_unloads_oldest_idle_agent(MultiAgentVersion::V1).await;
 }
 
+#[tokio::test]
+async fn warm_agent_access_updates_residency_eviction_order() {
+    let mut config = test_config().await;
+    let _ = config.features.enable(Feature::MultiAgentV2);
+    config.multi_agent_v2.max_concurrent_threads_per_session = 3;
+    let temp_home = tempfile::tempdir().expect("create temp home");
+    config.codex_home = temp_home.path().to_path_buf().try_into().unwrap();
+    config.cwd = temp_home.path().to_path_buf().try_into().unwrap();
+    let manager = ThreadManager::with_models_provider_and_home_for_tests(
+        CodexAuth::from_api_key("dummy"),
+        config.model_provider.clone(),
+        config.codex_home.to_path_buf(),
+        Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
+    );
+    let root = manager
+        .start_thread(StartThreadOptions::new(config.clone()))
+        .await
+        .expect("start root thread");
+    let control = manager.agent_control();
+    let state = control.upgrade().expect("thread manager should be live");
+
+    let first_slot = control
+        .reserve_agent_residency_slot(
+            &state,
+            &config,
+            MultiAgentVersion::V2,
+            /*protected_thread_id*/ None,
+        )
+        .await
+        .expect("first resident slot");
+    let first = spawn_subagent(
+        &control,
+        &state,
+        config.clone(),
+        root.thread_id,
+        "recently-used",
+    )
+    .await;
+    first_slot.commit(first.thread_id);
+    mark_thread_completed(first.thread.as_ref()).await;
+
+    let second_slot = control
+        .reserve_agent_residency_slot(
+            &state,
+            &config,
+            MultiAgentVersion::V2,
+            /*protected_thread_id*/ None,
+        )
+        .await
+        .expect("second resident slot");
+    let second = spawn_subagent(
+        &control,
+        &state,
+        config.clone(),
+        root.thread_id,
+        "least-recently-used",
+    )
+    .await;
+    second_slot.commit(second.thread_id);
+    mark_thread_completed(second.thread.as_ref()).await;
+
+    control
+        .state
+        .reserve_spawn_slot(/*max_threads*/ None)
+        .expect("first child metadata should register")
+        .commit(AgentMetadata {
+            agent_id: Some(first.thread_id),
+            ..Default::default()
+        });
+    control
+        .ensure_agent_loaded(config.clone(), first.thread_id)
+        .await
+        .expect("warm agent should remain loaded");
+
+    let _third_slot = control
+        .reserve_agent_residency_slot(
+            &state,
+            &config,
+            MultiAgentVersion::V2,
+            /*protected_thread_id*/ None,
+        )
+        .await
+        .expect("third reservation should evict the least recently used child");
+
+    assert!(manager.get_thread(first.thread_id).await.is_ok());
+    let err = manager
+        .get_thread(second.thread_id)
+        .await
+        .err()
+        .expect("least recently used child should have been evicted");
+    match err.details() {
+        CodexErrorDetails::ThreadNotFound(thread_id) => assert_eq!(*thread_id, second.thread_id),
+        _ => panic!("expected the older child to be missing, got {err:?}"),
+    }
+}
+
 async fn assert_residency_slot_unloads_oldest_idle_agent(multi_agent_version: MultiAgentVersion) {
     let mut config = test_config().await;
     match multi_agent_version {
@@ -103,6 +200,38 @@ async fn assert_residency_slot_unloads_oldest_idle_agent(multi_agent_version: Mu
     let first = spawn_subagent(&control, &state, config.clone(), root.thread_id, "worker-1").await;
     first_slot.commit(first.thread_id);
     mark_thread_completed(first.thread.as_ref()).await;
+
+    control
+        .state
+        .reserve_spawn_slot(/*max_threads*/ None)
+        .expect("reserve first registry slot")
+        .commit(AgentMetadata {
+            agent_id: Some(first.thread_id),
+            ..Default::default()
+        });
+    let lifecycle = control
+        .get_agent_metadata(first.thread_id)
+        .expect("registered first resident")
+        .lifecycle;
+    let transition = lifecycle.lock_transition().await;
+    let error = timeout(
+        Duration::from_secs(5),
+        control.reserve_agent_residency_slot(
+            &state,
+            &config,
+            multi_agent_version,
+            /*protected_thread_id*/ None,
+        ),
+    )
+    .await
+    .expect("eviction must not wait for another lifecycle transition")
+    .err()
+    .expect("locked resident cannot be evicted");
+    assert_matches!(
+        error.details(),
+        CodexErrorDetails::AgentLimitReached { max_threads: _ }
+    );
+    drop(transition);
 
     let second_slot = control
         .reserve_agent_residency_slot(

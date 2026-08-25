@@ -95,8 +95,13 @@ impl AgentControl {
                 continue;
             }
 
-            let multi_agent_version =
-                Box::pin(self.ensure_agent_loaded_locked(&state, config.clone(), agent_id)).await?;
+            let multi_agent_version = Box::pin(self.ensure_agent_loaded_locked(
+                &state,
+                config.clone(),
+                agent_id,
+                &lifecycle,
+            ))
+            .await?;
             if input.starts_turn() {
                 let thread = state.get_thread(agent_id).await?;
                 self.ensure_execution_capacity_for_turn_start(&thread)

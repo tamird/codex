@@ -40,7 +40,7 @@ impl AgentControl {
         let state = self.upgrade()?;
         let lifecycle = self.ensure_agent_known(thread_id)?.lifecycle;
         let _transition = lifecycle.lock_transition().await;
-        Box::pin(self.ensure_agent_loaded_locked(&state, config, thread_id)).await?;
+        Box::pin(self.ensure_agent_loaded_locked(&state, config, thread_id, &lifecycle)).await?;
         Ok(())
     }
 
@@ -49,17 +49,24 @@ impl AgentControl {
         state: &Arc<ThreadManagerState>,
         config: Config,
         thread_id: ThreadId,
+        lifecycle: &Arc<crate::agent::registry::AgentLifecycle>,
     ) -> CodexResult<MultiAgentVersion> {
-        if let Ok(thread) = state.get_thread(thread_id).await {
-            self.touch_loaded_agent_residency(state, thread_id).await;
-            return Ok(thread
-                .multi_agent_version()
-                .unwrap_or(MultiAgentVersion::V1));
-        }
         let registered_agent = self
             .state
             .agent_metadata_for_thread(thread_id)
             .ok_or(CodexErr::ThreadNotFound(thread_id))?;
+        if !Arc::ptr_eq(lifecycle, &registered_agent.lifecycle) {
+            return Err(CodexErr::ThreadNotFound(thread_id));
+        }
+        if let Ok(thread) = state.get_thread(thread_id).await {
+            if !Arc::ptr_eq(&self.state, &thread.session.services.agent_control.state) {
+                return Err(CodexErr::ThreadNotFound(thread_id));
+            }
+            self.touch_loaded_agent_residency(thread.as_ref());
+            return Ok(thread
+                .multi_agent_version()
+                .unwrap_or(MultiAgentVersion::V1));
+        }
 
         let stored_thread = state
             .read_stored_thread(ReadThreadParams {
@@ -220,13 +227,15 @@ impl AgentControl {
                 Ok(multi_agent_version)
             }
             Err(err) => {
-                if state.get_thread(thread_id).await.is_ok() {
+                if let Ok(thread) = state.get_thread(thread_id).await {
+                    if !Arc::ptr_eq(&self.state, &thread.session.services.agent_control.state) {
+                        return Err(CodexErr::ThreadNotFound(thread_id));
+                    }
+                    registered_agent.lifecycle.clear_cold_terminal_status();
                     self.state.clear_evicted_environments(thread_id);
                     drop(residency_slot);
-                    self.touch_loaded_agent_residency(state, thread_id).await;
-                    return Ok(state
-                        .get_thread(thread_id)
-                        .await?
+                    self.touch_loaded_agent_residency(thread.as_ref());
+                    return Ok(thread
                         .multi_agent_version()
                         .unwrap_or(MultiAgentVersion::V1));
                 }
