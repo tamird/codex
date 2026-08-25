@@ -2,9 +2,10 @@ use super::*;
 
 impl ChatWidget {
     pub(super) fn on_raw_response_item(&mut self, item: ResponseItem) {
-        let Some(display) = inter_agent_message_display_from_response_item(&item) else {
+        let Some(mut display) = inter_agent_message_display_from_response_item(&item) else {
             return;
         };
+        display.content = display_inter_agent_message_content(&display.content);
         self.add_to_history(history_cell::new_info_event(
             display.text(),
             /*hint*/ None,

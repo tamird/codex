@@ -5,7 +5,9 @@ use crate::legacy_core::config::ConfigBuilder;
 use app_test_support::create_fake_paginated_rollout;
 use app_test_support::create_fake_rollout;
 use app_test_support::rollout_path;
+use codex_protocol::AgentPath;
 use codex_protocol::ThreadId;
+use codex_protocol::protocol::InterAgentCommunication;
 use pretty_assertions::assert_eq;
 use tempfile::TempDir;
 
@@ -285,6 +287,47 @@ fn delegated_prompts_match_desktop_xml_contract() {
 }
 
 #[test]
+fn turn_summary_preserves_visible_inter_agent_messages() -> color_eyre::Result<()> {
+    let communication = InterAgentCommunication::new(
+        AgentPath::try_from("/root/worker").expect("valid agent path"),
+        AgentPath::root(),
+        Vec::new(),
+        "Ready for review.".to_string(),
+        /*trigger_turn*/ false,
+    );
+    let mut legacy_communication = communication.clone();
+    legacy_communication.content = "Message Type: MESSAGE\nTask name: /root\nSender: /root/worker\nPayload:\nReady for review.".to_string();
+    let encrypted = InterAgentCommunication::new_encrypted(
+        communication.author.clone(),
+        AgentPath::root(),
+        Vec::new(),
+        "opaque ciphertext".to_string(),
+        /*trigger_turn*/ false,
+    );
+    let turn: Turn = serde_json::from_value(json!({
+        "id": "turn-1",
+        "status": "completed",
+        "items": [
+            {"type": "interAgentCommunication", "id": "typed", "communication": communication},
+            {"type": "rawResponseItem", "id": "legacy", "item": legacy_communication.to_model_input_item()},
+            {"type": "interAgentCommunication", "id": "encrypted", "communication": encrypted},
+            {"type": "rawResponseItem", "id": "legacy-encrypted", "item": encrypted.to_model_input_item()}
+        ]
+    }))?;
+
+    for include_outputs in [false, true] {
+        assert_eq!(
+            turn_summary(&turn, include_outputs, DEFAULT_OUTPUT_CHARS)["items"],
+            json!([
+                {"type": "interAgentCommunication", "id": "typed", "author": "/root/worker", "text": "Ready for review."},
+                {"type": "interAgentCommunication", "id": "legacy", "author": "/root/worker", "text": "Ready for review."}
+            ])
+        );
+    }
+    Ok(())
+}
+
+#[test]
 fn activity_metadata_is_retained_without_including_outputs() -> color_eyre::Result<()> {
     let turn: Turn = serde_json::from_value(json!({
         "id": "turn-1",
@@ -370,40 +413,6 @@ fn activity_metadata_is_retained_without_including_outputs() -> color_eyre::Resu
     assert_eq!(
         no_outputs["items"][8]["result"],
         json!({"text": "", "truncated": true, "originalChars": 11})
-    );
-    Ok(())
-}
-
-#[test]
-fn turn_summary_bounds_inter_agent_messages_and_hides_encrypted_content() -> color_eyre::Result<()>
-{
-    let turn: Turn = serde_json::from_value(json!({
-        "id": "turn-1",
-        "status": "completed",
-        "items": [
-            {"type": "interAgentCommunication", "id": "visible", "communication": {
-                "author": "/root/worker", "recipient": "/root", "other_recipients": [],
-                "content": "x".repeat(DEFAULT_OUTPUT_CHARS * 2), "trigger_turn": false
-            }},
-            {"type": "interAgentCommunication", "id": "encrypted", "communication": {
-                "author": "/root/worker", "recipient": "/root", "other_recipients": [],
-                "content": "must stay hidden", "encrypted_content": "ciphertext", "trigger_turn": false
-            }},
-            {"type": "rawResponseItem", "id": "legacy", "item": {
-                "type": "message", "role": "assistant", "content": []
-            }}
-        ]
-    }))?;
-    let summary = turn_summary(&turn, false, DEFAULT_OUTPUT_CHARS);
-    assert_eq!(
-        summary["items"],
-        json!([
-            {"type": "interAgentCommunication", "id": "visible", "author": "/root/worker",
-                "recipient": "/root", "text": truncate(&"x".repeat(DEFAULT_OUTPUT_CHARS * 2), DEFAULT_OUTPUT_CHARS)},
-            {"type": "interAgentCommunication", "id": "encrypted", "author": "/root/worker",
-                "recipient": "/root", "text": null},
-            {"type": "rawResponseItem", "id": "legacy", "text": null}
-        ])
     );
     Ok(())
 }

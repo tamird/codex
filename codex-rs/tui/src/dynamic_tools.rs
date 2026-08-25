@@ -48,6 +48,8 @@ use codex_app_server_protocol::TurnStartParams;
 use codex_app_server_protocol::TurnStartResponse;
 use codex_app_server_protocol::TurnToolOutput;
 use codex_app_server_protocol::UserInput;
+use codex_app_server_protocol::inter_agent_message_display_from_response_item;
+use codex_app_server_protocol::visible_inter_agent_message_content;
 use codex_protocol::ThreadId;
 use codex_protocol::models::FunctionCallOutputBody;
 use serde::Deserialize;
@@ -1068,8 +1070,6 @@ async fn execute_inner(
                                     | ThreadItem::FunctionCallOutput { .. }
                                     | ThreadItem::HookPrompt { .. }
                                     | ThreadItem::AgentMessage { .. }
-                                    | ThreadItem::InterAgentCommunication { .. }
-                                    | ThreadItem::RawResponseItem { .. }
                                     | ThreadItem::Plan { .. }
                                     | ThreadItem::Reasoning { .. }
                                     | ThreadItem::SubAgentActivity { .. }
@@ -1077,6 +1077,8 @@ async fn execute_inner(
                                     | ThreadItem::EnteredReviewMode { .. }
                                     | ThreadItem::ExitedReviewMode { .. }
                                     | ThreadItem::ContextCompaction { .. } => None,
+                                    ThreadItem::InterAgentCommunication { id: _, communication: _ }
+                                    | ThreadItem::RawResponseItem { id: _, item: _ } => None,
                                 })
                                 });
                             polls.push(json!({
@@ -1324,7 +1326,7 @@ fn turn_summary(turn: &Turn, include_outputs: bool, output_chars: usize) -> Valu
         .items
         .iter()
         .rev()
-        .map(|item| match item {
+        .filter_map(|item| Some(match item {
             ThreadItem::UserMessage { id, content, .. } => json!({
                 "type": "userMessage",
                 "id": id,
@@ -1379,17 +1381,22 @@ fn turn_summary(turn: &Turn, include_outputs: bool, output_chars: usize) -> Valu
             ThreadItem::AgentMessage { id, text, phase, .. } => json!({
                 "type": "agentMessage", "id": id, "text": truncate(text, DEFAULT_OUTPUT_CHARS), "phase": phase
             }),
-            ThreadItem::InterAgentCommunication { id, communication } => json!({
-                "type": "interAgentCommunication", "id": id,
-                "author": communication.author, "recipient": communication.recipient,
-                "text": codex_app_server_protocol::visible_inter_agent_message_content(communication)
-                    .map(|text| truncate(&text, DEFAULT_OUTPUT_CHARS))
-            }),
-            ThreadItem::RawResponseItem { id, item } => json!({
-                "type": "rawResponseItem", "id": id,
-                "text": codex_app_server_protocol::inter_agent_message_display_from_response_item(item)
-                    .map(|display| truncate(&display.text(), DEFAULT_OUTPUT_CHARS))
-            }),
+            ThreadItem::InterAgentCommunication { id, communication } => {
+                let content = visible_inter_agent_message_content(communication)?;
+                json!({
+                    "type": "interAgentCommunication", "id": id,
+                    "author": communication.author,
+                    "text": truncate(&content, DEFAULT_OUTPUT_CHARS)
+                })
+            }
+            ThreadItem::RawResponseItem { id, item } => {
+                let display = inter_agent_message_display_from_response_item(item)?;
+                json!({
+                    "type": "interAgentCommunication", "id": id,
+                    "author": display.author,
+                    "text": truncate(&display.content, DEFAULT_OUTPUT_CHARS)
+                })
+            }
             ThreadItem::Plan { id, text } => json!({
                 "type": "plan", "id": id, "text": truncate(text, DEFAULT_OUTPUT_CHARS)
             }),
@@ -1531,7 +1538,7 @@ fn turn_summary(turn: &Turn, include_outputs: bool, output_chars: usize) -> Valu
             ThreadItem::ContextCompaction { id } => json!({
                 "type": "contextCompaction", "id": id
             }),
-        })
+        }))
         .take(20)
         .collect();
     items.reverse();
