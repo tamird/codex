@@ -24,6 +24,10 @@ use codex_protocol::models::PermissionProfile;
 use codex_protocol::openai_models::ModelServiceTier;
 use codex_protocol::openai_models::ModelsResponse;
 use codex_protocol::openai_models::ReasoningEffort;
+use codex_protocol::permissions::FileSystemAccessMode;
+use codex_protocol::permissions::FileSystemSandboxEntry;
+use codex_protocol::permissions::FileSystemSandboxPolicy;
+use codex_protocol::permissions::NetworkSandboxPolicy;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::HookEventName;
@@ -41,6 +45,7 @@ use codex_protocol::user_input::UserInput;
 use codex_skills_extension::HostSkillsSnapshot;
 use codex_skills_extension::SkillsExtensionConfig;
 use codex_skills_extension::install;
+use codex_thread_store::ReadThreadParams;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use core_test_support::hooks::trust_discovered_hooks;
 use core_test_support::responses::ev_assistant_message;
@@ -49,12 +54,15 @@ use core_test_support::responses::ev_function_call;
 use core_test_support::responses::ev_function_call_with_namespace;
 use core_test_support::responses::ev_response_created;
 use core_test_support::responses::mount_response_sequence;
+use core_test_support::responses::mount_sse_once;
 use core_test_support::responses::mount_sse_sequence;
 use core_test_support::responses::sse;
 use core_test_support::responses::sse_completed;
 use core_test_support::responses::sse_response;
 use core_test_support::responses::start_mock_server;
 use core_test_support::skip_if_no_network;
+use core_test_support::skip_if_sandbox;
+use core_test_support::skip_if_target_windows;
 use core_test_support::submit_thread_settings;
 use core_test_support::test_codex::test_codex;
 use core_test_support::wait_for_event;
@@ -707,6 +715,98 @@ print("{}")
     )?;
     assert_ne!(next_metadata["turn_id"], turn_id);
 
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn workspace_cwd_preserves_transition_when_agents_md_refresh_fails() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+    skip_if_target_windows!(
+        Ok(()),
+        "Windows restricted-token sandbox cannot enforce deny-read policies"
+    );
+    skip_if_sandbox!(Ok(()));
+
+    let fixture = linked_worktree_fixture();
+    std::fs::write(fixture.primary.join("AGENTS.md"), "Primary instructions.\n")?;
+    let denied_instructions = fixture.linked.join("AGENTS.md");
+    std::fs::write(&denied_instructions, "Linked instructions.\n")?;
+    let server = start_mock_server().await;
+    let responses = mount_sse_once(
+        &server,
+        sse(vec![
+            ev_response_created("resp-1"),
+            ev_function_call_with_namespace(
+                "set-cwd",
+                "workspace",
+                "set_cwd",
+                &json!({ "path": fixture.linked }).to_string(),
+            ),
+            ev_completed("resp-1"),
+        ]),
+    )
+    .await;
+    let primary = fixture.primary.clone();
+    let mut builder = test_codex().with_config(move |config| {
+        config.cwd = primary.clone();
+        config.workspace_roots = vec![primary];
+        config
+            .features
+            .enable(Feature::WorkspaceCwdTool)
+            .expect("enable workspace cwd tool");
+        let mut file_system_policy = FileSystemSandboxPolicy::read_only();
+        file_system_policy.entries.push(FileSystemSandboxEntry::new(
+            denied_instructions.into(),
+            FileSystemAccessMode::Deny,
+        ));
+        config
+            .permissions
+            .set_permission_profile(PermissionProfile::from_runtime_permissions(
+                &file_system_policy,
+                NetworkSandboxPolicy::Restricted,
+            ))
+            .expect("test config should allow a restricted read policy");
+    });
+    // The workspace tool requires one local environment; the deny-read rule must target
+    // that environment's linked worktree rather than a remote executor's filesystem.
+    let test = builder.build(&server).await?;
+    test.codex
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: "move into the linked worktree".to_string(),
+            text_elements: Vec::new(),
+        }]))
+        .await?;
+
+    let event = wait_for_event(&test.codex, |event| match event {
+        EventMsg::ThreadSettingsApplied(settings) => settings.thread_settings.cwd == fixture.linked,
+        EventMsg::Error(_) | EventMsg::TurnComplete(_) => true,
+        _ => false,
+    })
+    .await;
+    let EventMsg::ThreadSettingsApplied(settings) = event else {
+        anyhow::bail!("workspace change must be published before refresh failure: {event:?}");
+    };
+    assert_eq!(settings.thread_settings.cwd, fixture.linked);
+
+    let event = wait_for_event(&test.codex, |event| {
+        matches!(event, EventMsg::Error(_) | EventMsg::TurnComplete(_))
+    })
+    .await;
+    let EventMsg::Error(error) = event else {
+        anyhow::bail!("unreadable instructions must stop the next model step: {event:?}");
+    };
+    assert!(error.message.contains("AGENTS.md"), "{error:?}");
+    assert_eq!(responses.requests().len(), 1);
+
+    let stored = test
+        .thread_store
+        .read_thread(ReadThreadParams {
+            thread_id: test.session_configured.session_id.into(),
+            include_archived: false,
+            include_history: false,
+        })
+        .await?;
+    assert_eq!(stored.cwd, fixture.linked.into_path_buf());
     Ok(())
 }
 

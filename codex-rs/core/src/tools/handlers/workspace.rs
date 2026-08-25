@@ -199,6 +199,10 @@ impl ToolExecutor<ToolInvocation> for SetWorkspaceCwdHandler {
                 None
             };
 
+            if active_context_changed {
+                step_context.request_turn_context_refresh();
+            }
+            let mut instructions_refresh = Ok(());
             if changed {
                 let environments = session.services.turn_environments.snapshot().await;
                 // The next model step must observe the replacement environment's filesystem.
@@ -213,16 +217,16 @@ impl ToolExecutor<ToolInvocation> for SetWorkspaceCwdHandler {
                 }
                 let environments = session.services.turn_environments.snapshot().await;
                 let config = session.get_config().await;
-                session
+                instructions_refresh = session
                     .services
                     .agents_md_manager
                     .refresh(config.as_ref(), &environments)
                     .await
                     .map_err(|err| {
                         FunctionCallError::RespondToModel(format!(
-                            "workspace.set_cwd could not refresh AGENTS.md instructions: {err}"
+                            "workspace.set_cwd changed the workspace, but could not reload AGENTS.md: {err}"
                         ))
-                    })?;
+                    });
 
                 metadata_persisted = if let Some(live_thread) = session.live_thread() {
                     let git_info = GitInfoPatch {
@@ -272,9 +276,7 @@ impl ToolExecutor<ToolInvocation> for SetWorkspaceCwdHandler {
                     )
                     .await;
             }
-            if active_context_changed {
-                step_context.request_turn_context_refresh();
-            }
+            instructions_refresh?;
 
             Ok(boxed_tool_output(JsonToolOutput::new(json!({
                 "changed": changed,
