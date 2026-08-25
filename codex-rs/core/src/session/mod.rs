@@ -2123,10 +2123,7 @@ impl Session {
         );
         let recomputed_token_count =
             Self::recompute_token_usage_state_in_state(&mut state, turn_context.as_ref());
-        let checkpoint = Self::segment_state_checkpoint_from_state(
-            &state,
-            self.services.turn_environments.selections(),
-        );
+        let checkpoint = self.segment_state_checkpoint_from_state(&state);
         // Cancellation after this point cannot prove whether the detached publication owner
         // committed, so only a classified outcome may clear the restart requirement.
         let outcome = live_thread
@@ -2237,8 +2234,8 @@ impl Session {
         reason = "checkpoint fields are constructed from one locked session-state snapshot"
     )]
     fn segment_state_checkpoint_from_state(
+        &self,
         state: &SessionState,
-        environment_selections: Vec<TurnEnvironmentSelection>,
     ) -> CertifiedSegmentStateCheckpoint {
         let (info, rate_limits) = state.token_info_and_rate_limits();
         let window_ids = state.auto_compact_window_ids();
@@ -2246,7 +2243,7 @@ impl Session {
             CompactedItem {
                 message: String::new(),
                 replacement_history: Some(state.clone_history().annotated_items().to_vec()),
-                mcp_resource_origins: None,
+                mcp_resource_origins: self.services.mcp_runtime.resource_origin_checkpoint(),
                 window_number: Some(state.auto_compact_window_number()),
                 first_window_id: Some(window_ids.first_window_id.to_string()),
                 previous_window_id: window_ids.previous_window_id.map(|id| id.to_string()),
@@ -2268,7 +2265,7 @@ impl Session {
             ThreadSettingsAppliedEvent {
                 thread_settings: state
                     .session_configuration
-                    .thread_settings_snapshot(&environment_selections),
+                    .thread_settings_snapshot(&self.services.turn_environments.selections()),
             },
             TokenCountEvent { info, rate_limits },
         )
@@ -2277,10 +2274,7 @@ impl Session {
 
     async fn current_segment_state_checkpoint(&self) -> CertifiedSegmentStateCheckpoint {
         let state = self.state.lock().await;
-        Self::segment_state_checkpoint_from_state(
-            &state,
-            self.services.turn_environments.selections(),
-        )
+        self.segment_state_checkpoint_from_state(&state)
     }
 
     async fn previous_turn_settings(&self) -> Option<PreviousTurnSettings> {
