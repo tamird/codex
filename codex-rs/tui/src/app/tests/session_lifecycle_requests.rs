@@ -650,6 +650,205 @@ fn spawn_approved_task_tool_call(
 }
 
 #[tokio::test]
+async fn restored_server_permission_profile_survives_cd_without_turn_override() -> Result<()> {
+    use codex_protocol::models::ContentItem;
+    use codex_protocol::models::ResponseItem;
+    use core_test_support::responses;
+
+    let model_server = responses::start_mock_server().await;
+    let response = responses::mount_sse_once(
+        &model_server,
+        responses::sse(vec![
+            responses::ev_response_created("response-1"),
+            responses::ev_assistant_message("message-1", "done"),
+            responses::ev_completed("response-1"),
+        ]),
+    )
+    .await;
+    let (mut app, mut app_event_rx, _op_rx) = make_test_app_with_channels().await;
+    let codex_home = tempdir()?;
+    app.config.codex_home = codex_home.path().to_path_buf().abs();
+    app.config.sqlite = SqliteConfig::new_for_testing(codex_home.path().abs());
+    std::fs::write(
+        app.config.codex_home.join("config.toml"),
+        format!(
+            r#"
+model = "gpt-5.2"
+model_provider = "permissions-test"
+sandbox_mode = "workspace-write"
+
+[model_providers.permissions-test]
+name = "Permissions test"
+base_url = "{}/v1"
+wire_api = "responses"
+request_max_retries = 0
+stream_max_retries = 0
+"#,
+            model_server.uri()
+        ),
+    )?;
+    app.refresh_in_memory_config_from_disk().await?;
+    let destination = app.config.codex_home.join("destination");
+    std::fs::create_dir(&destination)?;
+    crate::legacy_core::config::set_project_trust_level(
+        app.config.codex_home.as_path(),
+        &destination,
+        codex_protocol::config_types::TrustLevel::Trusted,
+    )
+    .map_err(|error| color_eyre::eyre::eyre!(error.to_string()))?;
+    let (mut app_server, requests, proxy) = start_recording_app_server(
+        &app.config,
+        /*blocked_thread_list*/ None,
+        /*failed_thread_name*/ None,
+    )
+    .await?;
+    let previous = app_server.start_thread(&app.config).await?;
+    app.enqueue_primary_thread_session(previous.session, previous.turns)
+        .await?;
+    let mut target_config = app.config.clone();
+    target_config
+        .permissions
+        .set_permission_profile(PermissionProfile::read_only())?;
+    assert_ne!(
+        app.config.permissions.effective_permission_profile(),
+        target_config.permissions.effective_permission_profile()
+    );
+    let target = app_server.start_thread(&target_config).await?;
+    let target_thread_id = target.session.thread_id;
+    // Overview attachment resumes a persisted task, not an unmaterialized empty thread.
+    app_server
+        .thread_inject_items(
+            target_thread_id,
+            vec![ResponseItem::Message {
+                id: None,
+                role: "assistant".to_string(),
+                content: vec![ContentItem::OutputText {
+                    text: "Saved task context".to_string(),
+                }],
+                phase: None,
+                internal_chat_message_metadata_passthrough: None,
+            }],
+        )
+        .await?;
+    let mut tui = crate::tui::test_support::make_test_tui()?;
+    while app_event_rx.try_recv().is_ok() {}
+
+    app.select_agents_overview_thread(&mut tui, &mut app_server, target_thread_id)
+        .await?;
+
+    let attach_history = std::iter::from_fn(|| app_event_rx.try_recv().ok())
+        .filter_map(|event| match event {
+            AppEvent::InsertHistoryCell(cell) => {
+                Some(lines_to_single_string(&cell.display_lines(/*width*/ 200)))
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert_eq!(
+        app.chat_widget.thread_id(),
+        Some(target_thread_id),
+        "overview attach history: {attach_history}"
+    );
+    assert_eq!(
+        app.chat_widget
+            .config_ref()
+            .permissions
+            .effective_permission_profile(),
+        PermissionProfile::read_only()
+    );
+    assert_eq!(
+        app.runtime_permission_profile_override,
+        Some(RuntimePermissionProfileOverride::from_restored_config(
+            app.chat_widget.config_ref(),
+        ))
+    );
+
+    app.refresh_in_memory_config_from_disk().await?;
+    assert_eq!(
+        app.config.permissions.effective_permission_profile(),
+        PermissionProfile::read_only()
+    );
+    assert_eq!(app.config.permissions.active_permission_profile(), None);
+    let turn = AppCommand::user_turn(
+        vec![AppServerUserInput::Text {
+            text: "Continue the selected task".to_string(),
+            text_elements: Vec::new(),
+        }],
+        app.config.cwd.to_path_buf(),
+        app.config.permissions.approval_policy.value().into(),
+        app.config.permissions.active_permission_profile(),
+        "gpt-5.2".to_string(),
+        /*effort*/ None,
+        /*summary*/ None,
+        /*service_tier*/ None,
+        /*final_output_json_schema*/ None,
+        /*collaboration_mode*/ None,
+        /*personality*/ None,
+    );
+    assert!(
+        app.try_submit_active_thread_op_via_app_server(&mut app_server, target_thread_id, &turn)
+            .await?
+    );
+    let turns = recorded_params(&requests, "turn/start")
+        .into_iter()
+        .map(serde_json::from_value::<codex_app_server_protocol::TurnStartParams>)
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    assert_eq!(
+        turns
+            .into_iter()
+            .map(|turn| (turn.thread_id, turn.sandbox_policy, turn.permissions))
+            .collect::<Vec<_>>(),
+        vec![(target_thread_id.to_string(), None, None)]
+    );
+    tokio::time::timeout(std::time::Duration::from_secs(/*secs*/ 10), async {
+        loop {
+            let thread = app_server
+                .thread_read(target_thread_id, /*include_turns*/ true)
+                .await?;
+            if thread.turns.last().is_some_and(|turn| {
+                turn.status == TurnStatus::Completed
+                    && turn.items.iter().any(|item| {
+                        if let ThreadItem::AgentMessage {
+                            id: _,
+                            text,
+                            phase: _,
+                            memory_citation: _,
+                            delivery: _,
+                        } = item
+                        {
+                            text == "done"
+                        } else {
+                            false
+                        }
+                    })
+            }) {
+                return Ok::<(), color_eyre::Report>(());
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(/*millis*/ 10)).await;
+        }
+    })
+    .await??;
+    assert_eq!(response.requests().len(), 1);
+
+    app.change_working_directory(&mut tui, &mut app_server, destination.clone())
+        .await;
+
+    assert_eq!(app.chat_widget.config_ref().cwd, destination);
+    assert_eq!(
+        app.chat_widget
+            .config_ref()
+            .permissions
+            .effective_permission_profile(),
+        PermissionProfile::read_only()
+    );
+
+    app_server.shutdown().await?;
+    proxy.await??;
+    Ok(())
+}
+
+#[tokio::test]
 async fn external_transport_registers_dynamic_tools_and_finds_task_mentions() -> Result<()> {
     let (app, _codex_home) = make_history_test_app().await?;
     let (mut app_server, requests, proxy) = start_recording_app_server(
