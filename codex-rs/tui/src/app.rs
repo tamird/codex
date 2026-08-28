@@ -69,6 +69,7 @@ use crate::multi_agents::next_agent_shortcut_matches;
 use crate::multi_agents::previous_agent_shortcut_matches;
 use crate::multi_agents::sub_agent_activity_display;
 use crate::pager_overlay::Overlay;
+use crate::performance::PerformanceWindow;
 use crate::render::highlight::highlight_bash_to_lines;
 use crate::render::renderable::Renderable;
 use crate::resume_picker::SessionSelection;
@@ -448,6 +449,9 @@ fn managed_filesystem_sandbox_is_restricted(permission_profile: &PermissionProfi
 /// Smooth-mode streaming drains one line per tick, so this interval controls
 /// perceived typing speed for non-backlogged output.
 const COMMIT_ANIMATION_TICK: Duration = tui::TARGET_FRAME_INTERVAL;
+
+/// Report operations that take at least two redraw intervals.
+const SLOW_TUI_OPERATION_THRESHOLD: Duration = tui::TARGET_FRAME_INTERVAL.saturating_mul(2);
 
 #[derive(Debug, Clone)]
 pub struct AppExitInfo {
@@ -943,6 +947,7 @@ impl App {
     }
 
     fn render_chat_widget_frame(&mut self, tui: &mut tui::Tui, screen_size: Size) -> Result<Rect> {
+        let started_at = Instant::now();
         let dashboard_visible = self
             .chat_widget
             .selected_index_for_present_view(AGENTS_OVERVIEW_VIEW_ID)
@@ -955,25 +960,48 @@ impl App {
             self.schedule_immediate_resize_reflow(tui);
             self.maybe_run_resize_reflow(tui, screen_size)?;
         }
-        self.with_chat_widget_frame(screen_size.width, |desired_height, chat_widget| {
-            let desired_height = if dashboard_visible {
-                screen_size.height
-            } else {
-                desired_height
-            };
-            let mut rendered_area = Rect::default();
-            tui.draw_with_resize_reflow(desired_height, screen_size, |frame| {
-                let area = frame.area();
-                rendered_area = area;
-                chat_widget.render(area, frame.buffer);
-                self.chat_widget.note_rendered_width(area.width);
-                if let Some((x, y)) = chat_widget.cursor_pos(area) {
-                    frame.set_cursor_style(chat_widget.cursor_style(area));
-                    frame.set_cursor_position((x, y));
-                }
-            })?;
-            Ok(rendered_area)
-        })
+        let rendered_area =
+            self.with_chat_widget_frame(screen_size.width, |desired_height, chat_widget| {
+                let desired_height = if dashboard_visible {
+                    screen_size.height
+                } else {
+                    desired_height
+                };
+                let mut rendered_area = Rect::default();
+                tui.draw_with_resize_reflow(desired_height, screen_size, |frame| {
+                    let area = frame.area();
+                    rendered_area = area;
+                    chat_widget.render(area, frame.buffer);
+                    self.chat_widget.note_rendered_width(area.width);
+                    if let Some((x, y)) = chat_widget.cursor_pos(area) {
+                        frame.set_cursor_style(chat_widget.cursor_style(area));
+                        frame.set_cursor_position((x, y));
+                    }
+                })?;
+                Ok(rendered_area)
+            });
+        let duration = started_at.elapsed();
+        if duration >= SLOW_TUI_OPERATION_THRESHOLD {
+            let outcome = if rendered_area.is_ok() { "ok" } else { "error" };
+            self.session_telemetry.record_duration(
+                "codex.tui.slow_frame.duration_ms",
+                duration,
+                &[("outcome", outcome)],
+            );
+            if let Some(thread_id) = self.chat_widget.thread_id().or(self.primary_thread_id) {
+                tracing::debug!(
+                    target: "codex.performance",
+                    thread_id = %thread_id,
+                    operation = "tui.frame",
+                    outcome,
+                    width = screen_size.width,
+                    height = screen_size.height,
+                    duration_us = duration.as_micros(),
+                    "slow TUI frame render"
+                );
+            }
+        }
+        rendered_area
     }
 
     fn with_chat_widget_frame<T>(

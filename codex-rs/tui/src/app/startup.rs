@@ -768,6 +768,7 @@ See the Codex keymap documentation for supported actions and examples."
         #[cfg(debug_assertions)]
         let pre_loop_exit_reason: Option<ExitReason> = None;
 
+        let mut performance_window = PerformanceWindow::new(Instant::now());
         let exit_reason_result = if let Some(exit_reason) = pre_loop_exit_reason {
             Ok(exit_reason)
         } else {
@@ -783,8 +784,10 @@ See the Codex keymap documentation for supported actions and examples."
                         && has_pending_app_events
                     || (!waiting_for_initial_session_configured
                         && app.has_queued_startup_protected_request());
-                let control = select! {
+                let (control, event_kind, app_event_kind, started_at) = select! {
                     Some(event) = app_event_rx.recv() => {
+                        let started_at = Instant::now();
+                        let app_event_kind: &'static str = (&event).into();
                         let is_initial_session_header = matches!(
                             &event,
                             AppEvent::InsertHistoryCell(cell)
@@ -802,9 +805,21 @@ See the Codex keymap documentation for supported actions and examples."
                                 {
                                     break Err(err);
                                 }
-                                AppRunControl::Continue
+                                (
+                                    AppRunControl::Continue,
+                                    "application",
+                                    Some(app_event_kind),
+                                    started_at,
+                                )
                             }
-                            Ok(AppRunControl::Exit(reason)) => AppRunControl::Exit(reason),
+                            Ok(AppRunControl::Exit(reason)) => {
+                                (
+                                    AppRunControl::Exit(reason),
+                                    "application",
+                                    Some(app_event_kind),
+                                    started_at,
+                                )
+                            }
                             Err(err) => break Err(err),
                         }
                     }
@@ -818,6 +833,7 @@ See the Codex keymap documentation for supported actions and examples."
                         waiting_for_initial_session_configured,
                         app.active_thread_rx.is_some()
                     ) && !has_pending_app_events => {
+                        let started_at = Instant::now();
                         if let Some(event) = active {
                             if let Err(err) = app.handle_active_thread_event(tui, &mut app_server, event).await {
                                 break Err(err);
@@ -825,10 +841,20 @@ See the Codex keymap documentation for supported actions and examples."
                         } else {
                             app.clear_active_thread().await;
                         }
-                        AppRunControl::Continue
+                        (AppRunControl::Continue, "active_thread", None, started_at)
                     }
                     event = tui_events.next(), if !block_terminal_input_for_pending_startup_events => {
+                        let started_at = Instant::now();
                         if let Some(event) = event {
+                            let event_kind = match &event {
+                                TuiEvent::Key(_) => "key",
+                                TuiEvent::Paste(_) => "paste",
+                                TuiEvent::Resize(_) => "resize",
+                                TuiEvent::Draw => "draw",
+                                TuiEvent::Resume => "resume",
+                                TuiEvent::FocusGained => "focus_gained",
+                                TuiEvent::FocusLost => "focus_lost",
+                            };
                             if (matches!(
                                 &event,
                                 TuiEvent::Key(key)
@@ -849,15 +875,21 @@ See the Codex keymap documentation for supported actions and examples."
                                 app.startup_protected_input_boundary = false;
                             }
                             match app.handle_tui_event(tui, &mut app_server, event).await {
-                                Ok(control) => control,
+                                Ok(control) => (control, event_kind, None, started_at),
                                 Err(err) => break Err(err),
                             }
                         } else {
                             tracing::warn!("terminal input stream closed; shutting down active thread");
-                            app.handle_exit_mode(&mut app_server, ExitMode::ShutdownFirst).await
+                            (
+                                app.handle_exit_mode(&mut app_server, ExitMode::ShutdownFirst).await,
+                                "terminal_closed",
+                                None,
+                                started_at,
+                            )
                         }
                     }
                     app_server_event = app_server.next_event(), if listen_for_app_server_events => {
+                        let started_at = Instant::now();
                         match app_server_event {
                             Some(event) => app.handle_app_server_event(&app_server, event).await,
                             None => {
@@ -865,7 +897,7 @@ See the Codex keymap documentation for supported actions and examples."
                                 tracing::warn!("app-server event stream closed");
                             }
                         }
-                        AppRunControl::Continue
+                        (AppRunControl::Continue, "app_server", None, started_at)
                     }
                     () = async {
                         match app.chat_widget.terminal_title_next_refresh {
@@ -875,9 +907,10 @@ See the Codex keymap documentation for supported actions and examples."
                             None => std::future::pending().await,
                         }
                     } => {
+                        let started_at = Instant::now();
                         app.chat_widget.refresh_goal_status_indicator_for_time_tick();
                         app.chat_widget.refresh_terminal_title();
-                        AppRunControl::Continue
+                        (AppRunControl::Continue, "application", Some("TerminalTitleTick"), started_at)
                     }
                     () = async {
                         match app.commit_animation.as_mut() {
@@ -887,11 +920,42 @@ See the Codex keymap documentation for supported actions and examples."
                             None => std::future::pending().await,
                         }
                     }, if !has_pending_app_events => {
+                        let started_at = Instant::now();
                         crate::session_log::log_commit_tick();
                         app.chat_widget.on_commit_tick();
-                        AppRunControl::Continue
+                        (AppRunControl::Continue, "application", Some("CommitTick"), started_at)
                     }
                 };
+                let completed_at = Instant::now();
+                let duration = completed_at.saturating_duration_since(started_at);
+                if let Some(summary) = performance_window.record(
+                    event_kind,
+                    duration,
+                    SLOW_TUI_OPERATION_THRESHOLD,
+                    completed_at,
+                ) && let Some(thread_id) = app.chat_widget.thread_id().or(app.primary_thread_id)
+                {
+                    performance_window.report(summary, thread_id);
+                }
+                // Slow redraws already emit their own frame timing.
+                if event_kind != "draw" && duration >= SLOW_TUI_OPERATION_THRESHOLD {
+                    app.session_telemetry.record_duration(
+                        "codex.tui.slow_event.duration_ms",
+                        duration,
+                        &[("kind", event_kind)],
+                    );
+                    if let Some(thread_id) = app.chat_widget.thread_id().or(app.primary_thread_id) {
+                        tracing::debug!(
+                            target: "codex.performance",
+                            thread_id = %thread_id,
+                            operation = "tui.event",
+                            event_kind,
+                            app_event_kind = app_event_kind.unwrap_or(event_kind),
+                            duration_us = duration.as_micros(),
+                            "slow TUI event dispatch"
+                        );
+                    }
+                }
                 if App::should_stop_waiting_for_initial_session(
                     waiting_for_initial_session_configured,
                     app.primary_thread_id,
