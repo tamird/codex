@@ -41,6 +41,11 @@ In the codex-rs folder where the rust code lives:
   you add `include_str!`, `include_bytes!`, `sqlx::migrate!`, or similar build-time file or
   directory reads, update the crate's `BUILD.bazel` (`compile_data`, `build_script_data`, or test
   data) or Bazel may fail even when Cargo passes.
+  - In `codex-rs/core` and `codex-rs/tui`, put new embedded production resources under the crate's
+    `assets/` directory and test fixtures under `tests/fixtures/`. The existing Bazel globs pick up
+    new files in those directories without per-file BUILD edits. Load fixtures at runtime with
+    `codex_utils_cargo_bin::find_resource!`; keep Insta snapshots in their existing locations.
+    See [resource placement](codex-rs/README.md#resource-placement-in-core-and-tui) for details.
 - Do not create small helper methods that are referenced only once.
 - For tracing async work, instrument the function or method definition with
   `#[tracing::instrument(...)]` instead of attaching spans to futures with
