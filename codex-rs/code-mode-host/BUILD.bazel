@@ -1,6 +1,11 @@
 load("//:defs.bzl", "codex_rust_crate")
+load("//bazel/platforms:release_binaries.bzl", "multiplatform_binaries")
 
 codex_rust_crate(
     name = "code-mode-host",
     crate_name = "codex_code_mode_host",
+)
+
+multiplatform_binaries(
+    name = "codex-code-mode-host",
 )

@@ -16,6 +16,11 @@ multiplatform_binaries(
     name = "codex",
 )
 
+multiplatform_binaries(
+    name = "logs_client",
+    release_binaries_name = "logs_client_release_binaries",
+)
+
 codex_e2e_benchmark(
     name = "codex-help",
     binaries = [":codex"],
