@@ -239,7 +239,7 @@ def codex_rust_crate(
         binary_rustc_flags_extra: Mapping from binary names to extra rustc
             flags for those binary targets.
         rustc_env: Extra rustc_env entries to merge with defaults.
-        rustc_env_files: Generated compiler environment files for the library target.
+        rustc_env_files: Generated compiler environment files for library and binary targets.
         deps_extra: Extra normal deps beyond @crates resolution.
             Typically only needed when features add additional deps.
         integration_compile_data_extra: Extra compile_data for integration tests.
@@ -301,7 +301,9 @@ def codex_rust_crate(
         manifest_relpath = manifest_relpath[len("codex-rs/"):]
     manifest_path = manifest_relpath + "/Cargo.toml"
 
-    binaries = DEP_DATA.get(native.package_name())["binaries"]
+    package_data = DEP_DATA.get(native.package_name())
+    crate_version = package_data["version"]
+    binaries = package_data["binaries"]
 
     lib_srcs = crate_srcs or native.glob(["src/**/*.rs"], exclude = binaries.values(), allow_empty = True)
 
@@ -313,8 +315,7 @@ def codex_rust_crate(
             srcs = ["build.rs"],
             deps = all_crate_deps(build = True),
             data = build_script_data,
-            # Some build script deps sniff version-related env vars...
-            version = "0.0.0",
+            version = crate_version,
         )
 
         maybe_deps += [name + "-build-script"]
@@ -333,6 +334,7 @@ def codex_rust_crate(
             rustc_flags = rustc_flags_extra,
             rustc_env = rustc_env,
             rustc_env_files = rustc_env_files,
+            version = crate_version,
             visibility = ["//visibility:public"],
         )
 
@@ -362,6 +364,7 @@ def codex_rust_crate(
             rustc_env = rustc_env,
             data = test_data_extra,
             tags = test_tags + ["manual"],
+            version = crate_version,
         )
 
         unit_test_kwargs = {}
@@ -402,11 +405,16 @@ def codex_rust_crate(
             # generated rust_binary instead of leaking it to sibling binaries.
             compile_data = binary_compile_data_extra.get(binary, []),
             rustc_flags = rustc_flags_extra + binary_rustc_flags_extra.get(binary, []) + WINDOWS_RUSTC_LINK_FLAGS,
-            # rules_rust substitutes workspace status values only for stamped
-            # actions, so pass the existing key through to final binaries.
-            rustc_env = {"STABLE_GIT_COMMIT": "{STABLE_GIT_COMMIT}"},
+            # Keep changing revision metadata on final binaries so libraries
+            # remain reusable across stamped builds.
+            rustc_env = {
+                "CODEX_BUILD_COMMIT": "{BUILD_EMBED_LABEL}",
+                "STABLE_GIT_COMMIT": "{STABLE_GIT_COMMIT}",
+            },
+            rustc_env_files = rustc_env_files,
             srcs = native.glob(["src/**/*.rs"]),
             stamp = 1,
+            version = crate_version,
             visibility = ["//visibility:public"],
         )
 
@@ -428,6 +436,7 @@ def codex_rust_crate(
             rustc_env = rustc_env,
             data = test_data_extra,
             tags = test_tags + ["manual"],
+            version = crate_version,
         )
 
         binary_unit_test_kwargs = {}
@@ -559,6 +568,7 @@ def codex_rust_crate(
                 rustc_env = rustc_env,
                 target_compatible_with = WINDOWS_GNULLVM_INCOMPATIBLE,
                 tags = test_tags + ["manual"],
+                version = crate_version,
             )
 
             workspace_root_test(
@@ -600,6 +610,7 @@ def codex_rust_crate(
                 env = integration_test_cargo_env,
                 target_compatible_with = WINDOWS_GNULLVM_INCOMPATIBLE,
                 tags = test_tags,
+                version = crate_version,
                 **test_kwargs
             )
 
@@ -672,6 +683,7 @@ def codex_rust_crate(
             env = integration_test_cargo_env,
             target_compatible_with = WINDOWS_GNULLVM_ONLY,
             tags = test_tags + ["manual"],
+            version = crate_version,
         )
 
         workspace_root_test(

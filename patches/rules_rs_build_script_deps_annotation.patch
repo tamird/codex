@@ -1,5 +1,5 @@
-# What: restore explicit build-script dependency annotations used by Codex.
-# Scope: rules_rs crate-universe annotation plumbing only.
+# What: restore build-script dependencies and authoritative Cargo package versions.
+# Scope: rules_rs crate-universe annotation and workspace metadata plumbing only.
 
 diff --git a/rs/extensions.bzl b/rs/extensions.bzl
 --- a/rs/extensions.bzl
@@ -45,6 +45,17 @@ diff --git a/rs/private/annotations.bzl b/rs/private/annotations.bzl
          build_script_data = build_script_data,
          build_script_data_select = build_script_data_select,
          build_script_env = build_script_env,
+diff --git a/rs/private/cargo_workspace_graph.bzl b/rs/private/cargo_workspace_graph.bzl
+--- a/rs/private/cargo_workspace_graph.bzl
++++ b/rs/private/cargo_workspace_graph.bzl
+@@ -762,6 +762,7 @@ def workspace_dep_data(
+             "deps": deps,
+             "deps_by_platform": deps_by_platform,
+             "dev_deps": dev_deps,
+             "dev_deps_by_platform": dev_deps_by_platform,
+             "shared_libraries": shared_libraries,
++            "version": package["version"],
+         }
 diff --git a/rs/private/repository_utils.bzl b/rs/private/repository_utils.bzl
 --- a/rs/private/repository_utils.bzl
 +++ b/rs/private/repository_utils.bzl
