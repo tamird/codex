@@ -32,7 +32,7 @@ async fn workspace_publication_retries_explicit_settings_and_shares_late_metadat
         turn,
         finish: _,
         lookup: _,
-    } = activation_fixture(activation_models()).await;
+    } = activation_fixture(activation_models(), HashMap::new()).await;
     turn.turn_metadata_state
         .set_parent_turn_id("parent-turn".to_string());
     turn.turn_metadata_state
@@ -64,7 +64,7 @@ async fn workspace_publication_retries_explicit_settings_and_shares_late_metadat
     );
     let winning = turn.current_settings.load_full();
     target.settings = match session
-        .publish_context_transition(&target, prepared)
+        .publish_context_transition(&target, prepared, ContextTransitionKind::Workspace)
         .await
     {
         Err(ContextTransitionError::SettingsChanged(settings)) => settings,
@@ -93,7 +93,7 @@ async fn workspace_publication_retries_explicit_settings_and_shares_late_metadat
     turn.turn_metadata_state
         .mark_user_input_requested_during_turn();
     let published = session
-        .publish_context_transition(&target, prepared)
+        .publish_context_transition(&target, prepared, ContextTransitionKind::Workspace)
         .await
         .expect("publish with winning settings");
     let registered = session
@@ -151,7 +151,7 @@ async fn prepared_context_and_old_completion_cannot_retarget_reused_context() {
         turn,
         finish,
         lookup: _,
-    } = activation_fixture(activation_models()).await;
+    } = activation_fixture(activation_models(), HashMap::new()).await;
     let (done, cancellation_token) = active_task_identity(&session).await;
     let target = session
         .capture_context_transition(&turn, &done, &cancellation_token)
@@ -190,7 +190,9 @@ async fn prepared_context_and_old_completion_cannot_retarget_reused_context() {
             .is_none()
     );
     assert!(matches!(
-        session.publish_context_transition(&target, prepared).await,
+        session
+            .publish_context_transition(&target, prepared, ContextTransitionKind::Workspace)
+            .await,
         Err(ContextTransitionError::Unavailable),
     ));
     session.on_task_finished(&target.done, Ok(None)).await;

@@ -8,6 +8,7 @@ use crate::session::tests::make_session_and_context;
 use crate::session::tests::update_selected_settings_for_test;
 use crate::session::tests::update_turn_settings_for_test;
 use crate::state::TaskKind;
+use assert_matches::assert_matches;
 use codex_config::AutoReviewRequirementsToml;
 use codex_config::ConfigLayerStack;
 use codex_config::ConfigRequirements;
@@ -18,6 +19,8 @@ use codex_config::Sourced;
 use codex_http_client::HttpClientFactory;
 use codex_login::AuthManager;
 use codex_models_manager::CustomModelConfig;
+use codex_models_manager::ModelRoutingCandidate;
+use codex_models_manager::ModelRoutingProfile;
 use codex_models_manager::ModelsManagerConfig;
 use codex_models_manager::bundled_models_response;
 use codex_models_manager::manager::ModelsManager;
@@ -25,10 +28,13 @@ use codex_models_manager::manager::ModelsManagerFuture;
 use codex_models_manager::manager::RefreshStrategy;
 use codex_models_manager::manager::StaticModelsManager;
 use codex_models_manager::model_info::with_config_overrides;
+use codex_models_manager::routing::CandidateSelection;
+use codex_models_manager::routing::RoutingFailureClass;
 use codex_protocol::config_types::ApprovalsReviewer;
 use codex_protocol::config_types::CollaborationModeMask;
 use codex_protocol::config_types::ReasoningSummary;
 use codex_protocol::config_types::ServiceTier;
+use codex_protocol::error::CodexErrorDetails;
 use codex_protocol::openai_models::AutoReviewMessages;
 use codex_protocol::openai_models::GuardianV2ModelConfig;
 use codex_protocol::openai_models::GuardianV2TranscriptModelConfig;
@@ -42,6 +48,7 @@ use codex_protocol::protocol::TurnAbortReason;
 use pretty_assertions::assert_eq;
 use std::collections::BTreeSet;
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::sync::Mutex as StdMutex;
 use std::time::Duration;
 use test_case::test_case;
@@ -178,7 +185,10 @@ pub(in crate::session) struct ActivationFixture {
     pub(in crate::session) lookup: Arc<ModelLookupGate>,
 }
 
-pub(in crate::session) async fn activation_fixture(models: Vec<ModelInfo>) -> ActivationFixture {
+pub(in crate::session) async fn activation_fixture(
+    models: Vec<ModelInfo>,
+    custom_models: HashMap<String, CustomModelConfig>,
+) -> ActivationFixture {
     let (session, _) = make_session_and_context().await;
     let mut session = Arc::new(session);
     let mutable = Arc::get_mut(&mut session).expect("unshared test session");
@@ -198,6 +208,7 @@ pub(in crate::session) async fn activation_fixture(models: Vec<ModelInfo>) -> Ac
     let config = Arc::make_mut(&mut configuration.original_config_do_not_use);
     config.model = Some(MODEL_A.to_string());
     config.features = mutable.features.clone();
+    config.custom_models = custom_models;
     let settings = Arc::make_mut(&mut configuration.step_settings);
     settings.collaboration_mode = settings.collaboration_mode.with_updates(
         Some(MODEL_A.to_string()),
@@ -322,7 +333,7 @@ async fn submitted_sparse_updates_preserve_captured_steps_and_ordering() {
         turn,
         lookup,
         finish,
-    } = activation_fixture(models).await;
+    } = activation_fixture(models, HashMap::new()).await;
     let model_manager_config = {
         let state = session.state.lock().await;
         let configuration = &state.session_configuration;
@@ -531,7 +542,7 @@ async fn delayed_activation_does_not_retarget_a_task(change: TaskChangeDuringLoo
         turn,
         finish,
         lookup,
-    } = activation_fixture(models).await;
+    } = activation_fixture(models, HashMap::new()).await;
     let desired = desired_step_settings(&session).await;
     let original = turn.current_settings.load_full();
     let update_session = Arc::clone(&session);
@@ -609,6 +620,324 @@ async fn delayed_activation_does_not_retarget_a_task(change: TaskChangeDuringLoo
     session.abort_all_tasks(TurnAbortReason::Replaced).await;
 }
 
+#[tokio::test]
+async fn delayed_routing_retries_after_sparse_settings_publication() {
+    let mut models = activation_models();
+    let destination = models
+        .iter_mut()
+        .find(|model| model.slug == MODEL_B)
+        .expect("destination model");
+    destination.default_reasoning_level = Some(ReasoningEffort::Medium);
+    destination.default_service_tier = None;
+    let expected_destination = destination.clone();
+    let candidate = ModelRoutingCandidate {
+        model: MODEL_B.to_string(),
+        reasoning_effort: None,
+        service_tier: None,
+    };
+    let profile = CustomModelConfig {
+        model: MODEL_B.to_string(),
+        routing_profile: Some(ModelRoutingProfile {
+            candidates: vec![candidate],
+        }),
+        model_context_window: None,
+        model_auto_compact_token_limit: None,
+        trust_candidate_constraints: false,
+    };
+    let ActivationFixture {
+        session,
+        turn,
+        finish: _,
+        lookup,
+    } = activation_fixture(
+        models,
+        HashMap::from([("routing-profile".to_string(), profile)]),
+    )
+    .await;
+    let expected_destination = with_config_overrides(
+        expected_destination,
+        &turn.config.to_models_manager_config(),
+    );
+    let desired = desired_step_settings(&session).await;
+    let (cancellation_token, done) = {
+        let active = session.active_turn.lock().await;
+        let task = active
+            .as_ref()
+            .and_then(|active| active.task.as_ref())
+            .expect("active task");
+        (task.cancellation_token.clone(), Arc::clone(&task.done))
+    };
+    let before = session
+        .capture_step_context(Arc::clone(&turn), &cancellation_token)
+        .await
+        .expect("capture initial step");
+    let routing_session = Arc::clone(&session);
+    let routing_turn = Arc::clone(&turn);
+    let routing_done = Arc::clone(&done);
+    let routing_cancel = cancellation_token.clone();
+    let reroute = tokio::spawn(async move {
+        routing_session
+            .reroute_active_turn_context(
+                &routing_turn,
+                &routing_done,
+                "routing-profile",
+                &HashSet::new(),
+                &routing_cancel,
+            )
+            .await
+    });
+    lookup.wait_until_blocked().await;
+    assert_eq!(
+        session
+            .apply_turn_settings(
+                &turn.sub_id,
+                TurnSettingsUpdate {
+                    summary: Some(ReasoningSummary::Detailed),
+                    ..Default::default()
+                },
+            )
+            .await,
+        TurnSettingsUpdateOutcome::Applied,
+    );
+    let winning = session
+        .capture_step_context(Arc::clone(&turn), &cancellation_token)
+        .await
+        .expect("capture explicit settings publication");
+    lookup.release();
+    let routed = timeout(Duration::from_secs(/*secs*/ 10), reroute)
+        .await
+        .expect("routing completes after lookup")
+        .expect("routing task")
+        .expect("routing remains active")
+        .expect("routing selected a candidate");
+    let registered = session
+        .active_task_context(&done)
+        .await
+        .expect("original task remains registered");
+    assert!(Arc::ptr_eq(&registered, &routed));
+    let after = session
+        .capture_step_context(registered, &cancellation_token)
+        .await
+        .expect("capture routed settings");
+    assert!(Arc::ptr_eq(&after.turn, &routed));
+    assert_eq!(
+        [
+            step_values(&before),
+            step_values(&winning),
+            step_values(&after)
+        ],
+        [
+            (
+                MODEL_A,
+                Some(ReasoningEffort::Low),
+                ReasoningSummary::Concise,
+                None,
+            ),
+            (
+                MODEL_A,
+                Some(ReasoningEffort::Low),
+                ReasoningSummary::Detailed,
+                None,
+            ),
+            (
+                MODEL_B,
+                Some(ReasoningEffort::Medium),
+                ReasoningSummary::Detailed,
+                None,
+            ),
+        ],
+    );
+    assert_eq!(after.settings.model_info.as_ref(), &expected_destination);
+    assert_eq!(
+        routed.config.model_reasoning_summary,
+        Some(ReasoningSummary::Detailed),
+    );
+    assert_eq!(
+        session.services.thread_extension_data.get::<ModelInfo>(),
+        Some(Arc::clone(&after.settings.model_info)),
+    );
+    assert_eq!(desired_step_settings(&session).await, desired);
+    session.abort_all_tasks(TurnAbortReason::Replaced).await;
+}
+
+#[test_case(TaskChangeDuringLookup::CancelledWithRejectedDestination; "cancelled task preserves later routing state")]
+#[test_case(TaskChangeDuringLookup::FinishedAndReplaced; "replacement has a new context")]
+#[test_case(TaskChangeDuringLookup::FinishedAndReusedContext; "replacement reuses the original context")]
+#[tokio::test]
+async fn delayed_rejected_routing_preserves_later_health(change: TaskChangeDuringLookup) {
+    let mut models = activation_models();
+    models
+        .iter_mut()
+        .find(|model| model.slug == MODEL_B)
+        .expect("destination model")
+        .supported_reasoning_levels
+        .clear();
+    let rejected = ModelRoutingCandidate {
+        model: MODEL_B.to_string(),
+        reasoning_effort: Some(ReasoningEffort::High),
+        service_tier: None,
+    };
+    let profile = CustomModelConfig {
+        model: MODEL_B.to_string(),
+        routing_profile: Some(ModelRoutingProfile {
+            candidates: vec![rejected],
+        }),
+        model_context_window: None,
+        model_auto_compact_token_limit: None,
+        trust_candidate_constraints: false,
+    };
+    let ActivationFixture {
+        session,
+        turn,
+        finish,
+        lookup,
+    } = activation_fixture(
+        models,
+        HashMap::from([("routing-profile".to_string(), profile)]),
+    )
+    .await;
+    let (cancellation_token, done) = {
+        let active = session.active_turn.lock().await;
+        let task = active
+            .as_ref()
+            .and_then(|active| active.task.as_ref())
+            .expect("active task");
+        (task.cancellation_token.clone(), Arc::clone(&task.done))
+    };
+    let routing_session = Arc::clone(&session);
+    let routing_turn = Arc::clone(&turn);
+    let routing_done = Arc::clone(&done);
+    let routing_cancel = cancellation_token.clone();
+    let reroute = tokio::spawn(async move {
+        routing_session
+            .reroute_active_turn_context(
+                &routing_turn,
+                &routing_done,
+                "routing-profile",
+                &HashSet::new(),
+                &routing_cancel,
+            )
+            .await
+    });
+    lookup.wait_until_blocked().await;
+    let (retained, retained_done) = match change {
+        TaskChangeDuringLookup::CancelledWithRejectedDestination => {
+            cancellation_token.cancel();
+            (Arc::clone(&turn), Arc::clone(&done))
+        }
+        TaskChangeDuringLookup::FinishedAndReplaced
+        | TaskChangeDuringLookup::FinishedAndReusedContext => {
+            let completed = done.notified();
+            finish.notify_one();
+            timeout(Duration::from_secs(/*secs*/ 10), completed)
+                .await
+                .expect("original task completed");
+            let replacement = match change {
+                TaskChangeDuringLookup::FinishedAndReplaced => {
+                    session
+                        .new_turn_with_default_settings(
+                            "replacement-turn".to_string(),
+                            Default::default(),
+                        )
+                        .await
+                }
+                TaskChangeDuringLookup::FinishedAndReusedContext => Arc::clone(&turn),
+                TaskChangeDuringLookup::CancelledWithRejectedDestination => unreachable!(),
+            };
+            session
+                .spawn_task(
+                    Arc::clone(&replacement),
+                    Vec::new(),
+                    HeldStepTask {
+                        kind: TaskKind::Compact,
+                        finish: Arc::new(Notify::new()),
+                    },
+                )
+                .await;
+            let active = session.active_turn.lock().await;
+            let replacement_done =
+                Arc::clone(&active.as_ref().unwrap().task.as_ref().unwrap().done);
+            (replacement, replacement_done)
+        }
+    };
+    let retained_settings = retained.current_settings.load_full();
+    let later_candidate = ModelRoutingCandidate {
+        model: MODEL_A.to_string(),
+        reasoning_effort: Some(ReasoningEffort::Low),
+        service_tier: None,
+    };
+    let now = chrono::Utc::now();
+    let retry_at = {
+        let mut state = session.state.lock().await;
+        state.model_routing.reconcile_profile("later-profile");
+        state
+            .model_routing
+            .reconcile(std::slice::from_ref(&later_candidate));
+        state.model_routing.record_success(&later_candidate);
+        state.model_routing.record_failure(
+            &later_candidate,
+            RoutingFailureClass::TemporaryAvailability,
+            now,
+            /*minimum_retry_at*/ None,
+        )
+    };
+    let retained_model = retained.model_info().as_ref().clone();
+    session
+        .services
+        .thread_extension_data
+        .insert(retained_model.clone());
+    lookup.release();
+    assert_matches!(
+        timeout(Duration::from_secs(/*secs*/ 10), reroute)
+            .await
+            .expect("old selector completes after lookup")
+            .expect("routing task"),
+        Err(error) if matches!(error.details(), CodexErrorDetails::TurnAborted)
+    );
+    let routing_observations = {
+        let mut state = session.state.lock().await;
+        (
+            state.model_routing.last_success().cloned(),
+            state.model_routing.select_candidate(
+                std::slice::from_ref(&later_candidate),
+                &HashSet::new(),
+                now,
+            ),
+        )
+    };
+    assert_eq!(
+        routing_observations,
+        (
+            Some(later_candidate.clone()),
+            CandidateSelection::CoolingDown {
+                candidate: later_candidate,
+                retry_at,
+            },
+        ),
+    );
+    // Cancellation makes active_task_context unavailable without removing the task record.
+    let registered = {
+        let active = session.active_turn.lock().await;
+        let task = active
+            .as_ref()
+            .and_then(|active| active.task.as_ref())
+            .expect("retained task record");
+        assert!(Arc::ptr_eq(&task.done, &retained_done));
+        Arc::clone(&task.turn_context)
+    };
+    assert!(Arc::ptr_eq(&registered, &retained));
+    assert!(Arc::ptr_eq(
+        &registered.current_settings.load_full(),
+        &retained_settings,
+    ));
+    assert!(session.active_task_context(&done).await.is_none());
+    assert_eq!(
+        session.services.thread_extension_data.get::<ModelInfo>(),
+        Some(Arc::new(retained_model)),
+    );
+    session.abort_all_tasks(TurnAbortReason::Replaced).await;
+}
+
 #[derive(Clone, Copy)]
 enum ManagedAuthorizationChange {
     ApprovalPolicy,
@@ -626,7 +955,7 @@ async fn delayed_activation_rechecks_live_managed_authorization(
         turn,
         lookup,
         ..
-    } = activation_fixture(activation_models()).await;
+    } = activation_fixture(activation_models(), HashMap::new()).await;
     let original = turn.current_settings.load_full();
     let desired = desired_step_settings(&session).await;
     let update_session = Arc::clone(&session);

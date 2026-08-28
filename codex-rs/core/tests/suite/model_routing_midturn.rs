@@ -3,14 +3,23 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
+use assert_matches::assert_matches;
 use codex_config::McpServerConfig;
 use codex_features::Feature;
 use codex_models_manager::CustomModelConfig;
 use codex_models_manager::ModelRoutingCandidate;
 use codex_models_manager::ModelRoutingProfile;
+use codex_models_manager::bundled_models_response;
+use codex_protocol::config_types::ReasoningSummary;
+use codex_protocol::openai_models::ModelsResponse;
 use codex_protocol::openai_models::ReasoningEffort;
 use codex_protocol::protocol::EventMsg;
+use codex_protocol::protocol::Op;
 use codex_protocol::protocol::ThreadSettingsOverrides;
+use codex_protocol::protocol::TurnSettingsUpdate;
+use codex_protocol::protocol::TurnSettingsUpdateOutcome;
+use codex_protocol::request_user_input::RequestUserInputAnswer;
+use codex_protocol::request_user_input::RequestUserInputResponse;
 use codex_protocol::turn_input::TurnInputRequest;
 use codex_protocol::turn_input::TurnInputSubmission;
 use codex_protocol::user_input::UserInput;
@@ -157,6 +166,164 @@ fn assert_one_output(request: &core_test_support::responses::ResponsesRequest, c
         1,
         "expected one output for {call_id}"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sparse_turn_settings_after_reroute_preserve_the_fallback_model() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    const TOOL_CALL: &str = "before-reroute-tool";
+    const PAUSE_CALL: &str = "fallback-pause";
+    const PROMPT: &str = "continue on the fallback after updating the effort";
+    let server = start_mock_server().await;
+    let mock = mount_response_sequence(
+        &server,
+        vec![
+            sse_response(sse(vec![
+                ev_response_created("primary-tool-response"),
+                ev_function_call(TOOL_CALL, "test_sync_tool", "{}"),
+                ev_completed("primary-tool-response"),
+            ])),
+            overload_response("primary-continuation-failed"),
+            sse_response(sse(vec![
+                ev_response_created("fallback-response"),
+                ev_function_call(
+                    PAUSE_CALL,
+                    "request_user_input",
+                    &json!({
+                        "questions": [{
+                            "id": "continue",
+                            "header": "Continue",
+                            "question": "Continue with the fallback model?",
+                            "options": [{
+                                "label": "Yes (Recommended)",
+                                "description": "Continue the current turn."
+                            }, {
+                                "label": "No",
+                                "description": "Stop the current turn."
+                            }]
+                        }]
+                    })
+                    .to_string(),
+                ),
+                ev_completed("fallback-response"),
+            ])),
+            sse_response(sse_completed("updated-fallback-response")),
+        ],
+    )
+    .await;
+    let models = bundled_models_response()?;
+    let model = models
+        .models
+        .into_iter()
+        .find(|model| model.slug == "gpt-5.4")
+        .expect("bundled gpt-5.4 model");
+    let test = test_codex()
+        .with_config(move |config| {
+            config.model = Some(PROFILE.to_string());
+            config.custom_models = routing_models();
+            config.model_reasoning_effort = Some(ReasoningEffort::Low);
+            config.model_reasoning_summary = Some(ReasoningSummary::Concise);
+            config.model_catalog = Some(ModelsResponse {
+                models: [PRIMARY, FALLBACK]
+                    .into_iter()
+                    .map(|slug| {
+                        let mut model = model.clone();
+                        model.slug = slug.to_string();
+                        model.default_reasoning_level = Some(ReasoningEffort::Low);
+                        model
+                    })
+                    .collect(),
+            });
+            for feature in [
+                Feature::StepModelSwitching,
+                Feature::DefaultModeRequestUserInput,
+            ] {
+                config
+                    .features
+                    .enable(feature)
+                    .expect("enable test feature");
+            }
+        })
+        .build_with_auto_env(&server)
+        .await?;
+    submit_prompt(&test, PROMPT).await?;
+    let mut started_turns = Vec::new();
+    let paused = wait_for_event(&test.codex, |event| match event {
+        EventMsg::TurnStarted(event) => {
+            started_turns.push(event.turn_id.clone());
+            false
+        }
+        EventMsg::RequestUserInput(_) => true,
+        EventMsg::Error(error) => panic!("rerouted turn failed: {}", error.message),
+        _ => false,
+    })
+    .await;
+    let paused = assert_matches!(paused, EventMsg::RequestUserInput(paused) => paused);
+    assert_request_models(&mock, &[PRIMARY, PRIMARY, FALLBACK]);
+    let (reply, outcome) = tokio::sync::oneshot::channel();
+    test.codex
+        .submit(Op::TurnSettings {
+            turn_id: paused.turn_id.clone(),
+            update: TurnSettingsUpdate {
+                effort: Some(Some(ReasoningEffort::High)),
+                ..Default::default()
+            },
+            reply,
+        })
+        .await?;
+    let outcome = tokio::time::timeout(Duration::from_secs(/*secs*/ 10), outcome).await??;
+    assert_eq!(outcome, TurnSettingsUpdateOutcome::Applied);
+    test.codex
+        .submit(Op::UserInputAnswer {
+            id: paused.turn_id.clone(),
+            response: RequestUserInputResponse {
+                answers: HashMap::from([(
+                    "continue".to_string(),
+                    RequestUserInputAnswer {
+                        answers: vec!["Yes (Recommended)".to_string()],
+                    },
+                )]),
+            },
+        })
+        .await?;
+    let events = events_until_complete(&test).await;
+    for event in &events {
+        match event {
+            EventMsg::TurnStarted(event) => started_turns.push(event.turn_id.clone()),
+            EventMsg::TurnComplete(event) => assert_eq!(event.turn_id, paused.turn_id),
+            EventMsg::Error(error) => panic!("rerouted turn failed: {}", error.message),
+            _ => {}
+        }
+    }
+    assert_eq!(started_turns, vec![paused.turn_id]);
+    assert_request_models(&mock, &[PRIMARY, PRIMARY, FALLBACK, FALLBACK]);
+    let requests = mock.requests();
+    let (failed, fallback, updated) = assert_matches!(
+        requests.as_slice(),
+        [_, failed, fallback, updated] => (failed, fallback, updated)
+    );
+    assert_eq!(
+        fallback.body_json()["reasoning"],
+        json!({"effort": "low", "summary": "concise"})
+    );
+    assert_eq!(
+        updated.body_json()["reasoning"],
+        json!({"effort": "high", "summary": "concise"})
+    );
+    for request in [failed, fallback, updated] {
+        assert_one_output(request, TOOL_CALL);
+        assert_eq!(
+            user_input_texts(request)
+                .into_iter()
+                .filter(|text| text == PROMPT)
+                .collect::<Vec<_>>(),
+            vec![PROMPT.to_string()]
+        );
+    }
+    assert_one_output(updated, PAUSE_CALL);
+
+    Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

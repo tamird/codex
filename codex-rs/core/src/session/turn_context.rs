@@ -44,6 +44,7 @@ use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 use tracing::instrument;
 
+use super::model_routing::ModelRoutingOwner;
 use super::model_routing::ModelRoutingReason;
 
 pub(crate) type ShellSnapshotTask = Shared<BoxFuture<'static, Option<Arc<ShellSnapshotFile>>>>;
@@ -1248,6 +1249,7 @@ impl Session {
                     &turn_context,
                     profile_name,
                     &HashSet::new(),
+                    ModelRoutingOwner::Admission,
                 )
                 .await
             {

@@ -1,13 +1,16 @@
 //! Publishes rebuilt contexts only to the task and settings that prepared them.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
+use codex_models_manager::ModelRoutingCandidate;
 use codex_protocol::error::CodexErr;
 use codex_protocol::error::Result as CodexResult;
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 
 use super::GitEnrichmentPolicy;
+use super::model_routing::ModelRoutingOwner;
 use super::session::Session;
 use super::step_settings::ResolvedStepSettings;
 use super::turn_context::TurnContext;
@@ -24,6 +27,11 @@ pub(super) struct ContextTransitionTarget {
 pub(super) enum ContextTransitionError {
     SettingsChanged(Arc<ResolvedStepSettings>),
     Unavailable,
+}
+
+enum ContextTransitionKind {
+    Workspace,
+    Routing,
 }
 
 impl ContextTransitionTarget {
@@ -79,6 +87,7 @@ impl Session {
         &self,
         target: &ContextTransitionTarget,
         mut context: TurnContext,
+        kind: ContextTransitionKind,
     ) -> Result<Arc<TurnContext>, ContextTransitionError> {
         let mut active = self.active_turn.lock().await;
         let task = active
@@ -86,14 +95,17 @@ impl Session {
             .and_then(|turn| turn.task.as_mut())
             .ok_or(ContextTransitionError::Unavailable)?;
         target.check(Some(task))?;
-        context.multi_agent_version =
-            self.resolve_multi_agent_version_for_model(context.model_info(), &context.config);
+        if matches!(kind, ContextTransitionKind::Workspace) {
+            context.multi_agent_version =
+                self.resolve_multi_agent_version_for_model(context.model_info(), &context.config);
+        }
         self.services
             .thread_extension_data
             .insert(context.model_info().as_ref().clone());
         let context = Arc::new(context);
         task.turn_context = Arc::clone(&context);
-        if self.git_enrichment_policy == GitEnrichmentPolicy::Fresh
+        if matches!(kind, ContextTransitionKind::Workspace)
+            && self.git_enrichment_policy == GitEnrichmentPolicy::Fresh
             && context
                 .environments
                 .single_local_environment_cwd()
@@ -118,7 +130,60 @@ impl Session {
             let prepared = self
                 .prepare_workspace_turn_context(current, Arc::clone(&target.settings))
                 .await;
-            match self.publish_context_transition(&target, prepared).await {
+            match self
+                .publish_context_transition(&target, prepared, ContextTransitionKind::Workspace)
+                .await
+            {
+                Ok(context) => return Ok(context),
+                Err(ContextTransitionError::SettingsChanged(settings)) => {
+                    target.settings = settings
+                }
+                Err(ContextTransitionError::Unavailable) => return Err(CodexErr::TurnAborted),
+            }
+        }
+    }
+
+    pub(super) async fn reroute_active_turn_context(
+        &self,
+        current: &Arc<TurnContext>,
+        done: &Arc<Notify>,
+        profile_name: &str,
+        attempted: &HashSet<ModelRoutingCandidate>,
+        cancellation_token: &CancellationToken,
+    ) -> CodexResult<Option<Arc<TurnContext>>> {
+        let mut target = self
+            .capture_context_transition(current, done, cancellation_token)
+            .await
+            .ok_or(CodexErr::TurnAborted)?;
+        loop {
+            let selection = self
+                .select_model_routing_context(
+                    current,
+                    profile_name,
+                    attempted,
+                    ModelRoutingOwner::Active(&target),
+                )
+                .await;
+            let result = if let Some(selection) = selection {
+                if !self
+                    .wait_for_model_routing_retry(selection.retry_at, cancellation_token)
+                    .await
+                {
+                    return Err(CodexErr::TurnAborted);
+                }
+                let mut context = selection.context;
+                context.model_routing_previous_candidate = None;
+                context.model_routing_selection_reason = None;
+                self.publish_context_transition(&target, context, ContextTransitionKind::Routing)
+                    .await
+                    .map(Some)
+            } else {
+                let active = self.active_turn.lock().await;
+                target
+                    .check(active.as_ref().and_then(|turn| turn.task.as_ref()))
+                    .map(|()| None)
+            };
+            match result {
                 Ok(context) => return Ok(context),
                 Err(ContextTransitionError::SettingsChanged(settings)) => {
                     target.settings = settings

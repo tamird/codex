@@ -7,16 +7,25 @@ use chrono::DateTime;
 use chrono::Utc;
 use codex_models_manager::ModelRoutingCandidate;
 use codex_models_manager::routing::CandidateSelection;
+use codex_models_manager::routing::ModelRoutingState;
 use codex_models_manager::routing::RoutingFailureClass;
 use codex_protocol::error::CodexErrorDetails;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::WarningEvent;
+use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 use tracing::info;
 use tracing::warn;
 
+use super::context_transition::ContextTransitionTarget;
 use super::session::Session;
 use super::turn_context::TurnContext;
+
+#[derive(Clone, Copy)]
+pub(super) enum ModelRoutingOwner<'a> {
+    Admission,
+    Active(&'a ContextTransitionTarget),
+}
 
 /// Explains why a custom-model routing profile changed its active request configuration.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -43,6 +52,29 @@ pub(super) struct ModelRoutingSelection {
 }
 
 impl Session {
+    async fn with_model_routing_state<T>(
+        &self,
+        owner: ModelRoutingOwner<'_>,
+        update: impl FnOnce(&mut ModelRoutingState) -> T,
+    ) -> Option<T> {
+        let active = match owner {
+            ModelRoutingOwner::Admission => None,
+            ModelRoutingOwner::Active(_) => Some(self.active_turn.lock().await),
+        };
+        let mut state = self.state.lock().await;
+        if let ModelRoutingOwner::Active(target) = owner {
+            target
+                .check(
+                    active
+                        .as_ref()
+                        .and_then(|active| active.as_ref())
+                        .and_then(|turn| turn.task.as_ref()),
+                )
+                .ok()?;
+        }
+        Some(update(&mut state.model_routing))
+    }
+
     async fn model_routing_now(&self) -> DateTime<Utc> {
         match self
             .services
@@ -103,6 +135,7 @@ impl Session {
         base: &TurnContext,
         profile_name: &str,
         attempted: &HashSet<ModelRoutingCandidate>,
+        owner: ModelRoutingOwner<'_>,
     ) -> Option<ModelRoutingSelection> {
         let custom_model = base.config.custom_models.get(profile_name)?;
         let profile = custom_model.routing_profile.as_ref()?;
@@ -110,20 +143,20 @@ impl Session {
         let now = self.model_routing_now().await;
         let mut attempted = attempted.clone();
         let mut last_rejected = None;
-        let (profile_changed, previous_success) = {
-            let mut state = self.state.lock().await;
-            let previous_success = state.model_routing.last_success().cloned();
-            let profile_changed = state.model_routing.reconcile_profile(profile_name)
-                | state.model_routing.reconcile(&profile.candidates);
-            (profile_changed, previous_success)
-        };
+        let (profile_changed, previous_success) = self
+            .with_model_routing_state(owner, |routing| {
+                let previous_success = routing.last_success().cloned();
+                let profile_changed = routing.reconcile_profile(profile_name)
+                    | routing.reconcile(&profile.candidates);
+                (profile_changed, previous_success)
+            })
+            .await?;
         loop {
-            let selection = {
-                let mut state = self.state.lock().await;
-                state
-                    .model_routing
-                    .select_candidate(&profile.candidates, &attempted, now)
-            };
+            let selection = self
+                .with_model_routing_state(owner, |routing| {
+                    routing.select_candidate(&profile.candidates, &attempted, now)
+                })
+                .await?;
             let (candidate, retry_at) = match selection {
                 CandidateSelection::Ready(candidate) => (candidate, None),
                 CandidateSelection::CoolingDown {
@@ -175,30 +208,48 @@ impl Session {
 
     pub(super) async fn record_model_routing_failure(
         &self,
-        turn_context: &TurnContext,
+        turn_context: &Arc<TurnContext>,
+        done: &Arc<Notify>,
+        cancellation_token: &CancellationToken,
         failure: &ModelRoutingFailure,
     ) {
         let Some(candidate) = turn_context.model_routing_candidate.as_ref() else {
             return;
         };
+        let Some(target) = self
+            .capture_context_transition(turn_context, done, cancellation_token)
+            .await
+        else {
+            return;
+        };
         let now = self.model_routing_now().await;
-        self.state.lock().await.model_routing.record_failure(
-            candidate,
-            failure.class,
-            now,
-            failure.minimum_retry_at,
-        );
+        let _ = self
+            .with_model_routing_state(ModelRoutingOwner::Active(&target), |routing| {
+                routing.record_failure(candidate, failure.class, now, failure.minimum_retry_at);
+            })
+            .await;
     }
 
-    pub(super) async fn record_model_routing_success(&self, turn_context: &TurnContext) {
+    pub(super) async fn record_model_routing_success(
+        &self,
+        turn_context: &Arc<TurnContext>,
+        done: &Arc<Notify>,
+        cancellation_token: &CancellationToken,
+    ) {
         let Some(candidate) = turn_context.model_routing_candidate.as_ref() else {
             return;
         };
-        self.state
-            .lock()
+        let Some(target) = self
+            .capture_context_transition(turn_context, done, cancellation_token)
             .await
-            .model_routing
-            .record_success(candidate);
+        else {
+            return;
+        };
+        let _ = self
+            .with_model_routing_state(ModelRoutingOwner::Active(&target), |routing| {
+                routing.record_success(candidate);
+            })
+            .await;
     }
 
     pub(super) async fn notify_model_routing_change(
