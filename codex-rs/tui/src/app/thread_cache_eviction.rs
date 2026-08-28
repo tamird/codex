@@ -16,6 +16,19 @@ use std::cmp::Reverse;
 
 pub(super) const INACTIVE_HISTORY_BUDGET: usize = 64 * 1024 * 1024;
 
+/// The first blocking eligibility check, not a list of every reason a cache is pinned.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub(super) enum HistoryPinReason {
+    SideThread,
+    Active,
+    RunningTurn,
+    MissingSession,
+    MissingRollout,
+    PendingInteractive,
+    InFlightInput,
+    PendingLiveCompletion,
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum TerminalDelivery {
     PendingLive,
@@ -48,24 +61,42 @@ impl ThreadBufferedEvent {
 
 impl ThreadEventStore {
     pub(super) fn can_evict_history(&self) -> bool {
-        !self.active
-            && self.active_turn_id.is_none()
-            && self
-                .session
-                .as_ref()
-                .is_some_and(|session| session.rollout_path.is_some())
-            && self.side_parent_pending_status().is_none()
-            && !self
-                .input_state
-                .as_ref()
-                .is_some_and(ThreadInputState::has_in_flight_input)
-            && !matches!(
-                self.terminal_notification.as_ref(),
-                Some(TerminalNotification::Completed {
-                    notification: _,
-                    delivery: TerminalDelivery::PendingLive,
-                })
-            )
+        self.history_pin_reason().is_none()
+    }
+
+    pub(super) fn history_pin_reason(&self) -> Option<HistoryPinReason> {
+        if self.active {
+            return Some(HistoryPinReason::Active);
+        }
+        if self.active_turn_id.is_some() {
+            return Some(HistoryPinReason::RunningTurn);
+        }
+        let Some(session) = self.session.as_ref() else {
+            return Some(HistoryPinReason::MissingSession);
+        };
+        if session.rollout_path.is_none() {
+            return Some(HistoryPinReason::MissingRollout);
+        }
+        if self.side_parent_pending_status().is_some() {
+            return Some(HistoryPinReason::PendingInteractive);
+        }
+        if self
+            .input_state
+            .as_ref()
+            .is_some_and(ThreadInputState::has_in_flight_input)
+        {
+            return Some(HistoryPinReason::InFlightInput);
+        }
+        if matches!(
+            self.terminal_notification.as_ref(),
+            Some(TerminalNotification::Completed {
+                notification: _,
+                delivery: TerminalDelivery::PendingLive,
+            })
+        ) {
+            return Some(HistoryPinReason::PendingLiveCompletion);
+        }
+        None
     }
 
     pub(super) fn history_payload_bytes(&self) -> usize {
