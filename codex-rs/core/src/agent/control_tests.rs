@@ -6804,19 +6804,17 @@ async fn goal_supervisor_finish_serializes_with_the_next_start_inner() -> anyhow
     .await
     .expect("replacement supervisor request should start");
 
-    crate::goal_supervisor::record_followup_action(
-        &parent_thread.session,
-        &InterAgentCommunication::new(
-            AgentPath::root()
-                .join("goal_supervisor")
-                .expect("supervisor path"),
-            AgentPath::root(),
-            Vec::new(),
-            "continue".to_string(),
-            /*trigger_turn*/ true,
-        ),
-    )
-    .await;
+    let mut followup = InterAgentCommunication::new(
+        AgentPath::root()
+            .join("goal_supervisor")
+            .expect("supervisor path"),
+        AgentPath::root(),
+        Vec::new(),
+        "continue \"carefully\"\n🦀\u{0001}".repeat(/*n*/ 8192),
+        /*trigger_turn*/ true,
+    );
+    followup.set_turn_id_if_missing("private-followup-metadata");
+    crate::goal_supervisor::record_followup_action(&parent_thread.session, &followup).await;
     assert!(
         crate::goal_supervisor::finish_supervisor_helper_after_followup(
             &parent_thread.session,
@@ -6832,6 +6830,49 @@ async fn goal_supervisor_finish_serializes_with_the_next_start_inner() -> anyhow
     })
     .await
     .expect("idle recheck should replace a supervisor after its delivered followup");
+
+    let requests = request_log.requests();
+    let [_, _, next_request] = requests.as_slice() else {
+        panic!("expected first, replacement, and post-followup supervisor requests");
+    };
+    let next_input = next_request.input();
+    let continuities = next_input
+        .iter()
+        .filter(|item| item["role"] == "developer")
+        .flat_map(|item| item["content"].as_array().into_iter().flatten())
+        .filter_map(|item| item["text"].as_str())
+        .filter(|text| text.starts_with("# Goal Supervisor Continuity\n\n"))
+        .collect::<Vec<_>>();
+    let [continuity] = continuities.as_slice() else {
+        panic!("the next helper must receive exactly one continuity fragment");
+    };
+    assert!(continuity.len() <= 4096);
+    let continuity: serde_json::Value = serde_json::from_str(
+        continuity
+            .strip_prefix("# Goal Supervisor Continuity\n\n")
+            .expect("continuity header"),
+    )?;
+    let action = &continuity["previous_supervisor_action"];
+    assert_eq!(action["kind"], "followup_task");
+    let delivered = &action["delivered_parent_message"];
+    let preview = delivered["content_preview"]
+        .as_str()
+        .expect("followup preview");
+    assert!(!preview.is_empty());
+    assert!(followup.content.starts_with(preview));
+    assert_eq!(
+        delivered,
+        &serde_json::json!({
+            "author": "/root/goal_supervisor",
+            "author_truncated": false,
+            "recipient": "/root",
+            "recipient_truncated": false,
+            "trigger_turn": true,
+            "encrypted": false,
+            "content_preview": preview,
+            "content_truncated": true,
+        })
+    );
 
     let _ = harness
         .manager

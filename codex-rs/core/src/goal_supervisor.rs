@@ -1,13 +1,16 @@
 use crate::agent::control::SpawnAgentForkMode;
 use crate::agent::control::SpawnAgentOptions;
 use crate::agent::next_thread_spawn_depth;
+use crate::context::ContextualUserFragment;
+use crate::context::GoalSupervisorAction;
+use crate::context::GoalSupervisorContinuity;
+use crate::context::SupervisorActionKind;
 use crate::session::session::Session;
 use chrono::Utc;
 use codex_extension_api::ThreadIdleCause;
 use codex_history::RolloutItem;
 use codex_protocol::AgentPath;
 use codex_protocol::ThreadId;
-use codex_protocol::models::ContentItem;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::AgentStatus;
 use codex_protocol::protocol::Event;
@@ -20,7 +23,6 @@ use codex_protocol::protocol::ThreadGoalStatus;
 use codex_protocol::protocol::ThreadGoalUpdatedEvent;
 use codex_protocol::protocol::WarningEvent;
 use codex_protocol::user_input::UserInput;
-use serde::Serialize;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -87,14 +89,6 @@ struct SupervisorFailureBackoff {
     goal_id: Option<String>,
     consecutive_failures: u32,
     last_warned_base_delay_seconds: Option<u64>,
-}
-
-#[derive(Clone, Debug, Serialize)]
-#[serde(rename_all = "snake_case")]
-enum SupervisorActionKind {
-    CompactParentContext,
-    FollowupTask,
-    Snooze,
 }
 
 #[derive(Clone, Debug)]
@@ -993,43 +987,30 @@ pub(crate) async fn supervisor_continuity_context_item(
                 seconds.saturating_add(record.snoozed_seconds),
             )
         });
-    let continuity = serde_json::json!({
-        "supervisor_identity": "/root/goal_supervisor",
-        "activation_reason": "thread_idle",
-        "previous_supervisor_action": previous_supervisor_action.as_ref().map(|action| serde_json::json!({
-            "kind": action.kind,
-            "sent_at_utc": action.sent_at.to_rfc3339(),
-            "delivered_parent_message": action.delivered_parent_message,
-            "snoozed_seconds": action.snoozed_seconds,
-        })),
-        "goal_timing": {
-            "goal_created_at_utc": chrono::DateTime::<Utc>::from_timestamp(goal.created_at, 0).map(|created_at| created_at.to_rfc3339()),
-            "seconds_since_goal_created": Utc::now().timestamp().saturating_sub(goal.created_at),
-            "snooze_count_since_goal_created": snooze_count_since_goal_created,
-            "snoozed_seconds_since_goal_created": snoozed_seconds_since_goal_created,
-        },
-        "parent_timing": {
-            "last_parent_message_at_utc": last_parent_message_at.and_then(|completed_at| chrono::DateTime::<Utc>::from_timestamp(completed_at, 0)).map(|completed_at| completed_at.to_rfc3339()),
-            "snooze_count_since_last_parent_message": snooze_count_since_last_parent_message,
-            "snoozed_seconds_since_last_parent_message": snoozed_seconds_since_last_parent_message,
-        },
-    });
-    let continuity = match serde_json::to_string_pretty(&continuity) {
-        Ok(continuity) => continuity,
-        Err(err) => format!("failed to serialize goal supervisor continuity: {err}"),
+    let continuity = GoalSupervisorContinuity {
+        previous_supervisor_action: previous_supervisor_action.as_ref().map(
+            |SupervisorActionRecord {
+                 goal_id: _,
+                 kind,
+                 sent_at,
+                 delivered_parent_message,
+                 snoozed_seconds,
+             }| GoalSupervisorAction {
+                kind,
+                sent_at: *sent_at,
+                delivered_parent_message: delivered_parent_message.as_ref(),
+                snoozed_seconds: *snoozed_seconds,
+            },
+        ),
+        goal_created_at: goal.created_at,
+        now: Utc::now(),
+        snooze_count_since_goal_created,
+        snoozed_seconds_since_goal_created,
+        last_parent_message_at,
+        snooze_count_since_last_parent_message,
+        snoozed_seconds_since_last_parent_message,
     };
-    RolloutItem::ResponseItem(
-        ResponseItem::Message {
-            id: None,
-            role: "developer".to_string(),
-            content: vec![ContentItem::InputText {
-                text: format!("# Goal Supervisor Continuity\n\n{continuity}"),
-            }],
-            phase: None,
-            internal_chat_message_metadata_passthrough: None,
-        }
-        .into(),
-    )
+    RolloutItem::ResponseItem(ContextualUserFragment::into(continuity).into())
 }
 
 async fn persisted_snooze_delay(
