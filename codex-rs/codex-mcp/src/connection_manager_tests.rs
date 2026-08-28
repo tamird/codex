@@ -2519,7 +2519,7 @@ async fn capture_binding_exposes_cached_tools_before_startup() {
     store_current_tools(&cache_context, vec![cached_tool]);
     let startup_complete = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let startup_complete_for_client = Arc::clone(&startup_complete);
-    let (startup_started, wait_for_startup) = tokio::sync::oneshot::channel();
+    let (startup_started, mut wait_for_startup) = tokio::sync::oneshot::channel();
     let (release_startup, startup_released) = tokio::sync::oneshot::channel();
     let pending_client = async move {
         startup_started.send(()).expect("signal client startup");
@@ -2567,6 +2567,13 @@ async fn capture_binding_exposes_cached_tools_before_startup() {
     );
     let manager = Arc::new(manager);
     let cached_binding = capture_binding(&manager).await;
+    assert!(
+        matches!(
+            wait_for_startup.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ),
+        "capturing cached tools must not start a dormant pooled MCP server"
+    );
     assert_eq!(
         cached_binding
             .tools()
