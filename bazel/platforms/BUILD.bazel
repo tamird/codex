@@ -1,1 +1,3 @@
-# Release platform rules live in this package.
+load(":release_binaries.bzl", "declare_release_platforms")
+
+declare_release_platforms()
