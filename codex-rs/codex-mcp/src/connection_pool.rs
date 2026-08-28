@@ -1141,6 +1141,10 @@ impl McpConnectionLease {
             .is_ok_and(|connection| connection.client.has_recoverable_failed_startup())
     }
 
+    pub(crate) fn current_connection_id(&self) -> Option<u64> {
+        self.current().ok().map(|connection| connection.id)
+    }
+
     pub(crate) async fn stable_connection_state(&self) -> StableMcpConnectionState {
         let Ok(connection) = self.current() else {
             return StableMcpConnectionState::PendingOrClosed;

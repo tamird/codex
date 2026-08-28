@@ -196,4 +196,8 @@ impl McpConnectionSet {
             })
             .await
     }
+
+    pub(crate) fn current_connection_id(&self, server: &str) -> Option<u64> {
+        self.servers.get(server)?.connection.current_connection_id()
+    }
 }

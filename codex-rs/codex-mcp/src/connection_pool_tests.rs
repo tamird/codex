@@ -1080,6 +1080,31 @@ fn approval_policy_and_permission_profile_do_not_prevent_reuse() {
 }
 
 #[test]
+fn reused_connection_refreshes_oauth_contention_for_every_lease() {
+    let pool = McpConnectionPool::default();
+    let original = identity("server", "/one");
+    let mut refreshed = original.clone();
+    refreshed.oauth_store_was_contended = true;
+
+    let first = pool.acquire(original, McpConnectionPoolMode::Reuse, &route(), client);
+    let second = pool.acquire(refreshed, McpConnectionPoolMode::Reuse, &route(), client);
+
+    assert!(first.ptr_eq(&second));
+    assert!(
+        first
+            .connection_identity()
+            .expect("first connection identity")
+            .oauth_store_was_contended
+    );
+    assert!(
+        second
+            .connection_identity()
+            .expect("second connection identity")
+            .oauth_store_was_contended
+    );
+}
+
+#[test]
 fn replacement_becomes_preferred_without_revoking_old_lease() {
     let pool = McpConnectionPool::default();
     let old = pool.acquire(
@@ -1088,6 +1113,7 @@ fn replacement_becomes_preferred_without_revoking_old_lease() {
         &route(),
         client,
     );
+    let first_generation = old.current_connection_id();
     let replacement = pool.acquire(
         identity("server", "/one"),
         McpConnectionPoolMode::Replace,
@@ -1103,6 +1129,11 @@ fn replacement_becomes_preferred_without_revoking_old_lease() {
 
     assert!(old.ptr_eq(&replacement));
     assert!(replacement.ptr_eq(&reused));
+    assert_ne!(first_generation, replacement.current_connection_id());
+    assert_eq!(
+        replacement.current_connection_id(),
+        reused.current_connection_id()
+    );
     assert!(!old.is_connection_cancelled());
 }
 

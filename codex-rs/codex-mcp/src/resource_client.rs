@@ -152,13 +152,13 @@ pub struct McpResourceClient {
     runtime: Arc<McpRuntime>,
 }
 
-/// Opaque identity for the connection set currently used by an MCP resource client.
+/// Opaque identity for the connection set and Apps generation used by an MCP resource client.
 #[derive(Clone)]
-pub struct McpResourceClientCacheKey(Weak<McpConnectionSet>);
+pub struct McpResourceClientCacheKey(Weak<McpConnectionSet>, Option<u64>);
 
 impl PartialEq for McpResourceClientCacheKey {
     fn eq(&self, other: &Self) -> bool {
-        self.0.ptr_eq(&other.0)
+        self.0.ptr_eq(&other.0) && self.1 == other.1
     }
 }
 
@@ -178,9 +178,13 @@ impl McpResourceClient {
         Self { runtime }
     }
 
-    /// Returns the identity of the connection set used by this client.
+    /// Returns the identity of the connection set and Apps generation used by this client.
     pub fn cache_key(&self) -> McpResourceClientCacheKey {
-        McpResourceClientCacheKey(Arc::downgrade(&self.runtime.latest_connections()))
+        let connections = self.runtime.latest_connections();
+        McpResourceClientCacheKey(
+            Arc::downgrade(&connections),
+            connections.current_connection_id(CODEX_APPS_MCP_SERVER_NAME),
+        )
     }
 
     /// Returns whether this client can address the named server.
@@ -235,13 +239,12 @@ impl McpResourceClient {
         let (connections, _) = self
             .runtime
             .latest_connections_for_event_server(CODEX_APPS_MCP_SERVER_NAME)?;
-        let cache_key = McpResourceClientCacheKey(Arc::downgrade(&connections));
-        let result = connections
+        let (result, connection_id) = connections
             .run_client_request_by_name(
                 CODEX_APPS_MCP_SERVER_NAME,
                 |client, request_timeout| async move {
                     let managed = client.client().await.context("failed to get MCP client")?;
-                    managed
+                    let result = managed
                         .client
                         .send_custom_request_with_timeout(
                             "events/list",
@@ -249,10 +252,13 @@ impl McpResourceClient {
                             request_timeout,
                         )
                         .await
-                        .context("events/list failed for hosted Plugin Runtime")
+                        .context("events/list failed for hosted Plugin Runtime")?;
+                    Ok((result, client.connection_id()))
                 },
             )
             .await?;
+        let cache_key =
+            McpResourceClientCacheKey(Arc::downgrade(&connections), Some(connection_id));
         let ServerResult::CustomResult(result) = result else {
             return Err(anyhow!("events/list returned an unexpected MCP result"));
         };
