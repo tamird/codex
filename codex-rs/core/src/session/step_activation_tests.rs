@@ -17,6 +17,7 @@ use codex_config::RequirementSource;
 use codex_config::Sourced;
 use codex_http_client::HttpClientFactory;
 use codex_login::AuthManager;
+use codex_models_manager::CustomModelConfig;
 use codex_models_manager::ModelsManagerConfig;
 use codex_models_manager::bundled_models_response;
 use codex_models_manager::manager::ModelsManager;
@@ -40,6 +41,7 @@ use codex_protocol::protocol::Submission;
 use codex_protocol::protocol::TurnAbortReason;
 use pretty_assertions::assert_eq;
 use std::collections::BTreeSet;
+use std::collections::HashMap;
 use std::sync::Mutex as StdMutex;
 use std::time::Duration;
 use test_case::test_case;
@@ -52,7 +54,7 @@ use tokio_util::sync::CancellationToken;
 const MODEL_A: &str = "step-activation-a";
 const MODEL_B: &str = "step-activation-b";
 
-fn activation_models() -> Vec<ModelInfo> {
+pub(in crate::session) fn activation_models() -> Vec<ModelInfo> {
     let model = bundled_models_response()
         .expect("bundled models")
         .models
@@ -69,7 +71,7 @@ fn activation_models() -> Vec<ModelInfo> {
 }
 
 #[derive(Debug, Default)]
-struct ModelLookupGate {
+pub(in crate::session) struct ModelLookupGate {
     started: Notify,
     resume: Notify,
 }
@@ -129,6 +131,14 @@ impl ModelsManager for GatedModelsManager {
         self.inner.auth_manager()
     }
 
+    fn custom_models_snapshot(&self) -> Arc<HashMap<String, CustomModelConfig>> {
+        self.inner.custom_models_snapshot()
+    }
+
+    fn replace_custom_models(&self, custom_models: HashMap<String, CustomModelConfig>) {
+        self.inner.replace_custom_models(custom_models);
+    }
+
     fn list_collaboration_modes(&self) -> Vec<CollaborationModeMask> {
         self.inner.list_collaboration_modes()
     }
@@ -161,14 +171,14 @@ impl ModelsManager for GatedModelsManager {
     }
 }
 
-struct ActivationFixture {
-    session: Arc<Session>,
-    turn: Arc<TurnContext>,
-    finish: Arc<Notify>,
-    lookup: Arc<ModelLookupGate>,
+pub(in crate::session) struct ActivationFixture {
+    pub(in crate::session) session: Arc<Session>,
+    pub(in crate::session) turn: Arc<TurnContext>,
+    pub(in crate::session) finish: Arc<Notify>,
+    pub(in crate::session) lookup: Arc<ModelLookupGate>,
 }
 
-async fn activation_fixture(models: Vec<ModelInfo>) -> ActivationFixture {
+pub(in crate::session) async fn activation_fixture(models: Vec<ModelInfo>) -> ActivationFixture {
     let (session, _) = make_session_and_context().await;
     let mut session = Arc::new(session);
     let mutable = Arc::get_mut(&mut session).expect("unshared test session");

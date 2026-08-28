@@ -382,4 +382,4 @@ impl Session {
 
 #[cfg(test)]
 #[path = "step_activation_tests.rs"]
-mod tests;
+pub(super) mod tests;

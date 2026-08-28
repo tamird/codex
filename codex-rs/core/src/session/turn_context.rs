@@ -8,6 +8,7 @@ use crate::environment_selection::TurnEnvironmentSnapshot;
 use crate::exec_policy::AllowPrefixRules;
 use crate::shell_snapshot::ShellSnapshotFile;
 use crate::tools::sandboxing::executor_windows_sandbox_level;
+use crate::turn_metadata::AcceptedTurnMetadata;
 use arc_swap::ArcSwap;
 use codex_core_plugins::PluginCommandAttribution;
 use codex_core_plugins::ResolvedPluginMetricsOperation;
@@ -200,6 +201,12 @@ pub(crate) struct NewTurnContextOptions {
     pub(crate) cyber_access_program: Option<CyberAccessProgram>,
 }
 
+/// Selects accepted-turn state before publishing request metadata.
+pub(crate) enum TurnMetadataOrigin {
+    New,
+    PreserveAccepted(Arc<AcceptedTurnMetadata>),
+}
+
 /// The context needed for a single turn of the thread.
 #[derive(Debug)]
 pub struct TurnContext {
@@ -270,6 +277,14 @@ pub struct TurnContext {
 enum TurnMultiAgentRuntime {
     ResolveAndStore,
     Preview,
+}
+
+enum TurnContextSettings {
+    ResolveRouting,
+    PreserveActive {
+        settings: Arc<ResolvedStepSettings>,
+        accepted: Arc<AcceptedTurnMetadata>,
+    },
 }
 
 impl TurnContext {
@@ -896,6 +911,7 @@ impl Session {
         environments: TurnEnvironmentSnapshot,
         cwd: AbsolutePathBuf,
         sub_id: String,
+        metadata_origin: TurnMetadataOrigin,
         skills_snapshot: HostSkillsSnapshot,
     ) -> TurnContext {
         let model_info = &step_settings.model_info;
@@ -933,7 +949,7 @@ impl Session {
             per_turn_config.approvals_reviewer,
         );
         let per_turn_config = Arc::new(per_turn_config);
-        let turn_metadata_state = Arc::new(TurnMetadataState::new(
+        let mut turn_metadata_state = TurnMetadataState::new(
             session_id.to_string(),
             thread_id.to_string(),
             session_configuration.forked_from_thread_id,
@@ -947,7 +963,11 @@ impl Session {
             network.is_some(),
             auto_review_enabled,
             model_info,
-        ));
+        );
+        if let TurnMetadataOrigin::PreserveAccepted(accepted) = metadata_origin {
+            turn_metadata_state.accepted = accepted;
+        }
+        let turn_metadata_state = Arc::new(turn_metadata_state);
         turn_metadata_state
             .set_responses_api_metadata(per_turn_config.responses_api_metadata.clone());
         let (current_date, timezone) = local_time_context();
@@ -1069,7 +1089,7 @@ impl Session {
             options,
             TurnMultiAgentRuntime::ResolveAndStore,
             self.git_enrichment_policy,
-            /*resolve_model_routing*/ true,
+            TurnContextSettings::ResolveRouting,
         )
         .await
     }
@@ -1085,7 +1105,7 @@ impl Session {
             NewTurnContextOptions::default(),
             TurnMultiAgentRuntime::Preview,
             GitEnrichmentPolicy::Skip,
-            /*resolve_model_routing*/ true,
+            TurnContextSettings::ResolveRouting,
         )
         .await
     }
@@ -1098,7 +1118,7 @@ impl Session {
         options: NewTurnContextOptions,
         multi_agent_runtime: TurnMultiAgentRuntime,
         git_enrichment_policy: GitEnrichmentPolicy,
-        resolve_model_routing: bool,
+        settings: TurnContextSettings,
     ) -> Arc<TurnContext> {
         let turn_environments = self.services.turn_environments.snapshot().await;
         let primary_turn_environment = turn_environments.primary();
@@ -1113,17 +1133,34 @@ impl Session {
             .map(TurnEnvironment::permission_profile)
             .cloned()
             .unwrap_or_else(|| session_configuration.permission_profile());
-        let model_info = session_configuration
-            .step_settings
-            .resolve_model_info(
-                self.services.models_manager.as_ref(),
-                &session_configuration.model_info_overrides,
-                self.features.enabled(Feature::Personality),
-            )
-            .await;
+        let resolve_model_routing = matches!(settings, TurnContextSettings::ResolveRouting);
+        let (step_settings, metadata_origin) = match settings {
+            TurnContextSettings::ResolveRouting => {
+                let model_info = session_configuration
+                    .step_settings
+                    .resolve_model_info(
+                        self.services.models_manager.as_ref(),
+                        &session_configuration.model_info_overrides,
+                        self.features.enabled(Feature::Personality),
+                    )
+                    .await;
+                (
+                    Arc::new(ResolvedStepSettings::new(
+                        Arc::clone(&session_configuration.step_settings),
+                        Arc::new(model_info),
+                        self.features.enabled(Feature::FastMode),
+                    )),
+                    TurnMetadataOrigin::New,
+                )
+            }
+            TurnContextSettings::PreserveActive { settings, accepted } => {
+                (settings, TurnMetadataOrigin::PreserveAccepted(accepted))
+            }
+        };
+        let model_info = &step_settings.model_info;
         let multi_agent_version = match multi_agent_runtime {
             TurnMultiAgentRuntime::ResolveAndStore => {
-                self.resolve_multi_agent_version_for_model(&model_info, &per_turn_config)
+                self.resolve_multi_agent_version_for_model(model_info, &per_turn_config)
             }
             TurnMultiAgentRuntime::Preview => per_turn_config.multi_agent_version_for_model(
                 self.multi_agent_version()
@@ -1163,11 +1200,6 @@ impl Session {
                 .snapshot_for_config(&skills_input, fs)
                 .await
         };
-        let step_settings = Arc::new(ResolvedStepSettings::new(
-            Arc::clone(&session_configuration.step_settings),
-            Arc::new(model_info),
-            self.features.enabled(Feature::FastMode),
-        ));
         let mut turn_context: TurnContext = Self::make_turn_context(
             self.thread_id(),
             self.session_id(),
@@ -1195,6 +1227,7 @@ impl Session {
             turn_environments,
             cwd,
             sub_id,
+            metadata_origin,
             skills_snapshot,
         );
         turn_context.code_mode_available = self.services.code_mode_service.is_available();
@@ -1211,7 +1244,11 @@ impl Session {
                 .collaboration_mode
                 .model();
             if let Some(selection) = self
-                .select_model_routing_context(&turn_context, profile_name, &HashSet::new())
+                .select_model_routing_context(
+                    &turn_context,
+                    profile_name,
+                    &HashSet::new(),
+                )
                 .await
             {
                 let mut routed = selection.context;
@@ -1231,9 +1268,11 @@ impl Session {
                 turn_context = routed;
             }
         }
-        self.services
-            .thread_extension_data
-            .insert(turn_context.model_info().as_ref().clone());
+        if resolve_model_routing {
+            self.services
+                .thread_extension_data
+                .insert(turn_context.model_info().as_ref().clone());
+        }
         let turn_context = Arc::new(turn_context);
         if git_enrichment_policy == GitEnrichmentPolicy::Fresh
             && turn_context
@@ -1307,11 +1346,13 @@ impl Session {
     /// implicit skill invocation deduplication, and terminal error tracking. Filesystem-derived
     /// configuration, environment selections, permissions, skills, extension attachments, and
     /// request metadata come from the updated session configuration.
-    pub(crate) async fn refresh_active_turn_context(
+    pub(super) async fn prepare_workspace_turn_context(
         &self,
         current: &TurnContext,
-    ) -> Arc<TurnContext> {
-        let session_configuration = self.default_turn_configuration().await;
+        settings: Arc<ResolvedStepSettings>,
+    ) -> TurnContext {
+        let mut session_configuration = self.default_turn_configuration().await;
+        session_configuration.step_settings = Arc::new(settings.selected().clone());
         let refreshed = self
             .new_turn_context_from_configuration(
                 current.sub_id.clone(),
@@ -1320,9 +1361,12 @@ impl Session {
                     final_output_json_schema: current.final_output_json_schema.clone(),
                     cyber_access_program: current.cyber_access_program,
                 },
-                TurnMultiAgentRuntime::ResolveAndStore,
-                self.git_enrichment_policy,
-                /*resolve_model_routing*/ false,
+                TurnMultiAgentRuntime::Preview,
+                GitEnrichmentPolicy::Skip,
+                TurnContextSettings::PreserveActive {
+                    settings,
+                    accepted: Arc::clone(&current.turn_metadata_state.accepted),
+                },
             )
             .await;
         let mut refreshed = Arc::try_unwrap(refreshed)
@@ -1340,22 +1384,13 @@ impl Session {
             AtomicBool::new(current.server_model_warning_emitted.load(Ordering::Relaxed));
         refreshed.model_verification_emitted =
             AtomicBool::new(current.model_verification_emitted.load(Ordering::Relaxed));
-        if let (Some(profile_name), Some(candidate)) = (
-            current.model_profile.as_deref(),
-            current.model_routing_candidate.as_ref(),
-        ) {
-            refreshed = refreshed
-                .with_unchecked_routing_candidate(
-                    profile_name,
-                    candidate,
-                    &self.services.models_manager,
-                )
-                .await;
-        }
-        self.services
-            .thread_extension_data
-            .insert(refreshed.model_info().as_ref().clone());
-        Arc::new(refreshed)
+        refreshed.model_profile = current.model_profile.clone();
+        refreshed.model_routing_candidate = current.model_routing_candidate.clone();
+        refreshed.model_routing_previous_candidate =
+            current.model_routing_previous_candidate.clone();
+        refreshed.model_routing_selection_reason = current.model_routing_selection_reason;
+        refreshed.model_routing_retry_at = current.model_routing_retry_at;
+        refreshed
     }
 
     pub(crate) async fn new_startup_prewarm_turn_with_sub_id(

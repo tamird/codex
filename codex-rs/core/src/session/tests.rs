@@ -4,6 +4,7 @@ use super::step_settings::StepSettings;
 use super::step_settings::StepSettingsUpdate;
 pub(crate) use super::step_settings::tests::update_selected_settings_for_test;
 use super::turn_context::TurnEnvironment;
+use super::turn_context::TurnMetadataOrigin;
 use super::*;
 use crate::agents_md_manager::AgentsMdManager;
 use crate::compact::CompactionReporting;
@@ -7837,6 +7838,7 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
         resolved_turn_environments,
         session_configuration.cwd().clone(),
         "turn_id".to_string(),
+        TurnMetadataOrigin::New,
         skills_snapshot,
     );
     session.mark_mcp_runtime_dirty();
@@ -10246,6 +10248,7 @@ where
         resolved_turn_environments,
         session_configuration.cwd().clone(),
         "turn_id".to_string(),
+        TurnMetadataOrigin::New,
         skills_snapshot,
     ));
     session.mark_mcp_runtime_dirty();

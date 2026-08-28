@@ -225,6 +225,7 @@ use codex_protocol::error::Result as CodexResult;
 use codex_protocol::exec_output::StreamOutput;
 
 mod code_mode_warning;
+mod context_transition;
 pub(crate) mod context_window;
 mod environment;
 pub(crate) mod extension_metrics;

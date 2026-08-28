@@ -140,6 +140,7 @@ use codex_utils_stream_parser::extract_proposed_plan_text;
 use codex_utils_stream_parser::strip_citations;
 use futures::prelude::*;
 use futures::stream::FuturesOrdered;
+use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
 use tracing::error;
@@ -178,6 +179,7 @@ pub(crate) enum RunTurnProviderStartup {
 pub(crate) async fn run_turn(
     sess: Arc<Session>,
     mut turn_context: Arc<TurnContext>,
+    task_done: &Arc<Notify>,
     input: Vec<TurnInput>,
     provider_startup: RunTurnProviderStartup,
     cancellation_token: CancellationToken,
@@ -529,12 +531,12 @@ pub(crate) async fn run_turn(
                     refresh_turn_context,
                 } = sampling_request_output;
                 if refresh_turn_context {
-                    let refreshed_turn_context = sess
-                        .refresh_active_turn_context(turn_context.as_ref())
-                        .await;
+                    turn_context = sess
+                        .refresh_active_turn_context(&turn_context, task_done, &cancellation_token)
+                        .await?;
                     let refreshed_step_context = sess
                         .capture_step_context(
-                            Arc::clone(&refreshed_turn_context),
+                            Arc::clone(&turn_context),
                             &cancellation_token,
                         )
                         .await?;
@@ -549,7 +551,6 @@ pub(crate) async fn run_turn(
                             refreshed_step_context.as_ref(),
                         )
                         .await?;
-                    turn_context = refreshed_turn_context;
                     next_step_context = Some(refreshed_step_context);
                 }
                 if model_needs_follow_up {

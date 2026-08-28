@@ -44,6 +44,20 @@ impl SessionTask for RegularTask {
         input: Vec<TurnInput>,
         cancellation_token: CancellationToken,
     ) -> SessionTaskResult {
+        let done = {
+            // start_task holds this lock until the spawned task is registered.
+            let active = sess.active_turn.lock().await;
+            let Some(task) = active.as_ref().and_then(|turn| turn.task.as_ref()) else {
+                return Ok(None);
+            };
+            if !Arc::ptr_eq(&task.turn_context, &ctx)
+                || cancellation_token.is_cancelled()
+                || task.cancellation_token.is_cancelled()
+            {
+                return Ok(None);
+            }
+            Arc::clone(&task.done)
+        };
         let run_turn_span = trace_span!("run_turn");
         // Regular turns emit `TurnStarted` inline so first-turn lifecycle does
         // not wait on startup prewarm resolution.
@@ -85,6 +99,7 @@ impl SessionTask for RegularTask {
             let last_agent_message = run_turn(
                 Arc::clone(&sess),
                 Arc::clone(&ctx),
+                &done,
                 next_input,
                 provider_startup
                     .take()
