@@ -1,5 +1,3 @@
-use std::sync::Arc;
-
 use anyhow::Result;
 use anyhow::anyhow;
 use codex_protocol::protocol::McpStartupFailure;
@@ -32,7 +30,7 @@ impl McpConnectionSet {
                 view.trigger_startup().await;
                 match view
                     .connection
-                    .await_current_startup(Arc::clone(&self.session_route))
+                    .await_current_startup(view.session_route())
                     .await
                 {
                     Ok(_) => {}

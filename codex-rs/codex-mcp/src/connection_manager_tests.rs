@@ -110,11 +110,6 @@ impl McpConnectionSet {
             /*lifecycle*/ None,
             ElicitationRequestRouter::default(),
         );
-        let session_route = Arc::new(crate::request_router::McpSessionRoute::new(
-            String::new(),
-            elicitation_requests.clone(),
-            /*tx_event*/ None,
-        ));
         Self {
             servers: HashMap::new(),
             disabled_servers: Vec::new(),
@@ -128,20 +123,36 @@ impl McpConnectionSet {
             prefix_mcp_tool_names,
             non_prefixed_mcp_tool_servers: Vec::new(),
             elicitation_requests,
-            session_route,
             startup_cancellation_token: CancellationToken::new(),
             connection_pool: crate::McpConnectionPool::default(),
             trusted_access: None,
         }
     }
 
+    fn new_test_session_route(&self) -> Arc<McpSessionRouteOwner> {
+        Arc::new(McpSessionRouteOwner {
+            route: Arc::new(McpSessionRoute::new(
+                String::new(),
+                self.elicitation_requests.clone(),
+                /*tx_event*/ None,
+            )),
+        })
+    }
+
     fn insert_test_client(&mut self, name: impl Into<String>, client: AsyncManagedClient) {
         let name = name.into();
+        let session_route = self.new_test_session_route();
+        let connection = McpConnectionLease::from(client);
         self.servers.insert(
             name,
             McpServerView {
+                session_route: Arc::clone(&session_route),
+                startup_owner: Arc::new(McpStartupOwner {
+                    cancel_token: self.startup_cancellation_token.child_token(),
+                    _route_cleanup: connection.route_cleanup(Arc::clone(&session_route.route)),
+                }),
                 tool_filter: ToolFilter::default(),
-                connection: client.into(),
+                connection,
                 startup_trigger: None,
                 startup_status_published: None,
                 metadata: McpServerMetadata {
@@ -669,7 +680,7 @@ async fn connection_statuses_follow_latest_reconnect_outcome() {
     let client = &manager.servers[CODEX_APPS_MCP_SERVER_NAME].connection;
     assert!(
         client
-            .await_current_startup(Arc::clone(&manager.session_route))
+            .await_current_startup(manager.servers[CODEX_APPS_MCP_SERVER_NAME].session_route())
             .await
             .is_err()
     );
@@ -685,7 +696,7 @@ async fn connection_statuses_follow_latest_reconnect_outcome() {
         Status::Connected,
     ] {
         client
-            .reconnect_failed_startup(Arc::clone(&manager.session_route))
+            .reconnect_failed_startup(manager.servers[CODEX_APPS_MCP_SERVER_NAME].session_route())
             .await;
         started.notified().await;
         assert_eq!(
@@ -2020,12 +2031,15 @@ async fn codex_apps_extension_does_not_share_host_owned_tools_cache() -> anyhow:
 
     let (has_cache_context, has_cached_tools) = manager.servers[CODEX_APPS_MCP_SERVER_NAME]
         .connection
-        .run(Arc::clone(&manager.session_route), |client| async move {
-            (
-                client.codex_apps_tools_cache_context.is_some(),
-                client.has_cached_tools(),
-            )
-        })
+        .run(
+            manager.servers[CODEX_APPS_MCP_SERVER_NAME].session_route(),
+            |client| async move {
+                (
+                    client.codex_apps_tools_cache_context.is_some(),
+                    client.has_cached_tools(),
+                )
+            },
+        )
         .await?;
     assert!(
         !has_cache_context,
@@ -4352,9 +4366,10 @@ async fn executor_owned_chatgpt_mcp_accepts_only_safe_explicit_authorization() -
             .get("fake-first-party")
             .expect("fake first-party server")
             .connection
-            .run(Arc::clone(&manager.session_route), |client| async move {
-                client.client().await
-            })
+            .run(
+                manager.servers["fake-first-party"].session_route(),
+                |client| async move { client.client().await },
+            )
             .await
             .expect("fake first-party startup operation should run")
         {
@@ -4483,9 +4498,10 @@ async fn no_local_runtime_fails_local_stdio_but_keeps_local_http_server() {
     assert!(manager.contains_server("http"));
     let has_http_cache_context = manager.servers["http"]
         .connection
-        .run(Arc::clone(&manager.session_route), |client| async move {
-            client.tool_catalog_cache_context.is_some()
-        })
+        .run(
+            manager.servers["http"].session_route(),
+            |client| async move { client.tool_catalog_cache_context.is_some() },
+        )
         .await
         .expect("HTTP cache metadata should remain available without a local environment");
     assert!(has_http_cache_context);
@@ -4499,9 +4515,10 @@ async fn no_local_runtime_fails_local_stdio_but_keeps_local_http_server() {
         .get("stdio")
         .expect("stdio server")
         .connection
-        .run(Arc::clone(&manager.session_route), |client| async move {
-            client.client().await
-        })
+        .run(
+            manager.servers["stdio"].session_route(),
+            |client| async move { client.client().await },
+        )
         .await
         .expect("stdio startup operation should run")
     {
@@ -4849,6 +4866,7 @@ async fn manager_with_reusable_ready_server(
     let client = Arc::new(std::sync::Mutex::new(Some(
         create_ready_async_managed_client(tools).await,
     )));
+    let session_route = manager.new_test_session_route();
     let connection = connection_pool.acquire_named_with_startup_identity(
         "docs".to_string(),
         reusable_server_identity(config, runtime_context),
@@ -4859,7 +4877,7 @@ async fn manager_with_reusable_ready_server(
                 .startup_timeout_sec
                 .unwrap_or(DEFAULT_STARTUP_TIMEOUT),
         }),
-        &manager.session_route,
+        &session_route.route,
         move |request_router| {
             let mut client = client
                 .lock()
@@ -4873,6 +4891,11 @@ async fn manager_with_reusable_ready_server(
     manager.servers.insert(
         "docs".to_string(),
         McpServerView {
+            session_route: Arc::clone(&session_route),
+            startup_owner: Arc::new(McpStartupOwner {
+                cancel_token: manager.startup_cancellation_token.child_token(),
+                _route_cleanup: connection.route_cleanup(Arc::clone(&session_route.route)),
+            }),
             connection,
             startup_trigger: None,
             startup_status_published: None,
@@ -4907,6 +4930,7 @@ async fn manager_with_reusable_dormant_server(
     let (client, startup_started, release_startup) =
         create_gated_async_managed_client(ready_client);
     let client = Arc::new(std::sync::Mutex::new(Some(client)));
+    let session_route = manager.new_test_session_route();
     let connection = connection_pool.acquire_named_with_startup_identity(
         "docs".to_string(),
         reusable_server_identity(config, runtime_context),
@@ -4917,7 +4941,7 @@ async fn manager_with_reusable_dormant_server(
                 .startup_timeout_sec
                 .unwrap_or(DEFAULT_STARTUP_TIMEOUT),
         }),
-        &manager.session_route,
+        &session_route.route,
         move |request_router| {
             let mut client = client
                 .lock()
@@ -4932,6 +4956,11 @@ async fn manager_with_reusable_dormant_server(
     manager.servers.insert(
         "docs".to_string(),
         McpServerView {
+            session_route: Arc::clone(&session_route),
+            startup_owner: Arc::new(McpStartupOwner {
+                cancel_token: manager.startup_cancellation_token.child_token(),
+                _route_cleanup: connection.route_cleanup(Arc::clone(&session_route.route)),
+            }),
             connection,
             startup_trigger: Some(startup_trigger),
             startup_status_published: None,
@@ -5069,6 +5098,7 @@ async fn manager_with_recovering_apps_server(
         .boxed()
         .shared();
     let failed_client = Arc::new(failed_client);
+    let session_route = manager.new_test_session_route();
     let connection = connection_pool.acquire_named_with_startup_identity(
         CODEX_APPS_MCP_SERVER_NAME.to_string(),
         reusable_server_identity_for_name(CODEX_APPS_MCP_SERVER_NAME, config, runtime_context),
@@ -5079,7 +5109,7 @@ async fn manager_with_recovering_apps_server(
                 .startup_timeout_sec
                 .unwrap_or(DEFAULT_STARTUP_TIMEOUT),
         }),
-        &manager.session_route,
+        &session_route.route,
         move |request_router| AsyncManagedClient {
             client: failed_client.as_ref().clone(),
             is_codex_apps_mcp_server: true,
@@ -5099,6 +5129,11 @@ async fn manager_with_recovering_apps_server(
     manager.servers.insert(
         CODEX_APPS_MCP_SERVER_NAME.to_string(),
         McpServerView {
+            session_route: Arc::clone(&session_route),
+            startup_owner: Arc::new(McpStartupOwner {
+                cancel_token: manager.startup_cancellation_token.child_token(),
+                _route_cleanup: connection.route_cleanup(Arc::clone(&session_route.route)),
+            }),
             connection,
             startup_trigger: None,
             startup_status_published: None,
@@ -5194,6 +5229,7 @@ async fn reconciliation_reuses_connection_without_relisting_regular_tools() -> a
         cancel_token: CancellationToken::new(),
         request_router: Default::default(),
     })));
+    let session_route = previous.new_test_session_route();
     let connection = previous
         .connection_pool
         .acquire_named_with_startup_identity(
@@ -5206,7 +5242,7 @@ async fn reconciliation_reuses_connection_without_relisting_regular_tools() -> a
                     .startup_timeout_sec
                     .unwrap_or(DEFAULT_STARTUP_TIMEOUT),
             }),
-            &previous.session_route,
+            &session_route.route,
             move |request_router| {
                 let mut client = client
                     .lock()
@@ -5220,6 +5256,11 @@ async fn reconciliation_reuses_connection_without_relisting_regular_tools() -> a
     previous.servers.insert(
         "docs".to_string(),
         McpServerView {
+            session_route: Arc::clone(&session_route),
+            startup_owner: Arc::new(McpStartupOwner {
+                cancel_token: previous.startup_cancellation_token.child_token(),
+                _route_cleanup: connection.route_cleanup(Arc::clone(&session_route.route)),
+            }),
             connection,
             startup_trigger: None,
             startup_status_published: None,
@@ -5550,7 +5591,7 @@ async fn reconciliation_replaces_connection_when_auth_mode_changes() -> anyhow::
         .get("docs")
         .expect("refreshed server should exist")
         .connection
-        .await_current_startup(Arc::clone(&reconciled.session_route))
+        .await_current_startup(reconciled.servers["docs"].session_route())
         .await;
     assert_matches!(
         outcome.err().expect("changed auth mode must be validated"),
@@ -5716,7 +5757,7 @@ async fn reconciliation_reuses_apps_connection_while_startup_recovery_is_pending
     let reconnect_started_wait = reconnect_started.notified();
     previous.servers[CODEX_APPS_MCP_SERVER_NAME]
         .connection
-        .reconnect_failed_startup(Arc::clone(&previous.session_route))
+        .reconnect_failed_startup(previous.servers[CODEX_APPS_MCP_SERVER_NAME].session_route())
         .await;
     tokio::time::timeout(Duration::from_secs(1), reconnect_started_wait)
         .await
@@ -5776,7 +5817,7 @@ async fn reconciliation_replaces_recovering_apps_connection_when_identity_change
     let reconnect_started_wait = reconnect_started.notified();
     previous.servers[CODEX_APPS_MCP_SERVER_NAME]
         .connection
-        .reconnect_failed_startup(Arc::clone(&previous.session_route))
+        .reconnect_failed_startup(previous.servers[CODEX_APPS_MCP_SERVER_NAME].session_route())
         .await;
     tokio::time::timeout(Duration::from_secs(1), reconnect_started_wait)
         .await
@@ -6028,7 +6069,7 @@ async fn reconciliation_replaces_closed_connections() -> anyhow::Result<()> {
         .get("docs")
         .expect("test server should exist")
         .connection
-        .await_current_startup(Arc::clone(&previous.session_route))
+        .await_current_startup(previous.servers["docs"].session_route())
         .await?;
     connected_client.client = Arc::clone(&client);
     let replacement = Arc::new(std::sync::Mutex::new(Some(AsyncManagedClient {
@@ -6048,7 +6089,7 @@ async fn reconciliation_replaces_closed_connections() -> anyhow::Result<()> {
         "docs".to_string(),
         reusable_server_identity(&config, &runtime_context),
         crate::McpConnectionPoolMode::Replace,
-        &previous.session_route,
+        &previous.servers["docs"].session_route(),
         move |request_router| {
             let mut client = replacement
                 .lock()
@@ -6155,7 +6196,7 @@ async fn reconciliation_reconnects_when_host_plugin_root_changes() {
         "docs".to_string(),
         original_identity,
         crate::McpConnectionPoolMode::Reuse,
-        &previous.session_route,
+        &previous.servers["docs"].session_route(),
         move |request_router| {
             let mut client = initial_client.clone();
             client.request_router = request_router;

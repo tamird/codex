@@ -134,7 +134,7 @@ impl McpConnectionSet {
                     view.trigger_startup().await;
                 }
                 view.connection
-                    .reconnect_failed_startup(Arc::clone(&self.session_route))
+                    .reconnect_failed_startup(view.session_route())
                     .await;
                 let startup_complete = view.connection.startup_complete();
                 let catalog_override = if server_name == CODEX_APPS_MCP_SERVER_NAME {
@@ -146,7 +146,7 @@ impl McpConnectionSet {
                 let tool_filter = view.tool_filter.clone();
                 let Ok(Some(server_tools)) = view
                     .connection
-                    .run(Arc::clone(&self.session_route), move |client| async move {
+                    .run(view.session_route(), move |client| async move {
                         let tools = match catalog_override {
                             Some((connection_id, tools))
                                 if connection_id == client.connection_id() =>
@@ -257,9 +257,7 @@ impl McpConnectionSet {
                     if tokio::time::timeout_at(startup_deadline, async {
                         view.trigger_startup().await;
                         view.connection
-                            .await_current_startup_preserving_connection(Arc::clone(
-                                &self.session_route,
-                            ))
+                            .await_current_startup_preserving_connection(view.session_route())
                             .await
                     })
                     .await
@@ -272,7 +270,7 @@ impl McpConnectionSet {
                 view.trigger_startup().await;
                 let _ = view
                     .connection
-                    .await_current_startup_preserving_connection(Arc::clone(&self.session_route))
+                    .await_current_startup_preserving_connection(view.session_route())
                     .await;
                 return (server_name, view, cached_tools);
             }
@@ -293,7 +291,7 @@ impl McpConnectionSet {
                 let Some((client, server_tools)) = view
                     .connection
                     .capture_ready_client_and_tools(
-                        Arc::clone(&self.session_route),
+                        view.session_route(),
                         catalog_override,
                         view.tool_timeout,
                     )
@@ -420,7 +418,7 @@ impl McpConnectionSet {
         let tool_timeout = view.tool_timeout;
         let catalog_item_limit = view.catalog_item_limit;
         let (connection_id, managed_client, fetch_ticket, client_tools) = client
-            .run_mcp_request(Arc::clone(&self.session_route), move |client| async move {
+            .run_mcp_request(view.session_route(), move |client| async move {
                 let connection_id = client.connection_id();
                 let managed_client = client.client().await.context("failed to get client")?;
                 let fetch_ticket =

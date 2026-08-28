@@ -35,6 +35,7 @@ use crate::catalog::McpServerSource;
 use crate::connection_pool::McpConnectionLease;
 use crate::connection_pool::McpConnectionPool;
 use crate::connection_pool::McpConnectionPoolMode;
+use crate::connection_pool::McpConnectionRouteCleanup;
 use crate::connection_pool::McpConnectionStartupIdentity;
 use crate::connection_pool::McpPooledClient;
 use crate::elicitation::ElicitationRequestManager;
@@ -80,8 +81,36 @@ use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use tracing::warn;
 
+// A startup task can outlive the view that launched it after a compatible refresh.
+// Closing this server's route must not depend on other servers in the same set.
+struct McpSessionRouteOwner {
+    route: Arc<McpSessionRoute>,
+}
+
+impl Drop for McpSessionRouteOwner {
+    fn drop(&mut self) {
+        self.route.close();
+    }
+}
+
+// Only live views own this guard. Tasks keep the token, not the guard, so the last
+// view also unregisters the original observer route and cancels pending physical startup.
+struct McpStartupOwner {
+    cancel_token: CancellationToken,
+    _route_cleanup: McpConnectionRouteCleanup,
+}
+
+impl Drop for McpStartupOwner {
+    fn drop(&mut self) {
+        self.cancel_token.cancel();
+    }
+}
+
 #[derive(Clone)]
 struct McpServerView {
+    // Close this view's route before its shared startup owner checks for remaining live routes.
+    session_route: Arc<McpSessionRouteOwner>,
+    startup_owner: Arc<McpStartupOwner>,
     connection: McpConnectionLease,
     startup_trigger: Option<watch::Sender<bool>>,
     startup_status_published: Option<watch::Receiver<bool>>,
@@ -92,6 +121,10 @@ struct McpServerView {
 }
 
 impl McpServerView {
+    fn session_route(&self) -> Arc<McpSessionRoute> {
+        Arc::clone(&self.session_route.route)
+    }
+
     async fn trigger_startup(&self) {
         if let Some(startup_trigger) = &self.startup_trigger {
             startup_trigger.send_replace(true);
@@ -127,21 +160,8 @@ pub(crate) struct McpConnectionSet {
     non_prefixed_mcp_tool_servers: Vec<String>,
     elicitation_requests: ElicitationRequestManager,
     pub(crate) trusted_access: Option<TrustedAccessContext>,
-    session_route: Arc<McpSessionRoute>,
     startup_cancellation_token: CancellationToken,
     connection_pool: McpConnectionPool,
-}
-
-impl Drop for McpConnectionSet {
-    fn drop(&mut self) {
-        // Startup tasks retain leases. Cancel this view's tasks so dropping the last view
-        // cannot leave a pending startup holding its own connection alive indefinitely.
-        self.startup_cancellation_token.cancel();
-        self.session_route.close();
-        for view in self.servers.values() {
-            view.connection.unregister_route(&self.session_route);
-        }
-    }
 }
 
 impl McpConnectionSet {
@@ -222,11 +242,6 @@ impl McpConnectionSet {
                 elicitation_router,
             )
         };
-        let session_route = Arc::new(McpSessionRoute::new(
-            submit_id.clone(),
-            elicitation_requests.clone(),
-            tx_event.clone(),
-        ));
         let tool_plugin_provenance = Arc::new(tool_plugin_provenance);
         let startup_submit_id = submit_id;
         let static_chatgpt_auth_provider = auth
@@ -241,6 +256,13 @@ impl McpConnectionSet {
             .into_iter()
             .filter(|(_, server)| server.enabled())
         {
+            let session_route = Arc::new(McpSessionRouteOwner {
+                route: Arc::new(McpSessionRoute::new(
+                    startup_submit_id.clone(),
+                    elicitation_requests.clone(),
+                    tx_event.clone(),
+                )),
+            });
             let registration = config.mcp_server_catalog.server(&server_name);
             let is_host_owned_codex_apps = registration.is_some_and(|server| {
                 server
@@ -352,7 +374,6 @@ impl McpConnectionSet {
                 protocol_mode: expected_protocol_mode,
                 timeout: startup_timeout,
             };
-            let cancel_token = startup_cancellation_token.child_token();
             let tool_catalog_cache_context = if server_name == CODEX_APPS_MCP_SERVER_NAME {
                 None
             } else if let Ok(environment) = resolved_environment.as_ref() {
@@ -395,7 +416,7 @@ impl McpConnectionSet {
                 {
                     previous_view
                         .connection
-                        .await_current_startup(Arc::clone(&previous.session_route))
+                        .await_current_startup(previous_view.session_route())
                         .await
                         .err()
                         .is_some_and(|error| error.is_authentication_required())
@@ -413,7 +434,7 @@ impl McpConnectionSet {
                         previous
                             .servers
                             .get(&server_name)
-                            .map(|view| (view, Arc::clone(&previous.session_route)))
+                            .map(|view| (view, view.session_route()))
                     }) {
                         Some((previous_view, _))
                             if previous_view.catalog_item_limit != catalog_item_limit =>
@@ -536,7 +557,7 @@ impl McpConnectionSet {
                 connection_identity,
                 server_connection_pool_mode,
                 Some(startup_identity),
-                &session_route,
+                &session_route.route,
                 move |request_router| {
                     AsyncManagedClient::new(
                         factory_server_name.clone(),
@@ -557,9 +578,16 @@ impl McpConnectionSet {
                     )
                 },
             );
+            let startup_owner = Arc::new(McpStartupOwner {
+                cancel_token: startup_cancellation_token.child_token(),
+                _route_cleanup: connection.route_cleanup(Arc::clone(&session_route.route)),
+            });
+            let cancel_token = startup_owner.cancel_token.clone();
             servers.insert(
                 server_name.clone(),
                 McpServerView {
+                    session_route: Arc::clone(&session_route),
+                    startup_owner,
                     connection: connection.clone(),
                     startup_trigger,
                     startup_status_published: startup_status_receiver,
@@ -572,14 +600,15 @@ impl McpConnectionSet {
             let tx_event = tx_event.clone();
             let submit_id = startup_submit_id.clone();
             let publication_gate = publication_gate.clone();
-            let startup_route = Arc::clone(&session_route);
+            let startup_route = Arc::clone(&session_route.route);
             let startup = async move {
+                let _route_owner = session_route;
                 let mut startup_receiver = startup_receiver;
-                let deferred_startup = startup_receiver.is_some();
                 if let Some(startup_receiver) = startup_receiver.as_mut()
                     && tokio::select! {
                         started = startup_receiver.wait_for(|started| *started) => started.is_err(),
                         () = startup_route.closed() => true,
+                        () = cancel_token.cancelled() => true,
                     }
                 {
                     return (server_name, Err(StartupOutcomeError::Cancelled));
@@ -598,28 +627,11 @@ impl McpConnectionSet {
                     )
                     .await;
                 }
-                let mut outcome = if let Some(startup_receiver) = startup_receiver.as_mut() {
-                    // The trigger is never reset. Waiting for false therefore detects the view's
-                    // sender being dropped when a refresh replaces this coordinator.
-                    let outcome = tokio::select! {
-                        outcome = connection.await_current_startup(Arc::clone(&startup_route)) => {
-                            Some(outcome)
-                        }
-                        _ = startup_receiver.wait_for(|started| !*started) => None,
-                    };
-                    let Some(outcome) = outcome else {
-                        return (server_name, Err(StartupOutcomeError::Cancelled));
-                    };
-                    outcome
-                } else {
-                    tokio::select! {
-                        outcome = connection.await_current_startup(Arc::clone(&startup_route)) => {
-                            outcome
-                        }
-                        () = cancel_token.cancelled() => Err(StartupOutcomeError::Cancelled),
-                    }
+                let mut outcome = tokio::select! {
+                    outcome = connection.await_current_startup(Arc::clone(&startup_route)) => outcome,
+                    () = cancel_token.cancelled() => Err(StartupOutcomeError::Cancelled),
                 };
-                if !deferred_startup && cancel_token.is_cancelled() {
+                if cancel_token.is_cancelled() {
                     outcome = Err(StartupOutcomeError::Cancelled);
                 }
                 if let Some(tx_event) = tx_event.as_ref() {
@@ -662,7 +674,7 @@ impl McpConnectionSet {
                         }
                         Ok(_) | Err(_) => None,
                     };
-                    if !deferred_startup && cancel_token.is_cancelled() {
+                    if cancel_token.is_cancelled() {
                         outcome = Err(StartupOutcomeError::Cancelled);
                     }
                     let status = match &outcome {
@@ -697,7 +709,7 @@ impl McpConnectionSet {
                 if let Some(startup_status_published) = startup_status_published {
                     startup_status_published.send_replace(true);
                 }
-                if !deferred_startup && cancel_token.is_cancelled() {
+                if cancel_token.is_cancelled() {
                     outcome = Err(StartupOutcomeError::Cancelled);
                 }
 
@@ -732,7 +744,6 @@ impl McpConnectionSet {
             non_prefixed_mcp_tool_servers,
             elicitation_requests: elicitation_requests.clone(),
             trusted_access,
-            session_route,
             startup_cancellation_token: startup_cancellation_token.clone(),
             connection_pool,
         };
@@ -783,11 +794,6 @@ impl McpConnectionSet {
 
     pub fn empty(prefix_mcp_tool_names: bool) -> Self {
         let elicitation_requests = ElicitationRequestManager::default();
-        let session_route = Arc::new(McpSessionRoute::new(
-            String::new(),
-            elicitation_requests.clone(),
-            /*tx_event*/ None,
-        ));
         Self {
             servers: HashMap::new(),
             disabled_servers: Vec::new(),
@@ -801,7 +807,6 @@ impl McpConnectionSet {
             prefix_mcp_tool_names,
             non_prefixed_mcp_tool_servers: Vec::new(),
             elicitation_requests,
-            session_route,
             startup_cancellation_token: CancellationToken::new(),
             connection_pool: McpConnectionPool::default(),
             trusted_access: None,
@@ -812,8 +817,8 @@ impl McpConnectionSet {
         !self.servers.is_empty()
     }
 
-    pub(crate) fn session_route(&self) -> Arc<McpSessionRoute> {
-        Arc::clone(&self.session_route)
+    pub(crate) fn session_routes(&self) -> impl Iterator<Item = &Arc<McpSessionRoute>> {
+        self.servers.values().map(|view| &view.session_route.route)
     }
 
     pub(crate) fn contains_server(&self, server_name: &str) -> bool {
@@ -837,7 +842,7 @@ impl McpConnectionSet {
         view.trigger_startup().await;
         let timeout = view.tool_timeout;
         view.connection
-            .run_mcp_request(Arc::clone(&self.session_route), move |client| {
+            .run_mcp_request(view.session_route(), move |client| {
                 operation(client, timeout)
             })
             .await
@@ -896,7 +901,7 @@ impl McpConnectionSet {
         };
         view.trigger_startup().await;
         view.connection
-            .await_current_startup_preserving_connection(Arc::clone(&self.session_route))
+            .await_current_startup_preserving_connection(view.session_route())
             .await
             .is_ok()
     }
@@ -906,15 +911,16 @@ impl McpConnectionSet {
         let connections = self
             .servers
             .values()
-            .map(|view| view.connection.clone())
+            .map(|view| (view.connection.clone(), view.session_route()))
             .collect::<Vec<_>>();
-        let session_route = Arc::clone(&self.session_route);
-        self.startup_cancellation_token.cancel();
-        self.session_route.close();
+        self.cancel_startup();
+        for route in self.session_routes() {
+            route.close();
+        }
         // Keep cleanup alive if an interrupt cancels the refresh that requested it.
         let shutdown_task = tokio::spawn(async move {
             let mut final_connections = Vec::new();
-            for connection in connections {
+            for (connection, session_route) in connections {
                 connection.unregister_route(&session_route);
                 if connection.release() {
                     final_connections.push(connection);
@@ -944,6 +950,9 @@ impl McpConnectionSet {
 
     pub(crate) fn cancel_startup(&self) {
         self.startup_cancellation_token.cancel();
+        for view in self.servers.values() {
+            view.startup_owner.cancel_token.cancel();
+        }
     }
 
     pub fn plugin_id_for_mcp_server_name(&self, server_name: &str) -> Option<&str> {
@@ -963,7 +972,7 @@ impl McpConnectionSet {
         tokio::time::timeout(timeout, async {
             view.trigger_startup().await;
             view.connection
-                .await_current_startup_preserving_connection(Arc::clone(&self.session_route))
+                .await_current_startup_preserving_connection(view.session_route())
                 .await
                 .is_ok()
         })
@@ -1017,7 +1026,7 @@ impl McpConnectionSet {
         let server = server.to_string();
         let result: rmcp::model::CallToolResult = view
             .connection
-            .run_mcp_request(Arc::clone(&self.session_route), move |client| async move {
+            .run_mcp_request(view.session_route(), move |client| async move {
                 let managed = if wait_for_server {
                     client.client().await.context("failed to get client")?
                 } else {
@@ -1055,7 +1064,7 @@ impl McpConnectionSet {
             view.trigger_startup().await;
             match view
                 .connection
-                .await_current_startup(Arc::clone(&self.session_route))
+                .await_current_startup(view.session_route())
                 .await
             {
                 Ok(managed_client) => {

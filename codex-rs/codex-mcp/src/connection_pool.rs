@@ -464,6 +464,21 @@ pub(crate) struct McpConnectionLease {
     inner: Arc<LeaseInner>,
 }
 
+/// Unregisters a startup observer's route without retaining its logical connection lease.
+pub(crate) struct McpConnectionRouteCleanup {
+    slot: Weak<ConnectionSlot>,
+    route: Arc<McpSessionRoute>,
+}
+
+impl Drop for McpConnectionRouteCleanup {
+    fn drop(&mut self) {
+        match self.slot.upgrade() {
+            Some(slot) => slot.unregister_route(&self.route),
+            None => self.route.close(),
+        }
+    }
+}
+
 /// Stable-binding readiness for the physical connection currently preferred by a lease.
 ///
 /// Callers use the connection id to distinguish replacements that keep the same tool catalog.
@@ -793,6 +808,13 @@ impl Drop for RetireConnectionOnDrop {
 }
 
 impl McpConnectionLease {
+    pub(crate) fn route_cleanup(&self, route: Arc<McpSessionRoute>) -> McpConnectionRouteCleanup {
+        McpConnectionRouteCleanup {
+            slot: Arc::downgrade(&self.inner.slot),
+            route,
+        }
+    }
+
     fn new(slot: Arc<ConnectionSlot>) -> Self {
         Self {
             inner: Arc::new(LeaseInner {

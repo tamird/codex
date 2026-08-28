@@ -31,7 +31,7 @@ impl McpConnectionSet {
             let server_name = server_name.clone();
             view.trigger_startup().await;
             let connection = view.connection.clone();
-            let session_route = Arc::clone(&self.session_route);
+            let session_route = view.session_route();
             let timeout = view.tool_timeout;
             join_set.spawn(async move {
                 let result = connection
@@ -83,7 +83,7 @@ impl McpConnectionSet {
             let server_name = server_name.clone();
             view.trigger_startup().await;
             let connection = view.connection.clone();
-            let session_route = Arc::clone(&self.session_route);
+            let session_route = view.session_route();
             let timeout = view.tool_timeout;
             join_set.spawn(async move {
                 let result = connection
@@ -137,7 +137,7 @@ impl McpConnectionSet {
         let server = server.to_string();
         let timeout = view.tool_timeout;
         view.connection
-            .run_mcp_request(Arc::clone(&self.session_route), move |client| async move {
+            .run_mcp_request(view.session_route(), move |client| async move {
                 let managed = client.client().await.context("failed to get client")?;
                 managed
                     .client
@@ -161,7 +161,7 @@ impl McpConnectionSet {
         let server = server.to_string();
         let timeout = view.tool_timeout;
         view.connection
-            .run_mcp_request(Arc::clone(&self.session_route), move |client| async move {
+            .run_mcp_request(view.session_route(), move |client| async move {
                 let managed = client.client().await.context("failed to get client")?;
                 managed
                     .client
@@ -185,7 +185,7 @@ impl McpConnectionSet {
         let server = server.to_string();
         let timeout = view.tool_timeout;
         view.connection
-            .run_mcp_request(Arc::clone(&self.session_route), move |client| async move {
+            .run_mcp_request(view.session_route(), move |client| async move {
                 let managed = client.client().await.context("failed to get client")?;
                 let uri = params.uri.clone();
                 managed

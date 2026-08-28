@@ -109,27 +109,23 @@ pub struct McpRuntime {
 ///
 /// Refreshes preserve prior routes so in-flight calls keep their original event and elicitation
 /// attribution. Thread shutdown closes all retained routes before retiring physical connections.
+#[derive(Default)]
 struct McpRuntimeRouteRegistry {
     shutting_down: bool,
     live: Vec<Weak<McpSessionRoute>>,
 }
 
 impl McpRuntimeRouteRegistry {
-    fn new(initial: &Arc<McpSessionRoute>) -> Self {
-        Self {
-            shutting_down: false,
-            live: vec![Arc::downgrade(initial)],
-        }
-    }
-
-    fn register(&mut self, route: &Arc<McpSessionRoute>) -> bool {
+    fn register<'a>(&mut self, routes: impl Iterator<Item = &'a Arc<McpSessionRoute>>) -> bool {
         self.live.retain(|route| route.upgrade().is_some());
-        if self.shutting_down {
-            route.close();
-            return false;
+        for route in routes {
+            if self.shutting_down {
+                route.close();
+            } else {
+                self.live.push(Arc::downgrade(route));
+            }
         }
-        self.live.push(Arc::downgrade(route));
-        true
+        !self.shutting_down
     }
 
     fn begin_shutdown(&mut self) -> Vec<Arc<McpSessionRoute>> {
@@ -213,7 +209,6 @@ impl McpRuntime {
     /// runtime handle before its full MCP inputs are available.
     pub fn empty(prefix_mcp_tool_names: bool) -> Self {
         let connections = Arc::new(McpConnectionSet::empty(prefix_mcp_tool_names));
-        let session_route = connections.session_route();
         Self {
             current: ArcSwap::from_pointee(PublishedMcpRuntime {
                 connections,
@@ -230,7 +225,7 @@ impl McpRuntime {
             reconnect_pending: AtomicBool::new(false),
             elicitation_router: ElicitationRequestRouter::default(),
             resource_origins: Mutex::default(),
-            session_routes: Mutex::new(McpRuntimeRouteRegistry::new(&session_route)),
+            session_routes: Mutex::default(),
         }
     }
 
@@ -364,7 +359,7 @@ impl McpRuntime {
                 .session_routes
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if session_routes.register(&published.connections.session_route()) {
+            if session_routes.register(published.connections.session_routes()) {
                 self.current.store(Arc::clone(&published));
                 true
             } else {
@@ -923,9 +918,10 @@ mod tests {
             elicitation_requests.clone(),
             /*tx_event*/ None,
         ));
-        let mut registry = McpRuntimeRouteRegistry::new(&first);
+        let mut registry = McpRuntimeRouteRegistry::default();
+        assert!(registry.register([&first].into_iter()));
 
-        assert!(registry.register(&second));
+        assert!(registry.register([&second].into_iter()));
         assert!(!first.is_closed());
         assert!(!second.is_closed());
 
@@ -940,7 +936,7 @@ mod tests {
             elicitation_requests,
             /*tx_event*/ None,
         ));
-        assert!(!registry.register(&late));
+        assert!(!registry.register([&late].into_iter()));
         assert!(late.is_closed());
     }
 
