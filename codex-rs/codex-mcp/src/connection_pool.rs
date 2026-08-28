@@ -60,6 +60,7 @@ struct SharedConnection {
     /// Process-local identity used to bind cached catalogs to this exact generation.
     id: u64,
     client: Arc<AsyncManagedClient>,
+    startup_trigger: Mutex<Option<tokio::sync::watch::Sender<bool>>>,
     startup_identity: Option<McpConnectionStartupIdentity>,
     superseded: tokio_util::sync::CancellationToken,
     _diagnostics_guard: GaugeGuard,
@@ -73,6 +74,7 @@ impl SharedConnection {
         Self {
             id: NEXT_CONNECTION_ID.fetch_add(1, Ordering::Relaxed),
             client: Arc::new(client),
+            startup_trigger: Mutex::new(None),
             startup_identity,
             superseded: tokio_util::sync::CancellationToken::new(),
             _diagnostics_guard: LIVE_CONNECTIONS.track(),
@@ -865,6 +867,14 @@ impl McpConnectionLease {
         let mut operation = Some(operation);
         loop {
             let connection = self.current()?;
+            if let Some(startup_trigger) = connection
+                .startup_trigger
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .as_ref()
+            {
+                startup_trigger.send_replace(true);
+            }
             self.inner.slot.register_route(&route);
             let active_route = match connection
                 .client
@@ -1078,22 +1088,52 @@ impl McpConnectionLease {
         Some((connection.id, tools))
     }
 
-    /// Observes the current physical connection without acquiring a route or starting it.
-    pub(crate) async fn connection_status(&self) -> codex_protocol::mcp::McpServerConnectionStatus {
-        let Ok(connection) = self.current() else {
-            return codex_protocol::mcp::McpServerConnectionStatus::Cancelled;
-        };
-        connection.client.connection_status().await
-    }
-
     pub(crate) fn has_cached_tools(&self) -> bool {
         self.current()
             .is_ok_and(|connection| connection.client.has_cached_tools())
     }
 
+    /// Observes the current physical connection without acquiring a route or starting it.
+    pub(crate) async fn connection_status(&self) -> codex_protocol::mcp::McpServerConnectionStatus {
+        let Ok(connection) = self.current() else {
+            return codex_protocol::mcp::McpServerConnectionStatus::Cancelled;
+        };
+        use codex_protocol::mcp::McpServerConnectionStatus as Status;
+
+        let status = connection.client.connection_status().await;
+        // A session view may still describe an older generation's deferred startup.
+        let dormant = connection
+            .startup_trigger
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .is_some_and(|trigger| !*trigger.borrow());
+        if status == Status::Starting && dormant {
+            Status::NotStarted
+        } else {
+            status
+        }
+    }
+
     pub(crate) fn startup_complete(&self) -> bool {
         self.current()
             .is_ok_and(|connection| connection.client.startup_complete.load(Ordering::Acquire))
+    }
+
+    pub(crate) fn set_startup_trigger(
+        &self,
+        trigger: tokio::sync::watch::Sender<bool>,
+    ) -> (
+        tokio::sync::watch::Sender<bool>,
+        tokio::sync::watch::Receiver<bool>,
+    ) {
+        let connection = self.inner.slot.current();
+        let mut startup_trigger = connection
+            .startup_trigger
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let startup_trigger = startup_trigger.get_or_insert(trigger);
+        (startup_trigger.clone(), startup_trigger.subscribe())
     }
 
     pub(crate) fn has_recoverable_failed_startup(&self) -> bool {

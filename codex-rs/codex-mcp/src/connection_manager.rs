@@ -216,7 +216,9 @@ impl McpConnectionSet {
             .map(|(server_name, _)| server_name.clone())
             .collect::<Vec<_>>();
         required_servers.sort();
-        let reused_ready = Vec::new();
+        let mut summary = McpStartupCompleteEvent::default();
+        let mut started_new_server = false;
+        let mut inherited_pending_startup = false;
         let mut join_set = JoinSet::new();
         // Explicit reconnects have no previous set and must replace their clients eagerly.
         let allow_deferred_startup =
@@ -496,15 +498,16 @@ impl McpConnectionSet {
                             McpConnectionPoolMode::Replace
                         }
                         Some((previous_view, previous_session_route))
-                            if !previous_view
-                                .connection
-                                .await_current_startup(Arc::clone(&previous_session_route))
-                                .await
-                                .is_ok_and(|client| {
-                                    expected_protocol_mode.is_some_and(|expected| {
-                                        client.client.protocol_mode() == expected
-                                    })
-                                }) =>
+                            if previous_view.connection.startup_complete()
+                                && !previous_view
+                                    .connection
+                                    .await_current_startup(Arc::clone(&previous_session_route))
+                                    .await
+                                    .is_ok_and(|client| {
+                                        expected_protocol_mode.is_some_and(|expected| {
+                                            client.client.protocol_mode() == expected
+                                        })
+                                    }) =>
                         {
                             McpConnectionPoolMode::Replace
                         }
@@ -523,35 +526,23 @@ impl McpConnectionSet {
                     }
                 }
             };
-            let defer_startup = !unchanged_auth_failure
-                && allow_deferred_startup
-                && !tool_plugin_provenance.is_selected_plugin_mcp_server(&server_name)
-                && tool_catalog_cache_context
-                    .as_ref()
-                    .and_then(McpToolCatalogCacheContext::current_tools)
-                    .is_some_and(|tools| {
-                        tools.into_iter().any(|tool| {
-                            configured_tool_filter.allows(&tool.tool.name)
-                                && tool_is_model_visible(&tool)
-                        })
-                    });
-            let (
-                startup_trigger,
-                startup_receiver,
-                startup_status_published,
-                startup_status_receiver,
-            ) = if defer_startup {
-                let (trigger, receiver) = watch::channel(false);
-                let (status_published, status_receiver) = watch::channel(false);
-                (
-                    Some(trigger),
-                    Some(receiver),
-                    Some(status_published),
-                    Some(status_receiver),
-                )
-            } else {
-                (None, None, None, None)
-            };
+            // Keep pending lifecycle ownership with this session's original observer.
+            let previous_startup = reusable_previous
+                .filter(|_| {
+                    server_connection_pool_mode == McpConnectionPoolMode::Reuse
+                        && !unchanged_auth_failure
+                })
+                .and_then(|previous| {
+                    let previous_view = previous.servers.get(&server_name)?;
+                    if (!allow_deferred_startup && previous_view.startup_is_dormant())
+                        || previous_view.connection.has_recoverable_failed_startup()
+                    {
+                        return None;
+                    }
+                    let startup_complete = previous_view.connection.startup_complete();
+                    (startup_complete || !previous_view.startup_owner.cancel_token.is_cancelled())
+                        .then_some((previous_view, startup_complete))
+                });
             let connection = connection_pool.acquire_named_with_startup_identity(
                 server_name.clone(),
                 connection_identity,
@@ -578,11 +569,53 @@ impl McpConnectionSet {
                     )
                 },
             );
-            let startup_owner = Arc::new(McpStartupOwner {
-                cancel_token: startup_cancellation_token.child_token(),
-                _route_cleanup: connection.route_cleanup(Arc::clone(&session_route.route)),
-            });
+            let previous_startup = previous_startup
+                .filter(|(_, startup_complete)| !startup_complete || connection.startup_complete());
+            let startup_owner = match previous_startup {
+                Some((view, false)) => Arc::clone(&view.startup_owner),
+                Some((_, true)) | None => Arc::new(McpStartupOwner {
+                    cancel_token: startup_cancellation_token.child_token(),
+                    _route_cleanup: connection.route_cleanup(Arc::clone(&session_route.route)),
+                }),
+            };
             let cancel_token = startup_owner.cancel_token.clone();
+            let defer_startup = !unchanged_auth_failure
+                && allow_deferred_startup
+                && !connection.startup_complete()
+                && !tool_plugin_provenance.is_selected_plugin_mcp_server(&server_name)
+                && tool_catalog_cache_context
+                    .as_ref()
+                    .and_then(McpToolCatalogCacheContext::current_tools)
+                    .is_some_and(|tools| {
+                        tools.into_iter().any(|tool| {
+                            configured_tool_filter.allows(&tool.tool.name)
+                                && tool_is_model_visible(&tool)
+                        })
+                    });
+            let (
+                startup_trigger,
+                startup_receiver,
+                startup_status_published,
+                startup_status_receiver,
+            ) = if defer_startup {
+                let (trigger, _) = watch::channel(false);
+                let (trigger, receiver) = connection.set_startup_trigger(trigger);
+                let (status_published, status_receiver) =
+                    if let Some((view, false)) = previous_startup {
+                        (None, view.startup_status_published.clone())
+                    } else {
+                        let (status_published, status_receiver) = watch::channel(false);
+                        (Some(status_published), Some(status_receiver))
+                    };
+                (
+                    Some(trigger),
+                    Some(receiver),
+                    status_published,
+                    status_receiver,
+                )
+            } else {
+                (None, None, None, None)
+            };
             servers.insert(
                 server_name.clone(),
                 McpServerView {
@@ -597,6 +630,28 @@ impl McpConnectionSet {
                     catalog_item_limit,
                 },
             );
+            if let Some((previous_view, startup_complete)) = previous_startup {
+                if startup_complete {
+                    summary.ready.push(server_name);
+                } else {
+                    inherited_pending_startup = true;
+                    // Waiting would trigger a dormant server and hold the summary open.
+                    if !previous_view.startup_is_dormant() {
+                        let startup_route = Arc::clone(&session_route.route);
+                        // Await the shared outcome without emitting duplicate startup events.
+                        join_set.spawn(async move {
+                            (
+                                server_name,
+                                connection
+                                    .await_current_startup_preserving_connection(startup_route)
+                                    .await,
+                            )
+                        });
+                    }
+                }
+                continue;
+            }
+            started_new_server = true;
             let tx_event = tx_event.clone();
             let submit_id = startup_submit_id.clone();
             let publication_gate = publication_gate.clone();
@@ -747,6 +802,11 @@ impl McpConnectionSet {
             startup_cancellation_token: startup_cancellation_token.clone(),
             connection_pool,
         };
+        // Inherited-only refreshes leave completion with the original startup owner.
+        if !started_new_server && inherited_pending_startup {
+            join_set.shutdown().await;
+            return manager;
+        }
         let summary_publication_gate = publication_gate;
         tokio::spawn(async move {
             let outcomes = join_set.join_all().await;
@@ -754,10 +814,6 @@ impl McpConnectionSet {
                 if !summary_publication_gate.wait().await {
                     return;
                 }
-                let mut summary = McpStartupCompleteEvent {
-                    ready: reused_ready,
-                    ..Default::default()
-                };
                 for server_name in &summary.ready {
                     let _ = emit_update(
                         startup_submit_id.as_str(),

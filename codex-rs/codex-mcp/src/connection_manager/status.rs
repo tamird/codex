@@ -17,11 +17,6 @@ impl McpConnectionSet {
             .collect::<HashMap<_, _>>();
         for (name, view) in &self.servers {
             let status = view.connection.connection_status().await;
-            let status = if status == Status::Starting && view.startup_is_dormant() {
-                Status::NotStarted
-            } else {
-                status
-            };
             statuses.insert(name.clone(), status);
         }
         statuses
