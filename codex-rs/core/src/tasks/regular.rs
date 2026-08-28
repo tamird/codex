@@ -96,6 +96,9 @@ impl SessionTask for RegularTask {
         let mut next_input = input;
         let mut provider_startup = Some(provider_startup);
         loop {
+            let Some(ctx) = sess.active_task_context(&done).await else {
+                return Ok(None);
+            };
             let last_agent_message = run_turn(
                 Arc::clone(&sess),
                 Arc::clone(&ctx),
@@ -108,6 +111,9 @@ impl SessionTask for RegularTask {
             )
             .instrument(run_turn_span.clone())
             .await?;
+            let Some(ctx) = sess.active_task_context(&done).await else {
+                return Ok(last_agent_message);
+            };
             // Terminal errors are already reported. Let task completion preserve pending
             // input instead of restarting the failed turn for that same input.
             if ctx.terminal_error.lock().await.is_some() {

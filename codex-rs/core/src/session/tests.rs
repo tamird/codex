@@ -13049,8 +13049,15 @@ async fn task_finish_emits_turn_item_lifecycle_for_leftover_pending_user_input()
     let submission = submit_steer_only(&sess, pending_user_input.clone(), &tc.sub_id).await;
     assert!(matches!(submission, TurnInputSubmission::Steered { .. }));
 
-    sess.on_task_finished(Arc::clone(&tc), /*task_result*/ Ok(None))
-        .await;
+    let done = {
+        let active = sess.active_turn.lock().await;
+        let task = active
+            .as_ref()
+            .and_then(|turn| turn.task.as_ref())
+            .expect("task should remain registered until completion");
+        Arc::clone(&task.done)
+    };
+    sess.on_task_finished(&done, /*task_result*/ Ok(None)).await;
 
     let history = sess.clone_history().await;
     let expected = ResponseItem::Message {

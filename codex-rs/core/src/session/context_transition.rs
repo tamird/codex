@@ -45,6 +45,13 @@ impl ContextTransitionTarget {
 }
 
 impl Session {
+    pub(crate) async fn active_task_context(&self, done: &Arc<Notify>) -> Option<Arc<TurnContext>> {
+        let active = self.active_turn.lock().await;
+        let task = active.as_ref()?.task.as_ref()?;
+        (Arc::ptr_eq(&task.done, done) && !task.cancellation_token.is_cancelled())
+            .then(|| Arc::clone(&task.turn_context))
+    }
+
     pub(super) async fn capture_context_transition(
         &self,
         context: &Arc<TurnContext>,

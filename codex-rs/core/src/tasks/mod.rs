@@ -364,7 +364,6 @@ impl Session {
         );
         let handle = tokio::spawn(
             async move {
-                let ctx_for_finish = Arc::clone(&ctx);
                 let task_result = task_for_run
                     .run(
                         Arc::clone(&session),
@@ -377,20 +376,21 @@ impl Session {
                 let sess = Arc::clone(&session);
                 if let Err(err) = sess.flush_rollout().await {
                     warn!("failed to flush rollout before completing turn: {err}");
-                    sess.send_event(
-                        ctx_for_finish.as_ref(),
-                        EventMsg::Warning(WarningEvent {
-                            message: format!(
-                                "Failed to save the conversation transcript; Codex will continue retrying. Error: {err}"
-                            ),
-                        }),
-                    )
-                    .await;
+                    if let Some(ctx) = sess.active_task_context(&done_clone).await {
+                        sess.send_event(
+                            ctx.as_ref(),
+                            EventMsg::Warning(WarningEvent {
+                                message: format!(
+                                    "Failed to save the conversation transcript; Codex will continue retrying. Error: {err}"
+                                ),
+                            }),
+                        )
+                        .await;
+                    }
                 }
                 if !task_cancellation_token.is_cancelled() {
                     // Finish uniformly from the spawn site so all tasks share the same lifecycle.
-                    sess.on_task_finished(Arc::clone(&ctx_for_finish), task_result)
-                        .await;
+                    sess.on_task_finished(&done_clone, task_result).await;
                 }
                 done_clone.notify_waiters();
             }
@@ -616,9 +616,22 @@ impl Session {
 
     pub async fn on_task_finished(
         self: &Arc<Self>,
-        turn_context: Arc<TurnContext>,
+        done: &Arc<Notify>,
         task_result: SessionTaskResult,
     ) {
+        let (turn_context, turn_state) = {
+            let mut active = self.active_turn.lock().await;
+            let Some(active_turn) = active.as_mut() else {
+                return;
+            };
+            let Some(task) = active_turn.task.take_if(|task| {
+                Arc::ptr_eq(&task.done, done) && !task.cancellation_token.is_cancelled()
+            }) else {
+                return;
+            };
+            task.handle.detach();
+            (task.turn_context, Arc::clone(&active_turn.turn_state))
+        };
         let (last_agent_message, abort_reason) = match task_result {
             Ok(last_agent_message) => (last_agent_message, None),
             Err(err) if matches!(err.details(), CodexErrorDetails::TurnAborted) => {
@@ -644,17 +657,6 @@ impl Session {
             .turn_metadata_state
             .cancel_git_enrichment_task();
 
-        let turn_state = {
-            let mut active = self.active_turn.lock().await;
-            active.as_mut().and_then(|active_turn| {
-                let task = active_turn.task.take()?;
-                task.handle.detach();
-                Some(Arc::clone(&active_turn.turn_state))
-            })
-        };
-        let Some(turn_state) = turn_state else {
-            return;
-        };
         let pending_input = self
             .input_queue
             .take_pending_input_for_turn_state(turn_state.as_ref())

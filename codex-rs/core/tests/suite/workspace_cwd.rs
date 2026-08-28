@@ -1,13 +1,18 @@
 use std::collections::HashMap;
 use std::path::Path;
 use std::process::Command;
+use std::sync::Arc;
+use std::sync::Mutex;
 use std::time::Duration;
 
 use anyhow::Result;
 use assert_matches::assert_matches;
 use codex_core::config::Config;
+use codex_extension_api::ExtensionFuture;
 use codex_extension_api::ExtensionRegistry;
 use codex_extension_api::ExtensionRegistryBuilder;
+use codex_extension_api::TurnLifecycleContributor;
+use codex_extension_api::TurnStopInput;
 use codex_features::Feature;
 use codex_models_manager::CustomModelConfig;
 use codex_models_manager::ModelRoutingCandidate;
@@ -21,6 +26,8 @@ use codex_protocol::openai_models::ModelsResponse;
 use codex_protocol::openai_models::ReasoningEffort;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::EventMsg;
+use codex_protocol::protocol::HookEventName;
+use codex_protocol::protocol::HookRunStatus;
 use codex_protocol::protocol::Op;
 use codex_protocol::protocol::ThreadSettingsOverrides;
 use codex_protocol::protocol::TurnSettingsUpdate;
@@ -31,9 +38,11 @@ use codex_protocol::turn_input::TurnInputRequest;
 use codex_protocol::turn_input::TurnInputSubmission;
 use codex_protocol::turn_input::TurnStartOptions;
 use codex_protocol::user_input::UserInput;
+use codex_skills_extension::HostSkillsSnapshot;
 use codex_skills_extension::SkillsExtensionConfig;
 use codex_skills_extension::install;
 use codex_utils_absolute_path::AbsolutePathBuf;
+use core_test_support::hooks::trust_discovered_hooks;
 use core_test_support::responses::ev_assistant_message;
 use core_test_support::responses::ev_completed;
 use core_test_support::responses::ev_function_call;
@@ -53,7 +62,32 @@ use pretty_assertions::assert_eq;
 use serde_json::json;
 use tempfile::TempDir;
 
-fn skills_extensions() -> std::sync::Arc<ExtensionRegistry<Config>> {
+#[derive(Default)]
+struct CompletionSkillsRecorder(Mutex<Vec<Vec<String>>>);
+
+impl TurnLifecycleContributor for CompletionSkillsRecorder {
+    fn on_turn_stop<'a>(&'a self, input: TurnStopInput<'a>) -> ExtensionFuture<'a, ()> {
+        Box::pin(async move {
+            let Self(completed_skills) = self;
+            let snapshot = input
+                .turn_store
+                .get::<HostSkillsSnapshot>()
+                .expect("completion skills snapshot");
+            completed_skills.lock().expect("completion recorder").push(
+                snapshot
+                    .outcome()
+                    .skills
+                    .iter()
+                    .map(|skill| skill.name.clone())
+                    .collect(),
+            );
+        })
+    }
+}
+
+fn skills_extensions(
+    lifecycle: Arc<dyn TurnLifecycleContributor>,
+) -> Arc<ExtensionRegistry<Config>> {
     let mut extensions = ExtensionRegistryBuilder::<Config>::new();
     install(&mut extensions, |config: &Config| SkillsExtensionConfig {
         include_instructions: config.include_skill_instructions,
@@ -62,7 +96,8 @@ fn skills_extensions() -> std::sync::Arc<ExtensionRegistry<Config>> {
         orchestrator_skills_enabled: config.orchestrator_skills_enabled,
         shadow_selection_enabled: config.features.enabled(Feature::SkillSearch),
     });
-    std::sync::Arc::new(extensions.build())
+    extensions.turn_lifecycle_contributor(lifecycle);
+    Arc::new(extensions.build())
 }
 
 struct LinkedWorktreeFixture {
@@ -158,6 +193,7 @@ async fn workspace_cwd_switches_context_before_the_next_model_step() -> Result<(
     const TURN_STATE_HEADER: &str = "x-codex-turn-state";
     const PROMPT: &str = "move into the linked worktree and continue";
     const STEER_PROMPT: &str = "preserve this steering across the workspace change";
+    const LATE_PROMPT: &str = "continue the same turn after the model loop stopped";
 
     let fixture = linked_worktree_fixture();
     std::fs::write(
@@ -199,6 +235,7 @@ async fn workspace_cwd_switches_context_before_the_next_model_step() -> Result<(
             ])),
             sse_response(sse_completed("resp-5")),
             sse_response(sse_completed("resp-6")),
+            sse_response(sse_completed("resp-7")),
         ],
     )
     .await;
@@ -260,8 +297,41 @@ async fn workspace_cwd_switches_context_before_the_next_model_step() -> Result<(
                 .expect("enable test feature");
         }
     });
+    let completion_skills = Arc::new(CompletionSkillsRecorder::default());
     let test = builder
-        .with_extensions(skills_extensions())
+        .with_pre_build_hook(|home| {
+            let script_path = home.join("workspace_stop_hook.py");
+            std::fs::write(
+                &script_path,
+                r#"from pathlib import Path
+import sys
+import time
+
+sys.stdin.read()
+release = Path(__file__).with_name("workspace-stop-release")
+deadline = time.monotonic() + 10
+while not release.exists():
+    if time.monotonic() >= deadline:
+        raise TimeoutError("workspace stop hook was not released")
+    time.sleep(0.01)
+print("{}")
+"#,
+            )
+            .expect("write workspace stop hook");
+            let hooks = json!({
+                "hooks": {
+                    "Stop": [{"hooks": [{
+                        "type": "command",
+                        "command": format!("python3 \"{}\"", script_path.display()),
+                        "timeout": 10,
+                    }]}],
+                },
+            });
+            std::fs::write(home.join("hooks.json"), hooks.to_string())
+                .expect("write workspace stop hook config");
+        })
+        .with_config(trust_discovered_hooks)
+        .with_extensions(skills_extensions(completion_skills.clone()))
         .build(&server)
         .await?;
 
@@ -372,7 +442,59 @@ async fn workspace_cwd_switches_context_before_the_next_model_step() -> Result<(
             })
             .await?;
     }
+    // Stop runs after run_turn's final pending-input check. Steering here
+    // therefore resumes through RegularTask's outer loop, not a model step.
+    let stopping = wait_for_event(&test.codex, |event| match event {
+        EventMsg::HookStarted(event) => event.run.event_name == HookEventName::Stop,
+        EventMsg::TurnStarted(event) => {
+            started_turns.push(event.turn_id.clone());
+            false
+        }
+        EventMsg::Error(error) => panic!("workspace turn failed: {}", error.message),
+        _ => false,
+    })
+    .await;
+    let stopping = assert_matches!(stopping, EventMsg::HookStarted(stopping) => stopping);
+    assert_eq!(stopping.turn_id, Some(turn_id.clone()));
+    let late_submission = test
+        .codex
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: LATE_PROMPT.to_string(),
+            text_elements: Vec::new(),
+        }]))
+        .await?;
+    assert_eq!(
+        late_submission,
+        TurnInputSubmission::Steered {
+            turn_id: turn_id.clone()
+        }
+    );
+    std::fs::write(
+        test.codex_home_path().join("workspace-stop-release"),
+        "ready",
+    )?;
+    let mut gate_lifecycle = vec![stopping.run.status];
     let completion = wait_for_event(&test.codex, |event| match event {
+        EventMsg::HookStarted(event) => {
+            if event.run.id == stopping.run.id {
+                assert_eq!(event.turn_id, Some(turn_id.clone()));
+                gate_lifecycle.push(event.run.status);
+            }
+            false
+        }
+        EventMsg::HookCompleted(event) => {
+            if event.run.id == stopping.run.id {
+                assert_eq!(event.turn_id, Some(turn_id.clone()));
+                gate_lifecycle.push(event.run.status);
+                assert_eq!(
+                    event.run.status,
+                    HookRunStatus::Completed,
+                    "stop hook: {:?}",
+                    event.run
+                );
+            }
+            false
+        }
         EventMsg::TurnStarted(event) => {
             started_turns.push(event.turn_id.clone());
             false
@@ -385,11 +507,30 @@ async fn workspace_cwd_switches_context_before_the_next_model_step() -> Result<(
     let completion = assert_matches!(completion, EventMsg::TurnComplete(completion) => completion);
     assert_eq!(completion.turn_id, turn_id);
     assert_eq!(started_turns, vec![turn_id.clone()]);
+    assert_eq!(
+        gate_lifecycle,
+        vec![
+            HookRunStatus::Running,
+            HookRunStatus::Completed,
+            HookRunStatus::Running,
+            HookRunStatus::Completed,
+        ]
+    );
+    let recorded_skills = completion_skills
+        .0
+        .lock()
+        .expect("completion recorder")
+        .clone();
+    let stopped_skills = assert_matches!(recorded_skills.as_slice(), [skills] => skills);
+    assert!(
+        stopped_skills.iter().any(|name| name == "linked-cwd"),
+        "completion must use the refreshed workspace skills: {stopped_skills:?}"
+    );
 
     let requests = responses.requests();
-    let (initial, refreshed, repeated) = assert_matches!(
+    let (initial, refreshed, repeated, reentered) = assert_matches!(
         requests.as_slice(),
-        [initial, _, refreshed, _, repeated] => (initial, refreshed, repeated)
+        [initial, _, refreshed, _, repeated, reentered] => (initial, refreshed, repeated, reentered)
     );
     assert!(initial.tool_by_name("workspace", "set_cwd").is_some());
     assert!(
@@ -425,6 +566,24 @@ async fn workspace_cwd_switches_context_before_the_next_model_step() -> Result<(
         fixture.linked.as_path().to_string_lossy().as_ref()
     );
     assert_eq!(repeat_output["changed"], false);
+    assert!(reentered.body_contains_text("Use linked immediate instructions."));
+    assert!(reentered.body_contains_text("linked-cwd: linked worktree skill"));
+    assert!(
+        reentered
+            .message_input_texts("developer")
+            .iter()
+            .any(|text| {
+                text.contains("<permissions instructions>") && text.contains(linked_cwd.as_ref())
+            })
+    );
+    assert_eq!(
+        reentered
+            .message_input_texts("user")
+            .into_iter()
+            .filter(|text| text == LATE_PROMPT)
+            .collect::<Vec<_>>(),
+        vec![LATE_PROMPT.to_string()]
+    );
 
     let metadata = requests
         .iter()
@@ -475,9 +634,11 @@ async fn workspace_cwd_switches_context_before_the_next_model_step() -> Result<(
             })
         );
         assert_eq!(request.header("session-id"), Some(session_id.clone()));
+        // A new run_turn creates a fresh client session; refreshes and settings
+        // updates within the previous run must keep the server's turn state.
         assert_eq!(
             request.header(TURN_STATE_HEADER),
-            (index != 0).then(|| "workspace-turn-state".to_string())
+            (index != 0 && index != 5).then(|| "workspace-turn-state".to_string())
         );
         if index != 0 {
             assert_eq!(
@@ -525,6 +686,7 @@ async fn workspace_cwd_switches_context_before_the_next_model_step() -> Result<(
             }),
             selected.clone(),
             selected,
+            updated.clone(),
             updated.clone(),
             updated,
             json!({
