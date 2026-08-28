@@ -101,9 +101,7 @@ pub async fn detached_memory_responses_metadata(
 }
 
 #[derive(Debug)]
-pub(crate) struct TurnMetadataState {
-    cwd: AbsolutePathBuf,
-    repo_root: Option<PathBuf>,
+pub(crate) struct AcceptedTurnMetadata {
     session_id: String,
     thread_id: String,
     agent_name: String,
@@ -117,6 +115,18 @@ pub(crate) struct TurnMetadataState {
     thread_source: Option<ThreadSource>,
     turn_trigger: OnceLock<String>,
     turn_id: String,
+    turn_started_at_unix_ms: RwLock<Option<i64>>,
+    responsesapi_client_metadata: RwLock<BTreeMap<String, String>>,
+    root_turn_ambiguous: AtomicBool,
+    user_input_requested_during_turn: AtomicBool,
+}
+
+#[derive(Debug)]
+pub(crate) struct TurnMetadataState {
+    // Share accepted-turn state across workspace rebuilds so concurrent steering is retained.
+    pub(crate) accepted: Arc<AcceptedTurnMetadata>,
+    cwd: AbsolutePathBuf,
+    repo_root: Option<PathBuf>,
     // TODO(anp): Derive this cached tag from TurnEnvironment::sandbox_context
     // so metadata reflects the selected environment's backend.
     sandbox: Option<String>,
@@ -126,11 +136,7 @@ pub(crate) struct TurnMetadataState {
     node_repl_disabled: bool,
     enriched_workspaces: RwLock<Option<BTreeMap<String, TurnMetadataWorkspace>>>,
     tool_namespaces_info: RwLock<Option<TurnToolNamespacesInfo>>,
-    turn_started_at_unix_ms: RwLock<Option<i64>>,
     responses_api_metadata: RwLock<BTreeMap<String, String>>,
-    responsesapi_client_metadata: RwLock<BTreeMap<String, String>>,
-    root_turn_ambiguous: AtomicBool,
-    user_input_requested_during_turn: AtomicBool,
     enrichment_task: Mutex<Option<JoinHandle<()>>>,
     git_enrichment_complete: watch::Sender<bool>,
 }
@@ -174,21 +180,27 @@ impl TurnMetadataState {
             .unwrap_or_else(AgentPath::root)
             .to_string();
         Self {
+            accepted: Arc::new(AcceptedTurnMetadata {
+                session_id,
+                thread_id,
+                agent_name,
+                forked_from_thread_id,
+                parent_thread_id,
+                parent_turn_id: OnceLock::new(),
+                initiating_agent_path: OnceLock::new(),
+                root_turn_id: OnceLock::new(),
+                subagent_header: subagent_header_value(session_source),
+                subagent_kind: subagent_metadata_kind(session_source),
+                thread_source,
+                turn_trigger: OnceLock::new(),
+                turn_id,
+                turn_started_at_unix_ms: RwLock::new(None),
+                responsesapi_client_metadata: RwLock::new(BTreeMap::new()),
+                root_turn_ambiguous: AtomicBool::new(false),
+                user_input_requested_during_turn: AtomicBool::new(false),
+            }),
             cwd,
             repo_root,
-            session_id,
-            thread_id,
-            agent_name,
-            forked_from_thread_id,
-            parent_thread_id,
-            parent_turn_id: OnceLock::new(),
-            initiating_agent_path: OnceLock::new(),
-            root_turn_id: OnceLock::new(),
-            subagent_header: subagent_header_value(session_source),
-            subagent_kind: subagent_metadata_kind(session_source),
-            thread_source,
-            turn_trigger: OnceLock::new(),
-            turn_id,
             sandbox,
             sandbox_mode,
             auto_review_enabled,
@@ -196,11 +208,7 @@ impl TurnMetadataState {
             node_repl_disabled: model_info.node_repl_disabled,
             enriched_workspaces: RwLock::new(None),
             tool_namespaces_info: RwLock::new(None),
-            turn_started_at_unix_ms: RwLock::new(None),
             responses_api_metadata: RwLock::new(BTreeMap::new()),
-            responsesapi_client_metadata: RwLock::new(BTreeMap::new()),
-            root_turn_ambiguous: AtomicBool::new(false),
-            user_input_requested_during_turn: AtomicBool::new(false),
             enrichment_task: Mutex::new(None),
             git_enrichment_complete: watch::channel(/*init*/ true).0,
         }
@@ -237,6 +245,7 @@ impl TurnMetadataState {
             }
         }
         if self
+            .accepted
             .user_input_requested_during_turn
             .load(Ordering::Relaxed)
         {
@@ -265,7 +274,8 @@ impl TurnMetadataState {
     }
 
     pub(crate) fn mark_user_input_requested_during_turn(&self) {
-        self.user_input_requested_during_turn
+        self.accepted
+            .user_input_requested_during_turn
             .store(true, Ordering::Relaxed);
     }
 
@@ -281,51 +291,57 @@ impl TurnMetadataState {
         if parent_turn_id.trim().is_empty() {
             return;
         }
-        let _ = self.parent_turn_id.set(parent_turn_id);
+        let _ = self.accepted.parent_turn_id.set(parent_turn_id);
     }
 
     pub(crate) fn parent_turn_id(&self) -> Option<String> {
-        self.parent_turn_id.get().cloned()
+        self.accepted.parent_turn_id.get().cloned()
     }
 
     pub(crate) fn set_initiating_agent_path(&self, initiating_agent_path: AgentPath) {
-        let _ = self.initiating_agent_path.set(initiating_agent_path);
+        let _ = self
+            .accepted
+            .initiating_agent_path
+            .set(initiating_agent_path);
     }
 
     pub(crate) fn initiating_agent_path(&self) -> Option<&AgentPath> {
-        self.initiating_agent_path.get()
+        self.accepted.initiating_agent_path.get()
     }
 
     pub(crate) fn set_root_turn_id(&self, root_turn_id: String) {
         if root_turn_id.trim().is_empty() {
             return;
         }
-        let _ = self.root_turn_id.set(root_turn_id);
+        let _ = self.accepted.root_turn_id.set(root_turn_id);
     }
 
     pub(crate) fn set_turn_trigger(&self, turn_trigger: String) {
         if turn_trigger.trim().is_empty() {
             return;
         }
-        let _ = self.turn_trigger.set(turn_trigger);
+        let _ = self.accepted.turn_trigger.set(turn_trigger);
     }
 
     pub(crate) fn root_turn_id(&self) -> Option<String> {
-        self.root_turn_id
+        self.accepted
+            .root_turn_id
             .get()
-            .filter(|_| !self.root_turn_ambiguous.load(Ordering::Relaxed))
+            .filter(|_| !self.accepted.root_turn_ambiguous.load(Ordering::Relaxed))
             .cloned()
     }
 
     pub(crate) fn mark_root_turn_ambiguous(&self) {
-        self.root_turn_ambiguous.store(true, Ordering::Relaxed);
+        self.accepted
+            .root_turn_ambiguous
+            .store(true, Ordering::Relaxed);
     }
 
     pub(crate) fn can_start_root_turn(&self, session_source: &SessionSource) -> bool {
         if session_source.is_non_root_agent() {
             return false;
         }
-        match &self.thread_source {
+        match &self.accepted.thread_source {
             // Desktop create/fork/send lacks trusted app-server provenance; fail closed.
             Some(
                 ThreadSource::Subagent
@@ -344,6 +360,7 @@ impl TurnMetadataState {
         responsesapi_client_metadata: HashMap<String, String>,
     ) {
         *self
+            .accepted
             .responsesapi_client_metadata
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner) =
@@ -362,7 +379,8 @@ impl TurnMetadataState {
     }
 
     pub(crate) fn workspace_kind(&self) -> Option<String> {
-        self.responsesapi_client_metadata
+        self.accepted
+            .responsesapi_client_metadata
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(WORKSPACE_KIND_KEY)
@@ -385,6 +403,7 @@ impl TurnMetadataState {
 
     fn mcp_metadata_template(&self) -> CodexResponsesMetadata {
         let mut extra = self
+            .accepted
             .responsesapi_client_metadata
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -398,16 +417,16 @@ impl TurnMetadataState {
             extra.remove(key);
         }
         CodexResponsesMetadata {
-            turn_id: Some(self.turn_id.clone()),
-            agent_name: Some(self.agent_name.clone()),
-            forked_from_thread_id: self.forked_from_thread_id,
-            parent_thread_id: self.parent_thread_id,
-            parent_turn_id: self.parent_turn_id.get().cloned(),
+            turn_id: Some(self.accepted.turn_id.clone()),
+            agent_name: Some(self.accepted.agent_name.clone()),
+            forked_from_thread_id: self.accepted.forked_from_thread_id,
+            parent_thread_id: self.accepted.parent_thread_id,
+            parent_turn_id: self.accepted.parent_turn_id.get().cloned(),
             root_turn_id: self.root_turn_id(),
-            subagent_header: self.subagent_header.clone(),
-            subagent_kind: self.subagent_kind.clone(),
-            thread_source: self.thread_source.clone(),
-            turn_trigger: self.turn_trigger.get().cloned(),
+            subagent_header: self.accepted.subagent_header.clone(),
+            subagent_kind: self.accepted.subagent_kind.clone(),
+            thread_source: self.accepted.thread_source.clone(),
+            turn_trigger: self.accepted.turn_trigger.get().cloned(),
             sandbox: self.sandbox.clone(),
             sandbox_mode: self.sandbox_mode.clone(),
             auto_review_enabled: Some(self.auto_review_enabled),
@@ -423,8 +442,8 @@ impl TurnMetadataState {
             extra,
             ..CodexResponsesMetadata::new(
                 String::new(),
-                self.session_id.clone(),
-                self.thread_id.clone(),
+                self.accepted.session_id.clone(),
+                self.accepted.thread_id.clone(),
                 String::new(),
             )
         }
@@ -440,6 +459,7 @@ impl TurnMetadataState {
 
     fn current_turn_started_at_unix_ms(&self) -> Option<i64> {
         *self
+            .accepted
             .turn_started_at_unix_ms
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -447,6 +467,7 @@ impl TurnMetadataState {
 
     pub(crate) fn set_turn_started_at_unix_ms(&self, turn_started_at_unix_ms: i64) {
         *self
+            .accepted
             .turn_started_at_unix_ms
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(turn_started_at_unix_ms);
