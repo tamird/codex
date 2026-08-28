@@ -471,6 +471,7 @@ impl App {
             return Ok(terminal_width);
         }
 
+        let started_at = Instant::now();
         let reflow_result = self.render_transcript_lines_for_reflow(width);
         let reflowed_lines = reflow_result.lines;
         let reflowed_rows = reflowed_lines.len();
@@ -506,6 +507,20 @@ impl App {
             self.refresh_thread_usage_history_tail(tui)?;
         }
         self.request_scrollback_history_top_up(reflowed_rows);
+
+        let duration = started_at.elapsed();
+        if duration >= super::SLOW_TUI_OPERATION_THRESHOLD {
+            tracing::debug!(
+                target: "codex.performance",
+                operation = "tui.reflow",
+                duration_us = duration.as_micros(),
+                width,
+                transcript_cell_count = self.transcript_cells.len(),
+                rendered_row_count = reflowed_rows,
+                row_cap = self.resize_reflow_max_rows(),
+                "slow TUI transcript reflow"
+            );
+        }
 
         Ok(terminal_width)
     }

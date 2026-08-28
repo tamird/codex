@@ -882,6 +882,7 @@ impl App {
             return LoadedSubagentBackfill::default();
         };
 
+        let started_at = Instant::now();
         let loaded_thread_ids = match app_server
             .thread_loaded_list(ThreadLoadedListParams {
                 cursor: None,
@@ -897,8 +898,10 @@ impl App {
             }
         };
 
+        let loaded_thread_count = loaded_thread_ids.len();
         let mut threads = Vec::new();
         let mut had_read_error = false;
+        let mut read_count = 0;
         for thread_id in loaded_thread_ids {
             let Ok(thread_id) = ThreadId::from_string(&thread_id) else {
                 tracing::warn!("ignoring loaded thread with invalid id during subagent backfill");
@@ -909,6 +912,7 @@ impl App {
                 continue;
             }
 
+            read_count += 1;
             match app_server
                 .thread_read(thread_id, /*include_turns*/ false)
                 .await
@@ -921,7 +925,10 @@ impl App {
             }
         }
 
-        for thread in find_loaded_subagent_threads_for_primary(threads, primary_thread_id) {
+        let discovered_threads =
+            find_loaded_subagent_threads_for_primary(threads, primary_thread_id);
+        let discovered_thread_count = discovered_threads.len();
+        for thread in discovered_threads {
             let agent_path = thread.agent_path;
             let has_live_channel = self
                 .thread_event_channels
@@ -951,6 +958,29 @@ impl App {
             }
         }
         self.sync_active_agent_label();
+
+        let duration = started_at.elapsed();
+        let outcome = if had_read_error {
+            "partial"
+        } else {
+            "complete"
+        };
+        self.session_telemetry.record_duration(
+            "codex.tui.agent_backfill.duration_ms",
+            duration,
+            &[("outcome", outcome)],
+        );
+        if duration >= tui::TARGET_FRAME_INTERVAL {
+            tracing::debug!(
+                target: "codex.performance",
+                thread_id = %primary_thread_id,
+                loaded_threads = loaded_thread_count,
+                read_requests = read_count,
+                discovered_threads = discovered_thread_count,
+                duration_us = duration.as_micros(),
+                "slow TUI agent backfill"
+            );
+        }
 
         LoadedSubagentBackfill {
             completed: !had_read_error,

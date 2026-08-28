@@ -45,6 +45,7 @@ impl App {
         let embedded = server.uses_embedded_app_server();
         let handle = server.request_handle();
         let events = self.app_event_tx.clone();
+        let session_telemetry = self.session_telemetry.clone();
         let live: HashSet<_> = self
             .thread_event_channels
             .iter()
@@ -59,8 +60,12 @@ impl App {
             .filter_map(|(id, entry)| entry.is_closed.then_some(id))
             .collect();
         tokio::spawn(async move {
+            let started_at = Instant::now();
             let mut exhaustive = false;
             let mut timed_out = false;
+            let mut page_count = 0;
+            let mut scanned = 0;
+            let mut accepted = 0;
             let result = async {
                 let mut threads = Vec::new();
                 let mut cursor = None;
@@ -68,14 +73,13 @@ impl App {
                 let mut reachable = HashSet::from([root]);
                 let mut children_by_parent = HashMap::<ThreadId, Vec<(ThreadId, Thread)>>::new();
                 let mut parents = VecDeque::new();
-                let mut accepted = 0;
-                let mut scanned = 0;
                 let mut legacy = false;
                 let deadline = tokio::time::Instant::now() + AGENT_PICKER_MAX_SCAN_DURATION;
                 loop {
                     if !seen_cursors.insert((legacy, cursor.clone())) {
                         break;
                     }
+                    page_count += 1;
                     let request = handle.request_typed(ClientRequest::ThreadList {
                         request_id: RequestId::String(Uuid::new_v4().to_string()),
                         params: ThreadListParams {
@@ -100,6 +104,20 @@ impl App {
                         response = &mut request => response,
                         _ = tokio::time::sleep_until(deadline), if !timed_out => {
                             timed_out = true;
+                            session_telemetry.counter(
+                                "codex.tui.agent_picker.timeout",
+                                /*inc*/ 1,
+                                &[],
+                            );
+                            tracing::debug!(
+                                target: "codex.performance",
+                                thread_id = %root,
+                                pages = page_count,
+                                scanned_threads = scanned,
+                                accepted_threads = accepted,
+                                duration_us = started_at.elapsed().as_micros(),
+                                "TUI agent picker refresh timed out"
+                            );
                             events.send(AppEvent::AgentPickerThreadsLoaded {
                                 primary_thread_id: root,
                                 generation,
@@ -196,6 +214,33 @@ impl App {
                 Ok::<_, String>(threads)
             }
             .await;
+
+            let duration = started_at.elapsed();
+            let outcome = if timed_out {
+                "timed_out"
+            } else if result.is_err() {
+                "error"
+            } else {
+                "complete"
+            };
+            session_telemetry.record_duration(
+                "codex.tui.agent_picker.duration_ms",
+                duration,
+                &[("outcome", outcome)],
+            );
+            if duration >= tui::TARGET_FRAME_INTERVAL {
+                tracing::debug!(
+                    target: "codex.performance",
+                    thread_id = %root,
+                    pages = page_count,
+                    scanned_threads = scanned,
+                    accepted_threads = accepted,
+                    timed_out,
+                    duration_us = duration.as_micros(),
+                    "slow TUI agent picker refresh"
+                );
+            }
+
             events.send(AppEvent::AgentPickerThreadsLoaded {
                 primary_thread_id: root,
                 generation,

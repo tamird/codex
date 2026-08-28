@@ -848,6 +848,7 @@ impl App {
             }
             AppEvent::CodexOp(op) => {
                 let is_user_turn = matches!(&op, AppCommand::UserTurn { .. });
+                let prepare_started_at = Instant::now();
                 if is_user_turn {
                     let screen_size = tui.terminal.last_known_screen_size;
                     self.handle_draw_pre_render(tui, screen_size)?;
@@ -859,7 +860,30 @@ impl App {
                     self.render_chat_widget_frame(tui, screen_size)?;
                 }
                 self.chat_widget.prepare_local_op_submission(&op);
-                if let Err(err) = self.submit_active_thread_op(app_server, op).await {
+                let prepare_duration = prepare_started_at.elapsed();
+                let thread_id = self.active_thread_id;
+                let submit_started_at = Instant::now();
+                let result = self.submit_active_thread_op(app_server, op).await;
+                let submit_duration = submit_started_at.elapsed();
+                let duration = prepare_duration.saturating_add(submit_duration);
+                if duration >= SLOW_TUI_OPERATION_THRESHOLD
+                    && let Some(thread_id) = thread_id
+                {
+                    let op_kind = if is_user_turn { "user_turn" } else { "other" };
+                    let outcome = if result.is_ok() { "ok" } else { "error" };
+                    tracing::debug!(
+                        target: "codex.performance",
+                        thread_id = %thread_id,
+                        operation = "tui.codex_op",
+                        op_kind,
+                        outcome,
+                        prepare_duration_us = prepare_duration.as_micros(),
+                        submit_duration_us = submit_duration.as_micros(),
+                        duration_us = duration.as_micros(),
+                        "slow TUI operation submission"
+                    );
+                }
+                if let Err(err) = result {
                     let unsupported_permissions = err
                         .downcast_ref::<UnsupportedLegacyPermissionProfile>()
                         .is_some();
