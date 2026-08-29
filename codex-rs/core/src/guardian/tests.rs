@@ -3354,7 +3354,7 @@ async fn escalated_retry_bypasses_extension_approval_and_runs_guardian() -> anyh
 #[tokio::test]
 async fn guardian_ephemeral_retry_preserves_parallel_trunk_and_fork_history() -> anyhow::Result<()>
 {
-    const TEST_STACK_SIZE_BYTES: usize = 4 * 1024 * 1024;
+    const TEST_STACK_SIZE_BYTES: usize = 32 * 1024 * 1024;
 
     let handle =
         std::thread::Builder::new()

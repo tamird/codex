@@ -446,72 +446,76 @@ async fn failed_root_switch_keeps_background_requests_on_the_active_session() ->
 
 #[tokio::test]
 async fn root_switch_preserves_idle_root_with_running_subagent() -> Result<()> {
-    let mut app = make_test_app().await;
-    let mut app_server =
-        crate::start_embedded_app_server_for_picker(app.chat_widget.config_ref()).await?;
-    let previous = app_server.start_thread(&app.config).await?;
-    let previous_root_id = previous.session.thread_id;
-    app.enqueue_primary_thread_session(previous.session, previous.turns)
-        .await?;
-    let target_thread_id = ThreadId::from_string(
-        &app_test_support::create_fake_rollout(
-            app.config.codex_home.as_path(),
-            "2025-01-05T12-00-00",
-            "2025-01-05T12:00:00Z",
-            "Target task",
-            Some(&app.config.model_provider_id),
-            /*git_info*/ None,
-        )
-        .expect("materialize target rollout"),
-    )?;
-    let target = app_server
-        .resume_thread(
-            app.config.clone(),
-            target_thread_id,
-            crate::app_server_session::ResumeModelSettings::PreserveExistingThread,
-        )
-        .await?;
-    let child_id = ThreadId::new();
-    let idle_child_id = ThreadId::new();
-    app.ensure_thread_channel(idle_child_id);
-    app.upsert_agent_picker_thread(
-        child_id, /*agent_nickname*/ None, /*agent_role*/ None, /*is_closed*/ false,
-    );
-    app.agent_navigation.mark_running(child_id);
-    app.active_thread_id = Some(child_id);
-    let mut tui = crate::tui::test_support::make_test_tui()?;
+    Box::pin(async {
+        let mut app = make_test_app().await;
+        let mut app_server =
+            crate::start_embedded_app_server_for_picker(app.chat_widget.config_ref()).await?;
+        let previous = app_server.start_thread(&app.config).await?;
+        let previous_root_id = previous.session.thread_id;
+        app.enqueue_primary_thread_session(previous.session, previous.turns)
+            .await?;
+        let target_thread_id = ThreadId::from_string(
+            &app_test_support::create_fake_rollout(
+                app.config.codex_home.as_path(),
+                "2025-01-05T12-00-00",
+                "2025-01-05T12:00:00Z",
+                "Target task",
+                Some(&app.config.model_provider_id),
+                /*git_info*/ None,
+            )
+            .expect("materialize target rollout"),
+        )?;
+        let target = app_server
+            .resume_thread(
+                app.config.clone(),
+                target_thread_id,
+                crate::app_server_session::ResumeModelSettings::PreserveExistingThread,
+            )
+            .await?;
+        let child_id = ThreadId::new();
+        let idle_child_id = ThreadId::new();
+        app.ensure_thread_channel(idle_child_id);
+        app.upsert_agent_picker_thread(
+            child_id, /*agent_nickname*/ None, /*agent_role*/ None,
+            /*is_closed*/ false,
+        );
+        app.agent_navigation.mark_running(child_id);
+        app.active_thread_id = Some(child_id);
+        let mut tui = crate::tui::test_support::make_test_tui()?;
 
-    app.select_agents_overview_thread(&mut tui, &mut app_server, target.session.thread_id)
-        .await?;
+        app.select_agents_overview_thread(&mut tui, &mut app_server, target.session.thread_id)
+            .await?;
 
-    assert!(
-        app.agents_overview
-            .dispatched_requests
-            .contains_key(&idle_child_id)
-    );
-    app.handle_app_server_event(
-        &app_server,
-        AppServerEvent::ServerRequest(Box::new(ServerRequest::CurrentTimeRead {
-            request_id: RequestId::Integer(99),
-            params: CurrentTimeReadParams {
-                thread_id: idle_child_id.to_string(),
-            },
-        })),
-    )
-    .await;
-    assert!(app.agents_overview.dispatched_requests[&idle_child_id].is_empty());
-    let response: ThreadUnsubscribeResponse = app_server
-        .request_handle()
-        .request_typed(ClientRequest::ThreadUnsubscribe {
-            request_id: RequestId::String("verify-root-subscription".to_string()),
-            params: ThreadUnsubscribeParams {
-                thread_id: previous_root_id.to_string(),
-            },
-        })
-        .await?;
-    assert_eq!(response.status, ThreadUnsubscribeStatus::Unsubscribed);
-    app_server.shutdown().await?;
-    Ok(())
+        assert!(
+            app.agents_overview
+                .dispatched_requests
+                .contains_key(&idle_child_id)
+        );
+        app.handle_app_server_event(
+            &app_server,
+            AppServerEvent::ServerRequest(Box::new(ServerRequest::CurrentTimeRead {
+                request_id: RequestId::Integer(99),
+                params: CurrentTimeReadParams {
+                    thread_id: idle_child_id.to_string(),
+                },
+            })),
+        )
+        .await;
+        assert!(app.agents_overview.dispatched_requests[&idle_child_id].is_empty());
+        let response: ThreadUnsubscribeResponse = app_server
+            .request_handle()
+            .request_typed(ClientRequest::ThreadUnsubscribe {
+                request_id: RequestId::String("verify-root-subscription".to_string()),
+                params: ThreadUnsubscribeParams {
+                    thread_id: previous_root_id.to_string(),
+                },
+            })
+            .await?;
+        assert_eq!(response.status, ThreadUnsubscribeStatus::Unsubscribed);
+        app_server.shutdown().await?;
+        Ok(())
+    })
+    .await
 }
 
 #[tokio::test]

@@ -484,10 +484,7 @@ async fn apps_default_prompt_with_auto_review_routes_actual_mcp_approval_to_guar
         .requests()
         .into_iter()
         .find(|request| {
-            request
-                .message_input_texts("developer")
-                .iter()
-                .any(|text| text.starts_with("You are judging one planned coding-agent action."))
+            request.body_json()["client_metadata"]["x-openai-subagent"].as_str() == Some("guardian")
         })
         .expect("expected a Guardian request for the app MCP approval");
     assert!(guardian_request.body_contains_text("calendar_create_event"));

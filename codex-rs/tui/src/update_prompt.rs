@@ -209,21 +209,23 @@ impl WidgetRef for &UpdatePromptScreen {
                 "Release notes: ".dim(),
                 RELEASE_NOTES_URL.dim().underlined(),
             ])
-            .inset(Insets::tlbr(0, 2, 0, 0)),
+            .inset(Insets::tlbr(
+                /*top*/ 0, /*left*/ 2, /*bottom*/ 0, /*right*/ 0,
+            )),
         );
         column.push("");
         column.push(selection_option_row(
-            0,
+            /*index*/ 0,
             format!("Update now (runs `{update_command}`)"),
             self.highlighted == UpdateSelection::UpdateNow,
         ));
         column.push(selection_option_row(
-            1,
+            /*index*/ 1,
             "Skip".to_string(),
             self.highlighted == UpdateSelection::NotNow,
         ));
         column.push(selection_option_row(
-            2,
+            /*index*/ 2,
             "Skip until next version".to_string(),
             self.highlighted == UpdateSelection::DontRemind,
         ));
@@ -234,7 +236,9 @@ impl WidgetRef for &UpdatePromptScreen {
                 key_hint::plain(KeyCode::Enter).into(),
                 " to continue".dim(),
             ])
-            .inset(Insets::tlbr(0, 2, 0, 0)),
+            .inset(Insets::tlbr(
+                /*top*/ 0, /*left*/ 2, /*bottom*/ 0, /*right*/ 0,
+            )),
         );
         column.render(area, buf);
         crate::terminal_hyperlinks::mark_underlined_hyperlink(buf, area, RELEASE_NOTES_URL);
@@ -263,7 +267,8 @@ mod tests {
     #[test]
     fn update_prompt_snapshot() {
         let screen = new_prompt();
-        let mut terminal = Terminal::new(VT100Backend::new(80, 12)).expect("terminal");
+        let mut terminal =
+            Terminal::new(VT100Backend::new(/*width*/ 80, /*height*/ 12)).expect("terminal");
         terminal
             .draw(|frame| frame.render_widget_ref(&screen, frame.area()))
             .expect("render update prompt");

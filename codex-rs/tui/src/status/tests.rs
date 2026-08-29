@@ -174,12 +174,22 @@ fn render_lines(lines: &[Line<'static>]) -> Vec<String> {
     lines
         .iter()
         .map(|line| {
-            line.spans
+            let rendered = line
+                .spans
                 .iter()
                 .map(|span| span.content.as_ref())
-                .collect::<String>()
+                .collect::<String>();
+            normalize_version(&rendered)
         })
         .collect()
+}
+
+fn normalize_version(rendered: &str) -> String {
+    let version = format!("(v{})", crate::version::CODEX_CLI_VERSION);
+    rendered.replace(
+        &version,
+        &format!("(v0.0.0){}", " ".repeat(version.len().saturating_sub(8))),
+    )
 }
 
 fn sanitize_directory(lines: Vec<String>) -> Vec<String> {
@@ -233,7 +243,7 @@ fn buffer_to_text(buffer: &Buffer, width: u16) -> String {
                 .to_string()
         })
         .collect::<Vec<_>>();
-    sanitize_directory(lines).join("\n")
+    normalize_version(&sanitize_directory(lines).join("\n"))
 }
 
 fn reset_at_from(captured_at: &chrono::DateTime<chrono::Local>, seconds: i64) -> i64 {

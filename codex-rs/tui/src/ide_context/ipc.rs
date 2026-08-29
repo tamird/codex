@@ -1046,6 +1046,7 @@ mod tests {
 
     #[test]
     fn fetch_ide_context_falls_back_to_pre_migration_uid_zero_legacy_socket() {
+        use std::os::unix::fs::PermissionsExt;
         use std::os::unix::net::UnixListener;
 
         let tempdir = tempfile::tempdir().expect("tempdir");
@@ -1056,6 +1057,11 @@ mod tests {
             .expect("pre-migration UID-0 legacy socket path");
         std::fs::create_dir(pre_migration_socket_path.parent().expect("legacy parent"))
             .expect("create legacy parent");
+        std::fs::set_permissions(
+            pre_migration_socket_path.parent().expect("legacy parent"),
+            std::fs::Permissions::from_mode(0o700),
+        )
+        .expect("private legacy socket directory");
         let legacy_listener =
             UnixListener::bind(pre_migration_socket_path).expect("bind pre-migration legacy");
         let server = spawn_ide_context_server(legacy_listener, "legacy-root-pre-migration");
