@@ -220,9 +220,11 @@ async fn cache_eviction_waits_for_live_completion_delivery_and_respects_history_
 
 #[tokio::test]
 async fn evicted_policy_stop_survives_stale_history_and_blocks_queued_input() -> Result<()> {
-    for (history_id, history_status) in [
-        ("older", TurnStatus::Completed),
-        ("stopped", TurnStatus::Failed),
+    for (history_id, history_status, refresh_session) in [
+        ("older", TurnStatus::Completed, false),
+        ("stopped", TurnStatus::Failed, false),
+        ("older", TurnStatus::Completed, true),
+        ("stopped", TurnStatus::Failed, true),
     ] {
         let (mut app, _app_event_rx, mut op_rx) = make_test_app_with_channels().await;
         let thread_id = ThreadId::new();
@@ -244,7 +246,7 @@ async fn evicted_policy_stop_survives_stale_history_and_blocks_queued_input() ->
         {
             let channel = app.ensure_thread_channel(thread_id);
             let mut store = channel.store.lock().await;
-            store.set_session(session, Vec::new());
+            store.set_session(session.clone(), Vec::new());
             store.input_state = saved_input;
         }
         app.enqueue_thread_notification(thread_id, turn_started_notification(thread_id, "stopped"))
@@ -262,12 +264,26 @@ async fn evicted_policy_stop_survives_stale_history_and_blocks_queued_input() ->
         app.enqueue_thread_notification(thread_id, ServerNotification::TurnCompleted(completed))
             .await?;
         app.trim_thread_cache(/*budget*/ 0);
-        let snapshot = {
+        let mut snapshot = {
             let mut store = app.thread_event_channels[&thread_id].store.lock().await;
             assert!(store.history_reload_required);
             store.set_history_payload(vec![test_turn(history_id, history_status, Vec::new())]);
             store.snapshot()
         };
+        if refresh_session {
+            let turns = snapshot.turns.clone();
+            app.apply_refreshed_snapshot_thread(
+                thread_id,
+                AppServerStartedThread {
+                    session,
+                    turns,
+                    blocks_direct_input: false,
+                    task_tools_available: false,
+                },
+                &mut snapshot,
+            )
+            .await;
+        }
         app.replay_thread_snapshot(snapshot, /*resume_restored_queue*/ true);
         assert!(app.chat_widget.has_misalignment_policy_violation());
         assert!(app.chat_widget.queued_user_message_texts().is_empty());

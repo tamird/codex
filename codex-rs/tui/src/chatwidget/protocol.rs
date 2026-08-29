@@ -34,6 +34,22 @@ impl ChatWidget {
         notification: ServerNotification,
         replay_kind: Option<ReplayKind>,
     ) {
+        // A bounded history page can start a different turn before buffered terminal replay.
+        // That completion cannot establish that the identified running turn has finished. Keep
+        // chronological history rendering and live delivery on their existing paths; the store
+        // retains the terminal marker for later snapshots and owns its live acknowledgement.
+        if replay_kind.is_some()
+            && let ServerNotification::TurnCompleted(completed) = &notification
+            && self.turn_lifecycle.agent_turn_running
+            && self
+                .turn_lifecycle
+                .last_turn_id
+                .as_deref()
+                .is_some_and(|turn_id| turn_id != completed.turn.id)
+        {
+            return;
+        }
+
         // Reject misrouted child updates before shared notification handling mutates parent state.
         if let ServerNotification::McpServerStatusUpdated(notification) = &notification
             && let (Some(notification_thread_id), Some(thread_id)) =

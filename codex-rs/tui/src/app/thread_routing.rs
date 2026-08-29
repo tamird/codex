@@ -1444,17 +1444,18 @@ impl App {
             self.agent_navigation.mark_parent_owned(thread_id);
         }
         let AppServerStartedThread { session, turns, .. } = started;
+        snapshot
+            .events
+            .retain(ThreadEventStore::event_survives_session_refresh);
         if let Some(channel) = self.thread_event_channels.get(&thread_id) {
             let mut store = channel.store.lock().await;
             store.set_session(session.clone(), turns.clone());
             store.rebase_buffer_after_session_refresh();
             snapshot.input_state = store.input_state.clone();
+            snapshot.events.extend(store.terminal_replay_event());
         }
         snapshot.session = Some(session);
         snapshot.turns = turns;
-        snapshot
-            .events
-            .retain(ThreadEventStore::event_survives_session_refresh);
     }
 
     /// Opens the `/subagents` picker after refreshing cached labels for known threads.

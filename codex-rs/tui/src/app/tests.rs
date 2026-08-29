@@ -34,6 +34,8 @@ mod startup;
 mod stream_animation_tests;
 #[path = "tests/thread_cache_eviction_tests.rs"]
 mod thread_cache_eviction_tests;
+#[path = "tests/thread_cache_replay_tests.rs"]
+mod thread_cache_replay_tests;
 #[path = "tests/thread_usage.rs"]
 mod thread_usage;
 #[path = "tests/turn_submission.rs"]
