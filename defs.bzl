@@ -192,6 +192,8 @@ def codex_rust_crate(
         build_script_data = [],
         compile_data = [],
         binary_compile_data_extra = {},
+        binary_deps = {},
+        binary_srcs = {},
         lib_data_extra = [],
         rustc_flags_extra = [],
         binary_rustc_flags_extra = {},
@@ -235,6 +237,9 @@ def codex_rust_crate(
         compile_data: Non-Rust compile-time data for the library target.
         binary_compile_data_extra: Mapping from binary names to extra non-Rust
             compile-time data for those binary targets.
+        binary_deps: Complete dependency replacements for individual binaries,
+            including any library or build-script dependencies they require.
+        binary_srcs: Complete source replacements for individual binaries.
         lib_data_extra: Extra runtime data for the library target.
         binary_rustc_flags_extra: Mapping from binary names to extra rustc
             flags for those binary targets.
@@ -399,7 +404,7 @@ def codex_rust_crate(
             name = binary,
             crate_name = binary.replace("-", "_"),
             crate_root = main,
-            deps = all_crate_deps() + maybe_deps + deps_extra,
+            deps = binary_deps.get(binary, all_crate_deps() + maybe_deps + deps_extra),
             edition = crate_edition,
             # Keep per-binary Cargo link behavior scoped to the matching
             # generated rust_binary instead of leaking it to sibling binaries.
@@ -412,7 +417,7 @@ def codex_rust_crate(
                 "STABLE_GIT_COMMIT": "{STABLE_GIT_COMMIT}",
             },
             rustc_env_files = rustc_env_files,
-            srcs = native.glob(["src/**/*.rs"]),
+            srcs = binary_srcs.get(binary, native.glob(["src/**/*.rs"])),
             stamp = 1,
             version = crate_version,
             visibility = ["//visibility:public"],
