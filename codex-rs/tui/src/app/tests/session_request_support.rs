@@ -4,6 +4,7 @@ use codex_app_server_protocol::ClientRequest;
 use codex_app_server_protocol::JSONRPCError;
 use codex_app_server_protocol::JSONRPCMessage;
 use codex_app_server_protocol::JSONRPCResponse;
+use codex_app_server_protocol::ThreadListResponse;
 use futures::SinkExt;
 use futures::StreamExt;
 use std::sync::Mutex;
@@ -18,6 +19,8 @@ pub(super) enum BlockedThreadListPage {
     First,
     Second,
     SecondError,
+    /// One empty modern page followed by empty legacy pages with distinct cursors.
+    EmptyPages,
 }
 
 pub(super) type BlockedThreadList = (
@@ -60,6 +63,7 @@ pub(super) async fn start_recording_app_server(
     let proxy = tokio::spawn(async move {
         let (stream, _) = listener.accept().await?;
         let mut websocket = accept_async(stream).await?;
+        let mut empty_pages = None;
         while let Some(frame) = websocket.next().await {
             let Message::Text(text) = frame? else {
                 continue;
@@ -117,11 +121,27 @@ pub(super) async fn start_recording_app_server(
                             if blocked_page == BlockedThreadListPage::SecondError {
                                 params.cursor = Some("not-a-cursor".to_string());
                             }
+                            if blocked_page == BlockedThreadListPage::EmptyPages {
+                                empty_pages = Some(0);
+                            }
                             let _ = started.send(());
                             let _ = release.await;
                         }
                     }
-                    let response = match embedded.request(request).await? {
+                    let result = if let ClientRequest::ThreadList { params, .. } = &request
+                        && let Some(page_count) = empty_pages.as_mut()
+                    {
+                        *page_count += 1;
+                        Ok(serde_json::to_value(ThreadListResponse {
+                            data: Vec::new(),
+                            next_cursor: (!params.use_state_db_only)
+                                .then(|| format!("empty-page-{page_count}")),
+                            backwards_cursor: None,
+                        })?)
+                    } else {
+                        embedded.request(request).await?
+                    };
+                    let response = match result {
                         Ok(result) => JSONRPCMessage::Response(JSONRPCResponse {
                             id: request_id,
                             result,

@@ -16,6 +16,8 @@ pub(super) const AGENT_PICKER_VIEW_ID: &str = "agent-picker";
 const AGENT_PICKER_PAGE_SIZE: u32 = 100;
 const AGENT_PICKER_MAX_THREADS: usize = 1_000;
 const AGENT_PICKER_MAX_SCANNED_THREADS: usize = 10_000;
+/// Bound requests and retained cursors across both passes, including empty pages.
+pub(super) const AGENT_PICKER_MAX_PAGES: usize = 100;
 pub(super) const AGENT_PICKER_MAX_SCAN_DURATION: Duration = Duration::from_secs(5);
 
 impl App {
@@ -192,6 +194,7 @@ impl App {
                         && tokio::time::Instant::now() < deadline
                         && scanned < AGENT_PICKER_MAX_SCANNED_THREADS
                         && accepted < AGENT_PICKER_MAX_THREADS
+                        && page_count < AGENT_PICKER_MAX_PAGES
                     {
                         legacy = true;
                         cursor = None;
@@ -200,11 +203,13 @@ impl App {
                     if page.next_cursor.is_none()
                         || accepted >= AGENT_PICKER_MAX_THREADS
                         || scanned == AGENT_PICKER_MAX_SCANNED_THREADS
+                        || page_count == AGENT_PICKER_MAX_PAGES
                         || tokio::time::Instant::now() >= deadline
                     {
                         exhaustive = page.next_cursor.is_none()
                             && scanned < AGENT_PICKER_MAX_SCANNED_THREADS
                             && accepted < AGENT_PICKER_MAX_THREADS
+                            && page_count < AGENT_PICKER_MAX_PAGES
                             && legacy
                             && (!threads.is_empty() || embedded);
                         break;

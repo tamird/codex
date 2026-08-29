@@ -1,3 +1,4 @@
+use super::super::agent_picker::AGENT_PICKER_MAX_PAGES;
 use super::super::agent_picker::AGENT_PICKER_MAX_SCAN_DURATION;
 use super::session_request_support::BlockedThreadListPage;
 use super::session_request_support::start_recording_app_server;
@@ -613,6 +614,82 @@ async fn fresh_idle_observations_reject_older_active_picker_snapshots(
             .filter(|method| *method == expected_method)
             .count(),
         2
+    );
+
+    app_server.shutdown().await?;
+    proxy.await??;
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn empty_agent_picker_pages_share_a_hard_request_bound() -> Result<()> {
+    let (mut app, mut app_event_rx, _op_rx) = make_test_app_with_channels().await;
+    let codex_home = tempdir()?;
+    app.config.codex_home = codex_home.path().to_path_buf().abs();
+    app.config.sqlite = SqliteConfig::new_for_testing(codex_home.path().abs());
+    let (root_thread_id, _) = create_picker_rollouts(
+        codex_home.path(),
+        app.config.model_provider_id.as_str(),
+        /*index*/ 0,
+    )?;
+    let (started_tx, started_rx) = oneshot::channel();
+    let (release_tx, release_rx) = oneshot::channel();
+    let (mut app_server, requests, proxy) = start_recording_app_server(
+        &app.config,
+        Some((
+            root_thread_id,
+            started_tx,
+            release_rx,
+            BlockedThreadListPage::EmptyPages,
+        )),
+    )
+    .await?;
+    let root = app_server
+        .resume_thread(
+            app.config.clone(),
+            root_thread_id,
+            app.resume_model_settings(),
+        )
+        .await?;
+    app.enqueue_primary_thread_session(root.session, root.turns)
+        .await?;
+    let ghost_thread_id = ThreadId::new();
+    app.agent_navigation.upsert(
+        ghost_thread_id,
+        /*agent_nickname*/ None,
+        /*agent_role*/ None,
+        /*is_closed*/ true,
+    );
+
+    app.refresh_agent_picker_threads(&app_server, root_thread_id);
+    tokio::time::timeout(AGENT_PICKER_MAX_SCAN_DURATION, started_rx).await??;
+    release_tx
+        .send(())
+        .expect("release empty thread-list pages");
+    let completion = next_agent_picker_completion(&mut app_event_rx).await?;
+    assert_matches!(
+        &completion,
+        AppEvent::AgentPickerThreadsLoaded {
+            refresh: AgentPickerRefresh::Completed {
+                exhaustive: false,
+                result: Ok(threads),
+                ..
+            },
+            ..
+        } if threads.is_empty()
+    );
+    let mut tui = crate::tui::test_support::make_test_tui()?;
+    Box::pin(app.handle_event(&mut tui, &mut app_server, completion)).await?;
+    assert!(app.agent_navigation.get(&ghost_thread_id).is_some());
+    assert!(!app.agent_navigation.has_picker_refresh(root_thread_id));
+    assert_eq!(
+        requests
+            .lock()
+            .expect("requests")
+            .iter()
+            .filter(|method| *method == "thread/list")
+            .count(),
+        AGENT_PICKER_MAX_PAGES
     );
 
     app_server.shutdown().await?;
