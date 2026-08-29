@@ -15,6 +15,8 @@ use codex_app_server_protocol::SortDirection;
 use codex_app_server_protocol::ThreadHistoryMode;
 use codex_app_server_protocol::ThreadItemsListParams;
 use codex_app_server_protocol::ThreadItemsListResponse;
+use codex_app_server_protocol::ThreadListResponse;
+use codex_app_server_protocol::ThreadReadParams;
 use codex_app_server_protocol::ThreadStatus;
 use codex_protocol::AgentPath;
 use codex_protocol::items::AgentMessageContent;
@@ -47,6 +49,7 @@ enum HistoryCapabilities {
     LegacyOnlyUnsupportedVariant,
     LegacyDynamicToolsAndHistory,
     ForkHydrationFails,
+    SparseLoadedMetadata,
 }
 
 /// Returns and resets `(thread/loaded/list, thread/list, thread/read)` request counts.
@@ -137,6 +140,7 @@ async fn start_recording_app_server_with_history(
         let mut websocket = accept_async(stream).await?;
         let mut inventories = usize::from(failed_thread_name == Some("background"));
         let mut reject_detach = false;
+        let mut metadata_pages = 0;
         while let Some(frame) = websocket.next().await {
             let Message::Text(text) = frame? else {
                 continue;
@@ -192,6 +196,9 @@ async fn start_recording_app_server_with_history(
                             .is_some_and(|tools| {
                                 tools.iter().any(|tool| tool["type"] == "namespace")
                             });
+                    let sparse_metadata = history_capabilities
+                        == HistoryCapabilities::SparseLoadedMetadata
+                        && request.method == "thread/list";
                     let response = if reject_dynamic_tools {
                         JSONRPCMessage::Error(JSONRPCError {
                             id: request_id,
@@ -233,6 +240,30 @@ async fn start_recording_app_server_with_history(
                                 message: "fork history hydration failed".to_string(),
                             },
                         })
+                    } else if sparse_metadata && metadata_pages != 1 {
+                        metadata_pages += 1;
+                        if metadata_pages > 3 {
+                            // Fail a regression promptly instead of serving an endless baseline.
+                            JSONRPCMessage::Error(JSONRPCError {
+                                id: request_id,
+                                error: JSONRPCErrorError {
+                                    code: -32603,
+                                    data: None,
+                                    message: "metadata scan exceeded its useful work".to_string(),
+                                },
+                            })
+                        } else {
+                            let page = serde_json::to_value(ThreadListResponse {
+                                data: Vec::new(),
+                                next_cursor: (metadata_pages > 1)
+                                    .then(|| format!("sparse-metadata-{metadata_pages}")),
+                                backwards_cursor: None,
+                            })?;
+                            JSONRPCMessage::Response(JSONRPCResponse {
+                                id: request_id,
+                                result: page,
+                            })
+                        }
                     } else {
                         let background = request.method == "thread/backgroundTerminals/list" && {
                             inventories += usize::from(inventories > 0);
@@ -272,6 +303,19 @@ async fn start_recording_app_server_with_history(
                             })
                         } else {
                             let mut result = embedded.request(request).await?;
+                            if sparse_metadata {
+                                metadata_pages += 1;
+                                let mut page: ThreadListResponse = serde_json::from_value(
+                                    result.expect("real historical metadata page"),
+                                )?;
+                                page.data.retain(|thread| {
+                                    thread.agent_nickname.as_deref() == Some("batched")
+                                });
+                                page.next_cursor =
+                                    Some(format!("sparse-metadata-{metadata_pages}"));
+                                let page = serde_json::to_value(page)?;
+                                result = Ok(page);
+                            }
                             if background {
                                 let terminal = r#"{"data":[{"itemId":"x","processId":"x","command":"x","cwd":"/"}],"nextCursor":null}"#;
                                 result = Ok(serde_json::from_str(terminal)?);
@@ -411,6 +455,97 @@ async fn make_history_test_app() -> Result<(App, tempfile::TempDir)> {
     app.config.codex_home = codex_home.path().to_path_buf().abs();
     app.config.sqlite = SqliteConfig::new_for_testing(codex_home.path().abs());
     Ok((app, codex_home))
+}
+
+#[tokio::test]
+async fn loaded_metadata_backfill_bounds_sparse_pages_and_reads_only_missing_ids() -> Result<()> {
+    let (mut app, codex_home) = make_history_test_app().await?;
+    let root = create_history_rollout(&app.config, ThreadHistoryMode::Legacy, "root")?;
+    let mut children = Vec::new();
+    for (index, nickname) in ["batched", "fallback"].into_iter().enumerate() {
+        let agent_path = AgentPath::try_from(format!("/root/{nickname}"))
+            .map_err(color_eyre::eyre::Report::msg)?;
+        let child = create_fake_parented_rollout_with_source(
+            codex_home.path(),
+            &format!("2026-01-02T00-00-0{}", index + 1),
+            &format!("2026-01-02T00:00:0{}Z", index + 1),
+            "Saved child message",
+            Some(app.config.model_provider_id.as_str()),
+            /*git_info*/ None,
+            RolloutSessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+                parent_thread_id: root,
+                depth: 1,
+                agent_path: Some(agent_path),
+                agent_nickname: Some(nickname.to_string()),
+                agent_role: Some("worker".to_string()),
+            }),
+            root.into(),
+            root,
+        )
+        .map_err(|err| color_eyre::eyre::eyre!(err))?;
+        let child = ThreadId::from_string(&child)?;
+        children.push(child);
+    }
+    let (mut app_server, requests, proxy) = start_recording_app_server_with_history(
+        &app.config,
+        HistoryCapabilities::SparseLoadedMetadata,
+        /*blocked_thread_list*/ None,
+        /*failed_thread_name*/ None,
+        crate::app_server_session::ThreadParamsMode::Embedded,
+    )
+    .await?;
+    let root_session = app_server
+        .resume_thread(app.config.clone(), root, app.resume_model_settings())
+        .await?;
+    app.enqueue_primary_thread_session(root_session.session, root_session.turns)
+        .await?;
+    for child in &children {
+        app_server
+            .resume_thread(app.config.clone(), *child, app.resume_model_settings())
+            .await?;
+    }
+    requests.lock().expect("request recorder lock").clear();
+
+    let result = app.backfill_loaded_subagent_threads(&mut app_server).await;
+
+    assert!(result.completed);
+    assert_eq!(
+        recorded_params(&requests, "thread/list")
+            .iter()
+            .map(|params| params["ancestorThreadId"].clone())
+            .collect::<Vec<_>>(),
+        vec![
+            serde_json::json!(root),
+            serde_json::Value::Null,
+            serde_json::Value::Null
+        ]
+    );
+    assert_eq!(
+        recorded_params(&requests, "thread/read")
+            .into_iter()
+            .map(serde_json::from_value::<ThreadReadParams>)
+            .collect::<serde_json::Result<Vec<_>>>()?,
+        vec![ThreadReadParams {
+            thread_id: children[1].to_string(),
+            include_turns: false,
+        }]
+    );
+    assert_eq!(take_backfill_counts(&requests), (1, 3, 1));
+    for (child, nickname) in children.into_iter().zip(["batched", "fallback"]) {
+        assert_eq!(
+            app.agent_navigation.get(&child),
+            Some(&AgentPickerThreadEntry {
+                agent_nickname: Some(nickname.to_string()),
+                agent_role: Some("worker".to_string()),
+                agent_path: Some(format!("/root/{nickname}")),
+                is_running: false,
+                is_closed: false,
+            })
+        );
+    }
+    app_server.shutdown().await?;
+    proxy.await??;
+    Ok(())
 }
 
 #[tokio::test]

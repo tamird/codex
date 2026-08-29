@@ -6,6 +6,8 @@
 
 use std::io;
 
+use super::agent_picker::AGENT_PICKER_MAX_PAGES;
+use super::agent_picker::AGENT_PICKER_MAX_SCAN_DURATION;
 use super::agent_picker::AGENT_PICKER_VIEW_ID;
 use super::app_server_event_targets::ServerNotificationThreadTarget;
 use super::app_server_event_targets::server_notification_thread_target;
@@ -916,14 +918,26 @@ impl App {
         let mut loaded_thread_metadata = HashMap::new();
         let mut page_count = 0;
         if !loaded_thread_id_set.is_empty() {
+            // Batching must not scan unrelated history indefinitely for one missing loaded id.
+            // Share at most one page per useful id plus one probe across both listing modes;
+            // unresolved ids still use the exact-id fallback below.
+            let page_budget = loaded_thread_id_set
+                .len()
+                .saturating_add(1)
+                .min(AGENT_PICKER_MAX_PAGES);
+            let deadline = Instant::now() + AGENT_PICKER_MAX_SCAN_DURATION;
             let mut cursor = None;
             let mut seen_cursors = HashSet::new();
             let mut current_members_only = true;
             loop {
-                if !seen_cursors.insert((current_members_only, cursor.clone())) {
+                if page_count == page_budget
+                    || Instant::now() >= deadline
+                    || !seen_cursors.insert((current_members_only, cursor.clone()))
+                {
                     break;
                 }
                 page_count += 1;
+                // Retain the in-flight request until its reply before starting exact-id reads.
                 let page = match app_server
                     .thread_list(ThreadListParams {
                         cursor,
