@@ -1,6 +1,8 @@
 use codex_core::context::ContextualUserFragment;
 use codex_core::context::InternalContextSource;
 use codex_core::context::InternalModelContextFragment;
+use codex_core::context::MAX_GOAL_CONTEXT_BYTES;
+use codex_core::context::goal_objective_omission_notice;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::ThreadGoal;
 use codex_utils_template::Template;
@@ -35,26 +37,52 @@ fn parse_embedded_template(source: &'static str, template_name: &str) -> Templat
 }
 
 pub(crate) fn budget_limit_steering_item(goal: &ThreadGoal) -> ResponseItem {
-    goal_context_input_item(budget_limit_prompt(goal))
+    goal_context_input_item(goal, budget_limit_prompt)
 }
 
 pub(crate) fn objective_updated_steering_item(goal: &ThreadGoal) -> ResponseItem {
-    goal_context_input_item(objective_updated_prompt(goal))
+    goal_context_input_item(goal, objective_updated_prompt)
 }
 
 pub(crate) fn continuation_steering_item(goal: &ThreadGoal) -> ResponseItem {
-    goal_context_input_item(continuation_prompt(goal))
+    goal_context_input_item(goal, continuation_prompt)
 }
 
-fn goal_context_input_item(prompt: String) -> ResponseItem {
-    ContextualUserFragment::into(InternalModelContextFragment::new(
+fn goal_context_input_item(
+    goal: &ThreadGoal,
+    prompt: fn(&ThreadGoal, &str) -> String,
+) -> ResponseItem {
+    let omission = goal_objective_omission_notice(goal);
+    let objective = if goal.objective.len() <= MAX_GOAL_CONTEXT_BYTES {
+        &goal.objective
+    } else {
+        &omission
+    };
+    let mut fragment = InternalModelContextFragment::new(
         InternalContextSource::from_static("goal"),
-        prompt,
-    ))
+        prompt(goal, objective),
+    );
+    if fragment.render().len() > MAX_GOAL_CONTEXT_BYTES {
+        fragment = InternalModelContextFragment::new(
+            InternalContextSource::from_static("goal"),
+            prompt(goal, &omission),
+        );
+        if fragment.render().len() > MAX_GOAL_CONTEXT_BYTES {
+            // A future template may exhaust the budget even without the objective. Keep the
+            // delivery and goal metadata, explicitly omitting that whole context projection.
+            fragment = InternalModelContextFragment::new(
+                InternalContextSource::from_static("goal"),
+                format!(
+                    "Goal context omitted because its complete template exceeds the context limit.\n{omission}"
+                ),
+            );
+        }
+    }
+    ContextualUserFragment::into(fragment)
 }
 
-fn continuation_prompt(goal: &ThreadGoal) -> String {
-    let objective = escape_xml_text(&goal.objective);
+fn continuation_prompt(goal: &ThreadGoal, objective: &str) -> String {
+    let objective = escape_xml_text(objective);
     let tokens_used = goal.tokens_used.to_string();
     let token_budget = goal
         .token_budget
@@ -77,8 +105,8 @@ fn continuation_prompt(goal: &ThreadGoal) -> String {
         })
 }
 
-fn budget_limit_prompt(goal: &ThreadGoal) -> String {
-    let objective = escape_xml_text(&goal.objective);
+fn budget_limit_prompt(goal: &ThreadGoal, objective: &str) -> String {
+    let objective = escape_xml_text(objective);
     let time_used_seconds = goal.time_used_seconds.to_string();
     let tokens_used = goal.tokens_used.to_string();
     let token_budget = goal
@@ -98,8 +126,8 @@ fn budget_limit_prompt(goal: &ThreadGoal) -> String {
         })
 }
 
-fn objective_updated_prompt(goal: &ThreadGoal) -> String {
-    let objective = escape_xml_text(&goal.objective);
+fn objective_updated_prompt(goal: &ThreadGoal, objective: &str) -> String {
+    let objective = escape_xml_text(objective);
     let tokens_used = goal.tokens_used.to_string();
     let (token_budget, remaining_tokens) = match goal.token_budget {
         Some(token_budget) => (
@@ -127,3 +155,7 @@ fn escape_xml_text(input: &str) -> String {
         .replace('<', "&lt;")
         .replace('>', "&gt;")
 }
+
+#[cfg(test)]
+#[path = "steering_tests.rs"]
+mod tests;

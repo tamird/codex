@@ -39,6 +39,7 @@ use codex_protocol::ThreadId;
 use codex_protocol::config_types::CollaborationMode;
 use codex_protocol::config_types::ModeKind;
 use codex_protocol::config_types::Settings;
+use codex_protocol::models::ResponseInputItem;
 use codex_protocol::protocol::CodexErrorInfo;
 use codex_protocol::protocol::Event;
 use codex_protocol::protocol::EventMsg;
@@ -96,14 +97,13 @@ async fn installed_goal_tools_create_goal_and_fill_empty_preview() -> anyhow::Re
 }
 
 #[tokio::test]
-async fn installed_goal_tools_accept_full_sixteen_thousand_character_objective()
--> anyhow::Result<()> {
+async fn installed_goal_tools_preserve_full_bounded_objectives() -> anyhow::Result<()> {
     let runtime = test_runtime().await?;
     let thread_id = test_thread_id()?;
     seed_thread_metadata(runtime.as_ref(), thread_id).await?;
     let tools = installed_tools(runtime.clone(), thread_id).await;
     let tail = "FULL_OBJECTIVE_TAIL_9F3A";
-    let objective = format!("{}{}", "x".repeat(16_000 - tail.len()), tail);
+    let objective = format!("{}{}", "x".repeat(5_998 - tail.len()), tail);
     let create_tool = tool_by_name(&tools, "create_goal");
 
     let oversized = create_tool
@@ -139,6 +139,99 @@ async fn installed_goal_tools_accept_full_sixteen_thousand_character_objective()
             .is_some_and(|value| value.ends_with(tail)),
         true
     );
+    assert!(result.to_string().len() <= codex_core::context::MAX_GOAL_CONTEXT_BYTES);
+    Ok(())
+}
+
+#[tokio::test]
+async fn goal_tools_bound_legacy_projections_without_rewriting_the_stored_objective()
+-> anyhow::Result<()> {
+    for objective in [
+        format!("{}a", "a\n".repeat(/*n*/ 7_999)),
+        "\"".repeat(/*n*/ 5_000),
+        "x".repeat(/*n*/ 8_100),
+    ] {
+        let runtime = test_runtime().await?;
+        let thread_id = test_thread_id()?;
+        seed_thread_metadata(runtime.as_ref(), thread_id).await?;
+        let original = runtime
+            .thread_goals()
+            .replace_thread_goal(
+                thread_id,
+                &objective,
+                codex_state::ThreadGoalStatus::Paused,
+                /*token_budget*/ Some(10_000),
+            )
+            .await?;
+        let harness = GoalExtensionHarness::new(runtime.clone(), thread_id).await?;
+        harness
+            .goal_service
+            .set_thread_goal(
+                runtime.as_ref(),
+                GoalSetRequest {
+                    thread_id,
+                    objective: GoalObjectiveUpdate::Keep,
+                    status: Some(ThreadGoalStatus::Paused),
+                    token_budget: GoalTokenBudgetUpdate::Keep,
+                    max_goal_token_budget: None,
+                },
+            )
+            .await?;
+        let kept = runtime
+            .thread_goals()
+            .get_thread_goal(thread_id)
+            .await?
+            .unwrap();
+        let mut expected = original;
+        expected.updated_at = kept.updated_at;
+        assert_eq!(kept, expected);
+        let original = kept;
+        let tools = harness.tools();
+
+        for (tool_name, arguments, status) in [
+            ("get_goal", json!({}), ThreadGoalStatus::Paused),
+            (
+                "update_goal",
+                json!({ "status": "complete" }),
+                ThreadGoalStatus::Complete,
+            ),
+        ] {
+            let invocation = tool_call(tool_name, "legacy-goal-call", arguments);
+            let output = tool_by_name(&tools, tool_name)
+                .handle(invocation.clone())
+                .await?;
+            let value = output.code_mode_result(&invocation.payload);
+            let ResponseInputItem::FunctionCallOutput {
+                output: model_output,
+                ..
+            } = output.to_response_item("legacy-goal-call", &invocation.payload)
+            else {
+                anyhow::bail!("expected function output")
+            };
+            assert_eq!(model_output.body.to_text(), Some(value.to_string()));
+            assert!(value.to_string().len() <= codex_core::context::MAX_GOAL_CONTEXT_BYTES);
+            assert_eq!(value["goal"]["threadId"], json!(thread_id));
+            assert_eq!(value["goal"]["status"], json!(status));
+            assert!(
+                value["goal"]["objective"]
+                    .as_str()
+                    .unwrap()
+                    .contains("stored goal objective is unchanged but was omitted")
+            );
+
+            let stored = runtime
+                .thread_goals()
+                .get_thread_goal(thread_id)
+                .await?
+                .unwrap();
+            let mut expected = original.clone();
+            if status == ThreadGoalStatus::Complete {
+                expected.status = codex_state::ThreadGoalStatus::Complete;
+                expected.updated_at = stored.updated_at;
+            }
+            assert_eq!(stored, expected);
+        }
+    }
     Ok(())
 }
 

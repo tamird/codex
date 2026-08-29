@@ -1,5 +1,7 @@
 use std::sync::Arc;
 
+use codex_core::context::MAX_GOAL_CONTEXT_BYTES;
+use codex_core::context::goal_objective_omission_notice;
 use codex_extension_api::FunctionCallError;
 use codex_extension_api::JsonToolOutput;
 use codex_extension_api::ToolCall;
@@ -419,8 +421,31 @@ fn goal_response(
     goal: Option<ThreadGoal>,
     completion_budget_report: CompletionBudgetReport,
 ) -> Result<Box<dyn ToolOutput>, FunctionCallError> {
-    let value = serde_json::to_value(GoalToolResponse::new(goal, completion_budget_report))
-        .map_err(|err| FunctionCallError::Fatal(err.to_string()))?;
+    let mut response = GoalToolResponse::new(goal, completion_budget_report);
+    if let Some(goal) = response.goal.as_mut()
+        && goal.objective.len() > MAX_GOAL_CONTEXT_BYTES
+    {
+        goal.objective = goal_objective_omission_notice(goal);
+    }
+    let mut value =
+        serde_json::to_value(&response).map_err(|err| FunctionCallError::Fatal(err.to_string()))?;
+    if value.to_string().len() > MAX_GOAL_CONTEXT_BYTES
+        && let Some(goal) = response.goal.as_mut()
+    {
+        // This is only the returned projection; create/update may already have committed.
+        goal.objective = goal_objective_omission_notice(goal);
+        value = serde_json::to_value(&response)
+            .map_err(|err| FunctionCallError::Fatal(err.to_string()))?;
+    }
+    if value.to_string().len() > MAX_GOAL_CONTEXT_BYTES {
+        value = serde_json::json!({
+            "goal": response.goal.as_ref().map(|goal| serde_json::json!({
+                "threadId": goal.thread_id,
+                "status": goal.status,
+            })),
+            "contextOmitted": "The goal response was omitted because it exceeds the context limit. The stored objective and goal state are unchanged by this omission. Ask the user for a reference to the complete objective.",
+        });
+    }
     Ok(Box::new(JsonToolOutput::new(value)))
 }
 

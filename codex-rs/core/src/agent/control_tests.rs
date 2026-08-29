@@ -352,6 +352,15 @@ fn fork_previous_response_id_env_value_parses_truthy_values() {
 
 #[tokio::test]
 async fn goal_supervisor_helper_uses_full_history_fork_without_spawn_call_id() {
+    check_goal_supervisor_helper_fork("Ship the active user goal.").await;
+}
+
+#[tokio::test]
+async fn goal_supervisor_helper_delivers_bounded_legacy_assignment_without_changing_goal() {
+    check_goal_supervisor_helper_fork(&format!("{}a", "a\n".repeat(/*n*/ 7_999))).await;
+}
+
+async fn check_goal_supervisor_helper_fork(objective: &str) {
     let harness = AgentControlHarness::new().await;
     let mut parent_config = harness.config.clone();
     let _ = parent_config.features.enable(Feature::AgentPromptInjection);
@@ -385,10 +394,15 @@ async fn goal_supervisor_helper_uses_full_history_fork_without_spawn_call_id() {
         state_db,
         parent.thread_id,
         &parent.thread.session,
-        "Ship the active user goal.",
+        objective,
     )
     .await
     .expect("active goal should persist");
+    let stored_goal = state_db
+        .thread_goals()
+        .get_thread_goal(parent.thread_id)
+        .await
+        .unwrap();
 
     let helper_thread_id =
         crate::goal_supervisor::spawn_supervisor_helper_for_test(&parent.thread.session, &goal)
@@ -469,10 +483,37 @@ async fn goal_supervisor_helper_uses_full_history_fork_without_spawn_call_id() {
         helper_history.raw_items(),
         "# Goal Supervisor Assignment"
     ));
-    assert!(history_contains_text(
-        helper_history.raw_items(),
-        "Ship the active user goal."
-    ));
+    let assignment = helper_history
+        .raw_items()
+        .find_map(|item| match item {
+            ResponseItem::Message { role, content, .. } if role == "user" => {
+                content.iter().find_map(|item| match item {
+                    ContentItem::InputText { text }
+                        if text.starts_with("# Goal Supervisor Assignment") =>
+                    {
+                        Some(text)
+                    }
+                    _ => None,
+                })
+            }
+            _ => None,
+        })
+        .expect("supervisor assignment should still be delivered");
+    assert!(assignment.len() <= crate::context::MAX_GOAL_CONTEXT_BYTES);
+    if objective.len() > crate::context::MAX_GOAL_CONTEXT_BYTES {
+        assert!(assignment.contains(&crate::context::goal_objective_omission_notice(&goal)));
+        assert!(!assignment.contains(objective));
+    } else {
+        assert!(assignment.contains(objective));
+    }
+    assert_eq!(
+        state_db
+            .thread_goals()
+            .get_thread_goal(parent.thread_id)
+            .await
+            .unwrap(),
+        stored_goal,
+    );
 }
 
 fn spawn_agent_call(call_id: &str) -> ResponseItem {

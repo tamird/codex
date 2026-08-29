@@ -3,6 +3,7 @@ use crate::agent::control::SpawnAgentOptions;
 use crate::agent::next_thread_spawn_depth;
 use crate::context::ContextualUserFragment;
 use crate::context::GoalSupervisorAction;
+use crate::context::GoalSupervisorAssignment;
 use crate::context::GoalSupervisorContinuity;
 use crate::context::SupervisorActionKind;
 use crate::session::session::Session;
@@ -936,10 +937,11 @@ pub(crate) async fn spawn_supervisor_helper_for_test(
 }
 
 fn supervisor_helper_prompt(session: &Session, goal: &ThreadGoal) -> String {
-    format!(
-        "# Goal Supervisor Assignment\n\nParent agent id: {}\n\nActive goal objective:\n\n{}\n\nEvaluate whether the parent should continue now, snooze, compact, or mark the goal complete.",
-        session.thread_id, goal.objective
-    )
+    GoalSupervisorAssignment {
+        parent_thread_id: session.thread_id,
+        goal,
+    }
+    .render()
 }
 
 pub(crate) async fn supervisor_continuity_context_item(
