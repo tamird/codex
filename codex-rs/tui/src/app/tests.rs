@@ -101,6 +101,7 @@ use codex_app_server_protocol::ServerRequest;
 use codex_app_server_protocol::Thread;
 use codex_app_server_protocol::ThreadArchivedNotification;
 use codex_app_server_protocol::ThreadClosedNotification;
+use codex_app_server_protocol::ThreadGoalStatus;
 use codex_app_server_protocol::ThreadItem;
 use codex_app_server_protocol::ThreadSettings;
 use codex_app_server_protocol::ThreadSettingsUpdatedNotification;
@@ -5955,6 +5956,115 @@ async fn set_thread_goal_draft_materializes_long_objective_and_confirms_before_p
         Ok(())
     })
     .await
+}
+
+#[tokio::test]
+async fn set_thread_goal_draft_materializes_escaped_objective_before_replacing_goal() -> Result<()>
+{
+    Box::pin(async {
+        let mut app = make_test_app().await;
+        let mut app_server =
+            crate::start_embedded_app_server_for_picker(app.chat_widget.config_ref()).await?;
+        let started = app_server
+            .start_thread(app.chat_widget.config_ref())
+            .await?;
+        let thread_id = started.session.thread_id;
+        app.enqueue_primary_thread_session(started.session, started.turns)
+            .await?;
+        app_server
+            .thread_goal_set(
+                thread_id,
+                Some("Keep the current goal until the replacement is ready".to_string()),
+                Some(ThreadGoalStatus::Paused),
+                /*token_budget*/ None,
+            )
+            .await?;
+        let objective = "&".repeat(MAX_THREAD_GOAL_OBJECTIVE_CHARS);
+
+        app.set_thread_goal_draft(
+            &mut app_server,
+            thread_id,
+            goal_files::GoalDraft {
+                objective: objective.clone(),
+                ..Default::default()
+            },
+            crate::app_event::ThreadGoalSetMode::ReplaceExisting,
+        )
+        .await;
+
+        let goal = app_server
+            .thread_goal_get(thread_id)
+            .await?
+            .goal
+            .expect("replacement goal should be set");
+        let codex_home = app_server
+            .codex_home_path(&app.chat_widget.config_ref().codex_home)
+            .expect("codex home");
+        assert!(goal_files::objective_file_path(&goal.objective, Some(&codex_home)).is_some());
+        assert_eq!(
+            goal_files::objective_text_for_edit(
+                &mut app_server,
+                Some(&codex_home),
+                &goal.objective
+            )
+            .await
+            .expect("managed goal file should be readable"),
+            objective
+        );
+        app_server.shutdown().await?;
+        Ok(())
+    })
+    .await
+}
+
+#[tokio::test]
+async fn set_thread_goal_draft_preserves_goal_when_validation_or_materialization_fails()
+-> Result<()> {
+    let mut app = make_test_app().await;
+    let mut app_server =
+        crate::start_embedded_app_server_for_picker(app.chat_widget.config_ref()).await?;
+    let started = app_server
+        .start_thread(app.chat_widget.config_ref())
+        .await?;
+    let thread_id = started.session.thread_id;
+    app.enqueue_primary_thread_session(started.session, started.turns)
+        .await?;
+    let previous_goal = app_server
+        .thread_goal_set(
+            thread_id,
+            Some("Keep the current goal until the replacement is ready".to_string()),
+            Some(ThreadGoalStatus::Paused),
+            /*token_budget*/ None,
+        )
+        .await?
+        .goal;
+    let attachments_path = app.chat_widget.config_ref().codex_home.join("attachments");
+    let existing_file = b"an existing file prevents creating the attachment directory";
+    std::fs::write(&attachments_path, existing_file)?;
+
+    for objective in [
+        " \n\t".to_string(),
+        "&".repeat(MAX_THREAD_GOAL_OBJECTIVE_CHARS),
+    ] {
+        app.set_thread_goal_draft(
+            &mut app_server,
+            thread_id,
+            goal_files::GoalDraft {
+                objective,
+                ..Default::default()
+            },
+            crate::app_event::ThreadGoalSetMode::ReplaceExisting,
+        )
+        .await;
+
+        assert_eq!(
+            app_server.thread_goal_get(thread_id).await?.goal,
+            Some(previous_goal.clone())
+        );
+        assert_eq!(std::fs::read(&attachments_path)?, existing_file);
+    }
+    app_server.shutdown().await?;
+    Ok(())
 }
 
 #[tokio::test]

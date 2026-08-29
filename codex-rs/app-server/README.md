@@ -795,6 +795,8 @@ Experimental: use `memory/reset` to clear local memory artifacts and sqlite-back
 
 Use `thread/goal/set` to create or update the current goal for a materialized thread. Clients can set `budgetLimited` when they stop because a token budget is exhausted or nearly exhausted, `blocked` when progress is waiting on outside intervention, and `usageLimited` when usage availability stops further work. The system also sets `budgetLimited` when accounting crosses a configured token budget and `usageLimited` when a turn ends on a hard usage-limit error.
 
+New objective text must fit both 16,000 characters and 6,000 UTF-8 bytes in each of its raw, XML-escaped, and JSON-string representations. Use a file reference for larger objectives. Existing goal snapshots keep their previous fork-inheritance boundary; model-facing goal context uses bounded projections with an explicit omission notice when necessary, without rewriting the stored objective. `thread/goal/get` still returns the complete persisted goal.
+
 When `goals.max_goal_token_budget` is configured, new goals default to that limit, larger budgets are rejected, and setting `tokenBudget` to `null` resets the budget to the configured limit instead of removing it.
 
 ```json

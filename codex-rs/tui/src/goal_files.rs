@@ -10,7 +10,7 @@ use anyhow::Context;
 use anyhow::Result;
 use anyhow::bail;
 use codex_app_server_client::AppServerPath;
-use codex_protocol::protocol::MAX_THREAD_GOAL_OBJECTIVE_CHARS;
+use codex_protocol::protocol::validate_thread_goal_objective;
 use codex_protocol::user_input::TextElement;
 use uuid::Uuid;
 
@@ -118,7 +118,7 @@ pub(crate) async fn materialize_goal_draft(
             .collect(),
     );
 
-    if objective.chars().count() > MAX_THREAD_GOAL_OBJECTIVE_CHARS {
+    if validate_thread_goal_objective(&objective).is_err() {
         let path = ensure_goal_output_dir(app_server, codex_home, &mut output_dir)
             .await?
             .join(GOAL_FILE_NAME);
@@ -173,12 +173,9 @@ pub(crate) fn objective_file_path(
 
 pub(crate) fn objective_file_reference(path: &GoalFilePath) -> Result<String> {
     let reference = format!("{GOAL_FILE_PREFIX}{path}{GOAL_FILE_SUFFIX}");
-    let actual_chars = reference.chars().count();
-    if actual_chars > MAX_THREAD_GOAL_OBJECTIVE_CHARS {
-        bail!(
-            "Goal objective file reference is too long: {actual_chars} characters. Limit: {MAX_THREAD_GOAL_OBJECTIVE_CHARS} characters."
-        );
-    }
+    validate_thread_goal_objective(&reference)
+        .map_err(anyhow::Error::msg)
+        .context("Goal objective file reference is too large")?;
     Ok(reference)
 }
 
@@ -240,3 +237,7 @@ fn image_extension(path: &Path) -> String {
         .filter(|extension| !extension.is_empty())
         .unwrap_or_else(|| "png".to_string())
 }
+
+#[cfg(test)]
+#[path = "goal_files_tests.rs"]
+mod tests;

@@ -125,6 +125,25 @@ async fn installed_goal_tools_preserve_full_bounded_objectives() -> anyhow::Resu
             .is_none()
     );
 
+    let rejected = create_tool
+        .handle(tool_call(
+            "create_goal",
+            "call-create-newline-goal",
+            json!({ "objective": format!("{}a", "a\n".repeat(/*n*/ 7_999)) }),
+        ))
+        .await;
+    assert!(matches!(
+        rejected,
+        Err(FunctionCallError::RespondToModel(_))
+    ));
+    assert!(
+        runtime
+            .thread_goals()
+            .get_thread_goal(thread_id)
+            .await?
+            .is_none()
+    );
+
     let invocation = tool_call(
         "create_goal",
         "call-create-long-goal",

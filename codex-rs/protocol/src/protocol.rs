@@ -16,8 +16,8 @@ use strum_macros::EnumIter;
 
 use crate::AgentPath;
 use crate::ResponseItemId;
-use crate::SanitizedGitUrl;
 use crate::RolloutId;
+use crate::SanitizedGitUrl;
 use crate::SegmentId;
 use crate::SessionId;
 use crate::ThreadId;
@@ -4145,18 +4145,42 @@ pub enum ThreadGoalStatus {
 /// values must also satisfy the model-visible representation guard in
 /// [`validate_thread_goal_objective`].
 pub const MAX_THREAD_GOAL_OBJECTIVE_CHARS: usize = 16_000;
-// Leave room below the model-item ceiling for goal prompt templates and response wrappers. This is
-// a pathological-input guard, not a second user-facing goal limit.
-const MAX_THREAD_GOAL_OBJECTIVE_REPRESENTATION_TOKENS: usize = 6_000;
+// Conservative UTF-8 representation bytes, not estimated tokens. Each model-visible consumer
+// must also bound its complete rendered item, including its own template and wrappers.
+const MAX_THREAD_GOAL_OBJECTIVE_REPRESENTATION_BYTES: usize = 6_000;
 
 pub fn validate_thread_goal_objective(value: &str) -> Result<(), String> {
+    validate_goal_objective_representations(value, MAX_THREAD_GOAL_OBJECTIVE_REPRESENTATION_BYTES)
+}
+
+/// Preserves the historical acceptance boundary when copying an already persisted goal.
+///
+/// The former 6,000-token byte-ratio estimate admitted 24,000 representation bytes. This is a
+/// compatibility check, not a context safety bound; consumers must bound rendered projections.
+pub fn validate_thread_goal_snapshot_objective(value: &str) -> Result<(), String> {
+    validate_goal_objective_representations(value, /*max_representation_bytes*/ 24_000)
+}
+
+fn validate_goal_objective_representations(
+    value: &str,
+    max_representation_bytes: usize,
+) -> Result<(), String> {
+    const REPRESENTATION_ERROR: &str = "goal objective is too large to include safely in model context; use ordinary text or move bulky data into a referenced file";
     if value.is_empty() {
         return Err("goal objective must not be empty".to_string());
     }
-    if value.chars().count() > MAX_THREAD_GOAL_OBJECTIVE_CHARS {
+    if value
+        .chars()
+        .take(MAX_THREAD_GOAL_OBJECTIVE_CHARS + 1)
+        .count()
+        > MAX_THREAD_GOAL_OBJECTIVE_CHARS
+    {
         return Err(format!(
             "goal objective must be at most {MAX_THREAD_GOAL_OBJECTIVE_CHARS} characters"
         ));
+    }
+    if value.len() > max_representation_bytes {
+        return Err(REPRESENTATION_ERROR.to_string());
     }
     let json = serde_json::to_string(value)
         .map_err(|err| format!("failed to serialize goal objective: {err}"))?;
@@ -4167,17 +4191,8 @@ pub fn validate_thread_goal_objective(value: &str) -> Result<(), String> {
             _ => 1,
         })
     });
-    if codex_utils_string::approx_token_count(value)
-        > MAX_THREAD_GOAL_OBJECTIVE_REPRESENTATION_TOKENS
-        || codex_utils_string::approx_tokens_from_byte_count(xml_escaped_bytes) as usize
-            > MAX_THREAD_GOAL_OBJECTIVE_REPRESENTATION_TOKENS
-        || codex_utils_string::approx_token_count(&json)
-            > MAX_THREAD_GOAL_OBJECTIVE_REPRESENTATION_TOKENS
-    {
-        return Err(
-            "goal objective is too large to include safely in model context; use ordinary text or move bulky data into a referenced file"
-                .to_string(),
-        );
+    if xml_escaped_bytes > max_representation_bytes || json.len() > max_representation_bytes {
+        return Err(REPRESENTATION_ERROR.to_string());
     }
     Ok(())
 }
@@ -4640,7 +4655,7 @@ mod tests {
         let tail = "FULL_OBJECTIVE_TAIL_9F3A";
         let objective = format!(
             "{}{}",
-            "x".repeat(MAX_THREAD_GOAL_OBJECTIVE_CHARS - tail.chars().count()),
+            "x".repeat(MAX_THREAD_GOAL_OBJECTIVE_REPRESENTATION_BYTES - tail.len() - 2),
             tail
         );
         assert_eq!(validate_thread_goal_objective(&objective), Ok(()));
@@ -4654,6 +4669,20 @@ mod tests {
             "goal objective is too large to include safely in model context; use ordinary text or move bulky data into a referenced file"
                 .to_string(),
         );
+        for objective in [
+            format!("{objective}x"),
+            format!("{}a", "a\n".repeat(/*n*/ 7_999)),
+            "&".repeat(/*n*/ 1_201),
+        ] {
+            assert_eq!(
+                validate_thread_goal_objective(&objective),
+                representation_error
+            );
+        }
+        assert_eq!(
+            validate_thread_goal_objective(&"&".repeat(/*n*/ 1_200)),
+            Ok(())
+        );
         assert_eq!(
             validate_thread_goal_objective(&"🚀".repeat(MAX_THREAD_GOAL_OBJECTIVE_CHARS)),
             representation_error
@@ -4662,6 +4691,24 @@ mod tests {
             validate_thread_goal_objective(&"&".repeat(MAX_THREAD_GOAL_OBJECTIVE_CHARS)),
             representation_error
         );
+    }
+
+    #[test]
+    fn goal_snapshot_copy_retains_the_legacy_representation_boundary() {
+        for objective in [
+            "x".repeat(/*n*/ 16_000),
+            format!("{}a", "a\n".repeat(/*n*/ 7_999)),
+        ] {
+            assert_eq!(validate_thread_goal_snapshot_objective(&objective), Ok(()));
+            assert!(validate_thread_goal_objective(&objective).is_err());
+        }
+        assert_eq!(
+            validate_thread_goal_snapshot_objective(&"&".repeat(/*n*/ 4_800)),
+            Ok(())
+        );
+        assert!(validate_thread_goal_snapshot_objective(&"&".repeat(/*n*/ 4_801)).is_err());
+        assert!(validate_thread_goal_snapshot_objective(&"x".repeat(/*n*/ 16_001)).is_err());
+        assert!(validate_thread_goal_snapshot_objective("").is_err());
     }
 
     #[test]

@@ -905,7 +905,7 @@ async fn assert_thread_fork_at_named_boundary_keeps_only_terminal_prefix(
 }
 
 #[tokio::test]
-async fn thread_fork_defers_inherited_active_goal_until_next_turn() -> Result<()> {
+async fn thread_fork_defers_inherited_legacy_goal_until_next_turn() -> Result<()> {
     let server = create_mock_responses_server_sequence_unchecked(vec![
         responses::sse(vec![
             responses::ev_response_created("first-source-turn"),
@@ -983,7 +983,7 @@ async fn thread_fork_defers_inherited_active_goal_until_next_turn() -> Result<()
         .thread_goals()
         .replace_thread_goal(
             source_thread_id,
-            "continue after the retry",
+            &format!("{}a", "a\n".repeat(/*n*/ 7_999)),
             codex_state::ThreadGoalStatus::Active,
             /*token_budget*/ Some(150),
         )

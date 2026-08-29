@@ -1,5 +1,5 @@
 use codex_protocol::ThreadId;
-use codex_protocol::protocol::validate_thread_goal_objective;
+use codex_protocol::protocol::validate_thread_goal_snapshot_objective;
 use codex_state::StateRuntime;
 
 pub(super) async fn inherit_thread_goal_snapshot(
@@ -14,7 +14,7 @@ pub(super) async fn inherit_thread_goal_snapshot(
     else {
         return Ok(false);
     };
-    if let Err(err) = validate_thread_goal_objective(&goal.objective) {
+    if let Err(err) = validate_thread_goal_snapshot_objective(&goal.objective) {
         tracing::warn!(%source_thread_id, "skipping invalid inherited thread goal: {err}");
         return Ok(false);
     }
