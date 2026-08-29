@@ -304,6 +304,7 @@ impl App {
             .await
         {
             Ok(thread) => {
+                self.agent_navigation.invalidate_pending_picker_snapshots();
                 let is_parent_owned = thread_blocks_direct_input(&thread);
                 let agent_path = source_agent_path(&thread.source);
                 let is_running = matches!(
@@ -1021,6 +1022,7 @@ impl App {
             // A live channel can have an empty store after a successful spawn. Only apply server
             // status for channels that would otherwise need another liveness read.
             if !has_live_channel {
+                self.agent_navigation.invalidate_pending_picker_snapshots();
                 if thread.is_running {
                     self.agent_navigation.mark_running(thread.thread_id);
                 } else {

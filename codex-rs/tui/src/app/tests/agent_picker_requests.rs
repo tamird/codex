@@ -4,6 +4,7 @@ use super::session_request_support::start_recording_app_server;
 use super::*;
 use app_test_support::create_fake_parented_rollout_with_source;
 use app_test_support::create_fake_rollout;
+use codex_app_server_protocol::ThreadStatus;
 use codex_protocol::AgentPath;
 use codex_state::SqliteConfig;
 use pretty_assertions::assert_eq;
@@ -468,8 +469,7 @@ async fn dismissed_agent_picker_does_not_retry_invalidated_refresh() -> Result<(
     );
     app.agent_navigation
         .set_agent_path(child_thread_id, Some("/root/worker".to_string()));
-    app.agent_navigation
-        .set_running(child_thread_id, /*is_running*/ true);
+    app.agent_navigation.mark_running(child_thread_id);
     release_tx.send(()).expect("release blocked thread list");
     let completion = next_agent_picker_completion(&mut app_event_rx).await?;
     Box::pin(app.handle_event(&mut tui, &mut app_server, completion)).await?;
@@ -486,6 +486,131 @@ async fn dismissed_agent_picker_does_not_retry_invalidated_refresh() -> Result<(
             .expect("requests")
             .iter()
             .filter(|method| *method == "thread/list")
+            .count(),
+        2
+    );
+
+    app_server.shutdown().await?;
+    proxy.await??;
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn fresh_idle_thread_read_rejects_older_active_picker_snapshots() -> Result<()> {
+    fresh_idle_observations_reject_older_active_picker_snapshots(FreshPickerObservation::ThreadRead)
+        .await
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn fresh_idle_backfill_rejects_older_active_picker_snapshots() -> Result<()> {
+    fresh_idle_observations_reject_older_active_picker_snapshots(
+        FreshPickerObservation::LoadedBackfill,
+    )
+    .await
+}
+
+enum FreshPickerObservation {
+    ThreadRead,
+    LoadedBackfill,
+}
+
+async fn fresh_idle_observations_reject_older_active_picker_snapshots(
+    observation: FreshPickerObservation,
+) -> Result<()> {
+    let (mut app, _app_event_rx, _op_rx) = make_test_app_with_channels().await;
+    let codex_home = tempdir()?;
+    app.config.codex_home = codex_home.path().to_path_buf().abs();
+    app.config.sqlite = SqliteConfig::new_for_testing(codex_home.path().abs());
+    let (root_thread_id, child_thread_id) = create_picker_rollouts(
+        codex_home.path(),
+        app.config.model_provider_id.as_str(),
+        /*index*/ 0,
+    )?;
+    let (mut app_server, requests, proxy) =
+        start_recording_app_server(&app.config, /*blocked_thread_list*/ None).await?;
+    let model_settings = app.resume_model_settings();
+    let root = app_server
+        .resume_thread(app.config.clone(), root_thread_id, model_settings)
+        .await?;
+    app.enqueue_primary_thread_session(root.session, root.turns)
+        .await?;
+    app_server
+        .resume_thread(app.config.clone(), child_thread_id, model_settings)
+        .await?;
+    let mut old_active_thread = app_server
+        .thread_read(child_thread_id, /*include_turns*/ false)
+        .await?;
+    assert_eq!(old_active_thread.status, ThreadStatus::Idle);
+    old_active_thread.status = ThreadStatus::Active {
+        active_flags: Vec::new(),
+    };
+
+    // Start with a stopped entry to exercise successful observations that do not change status.
+    app.agent_navigation.upsert(
+        child_thread_id,
+        old_active_thread.agent_nickname.clone(),
+        old_active_thread.agent_role.clone(),
+        /*is_closed*/ false,
+    );
+    app.agent_navigation.mark_stopped(child_thread_id);
+    requests.lock().expect("requests").clear();
+    let expected_entry = AgentPickerThreadEntry {
+        agent_nickname: Some("worker".to_string()),
+        agent_role: Some("worker".to_string()),
+        agent_path: Some("/root/worker".to_string()),
+        is_running: false,
+        is_closed: false,
+    };
+    for _ in 0..2 {
+        let generation = app
+            .agent_navigation
+            .begin_picker_refresh(root_thread_id)
+            .expect("start pending picker snapshot");
+        match observation {
+            FreshPickerObservation::ThreadRead => {
+                assert!(
+                    app.refresh_agent_picker_thread_liveness(&mut app_server, child_thread_id)
+                        .await
+                );
+            }
+            FreshPickerObservation::LoadedBackfill => {
+                assert!(
+                    app.backfill_loaded_subagent_threads(&mut app_server)
+                        .await
+                        .completed
+                );
+            }
+        }
+        assert_eq!(
+            app.agent_navigation.get(&child_thread_id),
+            Some(&expected_entry)
+        );
+        app.apply_agent_picker_thread_refresh(
+            &app_server,
+            root_thread_id,
+            generation,
+            AgentPickerRefresh::Completed {
+                known_at_start: HashSet::from([root_thread_id, child_thread_id]),
+                exhaustive: true,
+                result: Ok(vec![old_active_thread.clone()]),
+            },
+        );
+        assert_eq!(
+            app.agent_navigation.get(&child_thread_id),
+            Some(&expected_entry)
+        );
+        assert!(!app.agent_navigation.has_picker_refresh(root_thread_id));
+    }
+    let expected_method = match observation {
+        FreshPickerObservation::ThreadRead => "thread/read",
+        FreshPickerObservation::LoadedBackfill => "thread/loaded/list",
+    };
+    assert_eq!(
+        requests
+            .lock()
+            .expect("requests")
+            .iter()
+            .filter(|method| *method == expected_method)
             .count(),
         2
     );
@@ -617,14 +742,14 @@ async fn paged_agent_picker_publishes_completed_descendants(
         .await?;
     app.enqueue_primary_thread_session(root.session, root.turns)
         .await?;
-    app.thread_event_channels
-        .insert(child_thread_id, ThreadEventChannel::new(/*capacity*/ 1));
-    app.agent_navigation
-        .record_sub_agent_activity(SubAgentActivityDisplay {
-            thread_id: child_thread_id,
-            agent_path: "/root/worker".to_string(),
-            is_running_hint: true,
-        });
+    app_server
+        .resume_thread(
+            app.config.clone(),
+            child_thread_id,
+            app.resume_model_settings(),
+        )
+        .await?;
+    assert!(app.agent_navigation.get(&child_thread_id).is_none());
 
     let ghost_thread_id = ThreadId::new();
     app.agent_navigation.upsert(
@@ -645,6 +770,7 @@ async fn paged_agent_picker_publishes_completed_descendants(
     Box::pin(app.handle_event(&mut tui, &mut app_server, AppEvent::OpenAgentPicker)).await?;
     tokio::time::timeout(AGENT_PICKER_MAX_SCAN_DURATION, started_rx).await??;
     assert_eq!(thread_list_count(), 3);
+    assert!(app.agent_navigation.get(&child_thread_id).is_none());
 
     let mut release_tx = Some(release_tx);
     let partial = if blocked_page == BlockedThreadListPage::Second {

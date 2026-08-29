@@ -137,6 +137,13 @@ impl AgentNavigationState {
         self.picker_refreshes.len() >= MAX_IN_FLIGHT_PICKER_ROOTS
     }
 
+    /// Fresh server observations supersede pending snapshots even when cached status is unchanged.
+    pub(crate) fn invalidate_pending_picker_snapshots(&mut self) {
+        if !self.picker_refreshes.is_empty() {
+            self.picker_refresh_generation = self.picker_refresh_generation.wrapping_add(1);
+        }
+    }
+
     /// Returns the cached picker entry for a specific thread id.
     ///
     /// Callers use this when they already know which thread they care about and need the last
