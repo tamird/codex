@@ -962,6 +962,20 @@ impl McpConnectionLease {
         .await?
     }
 
+    pub(crate) fn capture_ready_client(
+        &self,
+        route: Arc<McpSessionRoute>,
+    ) -> Option<McpPooledBindingClient> {
+        let connection = self.current().ok()?;
+        let managed = Arc::new(connection.client.ready_client()?);
+        Some(McpPooledBindingClient {
+            connection,
+            lease: self.clone(),
+            route,
+            managed,
+        })
+    }
+
     pub(crate) async fn capture_ready_client_and_tools(
         &self,
         route: Arc<McpSessionRoute>,
@@ -973,6 +987,30 @@ impl McpConnectionLease {
         // failed initial client.
         if self.has_recoverable_failed_startup() {
             return None;
+        }
+        if let Ok(connection) = self.current()
+            && !route.is_closed()
+            && !connection.client.cancel_token.is_cancelled()
+            && connection.client.startup_complete.load(Ordering::Acquire)
+            && let Some(Ok(client)) = connection.client.client.peek()
+            && Arc::ptr_eq(&connection, &self.inner.slot.current())
+        {
+            let mut managed = client.clone();
+            managed.tool_timeout = tool_timeout;
+            let tools = catalog_override
+                .and_then(|(connection_id, tools)| {
+                    (connection_id == connection.id).then_some(tools)
+                })
+                .unwrap_or_else(|| managed.tools.clone());
+            return Some((
+                McpPooledBindingClient {
+                    connection,
+                    lease: self.clone(),
+                    route,
+                    managed: Arc::new(managed),
+                },
+                tools,
+            ));
         }
         let binding_lease = self.clone();
         self.run(route.clone(), move |client| async move {
@@ -1041,6 +1079,15 @@ impl McpConnectionLease {
     > {
         loop {
             let observed_connection = self.current();
+            if let Ok(connection) = observed_connection.as_ref()
+                && !route.is_closed()
+                && !connection.client.cancel_token.is_cancelled()
+                && connection.client.startup_complete.load(Ordering::Acquire)
+                && let Some(Ok(client)) = connection.client.client.peek()
+                && Arc::ptr_eq(connection, &self.inner.slot.current())
+            {
+                return Ok(client.clone());
+            }
             let attempt = self
                 .run_with_abandoned_operation_action(
                     Arc::clone(&route),
@@ -1229,6 +1276,15 @@ impl McpConnectionLease {
     }
 
     pub(crate) async fn reconnect_failed_startup(&self, route: Arc<McpSessionRoute>) {
+        if let Ok(connection) = self.current()
+            && !route.is_closed()
+            && !connection.client.cancel_token.is_cancelled()
+            && connection.client.startup_complete.load(Ordering::Acquire)
+            && matches!(connection.client.client.peek(), Some(Ok(_)))
+            && Arc::ptr_eq(&connection, &self.inner.slot.current())
+        {
+            return;
+        }
         let lease = self.clone();
         tokio::spawn(async move {
             let reconnect_route = Arc::clone(&route);

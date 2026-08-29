@@ -142,38 +142,61 @@ impl McpConnectionSet {
                 } else {
                     None
                 };
-                let provenance = Arc::clone(&self.tool_plugin_provenance);
-                let tool_filter = view.tool_filter.clone();
-                let Ok(Some(server_tools)) = view
-                    .connection
-                    .run(view.session_route(), move |client| async move {
-                        let tools = match catalog_override {
-                            Some((connection_id, tools))
-                                if connection_id == client.connection_id() =>
-                            {
-                                client.prepare_tools(tools, provenance.as_ref())
-                            }
-                            _ => client.listed_tools(provenance.as_ref()).await?,
-                        };
-                        Some(filter_tools(tools, &tool_filter))
-                    })
-                    .instrument(trace_span!(
-                        "list_tools_for_server",
-                        server_name = %server_name,
-                        has_cached_tools,
-                        startup_complete
-                    ))
-                    .await
-                else {
-                    trace!(
-                        server_name = %server_name,
-                        has_cached_tools,
-                        startup_complete,
-                        "MCP server tools unavailable while building tool list"
-                    );
-                    return None;
-                };
-                server_tools
+                if startup_complete
+                    && !has_cached_tools
+                    && catalog_override.is_none()
+                    && let Some((_client, tools)) = view
+                        .connection
+                        .capture_ready_client_and_tools(
+                            view.session_route(),
+                            /*catalog_override*/ None,
+                            view.tool_timeout,
+                        )
+                        .await
+                {
+                    let tools = filter_tools(tools, &view.tool_filter);
+                    if server_name == CODEX_APPS_MCP_SERVER_NAME {
+                        prepare_codex_apps_tools_for_model(tools, &self.tool_plugin_provenance)
+                    } else {
+                        crate::rmcp_client::prepare_regular_mcp_tools_for_model(
+                            tools,
+                            &self.tool_plugin_provenance,
+                        )
+                    }
+                } else {
+                    let provenance = Arc::clone(&self.tool_plugin_provenance);
+                    let tool_filter = view.tool_filter.clone();
+                    let Ok(Some(server_tools)) = view
+                        .connection
+                        .run(view.session_route(), move |client| async move {
+                            let tools = match catalog_override {
+                                Some((connection_id, tools))
+                                    if connection_id == client.connection_id() =>
+                                {
+                                    client.prepare_tools(tools, provenance.as_ref())
+                                }
+                                _ => client.listed_tools(provenance.as_ref()).await?,
+                            };
+                            Some(filter_tools(tools, &tool_filter))
+                        })
+                        .instrument(trace_span!(
+                            "list_tools_for_server",
+                            server_name = %server_name,
+                            has_cached_tools,
+                            startup_complete
+                        ))
+                        .await
+                    else {
+                        trace!(
+                            server_name = %server_name,
+                            has_cached_tools,
+                            startup_complete,
+                            "MCP server tools unavailable while building tool list"
+                        );
+                        return None;
+                    };
+                    server_tools
+                }
             };
             Some(
                 server_tools

@@ -439,6 +439,105 @@ fn ready_client(
 }
 
 #[tokio::test]
+async fn ready_startup_does_not_wait_for_another_session_route() -> anyhow::Result<()> {
+    let pool = McpConnectionPool::default();
+    let active_route = route();
+    let sibling_route = route();
+    let managed = test_managed_client("ready").await?;
+    let active_lease = pool.acquire(
+        identity("server", "/one"),
+        McpConnectionPoolMode::Reuse,
+        &active_route,
+        move |request_router| ready_client(request_router, managed.clone()),
+    );
+    let sibling_lease = pool.acquire(
+        identity("server", "/one"),
+        McpConnectionPoolMode::Reuse,
+        &sibling_route,
+        client,
+    );
+    active_lease
+        .await_current_startup(Arc::clone(&active_route))
+        .await?;
+    let concurrent_active_lease = active_lease.clone();
+    let concurrent_active_route = Arc::clone(&active_route);
+
+    let active_started = Arc::new(Notify::new());
+    let release_active = Arc::new(Notify::new());
+    let active = {
+        let active_started = Arc::clone(&active_started);
+        let release_active = Arc::clone(&release_active);
+        tokio::spawn(async move {
+            active_lease
+                .run(active_route, move |_| async move {
+                    active_started.notify_one();
+                    release_active.notified().await;
+                })
+                .await
+        })
+    };
+    active_started.notified().await;
+
+    let ready = tokio::time::timeout(
+        Duration::from_millis(100),
+        sibling_lease.await_current_startup(Arc::clone(&sibling_route)),
+    )
+    .await??;
+    assert_eq!(ready.server_info.name, "ready");
+
+    let (binding, tools) = tokio::time::timeout(
+        Duration::from_millis(100),
+        sibling_lease.capture_ready_client_and_tools(
+            Arc::clone(&sibling_route),
+            /*catalog_override*/ None,
+            Some(Duration::from_secs(2)),
+        ),
+    )
+    .await?
+    .expect("ready shared client should be captured without waiting for another route");
+    assert_eq!(
+        (
+            binding.server_info.name.as_str(),
+            binding.tool_timeout(),
+            tools.len()
+        ),
+        ("ready", Some(Duration::from_secs(2)), 0),
+    );
+
+    sibling_lease
+        .reconnect_failed_startup(Arc::clone(&sibling_route))
+        .await;
+    tokio::task::yield_now().await;
+    tokio::time::timeout(
+        Duration::from_millis(100),
+        concurrent_active_lease.run(concurrent_active_route, |_| async {}),
+    )
+    .await??;
+
+    let sibling_started = Arc::new(Notify::new());
+    let sibling = {
+        let sibling_started = Arc::clone(&sibling_started);
+        tokio::spawn(async move {
+            sibling_lease
+                .run(sibling_route, move |_| async move {
+                    sibling_started.notify_one();
+                })
+                .await
+        })
+    };
+    assert!(
+        tokio::time::timeout(Duration::from_millis(25), sibling_started.notified())
+            .await
+            .is_err()
+    );
+    release_active.notify_one();
+    active.await??;
+    tokio::time::timeout(Duration::from_secs(1), sibling_started.notified()).await?;
+    sibling.await??;
+    Ok(())
+}
+
+#[tokio::test]
 async fn startup_wait_retries_a_superseded_connection_generation() -> anyhow::Result<()> {
     let pool = McpConnectionPool::default();
     let root_route = route();

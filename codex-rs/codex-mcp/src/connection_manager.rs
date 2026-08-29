@@ -48,6 +48,7 @@ use crate::request_router::McpSessionRoute;
 use crate::rmcp_client::AsyncManagedClient;
 use crate::rmcp_client::DEFAULT_STARTUP_TIMEOUT;
 use crate::rmcp_client::DEFAULT_TOOL_TIMEOUT;
+use crate::rmcp_client::ManagedClient;
 use crate::rmcp_client::StartupOutcomeError;
 use crate::runtime::McpPublicationGate;
 use crate::runtime::McpRuntimeInput;
@@ -1075,32 +1076,34 @@ impl McpConnectionSet {
         if let Some(serde_json::Value::Object(meta)) = meta.as_mut() {
             meta.remove(ENTITLEMENT_CONTEXT_KEY);
         }
-        if wait_for_server {
+        let tool_name = tool.to_string();
+        let server_name = server.to_string();
+        let call = move |client: Arc<ManagedClient>| async move {
+            client
+                .client
+                .call_tool(tool_name.clone(), arguments, meta, effective_timeout)
+                .await
+                .with_context(|| format!("tool call failed for `{server_name}/{tool_name}`"))
+        };
+        let route = view.session_route();
+        let result = if wait_for_server {
             view.trigger_startup().await;
-        }
-        let tool = tool.to_string();
-        let server = server.to_string();
-        let result: rmcp::model::CallToolResult = view
-            .connection
-            .run_mcp_request(view.session_route(), move |client| async move {
-                let managed = if wait_for_server {
-                    client.client().await.context("failed to get client")?
-                } else {
-                    let managed = client
-                        .ready_client()
-                        .ok_or_else(|| anyhow!("MCP server '{server}' is not connected"))?;
-                    if managed.client.is_closed().await {
-                        bail!("MCP server '{server}' is not connected");
-                    }
-                    managed
-                };
-                managed
-                    .client
-                    .call_tool(tool.clone(), arguments, meta, effective_timeout)
-                    .await
-                    .with_context(|| format!("tool call failed for `{server}/{tool}`"))
-            })
-            .await?;
+            view.connection
+                .run_mcp_request(route, move |client| async move {
+                    let managed = client.client().await.context("failed to get client")?;
+                    call(Arc::new(managed)).await
+                })
+                .await?
+        } else {
+            let client = view
+                .connection
+                .capture_ready_client(route)
+                .ok_or_else(|| anyhow!("MCP server '{server}' is not connected"))?;
+            if client.client.is_closed().await {
+                bail!("MCP server '{server}' is not connected");
+            }
+            client.run(call).await?
+        };
 
         Ok(call_tool_result_from_rmcp(result))
     }

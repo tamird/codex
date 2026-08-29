@@ -142,6 +142,7 @@ impl McpConnectionSet {
     fn insert_test_client(&mut self, name: impl Into<String>, client: AsyncManagedClient) {
         let name = name.into();
         let session_route = self.new_test_session_route();
+        client.request_router.register(&session_route.route);
         let connection = McpConnectionLease::from(client);
         self.servers.insert(
             name,
@@ -3289,7 +3290,32 @@ async fn list_all_tools_applies_legacy_mcp_prefix_by_default() {
     );
     manager.insert_test_client("rmcp", managed_client);
 
-    let tools = manager.list_all_tools().await;
+    let sibling_route = Arc::new(crate::request_router::McpSessionRoute::new(
+        String::new(),
+        manager.elicitation_requests.clone(),
+        /*tx_event*/ None,
+    ));
+    let sibling_started = Arc::new(Notify::new());
+    let release_sibling = Arc::new(Notify::new());
+    let sibling = {
+        let connection = manager.servers["rmcp"].connection.clone();
+        let sibling_started = Arc::clone(&sibling_started);
+        let release_sibling = Arc::clone(&release_sibling);
+        tokio::spawn(async move {
+            connection
+                .run(sibling_route, move |client| async move {
+                    client.client().await.expect("ready client should load");
+                    sibling_started.notify_one();
+                    release_sibling.notified().await;
+                })
+                .await
+        })
+    };
+    sibling_started.notified().await;
+
+    let tools = tokio::time::timeout(Duration::from_millis(100), manager.list_all_tools())
+        .await
+        .expect("ready tool listing should not wait for another session route");
     let tool = tools
         .iter()
         .find(|tool| tool.canonical_tool_name() == ToolName::namespaced("mcp__rmcp", "echo"))
@@ -3305,6 +3331,37 @@ async fn list_all_tools_applies_legacy_mcp_prefix_by_default() {
         ),
         expected
     );
+
+    let request_started = Arc::new(Notify::new());
+    let request = {
+        let connection = manager.servers["rmcp"].connection.clone();
+        let route = manager.servers["rmcp"].session_route();
+        let request_started = Arc::clone(&request_started);
+        tokio::spawn(async move {
+            connection
+                .run(route, move |_| async move {
+                    request_started.notify_one();
+                })
+                .await
+        })
+    };
+    assert!(
+        tokio::time::timeout(Duration::from_millis(25), request_started.notified())
+            .await
+            .is_err()
+    );
+    release_sibling.notify_one();
+    sibling
+        .await
+        .expect("sibling route should finish")
+        .expect("sibling operation should succeed");
+    tokio::time::timeout(Duration::from_secs(1), request_started.notified())
+        .await
+        .expect("real request should start after the sibling route is released");
+    request
+        .await
+        .expect("real request task should finish")
+        .expect("real request should succeed");
 }
 
 #[tokio::test]
@@ -3320,6 +3377,10 @@ async fn call_tool_requires_connection_without_waiting_for_startup() {
         /*prefix_mcp_tool_names*/ true,
     );
     manager.insert_test_client("docs", client);
+    let (trigger, _) = watch::channel(false);
+    let (_, startup_trigger) = manager.servers["docs"]
+        .connection
+        .set_startup_trigger(trigger);
 
     let pending_call = tokio::time::timeout(
         Duration::from_millis(50),
@@ -3337,6 +3398,10 @@ async fn call_tool_requires_connection_without_waiting_for_startup() {
     .expect("ready-only invocation must not wait for pending server startup")
     .expect_err("pending server must not accept ready-only calls");
     assert!(pending_call.to_string().contains("not connected"));
+    assert!(
+        !*startup_trigger.borrow(),
+        "ready-only calls must not trigger startup"
+    );
 
     let startup = tokio::spawn(async move { startup_client.client().await });
     startup_started.await.expect("server startup should begin");
