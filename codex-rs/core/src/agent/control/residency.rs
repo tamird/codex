@@ -1,5 +1,6 @@
 use super::AgentControl;
 use crate::agent::AgentStatus;
+use crate::agent::registry::AgentLifecycle;
 use crate::codex_thread::CodexThread;
 use crate::config::Config;
 use crate::goal_supervisor::is_goal_supervisor_helper_source;
@@ -10,12 +11,15 @@ use codex_protocol::error::CodexErrorDetails;
 use codex_protocol::error::Result as CodexResult;
 use codex_protocol::protocol::MultiAgentVersion;
 use codex_protocol::protocol::SessionSource;
+use futures::StreamExt;
+use futures::stream::FuturesUnordered;
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
+use tokio::sync::Notify;
 use tracing::warn;
 
 /// Idle agents remain warm without making the execution limit a memory-retention limit.
@@ -30,6 +34,8 @@ pub(super) struct AgentResidency {
     trim_scheduled: AtomicBool,
     /// Records completion notices that arrive while an eviction task is already running.
     trim_generation: AtomicUsize,
+    /// Wakes a deferred trim when another completion or resident removal changes its scan.
+    trim_requested: Notify,
 }
 
 /// Mutable residency accounting protected by `AgentResidency::state`.
@@ -103,11 +109,14 @@ impl AgentControl {
             .effective_agent_max_threads(multi_agent_version)
             .unwrap_or(usize::MAX);
         let resident_capacity = execution_capacity.min(DEFAULT_AGENT_RESIDENCY_LIMIT);
-        if self.agent_residency.resident_count() <= resident_capacity {
+        let residency = Arc::clone(&self.agent_residency);
+        // Scans temporarily pop candidates from the LRU across awaits. Notify an existing
+        // worker before trusting that transient count to decide whether to start a new one.
+        residency.trim_generation.fetch_add(1, Ordering::AcqRel);
+        residency.trim_requested.notify_one();
+        if residency.resident_count() <= resident_capacity {
             return;
         }
-        let residency = Arc::clone(&self.agent_residency);
-        residency.trim_generation.fetch_add(1, Ordering::AcqRel);
         if residency.trim_scheduled.swap(true, Ordering::AcqRel) {
             return;
         }
@@ -116,11 +125,9 @@ impl AgentControl {
         tokio::spawn(async move {
             loop {
                 let observed_generation = residency.trim_generation.load(Ordering::Acquire);
-                if let Ok(manager) = control.upgrade() {
-                    residency
-                        .trim_idle_residents(&control, &manager, resident_capacity)
-                        .await;
-                }
+                residency
+                    .trim_idle_residents(&control, resident_capacity)
+                    .await;
                 residency.trim_scheduled.store(false, Ordering::Release);
                 if residency.trim_generation.load(Ordering::Acquire) == observed_generation
                     || residency
@@ -152,6 +159,16 @@ enum EvictionResult {
     Unavailable,
 }
 
+struct EvictionScan {
+    result: EvictionResult,
+    blockers: Vec<ResidencyBlocker>,
+}
+
+enum ResidencyBlocker {
+    Transition(Arc<AgentLifecycle>),
+    CompletionWatcher(Arc<AgentLifecycle>),
+}
+
 impl AgentResidency {
     async fn reserve_slot(
         self: Arc<Self>,
@@ -168,10 +185,15 @@ impl AgentResidency {
                     active: true,
                 });
             }
-            match self
+            let EvictionScan {
+                result,
+                blockers: _,
+            } = self
                 .try_unload_one_resident(control, manager, &protected_thread_ids)
-                .await
-            {
+                .await;
+            // Admission can hold another lifecycle transition, so only the independent trim
+            // worker may wait for the blockers found by this scan.
+            match result {
                 EvictionResult::Unloaded => {}
                 EvictionResult::Retry => {
                     tokio::time::sleep(std::time::Duration::from_millis(10)).await;
@@ -191,18 +213,40 @@ impl AgentResidency {
         }
     }
 
-    async fn trim_idle_residents(
-        &self,
-        control: &AgentControl,
-        manager: &Arc<ThreadManagerState>,
-        resident_capacity: usize,
-    ) {
+    async fn trim_idle_residents(&self, control: &AgentControl, resident_capacity: usize) {
         while self.resident_count() > resident_capacity {
-            if matches!(
-                self.try_unload_one_resident(control, manager, &[]).await,
-                EvictionResult::Retry | EvictionResult::Unavailable
-            ) {
+            let Ok(manager) = control.upgrade() else {
                 return;
+            };
+            let EvictionScan { result, blockers } =
+                self.try_unload_one_resident(control, &manager, &[]).await;
+            // Waiting for a lifecycle must not keep the thread manager alive during shutdown.
+            drop(manager);
+            match result {
+                EvictionResult::Unloaded => continue,
+                EvictionResult::Retry | EvictionResult::Unavailable => {}
+            }
+            if blockers.is_empty() {
+                return;
+            }
+            let mut ready = blockers
+                .into_iter()
+                .map(|blocker| async move {
+                    match blocker {
+                        ResidencyBlocker::Transition(lifecycle) => {
+                            drop(lifecycle.lock_transition().await);
+                        }
+                        ResidencyBlocker::CompletionWatcher(lifecycle) => {
+                            lifecycle.wait_for_completion_watcher().await;
+                        }
+                    }
+                })
+                .collect::<FuturesUnordered<_>>();
+            // No transition guard is retained from the scan. A new completion can make a
+            // different resident unloadable while all of these blockers are still pending.
+            tokio::select! {
+                Some(()) = ready.next() => {}
+                () = self.trim_requested.notified() => {}
             }
         }
     }
@@ -224,16 +268,13 @@ impl AgentResidency {
         control: &AgentControl,
         manager: &Arc<ThreadManagerState>,
         protected_thread_ids: &[ThreadId],
-    ) -> EvictionResult {
+    ) -> EvictionScan {
         let candidates_to_scan = self.resident_count();
         let mut saw_active_watcher = false;
+        let mut blockers = Vec::new();
         for _ in 0..candidates_to_scan {
             let Some(candidate_thread_id) = self.pop_lru_candidate(protected_thread_ids) else {
-                return if saw_active_watcher {
-                    EvictionResult::Retry
-                } else {
-                    EvictionResult::Unavailable
-                };
+                break;
             };
             let registered_lifecycle = control
                 .get_agent_metadata(candidate_thread_id)
@@ -243,6 +284,7 @@ impl AgentResidency {
             // Eviction is opportunistic: never invert that lock order by waiting here.
             let Some(_transition) = lifecycle.try_lock_transition() else {
                 self.touch(candidate_thread_id);
+                blockers.push(ResidencyBlocker::Transition(lifecycle));
                 continue;
             };
             let Some(candidate_thread) = manager
@@ -281,6 +323,7 @@ impl AgentResidency {
             if lifecycle.completion_watcher_active() {
                 self.touch(candidate_thread_id);
                 saw_active_watcher = true;
+                blockers.push(ResidencyBlocker::CompletionWatcher(lifecycle));
                 continue;
             }
             let status = candidate_thread.agent_status().await;
@@ -306,12 +349,18 @@ impl AgentResidency {
                 self.touch(candidate_thread_id);
                 continue;
             }
-            return EvictionResult::Unloaded;
+            return EvictionScan {
+                result: EvictionResult::Unloaded,
+                blockers: Vec::new(),
+            };
         }
-        if saw_active_watcher {
-            EvictionResult::Retry
-        } else {
-            EvictionResult::Unavailable
+        EvictionScan {
+            result: if saw_active_watcher {
+                EvictionResult::Retry
+            } else {
+                EvictionResult::Unavailable
+            },
+            blockers,
         }
     }
 
@@ -354,6 +403,7 @@ impl AgentResidency {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .residents
             .retain(|resident_thread_id| *resident_thread_id != thread_id);
+        self.trim_requested.notify_one();
     }
 
     fn commit_slot(&self, thread_id: ThreadId) {

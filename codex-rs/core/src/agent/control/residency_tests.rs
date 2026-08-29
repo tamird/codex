@@ -1,13 +1,18 @@
+use super::EvictionResult;
+use super::EvictionScan;
+use super::ResidencyBlocker;
 use super::is_resident_session_source;
 use crate::StartThreadOptions;
 use crate::ThreadManager;
 use crate::agent::AgentControl;
+use crate::agent::registry::AgentLifecycle;
 use crate::agent::registry::AgentMetadata;
 use crate::codex_thread::CodexThread;
 use crate::config::Config;
 use crate::config::test_config;
 use crate::context::ContextualUserFragment;
 use crate::context::SubagentNotification;
+use crate::thread_manager::NewThread;
 use crate::thread_manager::ThreadManagerState;
 use assert_matches::assert_matches;
 use codex_features::Feature;
@@ -25,7 +30,11 @@ use codex_protocol::protocol::TurnAbortReason;
 use codex_protocol::protocol::TurnAbortedEvent;
 use codex_protocol::protocol::TurnCompleteEvent;
 use pretty_assertions::assert_eq;
+use std::future::Future;
+use std::future::poll_fn;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
+use std::task::Poll;
 use std::time::Duration;
 use tokio::time::sleep;
 use tokio::time::timeout;
@@ -60,6 +69,301 @@ async fn residency_slot_reservation_unloads_oldest_idle_v2_agent() {
 #[tokio::test]
 async fn residency_slot_reservation_unloads_oldest_idle_v1_agent() {
     assert_residency_slot_unloads_oldest_idle_agent(MultiAgentVersion::V1).await;
+}
+
+struct TrimFixture {
+    _home: tempfile::TempDir,
+    config: Config,
+    manager: ThreadManager,
+    control: AgentControl,
+    first: NewThread,
+    first_lifecycle: Arc<AgentLifecycle>,
+    second: NewThread,
+    second_lifecycle: Arc<AgentLifecycle>,
+}
+
+async fn trim_fixture() -> TrimFixture {
+    let mut config = test_config().await;
+    let _ = config.features.enable(Feature::MultiAgentV2);
+    config.multi_agent_v2.max_concurrent_threads_per_session = 3;
+    let home = tempfile::tempdir().expect("create temp home");
+    config.codex_home = home.path().to_path_buf().try_into().unwrap();
+    config.cwd = home.path().to_path_buf().try_into().unwrap();
+    let manager = ThreadManager::with_models_provider_and_home_for_tests(
+        CodexAuth::from_api_key("dummy"),
+        config.model_provider.clone(),
+        config.codex_home.to_path_buf(),
+        Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
+    );
+    let root = manager
+        .start_thread(StartThreadOptions::new(config.clone()))
+        .await
+        .expect("start root thread");
+    let control = manager.agent_control();
+    let state = control.upgrade().expect("thread manager should be live");
+    let mut residents = Vec::new();
+    for name in ["first", "second"] {
+        let slot = control
+            .reserve_agent_residency_slot(
+                &state,
+                &config,
+                MultiAgentVersion::V2,
+                /*protected_thread_id*/ None,
+            )
+            .await
+            .expect("reserve resident slot");
+        let thread = spawn_subagent(&control, &state, config.clone(), root.thread_id, name).await;
+        let metadata = AgentMetadata {
+            agent_id: Some(thread.thread_id),
+            ..Default::default()
+        };
+        let lifecycle = Arc::clone(&metadata.lifecycle);
+        control
+            .state
+            .reserve_spawn_slot(/*max_threads*/ None)
+            .expect("reserve registry slot")
+            .commit(metadata);
+        slot.commit(thread.thread_id);
+        residents.push((thread, lifecycle));
+    }
+    let [(first, first_lifecycle), (second, second_lifecycle)]: [(NewThread, Arc<AgentLifecycle>);
+        2] = residents
+        .try_into()
+        .unwrap_or_else(|_| panic!("expected two residents"));
+    // Reducing the execution limit makes the two existing residents exceed the warm target.
+    config.multi_agent_v2.max_concurrent_threads_per_session = 2;
+    TrimFixture {
+        _home: home,
+        config,
+        manager,
+        control,
+        first,
+        first_lifecycle,
+        second,
+        second_lifecycle,
+    }
+}
+
+enum ReleasedBlocker {
+    Transition,
+    CompletionWatcher,
+}
+
+#[tokio::test]
+async fn deferred_trim_resumes_after_completion_watcher_finishes() {
+    assert_deferred_trim_resumes(ReleasedBlocker::CompletionWatcher).await;
+}
+
+#[tokio::test]
+async fn deferred_trim_resumes_after_lifecycle_transition_finishes() {
+    assert_deferred_trim_resumes(ReleasedBlocker::Transition).await;
+}
+
+async fn assert_deferred_trim_resumes(released: ReleasedBlocker) {
+    let TrimFixture {
+        _home,
+        config: _,
+        manager,
+        control,
+        first,
+        first_lifecycle,
+        second,
+        second_lifecycle,
+    } = trim_fixture().await;
+    mark_thread_completed(first.thread.as_ref()).await;
+    mark_thread_completed(second.thread.as_ref()).await;
+    let transition = first_lifecycle.lock_transition().await;
+    let watcher = second_lifecycle
+        .try_start_completion_watcher()
+        .expect("register held watcher");
+    let state = control.upgrade().expect("thread manager should be live");
+    let EvictionScan { result, blockers } = control
+        .agent_residency
+        .try_unload_one_resident(&control, &state, &[])
+        .await;
+    assert!(
+        matches!(result, EvictionResult::Retry),
+        "held lifecycle work must defer eviction"
+    );
+    assert!(
+        matches!(
+            blockers.as_slice(),
+            [
+                ResidencyBlocker::Transition(_),
+                ResidencyBlocker::CompletionWatcher(_)
+            ]
+        ),
+        "the scan must retain both lifecycle transition and completion watcher blockers"
+    );
+    drop(state);
+
+    // Poll the production worker directly: the fixture's locks are otherwise uncontended, and
+    // disabling Tokio's cooperative budget keeps Pending tied to the held lifecycle blockers.
+    let mut trim = Box::pin(tokio::task::unconstrained(
+        control
+            .agent_residency
+            .trim_idle_residents(&control, /*resident_capacity*/ 1),
+    ));
+    assert!(futures::poll!(trim.as_mut()).is_pending());
+    let expected = match released {
+        ReleasedBlocker::Transition => {
+            drop(transition);
+            (false, true)
+        }
+        ReleasedBlocker::CompletionWatcher => {
+            drop(watcher);
+            (true, false)
+        }
+    };
+    timeout(Duration::from_secs(/*secs*/ 5), trim)
+        .await
+        .expect("releasing either blocker must finish trimming without another reservation");
+    assert_eq!(
+        (
+            manager.get_thread(first.thread_id).await.is_ok(),
+            manager.get_thread(second.thread_id).await.is_ok(),
+        ),
+        expected
+    );
+}
+
+#[tokio::test]
+async fn deferred_trim_wakes_for_a_new_completion_with_the_old_transition_held() {
+    let TrimFixture {
+        _home,
+        config,
+        manager,
+        control,
+        first,
+        first_lifecycle,
+        second,
+        second_lifecycle: _,
+    } = trim_fixture().await;
+    mark_thread_completed(first.thread.as_ref()).await;
+    let _transition = first_lifecycle.lock_transition().await;
+    let residency = &control.agent_residency;
+    // Own the scheduled worker while polling it directly, so a completion joins this worker
+    // through the real scheduling entry point instead of starting a second one.
+    assert!(!residency.trim_scheduled.swap(true, Ordering::AcqRel));
+    let mut trim = Box::pin(tokio::task::unconstrained(
+        residency.trim_idle_residents(&control, /*resident_capacity*/ 1),
+    ));
+    assert!(futures::poll!(trim.as_mut()).is_pending());
+    mark_thread_completed(second.thread.as_ref()).await;
+    control.schedule_agent_residency_trim(
+        &config,
+        MultiAgentVersion::V2,
+        &second.thread.session_source,
+    );
+    timeout(Duration::from_secs(/*secs*/ 5), trim)
+        .await
+        .expect("new completion must wake trimming without releasing the old transition");
+    residency.trim_scheduled.store(false, Ordering::Release);
+    assert_eq!(
+        (
+            manager.get_thread(first.thread_id).await.is_ok(),
+            manager.get_thread(second.thread_id).await.is_ok(),
+        ),
+        (true, false)
+    );
+}
+
+#[tokio::test]
+async fn deferred_trim_retains_completion_notices_while_a_candidate_is_out_of_the_lru() {
+    let TrimFixture {
+        _home,
+        config,
+        manager,
+        control,
+        first,
+        first_lifecycle: _,
+        second,
+        second_lifecycle,
+    } = trim_fixture().await;
+    mark_thread_completed(second.thread.as_ref()).await;
+    let _watcher = second_lifecycle
+        .try_start_completion_watcher()
+        .expect("register held watcher");
+    let residency = &control.agent_residency;
+    assert!(!residency.trim_scheduled.swap(true, Ordering::AcqRel));
+    let mut trim = Box::pin(tokio::task::unconstrained(
+        residency.trim_idle_residents(&control, /*resident_capacity*/ 1),
+    ));
+    poll_fn(|cx| {
+        // Completion cleared this turn, and the fixture has no task runner.
+        let _scan_gate = second
+            .thread
+            .session
+            .active_turn
+            .try_lock()
+            .expect("completed fixture turn must be unlocked");
+        assert!(trim.as_mut().poll(cx).is_pending());
+        // The first resident was nonterminal when scanned. The second is now popped and waiting
+        // at its active-turn lock, making the count temporarily equal to the retention target.
+        assert_eq!(residency.resident_count(), 1);
+        Poll::Ready(())
+    })
+    .await;
+    // This worker advances only when polled, so the candidate stays popped while completion
+    // is recorded after releasing the scan gate.
+    mark_thread_completed(first.thread.as_ref()).await;
+    control.schedule_agent_residency_trim(
+        &config,
+        MultiAgentVersion::V2,
+        &first.thread.session_source,
+    );
+    timeout(Duration::from_secs(/*secs*/ 5), trim)
+        .await
+        .expect("completion during a scan must survive the temporary resident count");
+    residency.trim_scheduled.store(false, Ordering::Release);
+    assert!(second_lifecycle.completion_watcher_active());
+    assert_eq!(
+        (
+            manager.get_thread(first.thread_id).await.is_ok(),
+            manager.get_thread(second.thread_id).await.is_ok(),
+        ),
+        (false, true)
+    );
+}
+
+#[tokio::test]
+async fn cancelling_deferred_trim_releases_its_lifecycle_waiters() {
+    let TrimFixture {
+        _home,
+        config: _,
+        manager,
+        control,
+        first,
+        first_lifecycle,
+        second,
+        second_lifecycle,
+    } = trim_fixture().await;
+    mark_thread_completed(first.thread.as_ref()).await;
+    mark_thread_completed(second.thread.as_ref()).await;
+    let transition = first_lifecycle.lock_transition().await;
+    let watcher = second_lifecycle
+        .try_start_completion_watcher()
+        .expect("register held watcher");
+    let mut trim = Box::pin(tokio::task::unconstrained(
+        control
+            .agent_residency
+            .trim_idle_residents(&control, /*resident_capacity*/ 1),
+    ));
+    assert!(futures::poll!(trim.as_mut()).is_pending());
+    drop(trim);
+    drop(transition);
+    let _transition = first_lifecycle
+        .try_lock_transition()
+        .expect("cancelled trim must not retain a transition waiter or guard");
+    assert!(second_lifecycle.completion_watcher_active());
+    assert_eq!(
+        (
+            manager.get_thread(first.thread_id).await.is_ok(),
+            manager.get_thread(second.thread_id).await.is_ok(),
+        ),
+        (true, true)
+    );
+    drop(watcher);
 }
 
 #[tokio::test]
