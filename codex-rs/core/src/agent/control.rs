@@ -11,6 +11,8 @@ use crate::agent_communication::AgentCommunicationKind;
 use crate::codex_thread::ThreadConfigSnapshot;
 use crate::config::Config;
 use crate::config::RolloutBudgetConfig;
+use crate::context::ContextualUserFragment;
+use crate::context::MultiAgentRoleInstructions;
 use crate::environment_selection::TurnEnvironmentSnapshot;
 use crate::inherited_thread_state::InheritedThreadState;
 use crate::rollout_budget::RolloutBudget;
@@ -1218,13 +1220,7 @@ fn synthetic_supervisor_list_agents_items(page: ListedAgentsPage) -> Vec<Rollout
 }
 
 fn role_prompt_item(prompt: String) -> ResponseItem {
-    ResponseItem::Message {
-        id: None,
-        role: "developer".to_string(),
-        content: vec![ContentItem::InputText { text: prompt }],
-        phase: None,
-        internal_chat_message_metadata_passthrough: None,
-    }
+    ContextualUserFragment::into(MultiAgentRoleInstructions::unmarked(prompt))
 }
 
 fn thread_spawn_depth(session_source: &SessionSource) -> Option<i32> {

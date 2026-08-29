@@ -224,6 +224,7 @@ use codex_protocol::error::Result as CodexResult;
 #[cfg(test)]
 use codex_protocol::exec_output::StreamOutput;
 
+mod agent_role_prompt;
 mod code_mode_warning;
 mod context_transition;
 pub(crate) mod context_window;
@@ -255,6 +256,15 @@ pub(crate) mod turn_context;
 mod turn_input;
 mod turn_suspension;
 mod world_state;
+pub(crate) use self::agent_role_prompt::load_agent_role_prompt;
+#[cfg(test)]
+use self::agent_role_prompt::load_root_agent_prompt;
+#[cfg(test)]
+use self::agent_role_prompt::load_root_agent_supervisor_prompt;
+#[cfg(test)]
+use self::agent_role_prompt::load_subagent_prompt;
+#[cfg(test)]
+pub(crate) use self::agent_role_prompt::load_supervisor_agent_prompt;
 use self::code_mode_warning::unsupported_code_mode_warning;
 #[cfg(test)]
 use self::handlers::submission_dispatch_span;
@@ -278,54 +288,6 @@ use self::turn_context::TurnContext;
 #[cfg(test)]
 mod rollout_reconstruction_tests;
 
-const ROOT_AGENT_PROMPT_FALLBACK: &str = include_str!("../../assets/root_agent_prompt.md");
-const ROOT_AGENT_SUPERVISOR_PROMPT_FALLBACK: &str =
-    include_str!("../../assets/root_agent_supervisor_prompt.md");
-const SUBAGENT_PROMPT_FALLBACK: &str = include_str!("../../assets/subagent_prompt.md");
-const SUPERVISOR_AGENT_PROMPT_FALLBACK: &str =
-    include_str!("../../assets/supervisor_agent_prompt.md");
-
-async fn load_agent_prompt_fallback(
-    codex_home: &Path,
-    fallback: &str,
-    override_filename: &str,
-) -> String {
-    let override_path = codex_home.join(override_filename);
-    if let Ok(contents) = tokio::fs::read_to_string(&override_path).await
-        && !contents.trim().is_empty()
-    {
-        return contents;
-    }
-
-    fallback.to_string()
-}
-
-pub(crate) async fn load_root_agent_prompt(codex_home: &Path) -> String {
-    load_agent_prompt_fallback(codex_home, ROOT_AGENT_PROMPT_FALLBACK, "AGENTS.root.md").await
-}
-
-async fn load_root_agent_supervisor_prompt(codex_home: &Path) -> String {
-    load_agent_prompt_fallback(
-        codex_home,
-        ROOT_AGENT_SUPERVISOR_PROMPT_FALLBACK,
-        "AGENTS.root-supervisor.md",
-    )
-    .await
-}
-
-pub(crate) async fn load_subagent_prompt(codex_home: &Path) -> String {
-    load_agent_prompt_fallback(codex_home, SUBAGENT_PROMPT_FALLBACK, "AGENTS.subagent.md").await
-}
-
-pub(crate) async fn load_supervisor_agent_prompt(codex_home: &Path) -> String {
-    load_agent_prompt_fallback(
-        codex_home,
-        SUPERVISOR_AGENT_PROMPT_FALLBACK,
-        "AGENTS.supervisor.md",
-    )
-    .await
-}
-
 fn history_contains_developer_text(
     history: &crate::context_manager::ContextManager,
     expected: &str,
@@ -341,49 +303,6 @@ fn history_contains_developer_text(
                     ))
         )
     })
-}
-
-pub(crate) async fn load_agent_role_prompt(
-    config: &Config,
-    session_source: &SessionSource,
-) -> Option<String> {
-    if !config.features.enabled(Feature::AgentPromptInjection) {
-        return None;
-    }
-
-    let role_prompt = match session_source {
-        SessionSource::SubAgent(SubAgentSource::ThreadSpawn { agent_role, .. })
-            if agent_role.as_deref() == Some(crate::goal_supervisor::GOAL_SUPERVISOR_ROLE_NAME) =>
-        {
-            load_supervisor_agent_prompt(&config.codex_home).await
-        }
-        SessionSource::SubAgent(_) => load_subagent_prompt(&config.codex_home).await,
-        SessionSource::Cli
-        | SessionSource::VSCode
-        | SessionSource::Exec
-        | SessionSource::Mcp
-        | SessionSource::Custom(_)
-        | SessionSource::Internal(_)
-        | SessionSource::Unknown => {
-            let mut prompt = load_root_agent_prompt(&config.codex_home).await;
-            if config.features.enabled(Feature::Goals)
-                && config.features.enabled(Feature::GoalSupervisor)
-            {
-                let supervisor_prompt = load_root_agent_supervisor_prompt(&config.codex_home).await;
-                if !supervisor_prompt.trim().is_empty() {
-                    prompt.push_str("\n\n");
-                    prompt.push_str(&supervisor_prompt);
-                }
-            }
-            prompt
-        }
-    };
-
-    if role_prompt.trim().is_empty() {
-        None
-    } else {
-        Some(role_prompt)
-    }
 }
 
 /// Notes from the previous real user turn.
@@ -4824,12 +4743,17 @@ impl Session {
                 state.history.clone(),
             )
         };
-        if let Some(role_prompt) =
-            load_agent_role_prompt(&turn_context.config, &session_source).await
-            && !history_contains_developer_text(&history, &role_prompt)
-        {
-            developer_sections.push(DeveloperInstructions::new(&role_prompt).render_fragment());
-        }
+        // Keep the bounded role contribution separate without changing its precedence over
+        // the configured developer instructions that follow it.
+        let mut role_messages: Vec<ResponseItem> =
+            load_agent_role_prompt(&turn_context.config, &session_source)
+                .await
+                .filter(|prompt| !history_contains_developer_text(&history, prompt))
+                .map(|prompt| {
+                    ContextualUserFragment::into(MultiAgentRoleInstructions::unmarked(prompt))
+                })
+                .into_iter()
+                .collect();
         let separate_guardian_developer_message =
             crate::guardian::is_basic_session_source(&session_source);
         // Keep the guardian policy prompt out of the aggregated developer bundle so it
@@ -4970,7 +4894,11 @@ impl Session {
                     if fragment.markers().0 == ModelSwitchInstructions::type_markers().0 =>
                 {
                     // New-model instructions must precede the rest of the developer context.
-                    developer_sections.insert(0, fragment.render_fragment());
+                    if role_messages.is_empty() {
+                        developer_sections.insert(0, fragment.render_fragment());
+                    } else {
+                        role_messages.insert(0, fragment.into_boxed_response_item());
+                    }
                 }
                 "developer" if fragment.markers().0 == MULTI_AGENT_MODE_OPEN_TAG => {
                     initial_multi_agent_mode = Some(fragment);
@@ -4996,7 +4924,7 @@ impl Session {
             }
         }
 
-        let mut items = Vec::with_capacity(4);
+        let mut items = role_messages;
         if let Some(developer_message) =
             crate::context_manager::updates::build_rendered_message(developer_sections)
         {

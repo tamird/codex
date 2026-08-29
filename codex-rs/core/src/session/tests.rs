@@ -14150,3 +14150,68 @@ async fn agent_prompt_injection_does_not_require_collab_feature() {
     assert!(prompt.contains("# You are a Subagent"));
     assert!(prompt.contains("## Subagent Responsibilities"));
 }
+
+#[tokio::test]
+async fn role_context_is_isolated_in_order_and_not_repeated_from_history() {
+    let home = tempfile::tempdir().unwrap();
+    let role_prompt = "r".repeat(8 * 1024);
+    tokio::fs::write(home.path().join("AGENTS.root.md"), &role_prompt)
+        .await
+        .unwrap();
+    let session = make_session_with_config(|config| {
+        config.codex_home =
+            AbsolutePathBuf::from_absolute_path(home.path()).expect("absolute temporary home");
+        config
+            .features
+            .enable(Feature::AgentPromptInjection)
+            .unwrap();
+        config.features.disable(Feature::Goals).unwrap();
+        config.developer_instructions = Some("configured developer instructions".to_string());
+    })
+    .await
+    .unwrap();
+    let turn_context = session.new_default_turn().await;
+    let mut world_state = WorldState::default();
+    world_state.add_section(crate::context::world_state::ModelInstructionsState::new(
+        "new-model",
+        Some("previous-model"),
+        "new model instructions".to_string(),
+    ));
+    let context = session
+        .build_initial_context_with_world_state(&turn_context, &world_state)
+        .await;
+    let mut expected_prefix = [
+        ContextualUserFragment::into(ModelSwitchInstructions::new(
+            "new model instructions".to_string(),
+        )),
+        ContextualUserFragment::into(MultiAgentRoleInstructions::unmarked(&role_prompt)),
+    ];
+    for item in &mut expected_prefix {
+        item.set_turn_id_if_missing(&turn_context.sub_id);
+    }
+    assert_eq!(&context[..2], &expected_prefix);
+    assert!(matches!(
+        &context[2],
+        ResponseItem::Message { role, content, .. }
+            if role == "developer" && content.contains(&ContentItem::InputText {
+                text: "configured developer instructions".to_string(),
+            })
+    ));
+
+    session
+        .record_conversation_items(&turn_context, &context)
+        .await;
+    let retained = session.clone_history().await;
+    let repeated = session
+        .build_initial_context_with_world_state(&turn_context, &world_state)
+        .await;
+    assert!(!repeated.iter().any(|item| matches!(
+        item,
+        ResponseItem::Message { content, .. }
+            if content.contains(&ContentItem::InputText { text: role_prompt.clone() })
+    )));
+    assert_eq!(
+        raw_history_items(&session.clone_history().await),
+        raw_history_items(&retained)
+    );
+}

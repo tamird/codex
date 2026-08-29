@@ -413,6 +413,30 @@ async fn goal_supervisor_helper_uses_full_history_fork_without_spawn_call_id() {
     );
     let supervisor_prompt =
         crate::session::load_supervisor_agent_prompt(&harness.config.codex_home).await;
+    let recorded_role = helper_history
+        .raw_items()
+        .find(|item| {
+            matches!(
+                item,
+                ResponseItem::Message { role, content, .. }
+                    if role == "developer" && content == &vec![ContentItem::InputText {
+                        text: supervisor_prompt.clone(),
+                    }]
+            )
+        })
+        .expect("supervisor role should be a separate developer item");
+    let mut expected_role =
+        ContextualUserFragment::into(MultiAgentRoleInstructions::unmarked(&supervisor_prompt));
+    if let (
+        ResponseItem::Message {
+            id: expected_id, ..
+        },
+        ResponseItem::Message { id, .. },
+    ) = (&mut expected_role, recorded_role)
+    {
+        *expected_id = id.clone();
+    }
+    assert_eq!(recorded_role, &expected_role);
     assert_eq!(
         helper_history
             .raw_items()
